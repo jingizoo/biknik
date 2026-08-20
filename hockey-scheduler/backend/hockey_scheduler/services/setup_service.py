@@ -14,6 +14,7 @@ from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..domain import (
+    AgeEligibilityRule,
     Club,
     ContactDestination,
     Division,
@@ -57,6 +58,24 @@ from ..domain import (
 )
 from ..domain.jersey import MAX_JERSEY_NUMBER, MIN_JERSEY_NUMBER
 from ..domain.shooting import VALID_SHOOTS, normalize_shoots
+from ..domain.identity import (
+    derive_display_name,
+    normalize_birthdate,
+    normalize_name_part,
+    normalize_preferred_name,
+    normalize_registration_number,
+    normalize_skill_rating,
+    normalized_name_key,
+    MAX_NAME_PART_LENGTH,
+    MAX_SKILL_RATING,
+    MIN_SKILL_RATING,
+)
+from ..domain.eligibility import (
+    evaluate_age_eligibility,
+    normalize_age_tiers,
+    normalize_cutoff,
+    normalize_enforcement,
+)
 from ..domain.errors import (
     ConcurrencyConflictError,
     DivisionMismatchError,
@@ -904,10 +923,12 @@ class SetupService:
         it removes a single ``LeagueSeason`` binding so an operator can, in turn,
         delete a permanent League (which blocks on its bindings — deletions are
         dependency-gated with no silent cascades). It is itself dependency-gated:
-        a binding that still owns Divisions, registrations, or Games is refused
-        (resolve those first), and it fails closed with ``season_archived`` on an
-        archived Season so read-only history is never rewritten. All checks run
-        before the single delete, so a refused unbind changes nothing."""
+        a binding that still owns Divisions, registrations, Games, schedule
+        scenarios, or age-eligibility rule history (#273 review round 2 finding 3)
+        is refused (resolve those first), and it fails closed with
+        ``season_archived`` on an archived Season so read-only history is never
+        rewritten. All checks run before the single delete, so a refused unbind
+        changes nothing."""
         ls = self.store.get_league_season(league_season_id)
         if ls is None:
             raise NotFoundError(
@@ -936,6 +957,20 @@ class SetupService:
                  if g.league_season_id == league_season_id]
         scenarios = [s for s in self.store.all_schedule_scenarios()
                      if s.league_season_id == league_season_id]
+        # #273 review round 2 finding 3: age-eligibility rule history is now
+        # an itemized dependent too. Previously this delete overlooked rule
+        # rows entirely, so removing a LeagueSeason left its
+        # age_eligibility_rules orphaned — pointing at a binding that no
+        # longer existed, with no operator-facing signal that history would
+        # be stranded. Also the SAME invariant migration 058's new FK on
+        # age_eligibility_rules.league_season_id now enforces at the
+        # database level (a DB-level backstop against a create-rule-vs-
+        # delete-binding race this service-level gate alone cannot close —
+        # this itemized check is still what gives an operator a friendly,
+        # actionable refusal instead of a raw constraint error on the
+        # non-race path).
+        rules = self.store.age_eligibility_rules_for_league_season(
+            league_season_id)
         self._block_if_dependents(
             "league_season", league_season_id, "season binding", [
                 self._dep_group("division", divisions, lambda d: d.name),
@@ -943,7 +978,9 @@ class SetupService:
                                 lambda r: self._team_name(r.team_id)),
                 self._dep_group("game", games, self._matchup),
                 self._dep_group("schedule scenario", scenarios,
-                                lambda s: s.name)])
+                                lambda s: s.name),
+                self._dep_group("age eligibility rule", rules,
+                                lambda r: f"v{r.version}")])
         self.store.delete_league_season(league_season_id)
         self._audit("league_season_deleted", "league_season", league_season_id,
                     actor_id, {"league_id": ls.league_id,
@@ -4182,6 +4219,19 @@ class SetupService:
         if player.is_active:
             self._assert_jersey_available(team_id, player.jersey_number,
                                           exclude_player_id=player.id)
+        # #273 review round 2 finding 2: the same same-team duplicate check
+        # create/update already run, now BEFORE the destination-team move —
+        # this method used to check ONLY jersey availability, so a player
+        # carrying a registration number could be moved onto a team that
+        # already had another player with that same number, landing two
+        # rows with one governing-body id on one team. Unlike the jersey
+        # check this is NOT conditioned on ``player.is_active``: the
+        # existing same-team check includes inactive players (deactivating a
+        # row must not free the identity for an accidental duplicate), so a
+        # move must honor the same rule regardless of the mover's active
+        # state.
+        self._assert_registration_number_available(
+            team_id, player.registration_number, exclude_player_id=player.id)
         player.team_id = team_id
         self.store.save_player(player)
         self._audit("player_team_assigned", "player", player.id, actor_id,
@@ -6656,18 +6706,64 @@ class SetupService:
             changed = list(changed) + ["league_id"]
         return existing, False, changed
 
-    def upsert_imported_player(self, code: str, name: str, team_id: str,
+    def upsert_imported_player(self, code: str, name: Optional[str],
+                               team_id: str,
                                position: Position, jersey_number: Optional[int],
                                email: Optional[str], existing=None,
                                actor_id: Optional[str] = None,
                                import_batch_id: Optional[str] = None,
-                               staged_original_jersey=_UNSET):
+                               staged_original_jersey=_UNSET,
+                               staged_original_registration=_UNSET,
+                               first_name: Optional[str] = None,
+                               last_name: Optional[str] = None,
+                               preferred_name: Optional[str] = None,
+                               birthdate: Optional[str] = None,
+                               registration_number: Optional[str] = None,
+                               shoots: Optional[str] = None,
+                               skill_rating=None):
         """Upsert a Player by its stable player_code (#260), syncing an
         optional email the same way ``add_player`` does: an existing
         ``player:<id>`` ContactDestination's value is updated in place,
         never duplicated. Omitting the email on a repeat row leaves a
         previously-set contact untouched — clearing/retiring a contact is
         #232's own explicit, audited action, never an import side effect.
+
+        #273 identity: the caller may supply structured
+        ``first_name``+``last_name`` (the flattened ``name`` is then derived
+        through the same shared contract as create/edit) plus the optional
+        ``preferred_name`` / ``birthdate`` / ``registration_number`` /
+        ``shoots`` / ``skill_rating`` cells. Every optional cell follows the
+        email rule above: ``None`` (absent/blank) means "leave as-is on
+        update, unset on create" — an import never clears identity data. A
+        same-team duplicate registration number is refused before any write;
+        a same-name-on-one-Team create appends the ``player_duplicate_warning``
+        audit (warn only, never a block or merge). ``staged_original_
+        registration`` (#273 review round 3 finding 1) is the pre-staging
+        registration_number a caller's own
+        :meth:`release_batch_player_registrations` pre-pass already reported
+        for this player, if it released one — see that method and
+        ``staged_original_jersey`` immediately below for why a caller running
+        that pre-pass must pass its result back here rather than let this
+        method read ``existing.registration_number`` directly.
+
+        ``jersey_number`` (#269, predates the ``identity_values`` pattern
+        above) now follows the SAME "leave as-is" contract, computed the
+        SAME way as ``registration_number``'s ``effective_registration``
+        just below (#424 round-4 review): a blank cell (``jersey_number is
+        None``) RETAINS the pre-staging original — ``staged_original_jersey``
+        when a :meth:`release_batch_player_jerseys` pre-pass supplied one,
+        else ``existing.jersey_number`` — rather than landing ``None`` and
+        silently clearing a real number. Before this fix, ``jersey_number``
+        was placed into ``values`` unconditionally as the raw (possibly
+        ``None``) argument and checked for availability the same raw way, so
+        a blank cell on a Team move both evaded the destination team's
+        uniqueness check (a ``None`` availability check is a deliberate
+        no-op — an absent jersey never collides) AND then overwrote the
+        retained value with ``None`` at write time, once
+        ``staged_original_jersey`` had already restored ``obj.jersey_number``
+        for diffing. A brand-new player (``existing is None``) has nothing to
+        retain, so its effective value is simply the supplied one, exactly as
+        before.
         """
         self._validate_jersey_number(jersey_number)
         # Validate/canonicalize the email BEFORE any player write (#268 review):
@@ -6677,7 +6773,25 @@ class SetupService:
         # transaction. None/blank canonicalizes to None -> a no-op below (the
         # import rule: an absent cell is "leave as-is", never a retirement).
         canonical_email = self._validate_email(email)
-        canonical_name = self._validate_player_name(name)
+        canonical_name, canonical_first, canonical_last = (
+            self._resolve_new_player_names(name, first_name, last_name))
+        identity_values = {}
+        if canonical_first is not None:
+            identity_values["first_name"] = canonical_first
+            identity_values["last_name"] = canonical_last
+        if preferred_name is not None:
+            identity_values["preferred_name"] = (
+                self._validate_preferred_name(preferred_name))
+        if birthdate is not None:
+            identity_values["birthdate"] = self._validate_birthdate(birthdate)
+        if registration_number is not None:
+            identity_values["registration_number"] = (
+                self._validate_registration_number(registration_number))
+        if shoots is not None:
+            identity_values["shoots"] = self._validate_shoots(shoots)
+        if skill_rating is not None:
+            identity_values["skill_rating"] = (
+                self._validate_skill_rating(skill_rating))
         if existing is not None:
             # #331 review round 15 finding 2 — re-fetch the Player under its
             # ROW LOCK before reading any of its fields, mirroring
@@ -6696,6 +6810,21 @@ class SetupService:
             # match zero rows while still reporting success (SQLite), or
             # lose a concurrent update (PostgreSQL).
             existing = self.store.get_player_for_update(existing.id)
+        # #424 round-4 review: the RETAINED fallback must be the TRUE
+        # pre-staging value — ``staged_original_jersey`` when the caller ran
+        # a swap-safe :meth:`release_batch_player_jerseys` pre-pass (mirrors
+        # #292), never ``existing.jersey_number`` read directly, which may
+        # already carry the transient released NULL. The EFFECTIVE value —
+        # the row's own supplied number, or that true original when the cell
+        # is blank — is what both the availability check and the actual
+        # write use from here on, exactly like ``effective_registration``
+        # below; ``jersey_number`` itself (the raw, possibly-``None``
+        # argument) is never used again past this point.
+        original_jersey = (
+            staged_original_jersey if staged_original_jersey is not _UNSET
+            else (existing.jersey_number if existing is not None else None))
+        effective_jersey_number = (
+            jersey_number if jersey_number is not None else original_jersey)
         # Enforce active-team jersey uniqueness on the IMPORTED target state
         # before any write (#269), so a conflicting row aborts the whole
         # one-transaction batch with zero committed players. An import never
@@ -6705,10 +6834,53 @@ class SetupService:
         target_active = True if existing is None else existing.is_active
         if target_active:
             self._assert_jersey_available(
-                team_id, jersey_number,
+                team_id, effective_jersey_number,
                 exclude_player_id=None if existing is None else existing.id)
         values = {"name": canonical_name, "team_id": team_id,
-                  "position": position, "jersey_number": jersey_number}
+                  "position": position,
+                  "jersey_number": effective_jersey_number,
+                  **identity_values}
+        # Same-team duplicate governing-body id (#273): refuse BEFORE any
+        # write, excluding the row's own player when this is an update.
+        #
+        # #273 review round 2 finding 2: check the EFFECTIVE registration
+        # number the row will carry after this write, not just a
+        # newly-supplied one. The previous version only checked when
+        # ``new_registration is not None`` and it differed from the
+        # existing row's stored value, so a blank cell (``registration_number``
+        # stays unset in ``identity_values`` here -- "leave as-is" on update,
+        # per this method's own contract) or an explicitly re-supplied
+        # UNCHANGED value skipped the check entirely, even though ``team_id``
+        # may be moving the player onto a team that already holds that same
+        # number. Now it always runs against the value the row will actually
+        # carry -- ``new_registration`` when the sheet supplied one, else the
+        # existing row's own retained value -- exactly like the unconditional
+        # jersey check just above. ``exclude_player_id`` keeps a same-team
+        # no-op (or a same-team re-import) from colliding with itself.
+        #
+        # #273 review round 3 finding 1: the RETAINED fallback must be the
+        # TRUE pre-staging value, not ``existing.registration_number`` read
+        # directly -- when the caller ran a swap/cycle-safe
+        # ``release_batch_player_registrations`` pre-pass (mirroring #292's
+        # jersey release) before calling this method, ``existing`` may
+        # already carry the transient released NULL, which would make a
+        # blank-cell row that is actually retaining a real number look like
+        # it holds nothing at all and skip this check entirely.
+        # ``staged_original_registration`` is that pre-pass's own reported
+        # original, exactly like ``staged_original_jersey`` above.
+        original_registration = (
+            staged_original_registration
+            if staged_original_registration is not _UNSET
+            else (existing.registration_number if existing is not None
+                 else None))
+        new_registration = identity_values.get("registration_number")
+        effective_registration = (
+            new_registration if new_registration is not None
+            else original_registration)
+        if effective_registration is not None:
+            self._assert_registration_number_available(
+                team_id, effective_registration,
+                exclude_player_id=None if existing is None else existing.id)
         if existing is None:
             # #331 review round 14 finding 3: same mechanism as
             # upsert_imported_team above -- reserve first, recheck under
@@ -6723,6 +6895,9 @@ class SetupService:
             self._audit("player_created", "player", obj.id, actor_id,
                        {"import_batch_id": import_batch_id, "external_ref": code,
                         "team_id": team_id})
+            # Same-name-on-one-Team WARNING (#273 AC[4]) — audit only.
+            self._warn_same_name_duplicates(
+                obj, actor_id, import_batch_id=import_batch_id)
             created, changed = True, []
         else:
             obj = existing
@@ -6731,8 +6906,34 @@ class SetupService:
             # set reflects the operator's true before→after — a Team-only move
             # that keeps the same number must NOT report a jersey change, and a
             # blank/keep-current cell must land the original, not the NULL.
+            # ``values["jersey_number"]`` is always the EFFECTIVE value
+            # computed above (#424 round-4 review) — the row's own supplied
+            # number, or this SAME restored original when the cell was blank
+            # — so a genuine blank-cell retain now diffs original-vs-original
+            # (no reported change) and a genuine supplied change still diffs
+            # original-vs-new (reported and applied) exactly as before.
             if staged_original_jersey is not _UNSET:
                 obj.jersey_number = staged_original_jersey
+            # Same restore-before-diff for registration_number (#273 review
+            # round 3 finding 1) — but registration_number reaches ``values``
+            # by a DIFFERENT route than jersey_number's effective-value
+            # computation above: it is placed into ``values`` ONLY when the
+            # sheet supplies a new one (the same "absent key = leave as-is"
+            # contract every other optional identity cell in
+            # ``identity_values`` follows), so the restore alone is enough
+            # here: a blank cell's ``values`` carries no "registration_number"
+            # key at all, ``_apply_changes`` never touches the just-restored
+            # original, and no false "changed" report follows; an explicitly
+            # re-supplied value is still in ``values`` and still overwrites +
+            # reports exactly as before. Both routes land on the same
+            # "blank retains, ``_apply_changes`` never sees a spurious diff"
+            # outcome; only the mechanism (unconditional effective value vs.
+            # conditional key placement) differs, because jersey_number is a
+            # required top-level field on every ``Player`` and
+            # registration_number is one of the purely-optional identity
+            # cells.
+            if staged_original_registration is not _UNSET:
+                obj.registration_number = staged_original_registration
             changed = self._apply_changes(obj, values)
             if changed:
                 self.store.save_player(obj)
@@ -6952,19 +7153,90 @@ class SetupService:
             self.store.save_player(existing)
         return released
 
+    def release_batch_player_registrations(self, assignments) -> dict:
+        """Stage a batch import's registration_number moves so a valid
+        same-team swap or longer cycle can commit (#273 review round 3
+        finding 1) — the SAME mechanism as :meth:`release_batch_player_jerseys`
+        (#292) above, applied to ``registration_number`` instead of
+        ``jersey_number``, with the one difference the invariant itself
+        already draws: a registration number is reserved by an INACTIVE
+        player too (migration 058, ``_assert_registration_number_available``),
+        so this release is NOT conditioned on ``is_active`` the way the
+        jersey release is.
+
+        A sequential per-row apply cannot commit an otherwise-valid same-team
+        registration swap (A ``REG-A``→``REG-B``, B ``REG-B``→``REG-A``) or a
+        longer cycle: the first write collides with the number a later row in
+        the SAME batch still holds. Run FIRST, inside the batch's single
+        transaction: for every EXISTING player (active or inactive) whose
+        final ``(team, registration_number)`` differs from its current one,
+        release the number it holds now (set ``registration_number = NULL`` —
+        always unconstrained; migration 058's partial unique index excludes
+        NULL), so the subsequent per-row assignment lands the validated final
+        state with no transient uniqueness failure. Only
+        ``registration_number`` is touched — the id, the team, the jersey,
+        and every other field are preserved — and no audit is written here:
+        the per-row upsert emits the real ``player_created`` /
+        ``player_updated`` entry with the final value. A genuine final-state
+        collision is still caught by the per-row
+        ``_assert_registration_number_available`` (and the DB index), so the
+        whole batch rolls back with zero writes — the SAME final-state
+        question :func:`hockey_scheduler.domain.identity.
+        plan_effective_registration_state` already answered for the preview
+        that gated this commit.
+
+        ``assignments`` is an iterable of ``(existing_player, final_team_id,
+        final_registration_number)``; new players (``existing_player is
+        None``), numberless players, and players staying in the same slot are
+        skipped. Returns ``{player_id: pre-release registration_number}`` for
+        exactly the players it released, so the apply step can restore each
+        real original — a blank/keep-current cell must land the ORIGINAL
+        value, not the transient NULL, and the single final audit must
+        describe the operator's real before→after, not the staging.
+        """
+        released = {}
+        for existing, final_team_id, final_registration in assignments:
+            if existing is None:
+                continue
+            if existing.registration_number is None:
+                continue  # holds no number → nothing to release
+            if (existing.team_id, existing.registration_number) == (
+                    final_team_id, final_registration):
+                continue  # staying put → keep it so real collisions still catch
+            released[existing.id] = existing.registration_number
+            existing.registration_number = None
+            self.store.save_player(existing)
+        return released
+
     # -- convenience: add a player to a team ------------------------------
     @_transactional
-    def add_player(self, team_id: str, name: str, position: Position,
+    def add_player(self, team_id: str, name: Optional[str], position: Position,
                    jersey_number: Optional[int] = None,
                    email: Optional[str] = None,
                    shoots: Optional[str] = None,
                    is_active: bool = True,
-                   actor_id: Optional[str] = None) -> Player:
+                   actor_id: Optional[str] = None,
+                   first_name: Optional[str] = None,
+                   last_name: Optional[str] = None,
+                   preferred_name: Optional[str] = None,
+                   birthdate: Optional[str] = None,
+                   registration_number: Optional[str] = None,
+                   skill_rating: Optional[int] = None) -> Player:
         """Manually create one Player (#114) — the same model/store the CSV
         import path writes, so a league admin isn't forced through Import for
         a single new arrival. Validation mirrors import_validator's row
         checks (jersey_number > 0, an ``@`` with a ``.`` after it in email)
-        so a manual create can't slip in data the bulk path would reject."""
+        so a manual create can't slip in data the bulk path would reject.
+
+        #273 identity: a caller supplies EITHER the legacy flattened ``name``
+        OR structured ``first_name``+``last_name`` (display name derived,
+        never free-typed) — one shared contract with edit and both imports
+        (:meth:`_resolve_new_player_names`). ``birthdate`` (private),
+        ``registration_number`` (private, same-team duplicates hard-refused),
+        ``preferred_name`` and the 1-7 ``skill_rating`` are optional. An
+        exact same-name teammate lacking disambiguating data appends a
+        ``player_duplicate_warning`` audit — a visible warning, never a
+        block and never a merge."""
         # Name the missing required field (#271) BEFORE the team lookup, so a
         # None/empty team_id is a clear `field_required` validation error rather
         # than the misleading `NotFoundError("Team None not found.")` — correct
@@ -6993,20 +7265,59 @@ class SetupService:
         canonical_email = self._validate_email(email)
         canonical_shoots = self._validate_shoots(shoots)
         canonical_position = self._validate_position(position)
-        canonical_name = self._validate_player_name(name)
+        display_name, canonical_first, canonical_last = (
+            self._resolve_new_player_names(name, first_name, last_name))
+        canonical_preferred = self._validate_preferred_name(preferred_name)
+        canonical_birthdate = self._validate_birthdate(birthdate)
+        canonical_registration = self._validate_registration_number(
+            registration_number)
+        canonical_skill = self._validate_skill_rating(skill_rating)
+        self._assert_registration_number_available(
+            team_id, canonical_registration)
         player = Player(id=self.store.next_id("player"), team_id=team_id,
-                        name=canonical_name,
+                        name=display_name,
                         position=canonical_position,
                         jersey_number=jersey_number,
                         shoots=canonical_shoots,
-                        is_active=is_active)
+                        is_active=is_active,
+                        first_name=canonical_first,
+                        last_name=canonical_last,
+                        preferred_name=canonical_preferred,
+                        birthdate=canonical_birthdate,
+                        registration_number=canonical_registration,
+                        skill_rating=canonical_skill)
         self.store.add_player(player)
         self._audit("player_added", "player", player.id, actor_id,
                     {"team_id": team_id})
+        self._warn_same_name_duplicates(player, actor_id)
         if canonical_email is not None:
             # Nonblank only: create/reactivate via the shared set/retire path.
             self._set_email_contact(f"player:{player.id}", canonical_email)
         return player
+
+    def _resolve_new_player_names(self, name, first_name, last_name):
+        """The ONE name-form contract for Player create and both imports
+        (#273 AC[3]) → ``(display_name, first, last)``.
+
+        Structured form: ``first_name``+``last_name`` (both required together
+        — ``structured_name_incomplete`` names the missing one), display name
+        DERIVED, and a nonblank flattened ``name`` alongside them is refused
+        (``conflicting_name_forms``) rather than silently ignored — two
+        disagreeing name forms in one request is operator error, not data.
+        Legacy form: flattened ``name`` alone, validated exactly as before
+        (#268). Structured parts are None in that case — never guessed by
+        splitting the display name.
+        """
+        if first_name is not None or last_name is not None:
+            if name is not None and (not isinstance(name, str) or name.strip()):
+                raise ValidationError(
+                    "Supply either name or first_name+last_name, not both.",
+                    {"reason": "conflicting_name_forms", "field": "name"})
+            canonical_first = self._validate_name_part(first_name, "first_name")
+            canonical_last = self._validate_name_part(last_name, "last_name")
+            return (derive_display_name(canonical_first, canonical_last),
+                    canonical_first, canonical_last)
+        return self._validate_player_name(name), None, None
 
     @staticmethod
     def _validate_email(email) -> Optional[str]:
@@ -7101,9 +7412,147 @@ class SetupService:
                 {"reason": "invalid_name", "field": "name"})
         return name.strip()
 
+    @staticmethod
+    def _validate_name_part(value, field: str) -> str:
+        """Canonicalize a REQUIRED structured name part (#273).
+
+        Shared by create, edit, and both import paths — one contract
+        (AC[3]). Trims and collapses internal whitespace; rejects
+        non-strings, blanks, and over-length values with a field-level
+        error naming the exact part.
+        """
+        canonical, reason = normalize_name_part(value)
+        if reason is not None:
+            raise ValidationError(
+                f"{field} must be a non-empty string of at most "
+                f"{MAX_NAME_PART_LENGTH} characters.",
+                {"reason": f"invalid_{field}", "field": field})
+        return canonical
+
+    @staticmethod
+    def _validate_preferred_name(value) -> Optional[str]:
+        """Optional preferred name (#273): blank/None → unset, else the same
+        shape rules as the required parts."""
+        canonical, reason = normalize_preferred_name(value)
+        if reason is not None:
+            raise ValidationError(
+                f"preferred_name must be a string of at most "
+                f"{MAX_NAME_PART_LENGTH} characters, or left blank.",
+                {"reason": "invalid_preferred_name", "field": "preferred_name"})
+        return canonical
+
+    def _validate_birthdate(self, value) -> Optional[str]:
+        """Optional PRIVATE birthdate (#273) → canonical ``YYYY-MM-DD``.
+
+        Must be a real calendar date, not in the future — "today" comes from
+        the service's injected clock, never a domain-side ``now()``. The
+        single gate for create, edit, and both import commits.
+        """
+        canonical, reason = normalize_birthdate(
+            value, today=self.clock().date())
+        if reason is not None:
+            raise ValidationError(
+                f"birthdate must be a real past calendar date in YYYY-MM-DD "
+                f"form ({reason}).",
+                {"reason": "invalid_birthdate", "field": "birthdate"})
+        return canonical
+
+    @staticmethod
+    def _validate_registration_number(value) -> Optional[str]:
+        """Optional governing-body registration number (#273): trimmed,
+        case preserved, no internal whitespace, bounded length."""
+        canonical, reason = normalize_registration_number(value)
+        if reason is not None:
+            raise ValidationError(
+                f"registration_number must be a short identifier without "
+                f"whitespace ({reason}).",
+                {"reason": "invalid_registration_number",
+                 "field": "registration_number"})
+        return canonical
+
+    @staticmethod
+    def _validate_skill_rating(value) -> Optional[int]:
+        """Optional 1-7 skill rating (#287 owner ruling → #273); None/blank =
+        unrated, a fully supported state."""
+        canonical, reason = normalize_skill_rating(value)
+        if reason is not None:
+            raise ValidationError(
+                f"skill_rating must be an integer between {MIN_SKILL_RATING} "
+                f"and {MAX_SKILL_RATING}, or left blank.",
+                {"reason": "invalid_skill_rating", "field": "skill_rating"})
+        return canonical
+
+    def _assert_registration_number_available(
+            self, team_id: str, registration_number: Optional[str],
+            exclude_player_id: Optional[str] = None) -> None:
+        """Refuse a SAME-TEAM duplicate governing-body id (#273).
+
+        Two rows on one Team carrying one registration number is
+        definitionally the same athlete twice — a hard field-level error, not
+        a warning (and not a merge: the caller's row is simply refused).
+        CROSS-team duplicates stay allowed: under the legacy permanent
+        Player→Team model one human on two teams is two legitimate rows
+        (#205 restructures that); ``player_duplicate_report`` surfaces them
+        as warnings instead. Includes inactive players — deactivating a row
+        must not free the identity for an accidental duplicate.
+        """
+        if registration_number is None:
+            return
+        for other in self.store.players_for_team(team_id):
+            if other.id == exclude_player_id:
+                continue
+            if other.registration_number == registration_number:
+                raise ValidationError(
+                    "registration_number is already used by another player "
+                    "on this team.",
+                    {"reason": "duplicate_registration_number",
+                     "field": "registration_number"})
+
+    def _warn_same_name_duplicates(self, player, actor_id,
+                                   import_batch_id=None) -> None:
+        """Append a ``player_duplicate_warning`` audit when a just-written
+        player is an exact same-name record on one Team lacking
+        disambiguating data (#273 AC[4]).
+
+        A pair counts as DISAMBIGUATED only when both rows carry a birthdate
+        or registration number that proves them different people; anything
+        less is warned. A WARNING only — never a block, and never any merge
+        (records are never matched by name alone, per #273 and the epic #205
+        ruling). The audit detail carries ids only: no name text, no
+        birthdate, no registration number.
+        """
+        key = normalized_name_key(player.name)
+        if key is None:
+            return
+        matches = []
+        for other in self.store.players_for_team(player.team_id):
+            if other.id == player.id:
+                continue
+            if normalized_name_key(other.name) != key:
+                continue
+            proven_different = (
+                (player.birthdate is not None and other.birthdate is not None
+                 and player.birthdate != other.birthdate)
+                or (player.registration_number is not None
+                    and other.registration_number is not None
+                    and player.registration_number
+                    != other.registration_number))
+            if not proven_different:
+                matches.append(other.id)
+        if matches:
+            detail = {"team_id": player.team_id,
+                      "matching_player_ids": sorted(matches)}
+            if import_batch_id is not None:
+                detail["import_batch_id"] = import_batch_id
+            self._audit("player_duplicate_warning", "player", player.id,
+                        actor_id, detail)
+
     @_transactional
     def update_player(self, player_id: str, *, name=_UNSET, position=_UNSET,
                       jersey_number=_UNSET, shoots=_UNSET, email=_UNSET,
+                      first_name=_UNSET, last_name=_UNSET,
+                      preferred_name=_UNSET, birthdate=_UNSET,
+                      registration_number=_UNSET, skill_rating=_UNSET,
                       actor_id: Optional[str] = None) -> Player:
         """Correct a Player's profile in place (#268) — id and history unchanged.
 
@@ -7120,18 +7569,90 @@ class SetupService:
         transaction — leaves ZERO partial state. A genuine no-op writes nothing
         and appends no ``player_updated`` audit (so the trail never lies). The
         audit's ``changed_fields`` names WHICH fields changed, never the email
-        address or any other value.
+        address or any other value (nor, #273, the birthdate or registration
+        number — private values never enter the audit trail).
+
+        #273 identity edits share the create/import contract: while a player
+        carries structured names the flattened ``name`` is DERIVED — editing
+        it directly is refused (``name_is_derived``); edit the parts instead
+        and the display name follows. The parts live and die together:
+        ending up with exactly one of first/last set is
+        ``structured_name_incomplete``; clearing BOTH (explicit None) returns
+        the player to legacy flattened-name state (the display name stays —
+        it is required — and may be edited in that same call). A changed
+        registration number re-checks same-team uniqueness excluding self.
         """
         player = self.store.get_player_for_update(player_id)
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
 
         changed = []
+        # -- structured names first (#273): the flattened name's editability
+        # depends on the structured state AFTER these edits are applied.
+        if first_name is not _UNSET or last_name is not _UNSET:
+            new_first = (player.first_name if first_name is _UNSET
+                         else None if first_name is None
+                         else self._validate_name_part(first_name,
+                                                       "first_name"))
+            new_last = (player.last_name if last_name is _UNSET
+                        else None if last_name is None
+                        else self._validate_name_part(last_name, "last_name"))
+            # Validate the whole name-form outcome BEFORE any assignment.
+            if (new_first is None) != (new_last is None):
+                raise ValidationError(
+                    "first_name and last_name are set and cleared together.",
+                    {"reason": "structured_name_incomplete",
+                     "field": ("first_name" if new_first is None
+                               else "last_name")})
+            if new_first is not None and name is not _UNSET:
+                raise ValidationError(
+                    "Supply either name or first_name+last_name, not both.",
+                    {"reason": "conflicting_name_forms", "field": "name"})
+            if new_first != player.first_name:
+                player.first_name = new_first
+                changed.append("first_name")
+            if new_last != player.last_name:
+                player.last_name = new_last
+                changed.append("last_name")
+            if new_first is not None:
+                derived = derive_display_name(new_first, new_last)
+                if derived != player.name:
+                    player.name = derived
+                    changed.append("name")
         if name is not _UNSET:
+            if player.first_name is not None or player.last_name is not None:
+                raise ValidationError(
+                    "name is derived from first_name+last_name on this "
+                    "player; edit those instead.",
+                    {"reason": "name_is_derived", "field": "name"})
             new_name = self._validate_player_name(name)
             if new_name != player.name:
                 player.name = new_name
                 changed.append("name")
+        if preferred_name is not _UNSET:
+            new_preferred = self._validate_preferred_name(preferred_name)
+            if new_preferred != player.preferred_name:
+                player.preferred_name = new_preferred
+                changed.append("preferred_name")
+        if birthdate is not _UNSET:
+            new_birthdate = self._validate_birthdate(birthdate)
+            if new_birthdate != player.birthdate:
+                player.birthdate = new_birthdate
+                changed.append("birthdate")
+        if registration_number is not _UNSET:
+            new_registration = self._validate_registration_number(
+                registration_number)
+            if new_registration != player.registration_number:
+                self._assert_registration_number_available(
+                    player.team_id, new_registration,
+                    exclude_player_id=player.id)
+                player.registration_number = new_registration
+                changed.append("registration_number")
+        if skill_rating is not _UNSET:
+            new_skill = self._validate_skill_rating(skill_rating)
+            if new_skill != player.skill_rating:
+                player.skill_rating = new_skill
+                changed.append("skill_rating")
         if position is not _UNSET:
             new_position = self._validate_position(position)
             if new_position != player.position:
@@ -7165,6 +7686,242 @@ class SetupService:
             self._audit("player_updated", "player", player.id, actor_id,
                         {"changed_fields": fields})
         return player
+
+    # -- age eligibility rules + duplicate detection (#273) ---------------
+
+    @_transactional
+    def set_age_eligibility_rule(self, league_season_id: str,
+                                 cutoff_month, cutoff_day, tiers,
+                                 enforcement=None,
+                                 actor_id: Optional[str] = None
+                                 ) -> AgeEligibilityRule:
+        """Append the next VERSION of a LeagueSeason's age-eligibility rule.
+
+        Rules are immutable rows; "changing the rule" writes version N+1 and
+        leaves history intact, so any past eligibility answer can name and
+        reproduce the exact version it used (the owner's versioned-policy
+        pattern from epic #205). Cutoff month/day (Feb 29 refused — the
+        cutoff must exist every year), tiers, and the warn-first
+        ``enforcement`` mode are canonicalized by the pure domain module
+        before any write. Audited without PII: the detail carries scope,
+        version, cutoff, tier codes, and mode.
+
+        #273 review round 2 finding 3: the OWNING Season is locked (row-locked
+        via ``_require_active_season``, mirroring ``create_league_season`` /
+        ``delete_league_season``'s identical Season-first lock order) BEFORE
+        any further work, and the LeagueSeason binding is RE-READ under that
+        lock. A prior revision read the LeagueSeason with a plain unlocked
+        get, never called ``_require_active_season`` at all, and computed
+        ``max(version) + 1`` with no lock held — so a rule could be appended
+        to an ARCHIVED Season's history (frozen history silently mutated),
+        and two concurrent callers appending a rule for the SAME
+        league_season_id could both read the same ``existing`` list and both
+        compute the same next version (the unique ``(league_season_id,
+        version)`` index would then reject the loser outright, rather than
+        the two committing consecutive versions the way two concurrent
+        ``create_league_season``/``archive_season`` callers already do
+        elsewhere in this file). Locking the Season row first closes both
+        holes at once: it fails closed on an archived Season exactly like
+        every other Season-owned write, AND it serializes every writer
+        appending a rule for a LeagueSeason under that same Season — a second
+        writer blocks on the row lock until the first commits, then re-reads
+        ``existing`` (below) and sees the just-committed row, so both writers
+        succeed with genuinely consecutive versions instead of racing for the
+        same one. The RE-READ of the LeagueSeason itself (like
+        ``delete_league_season``'s own re-fetch) catches a concurrent
+        ``delete_league_season`` of this SAME binding, which takes the
+        identical Season-row lock first: the loser of that race fails closed
+        with ``not_found`` and zero mutation rather than resurrecting a
+        rule against a binding that no longer exists.
+        """
+        if not league_season_id:
+            raise ValidationError(
+                "league_season_id is required.",
+                {"reason": "field_required", "field": "league_season_id"})
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
+            raise NotFoundError(
+                f"LeagueSeason {league_season_id} not found.")
+        if ls.season_id:
+            self._require_active_season(ls.season_id)  # #159 read-only guard
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
+            raise NotFoundError(
+                f"LeagueSeason {league_season_id} not found.")
+        canonical_cutoff, reason = normalize_cutoff(cutoff_month, cutoff_day)
+        if reason is not None:
+            raise ValidationError(
+                f"cutoff must be a month/day that exists every year "
+                f"({reason}).",
+                {"reason": "invalid_cutoff",
+                 "field": ("cutoff_month" if reason
+                           in ("month_out_of_range", "not_an_integer")
+                           else "cutoff_day")})
+        canonical_tiers, reason = normalize_age_tiers(tiers)
+        if reason is not None:
+            raise ValidationError(
+                f"tiers must be a non-empty list of unique "
+                f"{{code, max_age}} entries ({reason}).",
+                {"reason": "invalid_tiers", "field": "tiers"})
+        canonical_enforcement, reason = normalize_enforcement(enforcement)
+        if reason is not None:
+            raise ValidationError(
+                "enforcement must be 'warn' or 'block'.",
+                {"reason": "invalid_enforcement", "field": "enforcement"})
+        # Still holding the Season row lock acquired above: a second
+        # concurrent writer blocks on that SAME lock until this transaction
+        # commits or rolls back, so the version it computes here can never
+        # race another writer's — see the docstring.
+        existing = self.store.age_eligibility_rules_for_league_season(
+            league_season_id)
+        version = existing[-1].version + 1 if existing else 1
+        rule = AgeEligibilityRule(
+            id=self.store.next_id("agerule"),
+            league_season_id=league_season_id,
+            version=version,
+            cutoff_month=canonical_cutoff[0],
+            cutoff_day=canonical_cutoff[1],
+            tiers=canonical_tiers,
+            enforcement=canonical_enforcement,
+            created_at=self.clock(),
+            actor_id=actor_id)
+        self.store.add_age_eligibility_rule(rule)
+        self._audit(
+            "age_eligibility_rule_set", "age_eligibility_rule", rule.id,
+            actor_id,
+            {"league_season_id": league_season_id, "version": version,
+             "cutoff": f"{rule.cutoff_month:02d}-{rule.cutoff_day:02d}",
+             "tier_codes": [t["code"] for t in canonical_tiers],
+             "enforcement": canonical_enforcement})
+        return rule
+
+    def current_age_eligibility_rule(
+            self, league_season_id: str) -> Optional[AgeEligibilityRule]:
+        """The highest-version rule for a LeagueSeason, or None."""
+        rules = self.store.age_eligibility_rules_for_league_season(
+            league_season_id)
+        return rules[-1] if rules else None
+
+    def evaluate_player_age_eligibility(self, player_id: str,
+                                        division_id: str) -> dict:
+        """Answer #273's acceptance question for one athlete and Division.
+
+        Resolves the Division → LeagueSeason → current rule + Season start,
+        reads the athlete's birthdate, and delegates the actual decision to
+        the pure domain evaluator. The result names the exact rule id +
+        version it used and NEVER contains the birthdate itself — only
+        derived values (status/reason/age-at-cutoff), so it is safe as the
+        Coach-facing eligibility summary the bounded-#124 ruling requires
+        (raw protected values stay operator-only). Honest indeterminates
+        (``no_rule`` / ``no_birthdate`` / ``unknown_tier`` /
+        ``no_season_start``) are answers, never guesses. Nothing here blocks
+        anything: wiring ``enforcement == "block"`` into registration/roster
+        mutations is explicitly later policy work.
+        """
+        player = self.store.get_player(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+        division = self.store.get_division(division_id)
+        if division is None:
+            raise NotFoundError(f"Division {division_id} not found.")
+        league_season = self.store.get_league_season(
+            division.league_season_id)
+        rule = self.current_age_eligibility_rule(division.league_season_id)
+        out = {"player_id": player_id, "division_id": division_id,
+               "league_season_id": division.league_season_id,
+               "rule_id": None, "rule_version": None, "enforcement": None}
+        if rule is None:
+            out.update({"status": "indeterminate", "reason": "no_rule",
+                        "tier_code": None, "max_age": None,
+                        "age_at_cutoff": None, "cutoff_date": None})
+            return out
+        season = (self.store.get_season(league_season.season_id)
+                  if league_season is not None else None)
+        result = evaluate_age_eligibility(
+            birthdate=player.birthdate,
+            tier_declared=division.age_group,
+            cutoff_month=rule.cutoff_month,
+            cutoff_day=rule.cutoff_day,
+            season_start=season.start_date if season is not None else None,
+            tiers=rule.tiers)
+        out.update({"rule_id": rule.id, "rule_version": rule.version,
+                    "enforcement": rule.enforcement, **result})
+        return out
+
+    def player_duplicate_report(self,
+                                team_id: Optional[str] = None) -> List[dict]:
+        """Duplicate-candidate WARNINGS across players (#273 AC[4]).
+
+        Detection keys on the STABLE identifiers plus birthdate context —
+        never on name alone, and this report never merges, writes, or even
+        suggests a merge; it only points an operator at rows to inspect.
+
+        Three warning shapes, each with sorted ``player_ids``:
+
+        * ``same_name_same_team_undisambiguated`` — exact same-name records
+          on one Team where no pair is PROVEN different people by differing
+          birthdates or registration numbers (the issue's minimum warning).
+        * ``shared_registration_number`` — one governing-body id on multiple
+          rows (cross-team; same-team is hard-refused at write time). The
+          identifier value itself is included: this report is operator
+          tooling and is listed for the MANAGE_SETUP-gated surface in the
+          web follow-up, mirroring ``include_email``.
+        * ``same_name_same_birthdate`` — same name AND same birthdate on
+          different Teams: very likely one athlete row-duplicated under the
+          legacy permanent Player→Team model. The shared birthdate is NOT
+          echoed into the report.
+        """
+        players = (self.store.players_for_team(team_id) if team_id
+                   else self.store.all_players())
+        warnings = []
+        by_team_name = {}
+        for p in players:
+            key = normalized_name_key(p.name)
+            if key is not None:
+                by_team_name.setdefault((p.team_id, key), []).append(p)
+        for (group_team_id, _key), group in sorted(by_team_name.items()):
+            if len(group) < 2:
+                continue
+            proven = all(
+                (a.birthdate is not None and b.birthdate is not None
+                 and a.birthdate != b.birthdate)
+                or (a.registration_number is not None
+                    and b.registration_number is not None
+                    and a.registration_number != b.registration_number)
+                for i, a in enumerate(group) for b in group[i + 1:])
+            if not proven:
+                warnings.append({
+                    "type": "same_name_same_team_undisambiguated",
+                    "team_id": group_team_id,
+                    "name": group[0].name,
+                    "player_ids": sorted(p.id for p in group)})
+        by_registration = {}
+        for p in players:
+            if p.registration_number is not None:
+                by_registration.setdefault(
+                    p.registration_number, []).append(p)
+        for registration, group in sorted(by_registration.items()):
+            if len(group) >= 2:
+                warnings.append({
+                    "type": "shared_registration_number",
+                    "registration_number": registration,
+                    "team_ids": sorted({p.team_id for p in group}),
+                    "player_ids": sorted(p.id for p in group)})
+        by_name_birthdate = {}
+        for p in players:
+            key = normalized_name_key(p.name)
+            if key is not None and p.birthdate is not None:
+                by_name_birthdate.setdefault(
+                    (key, p.birthdate), []).append(p)
+        for (_key, _bd), group in sorted(by_name_birthdate.items()):
+            teams = {p.team_id for p in group}
+            if len(group) >= 2 and len(teams) >= 2:
+                warnings.append({
+                    "type": "same_name_same_birthdate",
+                    "name": group[0].name,
+                    "team_ids": sorted(teams),
+                    "player_ids": sorted(p.id for p in group)})
+        return warnings
 
     def _set_email_contact(self, recipient_ref: str, email) -> bool:
         """The one set/retire path for a recipient's EMAIL ``ContactDestination``.
@@ -7482,7 +8239,11 @@ class SetupService:
         # the single write transaction below, so the lock is held through every
         # import mutation (#159).
 
-        result = validate_import(sheets, store=self.store)
+        # today (#273): lets the dry-run report a future birthdate BEFORE
+        # any write, from this service's injected clock (never a validator-
+        # side now()).
+        result = validate_import(sheets, store=self.store,
+                                 today=self.clock().date())
         if not result["ok"]:
             return {"committed": False, "summary": result["summary"],
                     "errors": result["errors"], "warnings": result["warnings"]}
@@ -8129,11 +8890,38 @@ class SetupService:
                     released = self.release_batch_player_jerseys(
                         _final_slot(row) for row in player_rows)
 
+                    # Swap-safe apply, registration_number (#273 review round
+                    # 3 finding 1, mirrors the jersey release just above):
+                    # release every existing player's registration_number
+                    # whose final (team, registration) differs from its
+                    # current one BEFORE any per-row write, so a valid
+                    # same-team (or cross-team) swap or longer cycle commits
+                    # without a transient uniqueness failure. A blank
+                    # registration_number cell RETAINS the current value
+                    # (final == current → not released).
+                    def _final_registration(row):
+                        existing = by_code.get(_clean(row.get("player_code")))
+                        team_id = team_code_to_id.get(_clean(row.get("team_code")))
+                        raw = row.get("registration_number")
+                        registration = (_clean(raw) if not _blank(raw)
+                                        else (existing.registration_number
+                                              if existing else None))
+                        return existing, team_id, registration
+                    released_registrations = self.release_batch_player_registrations(
+                        _final_registration(row) for row in player_rows)
+
                     for row in player_rows:
                         player_code = _clean(row.get("player_code"))
-                        full_name = self._validate_player_name(
-                            (f"{_clean(row.get('first_name'))} "
-                             f"{_clean(row.get('last_name'))}").strip())
+                        # #273: the sheet's structured names are PERSISTED now
+                        # (they were previously flattened away at write time),
+                        # through the same shared name contract create/edit
+                        # use; the display name is derived, never free-typed.
+                        canonical_first = self._validate_name_part(
+                            _clean(row.get("first_name")), "first_name")
+                        canonical_last = self._validate_name_part(
+                            _clean(row.get("last_name")), "last_name")
+                        full_name = derive_display_name(canonical_first,
+                                                        canonical_last)
                         # validate_import already guarantees this team_code matches a
                         # row in THIS SAME upload's teams sheet; .get() is just a
                         # defensive belt-and-suspenders check against a bug elsewhere.
@@ -8151,6 +8939,31 @@ class SetupService:
                                    if not _blank(position_raw) else None)
                         email_raw = row.get("email")
                         email = _clean(email_raw) if not _blank(email_raw) else None
+                        # Optional identity cells (#273) + the shoots import
+                        # wiring gap (#268 covered create/edit only). A blank
+                        # or absent cell means "leave as-is" on update and
+                        # unset on create — never a clearing write (the email
+                        # rule).
+                        preferred_cell = (
+                            self._validate_preferred_name(
+                                _clean(row.get("preferred_name")))
+                            if not _blank(row.get("preferred_name")) else None)
+                        shoots_cell = (
+                            self._validate_shoots(_clean(row.get("shoots")))
+                            if not _blank(row.get("shoots")) else None)
+                        birthdate_cell = (
+                            self._validate_birthdate(
+                                _clean(row.get("birthdate")))
+                            if not _blank(row.get("birthdate")) else None)
+                        registration_cell = (
+                            self._validate_registration_number(
+                                _clean(row.get("registration_number")))
+                            if not _blank(row.get("registration_number"))
+                            else None)
+                        skill_cell = (
+                            self._validate_skill_rating(
+                                _clean(row.get("skill_rating")))
+                            if not _blank(row.get("skill_rating")) else None)
 
                         player = next((p for p in self.store.all_players()
                                       if p.external_ref == player_code), None)
@@ -8180,10 +8993,70 @@ class SetupService:
                                 self._assert_jersey_available(
                                     team_id, target_jersey, exclude_player_id=player.id)
                             player.name = full_name
+                            player.first_name = canonical_first
+                            player.last_name = canonical_last
                             player.team_id = team_id
                             player.jersey_number = target_jersey
                             if position is not None:
                                 player.position = position
+                            if preferred_cell is not None:
+                                player.preferred_name = preferred_cell
+                            if shoots_cell is not None:
+                                player.shoots = shoots_cell
+                            if birthdate_cell is not None:
+                                player.birthdate = birthdate_cell
+                            # #273 review round 2 finding 2: check the
+                            # EFFECTIVE registration number the row will
+                            # carry after this write, not just a
+                            # newly-supplied cell. The previous version
+                            # only checked ``registration_cell is not
+                            # None and registration_cell !=
+                            # player.registration_number``, so a BLANK
+                            # cell (registration_cell is None -- "leave
+                            # as-is", the same rule every other optional
+                            # cell in this loop follows) or an explicitly
+                            # re-supplied UNCHANGED value skipped the
+                            # check entirely, even though ``team_id`` a
+                            # few lines up may already have moved this
+                            # player onto a team that holds that same
+                            # number on another row. Always check the
+                            # value the row will actually end up
+                            # carrying, exactly like the unconditional
+                            # jersey check above; exclude_player_id keeps
+                            # a same-team re-import from colliding with
+                            # itself.
+                            #
+                            # #273 review round 3 finding 1: the RETAINED
+                            # fallback must be the TRUE pre-staging value —
+                            # resolved from ``released_registrations``
+                            # (captured before the swap-safe release above),
+                            # never ``player.registration_number`` read
+                            # directly, which may already hold the transient
+                            # released NULL — exactly the same original vs.
+                            # transient distinction ``original_jersey`` draws
+                            # for jersey_number just above. The final value is
+                            # then assigned UNCONDITIONALLY (mirroring
+                            # ``player.jersey_number = target_jersey`` above),
+                            # not only ``if registration_cell is not None``:
+                            # a blank cell's effective value already equals
+                            # the just-restored original when nothing else in
+                            # this batch moved it, and equals the row's own
+                            # supplied value when it did — either way this is
+                            # always the row's true final state, so it is
+                            # always safe (and, once release is in play,
+                            # required) to land it.
+                            original_registration = released_registrations.get(
+                                player.id, player.registration_number)
+                            effective_registration = (
+                                registration_cell if registration_cell is not None
+                                else original_registration)
+                            if effective_registration is not None:
+                                self._assert_registration_number_available(
+                                    team_id, effective_registration,
+                                    exclude_player_id=player.id)
+                            player.registration_number = effective_registration
+                            if skill_cell is not None:
+                                player.skill_rating = skill_cell
                             self.store.save_player(player)
                             self._audit("player_updated", "player", player.id, actor_id,
                                         {"team_id": team_id, "import_batch_id": batch_id})
@@ -8192,6 +9065,10 @@ class SetupService:
                             # A brand-new imported player is active, so its number must
                             # be free among the team's active players (#269).
                             self._assert_jersey_available(team_id, jersey_number)
+                            # Same-team duplicate governing-body id (#273): hard
+                            # error BEFORE the write, aborting the whole batch.
+                            self._assert_registration_number_available(
+                                team_id, registration_cell)
                             # The domain model requires a Position with no default,
                             # but #92 doesn't require the CSV to supply one — default
                             # a brand-new player to FORWARD as an explicit judgment
@@ -8200,10 +9077,21 @@ class SetupService:
                                             name=full_name,
                                             position=position or Position.FORWARD,
                                             jersey_number=jersey_number,
-                                            external_ref=player_code)
+                                            external_ref=player_code,
+                                            first_name=canonical_first,
+                                            last_name=canonical_last,
+                                            preferred_name=preferred_cell,
+                                            shoots=shoots_cell,
+                                            birthdate=birthdate_cell,
+                                            registration_number=registration_cell,
+                                            skill_rating=skill_cell)
                             self.store.add_player(player)
                             self._audit("player_added", "player", player.id, actor_id,
                                         {"team_id": team_id, "import_batch_id": batch_id})
+                            # Same-name-on-one-Team WARNING (#273 AC[4]) —
+                            # an audit entry, never a block, never a merge.
+                            self._warn_same_name_duplicates(
+                                player, actor_id, import_batch_id=batch_id)
                             counts["players_created"] += 1
 
                         # A blank cell parsed to None above → no-op (leave any existing

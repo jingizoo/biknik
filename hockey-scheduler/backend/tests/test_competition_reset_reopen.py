@@ -51,6 +51,17 @@ def _downgrade_035(store):
     with store.transaction():
         cur = store.conn.cursor()
         cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
+        # 058 (#273) age_eligibility_rules ALSO references league_seasons, for
+        # the SAME PostgreSQL reason -- but unlike schedule_scenarios, 058 is
+        # NOT un-recorded below: it also ALTERs the (unrelated-to-this-test)
+        # players table, and those columns are never reversed here, so
+        # replaying 058 in full would fail on "column already exists". 058
+        # stays recorded as applied (its players-side effects are genuinely
+        # still there and correct); only its league_seasons-dependent TABLE
+        # is dropped to unblock this historical rewind. age_eligibility_rules
+        # itself does not come back after the replay below -- harmless, since
+        # nothing in this migration-history suite reads or writes it.
+        cur.execute("DROP TABLE IF EXISTS age_eligibility_rules")
         cur.execute("DROP INDEX IF EXISTS ix_teams_league")
         cur.execute("ALTER TABLE teams DROP COLUMN league_id")
         cur.execute("DROP INDEX IF EXISTS ux_team_league_season")

@@ -31,6 +31,7 @@ from ..domain import (
     SchedulingPolicy,
     PolicyScopeType,
     ActiveContext,
+    AgeEligibilityRule,
     GameResult,
     League,
     LeagueSeason,
@@ -99,6 +100,7 @@ from .db_errors import (
     translate_player_jersey_exception,
     translate_program_org_fk_exception,
     translate_reassignment_fk_exception,
+    translate_registration_number_exception,
     translate_venue_hierarchy_fk_exception,
 )
 from .integrity_checks import (
@@ -149,7 +151,10 @@ def _jsonc():
 
 
 def _jsonl():
-    """Like ``_jsonc`` but list-biased: an EMPTY list is a legitimate value
+    """JSON-encoded LIST column (e.g. SeasonCopyForwardCommit registrations,
+    AgeEligibilityRule.tiers).
+
+    Like ``_jsonc`` but list-biased: an EMPTY list is a legitimate value
     (a copy-forward commit that created zero registrations), so this must
     round-trip ``[]`` as ``[]`` rather than folding it into ``{}`` the way
     ``_jsonc``'s dict-biased ``v or {}`` would."""
@@ -201,6 +206,11 @@ SPECS = {
     League: Spec(League, "leagues"),
     LeagueSeason: Spec(LeagueSeason, "league_seasons"),
     Division: Spec(Division, "divisions"),
+    # Child of league_seasons (#273); before its parent for the factory-reset
+    # child-first deletion order, like the other LeagueSeason children here.
+    AgeEligibilityRule: Spec(
+        AgeEligibilityRule, "age_eligibility_rules",
+        {"tiers": _jsonl(), "created_at": _dt()}),
     SeasonTeamRegistration: Spec(
         SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
     SeasonCopyForwardCommit: Spec(
@@ -1540,6 +1550,14 @@ class SqlStore:
         except Exception as exc:
             translated = translate_player_jersey_exception(
                 exc, player.team_id, player.jersey_number)
+            # ux_players_team_registration_number (migration 058, #273 review
+            # round 2 finding 2): the database backstop for the same-team
+            # registration-number invariant, checked after the jersey
+            # violation (a different unique index on this same table) so a
+            # non-match falls through cleanly to it.
+            if translated is None:
+                translated = translate_registration_number_exception(
+                    exc, player.team_id, player.registration_number)
             # players.team_id → teams(id) (migration 040): a race-losing write
             # onto a concurrently-deleted team surfaces as the same stable
             # conflict the service raises when it validates the team (#201 Slice 2).
@@ -1990,6 +2008,14 @@ class SqlStore:
         self._delete(SchedulingPolicy, policy_id)
     def all_scheduling_policies(self):
         return self._query(SchedulingPolicy, order="id")
+
+    # -- versioned age eligibility rules (#273) --------------------------
+    def add_age_eligibility_rule(self, rule): return self._insert(rule)
+    def get_age_eligibility_rule(self, rule_id):
+        return self._get(AgeEligibilityRule, rule_id)
+    def age_eligibility_rules_for_league_season(self, league_season_id):
+        return self._query(AgeEligibilityRule, "league_season_id = ?",
+                           (league_season_id,), order="version")
 
     # -- immutable schedule scenarios (#378) -----------------------------
     def add_schedule_scenario(self, scenario): return self._insert(scenario)

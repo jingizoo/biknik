@@ -33,7 +33,7 @@ import unittest
 from helpers import BACKEND, fresh_sql_store  # noqa: F401
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Role
+from hockey_scheduler.domain import Position, Program, Role, Team
 from hockey_scheduler.domain.privacy import (
     ACCESS_ALLOWED,
     ACCESS_DENIED,
@@ -41,7 +41,7 @@ from hockey_scheduler.domain.privacy import (
 )
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import visibility_policy as vp
-from hockey_scheduler.store import SqlStore
+from hockey_scheduler.store import InMemoryStore, SqlStore
 
 C = SensitiveFieldCategory
 
@@ -52,6 +52,11 @@ SENTINEL_PUSH = "sentinel-secret-push-token-XYZZY"
 # (channel=push) — this one plants a REAL DeviceToken row (#426 round-3
 # review finding 1's own repro shape: "push-secret-token-426").
 SENTINEL_DEVICE_TOKEN = "sentinel-secret-device-token-QWERTY"
+# #424 audit-wiring: BIRTHDATE/REGISTRATION_NUMBER sentinels for the three
+# newly-gated call sites below (list_players include_identity,
+# player_duplicate_report, evaluate_player_eligibility).
+SENTINEL_BIRTHDATE = "2015-03-02"
+SENTINEL_REGISTRATION = "sentinel-secret-registration-QWERTY"
 
 
 class _Base(unittest.TestCase):
@@ -754,6 +759,666 @@ class PostgresFacadeDurabilityTest(unittest.TestCase):
                          {ACCESS_ALLOWED, ACCESS_DENIED})
         for row in rows:
             self.assertNotIn(SENTINEL_EMAIL, str(vars(row)))
+
+
+class _IdentityAuditBase(unittest.TestCase):
+    """A MINIMAL, isolated fixture (its own Program/Season/League/
+    LeagueSeason/Division/Team, not the noisy pilot-scale full_demo_store
+    the classes above use) so ALLOW/DENY row counts are exact and never
+    entangled with the demo's own dozens of pre-seeded players or with
+    #369 Program-scoping for a role that has no assignment into the demo's
+    Program. See test_athlete_identity.py's FacadePrivacyTest and
+    test_age_eligibility.py's EligibilityRuleServiceTest for the same
+    fixture shape used the same way."""
+
+    def setUp(self):
+        from datetime import datetime, timezone
+        from hockey_scheduler.domain import (
+            Division, League, LeagueSeason, Season)
+        self.store = InMemoryStore()
+        self.store.add_program(Program(id="pr", name="P"))
+        self.store.add_season(Season(
+            id="se", program_id="pr", name="Fall",
+            start_date=datetime(2026, 9, 1, tzinfo=timezone.utc)))
+        self.store.add_league(League(id="lg", program_id="pr", name="L"))
+        self.store.add_league_season(
+            LeagueSeason(id="ls", league_id="lg", season_id="se"))
+        self.store.add_division(Division(
+            id="d", league_season_id="ls", name="D1", age_group="U10"))
+        self.store.add_team(Team(id="t1", name="T1", program_id="pr"))
+        self.store.add_team(Team(id="t2", name="T2", program_id="pr"))
+        self.api = ApiService(self.store)
+
+    def rows(self, **kw):
+        return self.store.list_data_access(**kw)
+
+
+# =========================================================================== #
+# #424 audit-wiring: list_players(include_identity=True) — BIRTHDATE and      #
+# REGISTRATION_NUMBER, gated as two INDEPENDENT categories.                   #
+# =========================================================================== #
+class IdentityFieldReadAuditTest(_IdentityAuditBase):
+    """Mirrors AllowedReadAuditTest/FailClosedRefusalTest/ValueNeverInLogTest
+    above, but for ``list_players(include_identity=True)`` — the LIST
+    itself is never gated (mask, not refuse), matching ``include_email``'s
+    own precedent two branches below it in ``ApiService.list_players``."""
+
+    def _seed(self):
+        return self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Priv",
+            last_name="Fields", birthdate=SENTINEL_BIRTHDATE,
+            registration_number=SENTINEL_REGISTRATION)
+
+    def test_authorized_role_gets_both_fields_and_one_allowed_row_per_category(self):
+        p = self._seed()
+        rows_out = self.api.list_players(
+            team_id="t1", include_identity=True, role=Role.LEAGUE_ADMIN,
+            user_id="user_admin")
+        self.assertEqual(len(rows_out), 1)
+        row = rows_out[0]
+        self.assertEqual(row["birthdate"], SENTINEL_BIRTHDATE)
+        self.assertEqual(row["registration_number"], SENTINEL_REGISTRATION)
+
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)  # one per category, per #424 design
+        self.assertEqual({r.category for r in rows},
+                         {C.BIRTHDATE, C.REGISTRATION_NUMBER})
+        for r in rows:
+            self.assertEqual(r.outcome, ACCESS_ALLOWED)
+            self.assertEqual(r.actor_role, "league_admin")
+            self.assertEqual(r.actor_user_id, "user_admin")
+            self.assertEqual(r.subject_id, f"player:{p.id}")
+            self.assertEqual(r.purpose, "list_players_identity")
+        # One call = one correlation id across both category rows.
+        self.assertEqual(len({r.request_id for r in rows}), 1)
+
+    def test_unauthorized_but_scoped_role_masks_both_fields_and_records_denials(self):
+        # VIEWER is a #369 GLOBAL scoping role (so the roster itself is NOT
+        # hidden by Program-scoping) but has NO privacy grant for either
+        # category (see visibility_policy._POLICY) — isolating the
+        # assertion to the IDENTITY gate specifically, not scoping.
+        self._seed()
+        rows_out = self.api.list_players(
+            team_id="t1", include_identity=True, role=Role.VIEWER,
+            user_id="user_viewer")
+        self.assertEqual(len(rows_out), 1)
+        row = rows_out[0]
+        self.assertIsNone(row["birthdate"])
+        self.assertIsNone(row["registration_number"])
+
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r.category for r in rows},
+                         {C.BIRTHDATE, C.REGISTRATION_NUMBER})
+        for r in rows:
+            self.assertEqual(r.outcome, ACCESS_DENIED)
+            self.assertEqual((r.subject_type, r.subject_id),
+                             ("recipient", "*"))
+
+    def test_no_principal_masks_and_records_denials(self):
+        self._seed()
+        rows_out = self.api.list_players(team_id="t1",
+                                         include_identity=True)
+        for row in rows_out:
+            self.assertIsNone(row.get("birthdate"))
+            self.assertIsNone(row.get("registration_number"))
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r.actor_role for r in rows}, {vp.NO_PRINCIPAL})
+
+    def test_include_identity_false_gates_nothing_and_audits_nothing(self):
+        self._seed()
+        self.api.list_players(team_id="t1")
+        self.assertEqual(len(self.rows()), 0)
+
+    def test_no_stored_row_contains_the_sentinel_values(self):
+        self._seed()
+        self.api.list_players(team_id="t1", include_identity=True,
+                              role=Role.LEAGUE_ADMIN)
+        self.api.list_players(team_id="t1", include_identity=True,
+                              role=Role.VIEWER)
+        self.api.list_players(team_id="t1", include_identity=True)
+        for row in self.rows():
+            text = str(vars(row))
+            self.assertNotIn(SENTINEL_BIRTHDATE, text)
+            self.assertNotIn(SENTINEL_REGISTRATION, text)
+        # Positive control: the sentinels DO live on the stored Player.
+        players = self.store.players_for_team("t1")
+        self.assertIn(SENTINEL_BIRTHDATE, [p.birthdate for p in players])
+        self.assertIn(SENTINEL_REGISTRATION,
+                      [p.registration_number for p in players])
+
+
+# =========================================================================== #
+# #424 audit-wiring: player_duplicate_report — REGISTRATION_NUMBER,           #
+# whole-call refusal (no partial/masked report).                             #
+# =========================================================================== #
+class PlayerDuplicateReportAuditTest(_IdentityAuditBase):
+    def _seed_pair(self):
+        p1 = self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Sam", last_name="Lee",
+            registration_number=SENTINEL_REGISTRATION)
+        p2 = self.api.setup.add_player(
+            "t2", None, Position.GOALIE, first_name="Alex", last_name="Wu",
+            registration_number=SENTINEL_REGISTRATION)
+        return p1, p2
+
+    def test_authorized_role_gets_the_report_and_one_allowed_row_per_disclosed_player(self):
+        p1, p2 = self._seed_pair()
+        report = self.api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", report)
+        shared = [w for w in report["warnings"]
+                 if w["type"] == "shared_registration_number"]
+        self.assertEqual(shared[0]["registration_number"],
+                         SENTINEL_REGISTRATION)
+
+        # #424 round-N+1 owner review finding A: audit subjects are sourced
+        # from the FULL player collection the underlying service examined
+        # (here, both seeded players), never inferred from which players
+        # happen to be implicated in an emitted warning. Both p1 and p2 are
+        # examined for BOTH categories -- p1/p2's registration_number is
+        # what produced the one warning, and their birthdate is read (and
+        # found None) by the very same by_name_birthdate pass that would
+        # have raised a same_name_same_birthdate warning had it matched.
+        # One ALLOWED row per (player, category): 2 players x 2 categories.
+        rows = self.rows()
+        self.assertEqual(len(rows), 4)
+        reg_rows = [r for r in rows if r.category == C.REGISTRATION_NUMBER]
+        bd_rows = [r for r in rows if r.category == C.BIRTHDATE]
+        self.assertEqual({r.subject_id for r in reg_rows},
+                         {f"player:{p1.id}", f"player:{p2.id}"})
+        self.assertEqual({r.subject_id for r in bd_rows},
+                         {f"player:{p1.id}", f"player:{p2.id}"})
+        for row in rows:
+            self.assertIn(row.category, (C.REGISTRATION_NUMBER, C.BIRTHDATE))
+            self.assertEqual(row.outcome, ACCESS_ALLOWED)
+            self.assertEqual(row.actor_role, "league_admin")
+            self.assertEqual(row.actor_user_id, "user_admin")
+            self.assertEqual(row.purpose, "player_duplicate_report")
+        self.assertEqual(len({r.request_id for r in rows}), 1)
+
+    def test_unrelated_examined_players_are_audited_too(self):
+        # #424 round-N+1 owner review finding A -- THE regression: a mixed
+        # collection where SOME players are implicated in a warning and
+        # OTHERS are merely examined (read, compared, found to collide with
+        # nothing) must audit every one of them for both categories, not
+        # just the ones whose ids happen to appear in an emitted warning's
+        # player_ids.
+        p1, p2 = self._seed_pair()  # the one shared_registration_number pair
+        unrelated1 = self.api.setup.add_player(
+            "t1", None, Position.DEFENSE, first_name="Uma", last_name="Ortiz",
+            registration_number="REG-UNRELATED-1", birthdate="2014-05-01")
+        unrelated2 = self.api.setup.add_player(
+            "t2", None, Position.FORWARD, first_name="Nia", last_name="Park",
+            registration_number="REG-UNRELATED-2", birthdate="2014-06-02")
+
+        report = self.api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", report)
+        # Only the p1/p2 pair produces a warning -- unrelated1/2 collide
+        # with nothing and appear in NO warning's player_ids.
+        for w in report["warnings"]:
+            self.assertNotIn(unrelated1.id, w["player_ids"])
+            self.assertNotIn(unrelated2.id, w["player_ids"])
+
+        all_ids = {f"player:{p.id}"
+                  for p in (p1, p2, unrelated1, unrelated2)}
+        rows = self.rows()
+        reg_subjects = {r.subject_id for r in rows
+                        if r.category == C.REGISTRATION_NUMBER}
+        bd_subjects = {r.subject_id for r in rows
+                      if r.category == C.BIRTHDATE}
+        self.assertEqual(reg_subjects, all_ids,
+                         "REGISTRATION_NUMBER audit must cover every "
+                         "examined player, not just warning-implicated ones")
+        self.assertEqual(bd_subjects, all_ids,
+                         "BIRTHDATE audit must cover every examined player, "
+                         "not just warning-implicated ones")
+        for row in rows:
+            self.assertEqual(row.outcome, ACCESS_ALLOWED)
+        # No protected value (registration number or birthdate) ever rides
+        # a log field.
+        for row in rows:
+            text = str(vars(row))
+            self.assertNotIn(SENTINEL_REGISTRATION, text)
+            self.assertNotIn("REG-UNRELATED", text)
+            self.assertNotIn("2014-05-01", text)
+            self.assertNotIn("2014-06-02", text)
+
+    def test_birthdate_touching_warning_types_audit_the_implicated_players(self):
+        # #424 round-N owner review finding 1: same_name_same_team_
+        # undisambiguated and same_name_same_birthdate both hinge on a
+        # birthdate comparison -- their player_ids must land in the
+        # BIRTHDATE audit row's subjects, not just the collection-level "*".
+        same_team_a = self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Sam", last_name="Lee")
+        same_team_b = self.api.setup.add_player(
+            "t1", None, Position.GOALIE, first_name="Sam", last_name="Lee")
+        cross_team_a = self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Cross",
+            last_name="Bday", birthdate=SENTINEL_BIRTHDATE)
+        cross_team_b = self.api.setup.add_player(
+            "t2", None, Position.FORWARD, first_name="Cross",
+            last_name="Bday", birthdate=SENTINEL_BIRTHDATE)
+
+        report = self.api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", report)
+        types = {w["type"] for w in report["warnings"]}
+        self.assertIn("same_name_same_team_undisambiguated", types)
+        self.assertIn("same_name_same_birthdate", types)
+
+        bd_rows = [r for r in self.rows() if r.category == C.BIRTHDATE]
+        self.assertEqual(len(bd_rows), 4)
+        self.assertEqual(
+            {r.subject_id for r in bd_rows},
+            {f"player:{same_team_a.id}", f"player:{same_team_b.id}",
+             f"player:{cross_team_a.id}", f"player:{cross_team_b.id}"})
+
+    def test_unauthorized_role_refuses_the_whole_call(self):
+        self._seed_pair()
+        result = self.api.player_duplicate_report(
+            actor_role=Role.COACH, actor_user_id="user_coach")
+        self.assertEqual(result["error"]["code"], "forbidden")
+        self.assertNotIn("warnings", result)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual((rows[0].subject_type, rows[0].subject_id),
+                         ("recipient", "*"))
+
+    def test_no_principal_refuses_the_whole_call(self):
+        self._seed_pair()
+        result = self.api.player_duplicate_report()
+        self.assertEqual(result["error"]["code"], "forbidden")
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].actor_role, vp.NO_PRINCIPAL)
+
+    def test_no_stored_row_contains_the_sentinel_value(self):
+        self._seed_pair()
+        self.api.player_duplicate_report(actor_role=Role.LEAGUE_ADMIN)
+        self.api.player_duplicate_report(actor_role=Role.COACH)
+        self.api.player_duplicate_report()
+        for row in self.rows():
+            self.assertNotIn(SENTINEL_REGISTRATION, str(vars(row)))
+        # Positive control: the report ITSELF echoes the sentinel.
+        report = self.api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN)
+        dumped = json.dumps(report)
+        self.assertIn(SENTINEL_REGISTRATION, dumped)
+
+
+# =========================================================================== #
+# #424 round-N+1 owner review finding A: same mixed-collection regression,   #
+# proven on all three backends (the fix reads the SAME players_for_team/     #
+# all_players collection SqlStore/InMemoryStore already serve identically). #
+# =========================================================================== #
+class PlayerDuplicateReportMixedCollectionTriBackendTest(unittest.TestCase):
+    """Finding A's exact required regression, run for real against Memory,
+    SQLite, AND PostgreSQL (not just the Memory-only fixture above): a
+    collection containing one warning pair PLUS unrelated players with
+    distinct identity values must audit every examined player -- not just
+    the warning-implicated ones -- for both BIRTHDATE and
+    REGISTRATION_NUMBER, and no protected value may ever appear in a log
+    field."""
+
+    def _backends(self):
+        stores = [("memory", InMemoryStore()), ("sqlite", SqlStore(":memory:"))]
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            stores.append(("postgres", fresh_sql_store(url)))
+        return stores
+
+    def test_every_examined_player_audited_for_both_categories(self):
+        for label, store in self._backends():
+            with self.subTest(backend=label):
+                try:
+                    store.add_team(Team(id="t1", name="T1"))
+                    store.add_team(Team(id="t2", name="T2"))
+                    api = ApiService(store)
+                    p1 = api.setup.add_player(
+                        "t1", None, Position.FORWARD, first_name="Sam",
+                        last_name="Lee",
+                        registration_number="REG-SHARED-" + label)
+                    p2 = api.setup.add_player(
+                        "t2", None, Position.GOALIE, first_name="Alex",
+                        last_name="Wu",
+                        registration_number="REG-SHARED-" + label)
+                    unrelated1 = api.setup.add_player(
+                        "t1", None, Position.DEFENSE, first_name="Uma",
+                        last_name="Ortiz",
+                        registration_number="REG-U1-" + label,
+                        birthdate="2014-05-01")
+                    unrelated2 = api.setup.add_player(
+                        "t2", None, Position.FORWARD, first_name="Nia",
+                        last_name="Park",
+                        registration_number="REG-U2-" + label,
+                        birthdate="2014-06-02")
+
+                    report = api.player_duplicate_report(
+                        actor_role=Role.LEAGUE_ADMIN,
+                        actor_user_id="user_admin")
+                    self.assertNotIn("error", report, (label, report))
+                    for w in report["warnings"]:
+                        self.assertNotIn(unrelated1.id, w["player_ids"],
+                                         label)
+                        self.assertNotIn(unrelated2.id, w["player_ids"],
+                                         label)
+
+                    rows = store.list_data_access()
+                    all_subjects = {f"player:{p.id}"
+                                   for p in (p1, p2, unrelated1, unrelated2)}
+                    reg_subjects = {r.subject_id for r in rows
+                                   if r.category == C.REGISTRATION_NUMBER}
+                    bd_subjects = {r.subject_id for r in rows
+                                  if r.category == C.BIRTHDATE}
+                    self.assertEqual(
+                        reg_subjects, all_subjects,
+                        f"[{label}] REGISTRATION_NUMBER must audit every "
+                        "examined player, including non-warning ones")
+                    self.assertEqual(
+                        bd_subjects, all_subjects,
+                        f"[{label}] BIRTHDATE must audit every examined "
+                        "player, including non-warning ones")
+                    for row in rows:
+                        self.assertEqual(row.outcome, ACCESS_ALLOWED, label)
+                        text = str(vars(row))
+                        self.assertNotIn("REG-SHARED", text, label)
+                        self.assertNotIn("REG-U1", text, label)
+                        self.assertNotIn("REG-U2", text, label)
+                        self.assertNotIn("2014-05-01", text, label)
+                        self.assertNotIn("2014-06-02", text, label)
+                finally:
+                    if isinstance(store, SqlStore):
+                        store.close()
+
+
+def _fresh_eligibility_fixture():
+    """A standalone, minimal fixture (own store/api/setup) for the
+    role-matrix test below, which needs a FRESH player+store per role so
+    each iteration's audit rows and eligibility state never leak into the
+    next -- same minimal-fixture shape ``_IdentityAuditBase.setUp`` uses,
+    factored out since the matrix test can't reuse ``self.store`` across
+    ``subTest`` iterations without cross-contaminating row counts."""
+    from datetime import datetime, timezone
+    from hockey_scheduler.domain import Division, League, LeagueSeason, Season
+    store = InMemoryStore()
+    store.add_program(Program(id="pr", name="P"))
+    store.add_season(Season(
+        id="se", program_id="pr", name="Fall",
+        start_date=datetime(2026, 9, 1, tzinfo=timezone.utc)))
+    store.add_league(League(id="lg", program_id="pr", name="L"))
+    store.add_league_season(
+        LeagueSeason(id="ls", league_id="lg", season_id="se"))
+    store.add_division(Division(id="d", league_season_id="ls", name="D1",
+                                age_group="U10"))
+    store.add_team(Team(id="t1", name="T1", program_id="pr"))
+    store.add_team(Team(id="t2", name="T2", program_id="pr"))
+    api = ApiService(store)
+    return store, api, api.setup
+
+
+# =========================================================================== #
+# #424 audit-wiring: evaluate_player_eligibility — BIRTHDATE at SUMMARY       #
+# fidelity (may_read_summary, not may_read_raw), whole-call refusal.         #
+# =========================================================================== #
+class EligibilitySummaryAuditTest(_IdentityAuditBase):
+    def _seed(self):
+        self.api.set_age_eligibility_rule(
+            "ls", 12, 31, [{"code": "U10", "max_age": 30}])
+        return self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Priv",
+            last_name="Fields", birthdate=SENTINEL_BIRTHDATE)
+
+    def test_coach_gets_summary_fidelity_and_one_allowed_row(self):
+        p = self._seed()
+        result = self.api.evaluate_player_eligibility(
+            p.id, "d", actor_role=Role.COACH, actor_user_id="user_coach")
+        self.assertNotIn("error", result)
+        self.assertNotIn("birthdate", result)
+
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.category, C.BIRTHDATE)
+        self.assertEqual(row.outcome, ACCESS_ALLOWED)
+        self.assertEqual(row.actor_role, "coach")
+        self.assertEqual(row.actor_user_id, "user_coach")
+        self.assertEqual(row.subject_id, f"player:{p.id}")
+        self.assertEqual(row.purpose, "evaluate_player_eligibility")
+
+    def test_league_admin_raw_grant_also_covers_the_summary_gate(self):
+        # may_read_summary(role, category) is >= SUMMARY: a RAW grant
+        # (LEAGUE_ADMIN) satisfies it too, not only an exact SUMMARY match.
+        p = self._seed()
+        result = self.api.evaluate_player_eligibility(
+            p.id, "d", include_details=True, actor_role=Role.LEAGUE_ADMIN,
+            actor_user_id="user_admin")
+        self.assertNotIn("error", result)
+        self.assertIsNotNone(result.get("age_at_cutoff"))
+
+    def test_coach_requesting_details_gets_summary_masked_not_refused(self):
+        # #424 round-N owner review finding 3: COACH holds SUMMARY (not
+        # RAW) on BIRTHDATE, so include_details=True must NOT hand COACH
+        # the operator-only age_at_cutoff/cutoff_date fields -- but the
+        # call itself still succeeds with the SUMMARY-safe subset (mask,
+        # not refuse), since that subset remains meaningful on its own.
+        p = self._seed()
+        result = self.api.evaluate_player_eligibility(
+            p.id, "d", include_details=True, actor_role=Role.COACH,
+            actor_user_id="user_coach")
+        self.assertNotIn("error", result, result)
+        self.assertNotIn("age_at_cutoff", result)
+        self.assertNotIn("cutoff_date", result)
+        # The SUMMARY-safe fields are still present and correct.
+        self.assertEqual(result["status"], "eligible")
+        self.assertEqual(result["tier_code"], "U10")
+
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        summary_rows = [r for r in rows
+                        if r.purpose == "evaluate_player_eligibility"]
+        detail_rows = [r for r in rows
+                       if r.purpose == "evaluate_player_eligibility_details"]
+        self.assertEqual(len(summary_rows), 1)
+        self.assertEqual(summary_rows[0].outcome, ACCESS_ALLOWED)
+        self.assertEqual(len(detail_rows), 1)
+        self.assertEqual(detail_rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(detail_rows[0].actor_role, "coach")
+        self.assertEqual(detail_rows[0].subject_id, f"player:{p.id}")
+
+    def test_league_admin_requesting_details_gets_an_allowed_detail_row(self):
+        p = self._seed()
+        self.api.evaluate_player_eligibility(
+            p.id, "d", include_details=True, actor_role=Role.LEAGUE_ADMIN,
+            actor_user_id="user_admin")
+        rows = self.rows()
+        detail_rows = [r for r in rows
+                       if r.purpose == "evaluate_player_eligibility_details"]
+        self.assertEqual(len(detail_rows), 1)
+        self.assertEqual(detail_rows[0].outcome, ACCESS_ALLOWED)
+        self.assertEqual(detail_rows[0].category, C.BIRTHDATE)
+
+    def test_include_details_false_never_writes_a_detail_row(self):
+        p = self._seed()
+        for role in (Role.COACH, Role.LEAGUE_ADMIN):
+            self.api.evaluate_player_eligibility(
+                p.id, "d", actor_role=role, actor_user_id="u")
+        self.assertEqual(
+            [r for r in self.rows()
+             if r.purpose == "evaluate_player_eligibility_details"], [])
+
+    def test_role_matrix_summary_vs_raw_tier_for_every_role(self):
+        # #424 round-N owner review finding 3: enumerate every role's
+        # actual grant/deny/tier at BOTH the SUMMARY (whole-call) gate and
+        # the RAW (detail-field) gate, mirroring test_privacy_policy.py's
+        # PolicyMatrixTest convention -- no sampling.
+        EXPECTED = {
+            Role.LEAGUE_ADMIN: ("summary_ok", "details_ok"),
+            Role.ARENA_MANAGER: ("refused", None),
+            Role.COACH: ("summary_ok", "details_masked"),
+            Role.PLAYER: ("refused", None),
+            Role.GUARDIAN: ("refused", None),
+            Role.OFFICIAL: ("refused", None),
+            Role.VIEWER: ("refused", None),
+        }
+        self.assertEqual(set(EXPECTED), set(Role))
+        for role, (whole_call, detail_tier) in EXPECTED.items():
+            with self.subTest(role=role.value):
+                store, api, setup = _fresh_eligibility_fixture()
+                setup.set_age_eligibility_rule(
+                    "ls", 12, 31, [{"code": "U10", "max_age": 30}])
+                p = setup.add_player(
+                    "t1", None, Position.FORWARD, first_name="Priv",
+                    last_name="Fields", birthdate=SENTINEL_BIRTHDATE)
+                result = api.evaluate_player_eligibility(
+                    p.id, "d", include_details=True, actor_role=role,
+                    actor_user_id=f"user_{role.value}")
+                if whole_call == "refused":
+                    self.assertEqual(result["error"]["code"], "forbidden",
+                                     role.value)
+                else:
+                    self.assertNotIn("error", result, (role.value, result))
+                    if detail_tier == "details_ok":
+                        self.assertIsNotNone(result.get("age_at_cutoff"),
+                                             role.value)
+                        self.assertIsNotNone(result.get("cutoff_date"),
+                                             role.value)
+                    else:
+                        self.assertIsNone(result.get("age_at_cutoff"),
+                                          role.value)
+                        self.assertIsNone(result.get("cutoff_date"),
+                                          role.value)
+                        self.assertEqual(result["status"], "eligible",
+                                         role.value)
+
+    def test_unauthorized_role_refuses_the_whole_call_default_and_details(self):
+        p = self._seed()
+        for kwargs in ({}, {"include_details": True}):
+            result = self.api.evaluate_player_eligibility(
+                p.id, "d", actor_role=Role.VIEWER,
+                actor_user_id="user_viewer", **kwargs)
+            self.assertEqual(result["error"]["code"], "forbidden")
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r.outcome == ACCESS_DENIED for r in rows))
+
+    def test_no_principal_refuses_the_whole_call(self):
+        p = self._seed()
+        result = self.api.evaluate_player_eligibility(p.id, "d")
+        self.assertEqual(result["error"]["code"], "forbidden")
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].actor_role, vp.NO_PRINCIPAL)
+
+    def test_no_stored_row_contains_the_sentinel_birthdate(self):
+        p = self._seed()
+        self.api.evaluate_player_eligibility(p.id, "d",
+                                             actor_role=Role.COACH)
+        self.api.evaluate_player_eligibility(p.id, "d",
+                                             actor_role=Role.VIEWER)
+        self.api.evaluate_player_eligibility(p.id, "d")
+        for row in self.rows():
+            self.assertNotIn(SENTINEL_BIRTHDATE, str(vars(row)))
+        # Positive control: the sentinel lives on the stored Player.
+        self.assertEqual(self.store.get_player(p.id).birthdate,
+                         SENTINEL_BIRTHDATE)
+
+
+# =========================================================================== #
+# #424 audit-wiring: durability across a real database (SQLite/PostgreSQL),  #
+# mirroring SqliteFacadeDurabilityTest/PostgresFacadeDurabilityTest above.    #
+# =========================================================================== #
+class SqliteIdentityAuditDurabilityTest(unittest.TestCase):
+    def _store(self):
+        fd, self._tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(os.remove, self._tmp)
+        self._reopen = lambda: SqlStore(self._tmp)
+        return SqlStore(self._tmp)
+
+    def test_all_three_call_sites_survive_reopen(self):
+        store = self._store()
+        api = ApiService(store)
+        store.add_program(Program(id="pr", name="P"))
+        store.add_team(Team(id="t1", name="T1", program_id="pr"))
+        p = api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Priv",
+            last_name="Fields", birthdate=SENTINEL_BIRTHDATE,
+            registration_number=SENTINEL_REGISTRATION)
+
+        self.assertNotIn("error", api.list_players(
+            team_id="t1", include_identity=True, role=Role.LEAGUE_ADMIN,
+            user_id="user_admin"))
+        api.list_players(team_id="t1", include_identity=True,
+                         role=Role.COACH)
+        self.assertNotIn("error", api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN))
+        refused = api.player_duplicate_report(actor_role=Role.COACH)
+        self.assertEqual(refused["error"]["code"], "forbidden")
+        store.close()
+
+        reopened = self._reopen()
+        self.addCleanup(reopened.close)
+        rows = reopened.list_data_access()
+        # 2 (identity ALLOW) + 2 (identity DENY) + 2 (dup ALLOW: REGISTRATION_
+        # NUMBER + BIRTHDATE, #424 round-N owner review finding 1) +
+        # 1 (dup DENY: whole-call refusal writes one row, on the first
+        # denied category checked)
+        self.assertEqual(len(rows), 7)
+        outcomes = {r.outcome for r in rows}
+        self.assertEqual(outcomes, {ACCESS_ALLOWED, ACCESS_DENIED})
+        for row in rows:
+            text = str(vars(row))
+            self.assertNotIn(SENTINEL_BIRTHDATE, text)
+            self.assertNotIn(SENTINEL_REGISTRATION, text)
+        self.assertEqual(reopened.get_player(p.id).birthdate,
+                         SENTINEL_BIRTHDATE)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL suite only (TEST_DATABASE_URL not set)")
+class PostgresIdentityAuditDurabilityTest(unittest.TestCase):
+    def test_all_three_call_sites_survive_reopen(self):
+        url = os.environ["TEST_DATABASE_URL"]
+        store = fresh_sql_store(url)
+        api = ApiService(store)
+        store.add_program(Program(id="pr", name="P"))
+        store.add_team(Team(id="t1", name="T1", program_id="pr"))
+        p = api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Priv",
+            last_name="Fields", birthdate=SENTINEL_BIRTHDATE,
+            registration_number=SENTINEL_REGISTRATION)
+
+        self.assertNotIn("error", api.list_players(
+            team_id="t1", include_identity=True, role=Role.LEAGUE_ADMIN,
+            user_id="user_admin"))
+        api.list_players(team_id="t1", include_identity=True,
+                         role=Role.COACH)
+        self.assertNotIn("error", api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN))
+        refused = api.player_duplicate_report(actor_role=Role.COACH)
+        self.assertEqual(refused["error"]["code"], "forbidden")
+        store.close()
+
+        reopened = SqlStore(url)
+        self.addCleanup(reopened.close)
+        rows = reopened.list_data_access()
+        # 2 (identity ALLOW) + 2 (identity DENY) + 2 (dup ALLOW: REGISTRATION_
+        # NUMBER + BIRTHDATE, #424 round-N owner review finding 1) +
+        # 1 (dup DENY: whole-call refusal writes one row, on the first
+        # denied category checked)
+        self.assertEqual(len(rows), 7)
+        self.assertEqual({r.outcome for r in rows},
+                         {ACCESS_ALLOWED, ACCESS_DENIED})
+        for row in rows:
+            text = str(vars(row))
+            self.assertNotIn(SENTINEL_BIRTHDATE, text)
+            self.assertNotIn(SENTINEL_REGISTRATION, text)
+        self.assertEqual(reopened.get_player(p.id).birthdate,
+                         SENTINEL_BIRTHDATE)
 
 
 if __name__ == "__main__":

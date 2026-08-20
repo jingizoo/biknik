@@ -143,6 +143,33 @@ def _serialize(obj) -> dict:
     return _jsonify(obj)
 
 
+# The #273 PRIVATE athlete-identity fields. NEVER serialized by default —
+# every Player-carrying facade payload goes through _player_dto, so a bare
+# _serialize(Player) can't quietly leak them into a coach/public response.
+_PLAYER_PRIVATE_FIELDS = ("birthdate", "registration_number")
+
+
+def _player_dto(player, include_identity: bool = False) -> dict:
+    """Serialize a Player with the #273 private identity fields stripped.
+
+    The DEFAULT shape for every facade payload that carries a Player —
+    create/edit/deactivate responses and every list — so ordinary-Coach and
+    public consumers can never receive a birthdate or governing-body
+    registration number (#273 AC[2]; the bounded-#124 owner ruling: coaches
+    get eligibility summaries, never raw protected values). Operator
+    surfaces opt in per call via ``include_identity``, to be MANAGE_SETUP-
+    gated at the HTTP layer exactly like ``include_email`` (#268).
+    ``skill_rating`` stays in the default DTO deliberately: it is the
+    coach-facing 1-7 rating #287's substitute ranking consumes, not
+    identity data.
+    """
+    row = _serialize(player)
+    if not include_identity:
+        for field in _PLAYER_PRIVATE_FIELDS:
+            row.pop(field, None)
+    return row
+
+
 def _group(rows, attr):
     """Index dataclass rows by a foreign-key attribute → {key: [rows]}.
 
@@ -5449,13 +5476,22 @@ class ApiService:
         collection-level ``("recipient", "*")`` subject — a refused caller
         learned nothing, so no per-subject rows are enumerated (the
         enumeration itself would be a disclosure vector).
+
+        The message names ``category`` generically (#424 audit-wiring):
+        this method now gates BIRTHDATE and REGISTRATION_NUMBER reads too,
+        not only CONTACT_DESTINATION, so a hardcoded "contact destinations"
+        message would misdescribe a refused eligibility or duplicate-report
+        call. ``details["category"]`` already carried the real machine-
+        readable category value before this change; the human-readable text
+        now agrees with it instead of always naming the first category this
+        method was ever used for.
         """
         self._record_sensitive_read(
             category, [("recipient", "*")], purpose,
             actor_user_id, actor_role_label, ACCESS_DENIED, request_id,
             durable=True)
         raise NotAuthorizedError(
-            "Your role can't read stored contact destinations.",
+            "Your role can't read this protected data.",
             {"reason": "sensitive_read_denied", "category": category.value,
              "request_id": request_id})
 
@@ -11648,7 +11684,11 @@ class ApiService:
     @catch
     def delete_player(self, player_id: str,
                       actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.delete_player(player_id, actor_id))
+        # #273 review round 2 finding 1: every Player-carrying payload routes
+        # through _player_dto, including a delete's echoed row — a bare
+        # _serialize here quietly carried the private birthdate/registration
+        # number back to whatever caller issued the delete.
+        return _player_dto(self.setup.delete_player(player_id, actor_id))
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     @catch
@@ -11708,7 +11748,11 @@ class ApiService:
     @catch
     def assign_player_team(self, player_id: str, team_id: str,
                            actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.assign_player_team(player_id, team_id, actor_id))
+        # #273 review round 2 finding 1: same _player_dto routing as every
+        # other Player-carrying payload — a move's echoed row must never
+        # carry the private birthdate/registration number either.
+        return _player_dto(self.setup.assign_player_team(
+            player_id, team_id, actor_id))
 
     @catch
     def assign_program_organization(self, program_id: str,
@@ -11864,24 +11908,42 @@ class ApiService:
         return out
 
     @catch
-    def create_player(self, team_id: str, name: str, position: str,
+    def create_player(self, team_id: str, name: Optional[str] = None,
+                      position: str = None,
                       jersey_number: Optional[int] = None,
                       email: Optional[str] = None,
                       shoots: Optional[str] = None,
                       is_active: bool = True,
-                      actor_id: Optional[str] = None) -> dict:
+                      actor_id: Optional[str] = None,
+                      first_name: Optional[str] = None,
+                      last_name: Optional[str] = None,
+                      preferred_name: Optional[str] = None,
+                      birthdate: Optional[str] = None,
+                      registration_number: Optional[str] = None,
+                      skill_rating: Optional[int] = None) -> dict:
         # Pass position through raw: the service's canonical _validate_position
         # parses/validates it with a field-level invalid_position error (#268
         # review), so create and edit share one validator and the same field.
-        return _serialize(self.setup.add_player(
+        # #273: either flattened `name` or structured first+last (one shared
+        # service contract); the response is the default Player DTO, which
+        # strips the private birthdate/registration_number like every other
+        # facade payload — the operator list re-reads them via its explicit
+        # opt-in.
+        return _player_dto(self.setup.add_player(
             team_id, name, position,
             jersey_number=jersey_number, email=email, shoots=shoots,
-            is_active=is_active, actor_id=actor_id))
+            is_active=is_active, actor_id=actor_id,
+            first_name=first_name, last_name=last_name,
+            preferred_name=preferred_name, birthdate=birthdate,
+            registration_number=registration_number,
+            skill_rating=skill_rating))
 
     @catch
     def list_players(self, team_id: Optional[str] = None,
-                     include_email: bool = False, user_id=None, role=None,
-                     scope=None) -> List[dict]:
+                     include_email: bool = False,
+                     user_id=None, role=None,
+                     scope=None, *,
+                     include_identity: bool = False) -> List[dict]:
         """#369 self-audit: when a real user context is supplied, the
         unfiltered list narrows to Teams in the caller's ACTIVE Program.
 
@@ -11894,51 +11956,140 @@ class ApiService:
         the same reasoning makes a cross-Program answer wrong. Called with no
         user context (the default), behavior is unchanged for existing
         internal callers.
+
+        ``include_identity`` (#273) is KEYWORD-ONLY, appended after every
+        pre-existing positional parameter (#273 review round 2 finding 1): an
+        earlier revision inserted it before ``user_id``, so an unchanged
+        legacy positional call like ``list_players("t1", False,
+        "legacy-user")`` silently reinterpreted its own third argument as
+        ``include_identity="legacy-user"`` — a truthy string that opted the
+        call into both private fields AND dropped ``user_id`` (defeating the
+        #369 Program-scoping gate below, since ``role`` then never arrives
+        either). Keyword-only closes both holes at once: no positional slot
+        can ever reach this parameter again.
+
+        When ``include_identity`` is set (#424 round-N owner review finding
+        2), the Player read that embeds BIRTHDATE/REGISTRATION_NUMBER into
+        the returned rows runs INSIDE the SAME ``with self.store.
+        transaction():`` block as the ALLOWED audit write, not as a separate
+        already-autocommitted statement beforehand — mirroring
+        ``list_contact_destinations``'/``get_delivery_overview``'s own
+        "read + record in one transaction" shape, so the two commit or roll
+        back together instead of being two independent units of work.
+        ``resolve_with_league`` runs BEFORE that transaction opens, not
+        inside it: it takes its own SERIALIZABLE snapshot as the OUTERMOST
+        transaction (``context_service.py``'s own contract — a nested join
+        can never RAISE the isolation of an already-open plain
+        transaction), and Program/League scoping carries no BIRTHDATE/
+        REGISTRATION_NUMBER sensitivity of its own, so hoisting it out
+        reintroduces none of finding 2's gap.
         """
-        players = (self.store.players_for_team(team_id) if team_id
-                  else self.store.all_players())
-        # The Program ceiling applies to BOTH forms. An earlier revision
-        # scoped only the unfiltered form (`team_id is None and role is not
-        # None`), which left an IDOR: `?team_id=<another Program's team>`
-        # skipped the gate entirely and returned that Team's players -- and,
-        # on this MANAGE_SETUP route, their emails. `team_id` is a caller-
-        # supplied identifier, so it selects WHICH rows to consider; it can
-        # never be evidence of authorization for them.
-        if role is not None:
+        program = league = None
+        scope_resolved = role is not None
+        if scope_resolved:
             program, _season, league = self.context.resolve_with_league(
                 user_id, role, scope)
-            if program is None:
-                players = []
-            else:
-                # A selected League narrows here too, via the Team's REAL
-                # permanent competition League (`Team.league_id`, #283 -- not
-                # any of the legacy `league_id` fields that store a Program).
-                # Players are League-narrowable in a way Clubs/Organizations/
-                # Venues are not, and the rest of the surface already treats
-                # them that way: get_setup_progress's "roster" workflow and
-                # the Setup roster summary both League-filter players, and
-                # get_setup_overview_v2 League-narrows teams. Leaving the
-                # Players card Program-wide contradicted its own screen.
-                in_scope = {t.id for t in self.store.all_teams()
-                            if t.program_id == program.id
-                            and (league is None or t.league_id == league.id)}
-                players = [p for p in players if p.team_id in in_scope]
-        rows = [_serialize(p) for p in players]
-        # The Player DTO deliberately carries no email (it reaches coach/roster
-        # views). Only the MANAGE_SETUP-gated operator list opts in, so the edit
-        # drawer (#268) can prefill the current address without ever exposing it
-        # on a coach/public payload.
-        #
-        # This IS a sensitive read of the SAME CONTACT_DESTINATION category
-        # the contacts registry gates (#426 review finding 2:
-        # "Player-email reads... also read or return stored destinations
-        # outside this gate") — policy-checked and audited using the SAME
-        # `role`/`user_id` this method already threads through for Program
-        # scoping. Masks rather than refuses on denial (the player LIST
-        # itself is not privacy-gated, only the email column is), so an
-        # unauthorized `include_email=True` caller still gets the roster,
-        # just with every email blanked — one durable denial row, not a
-        # broken listing.
+
+        def _fetch_rows():
+            players = (self.store.players_for_team(team_id) if team_id
+                      else self.store.all_players())
+            # The Program ceiling applies to BOTH forms. An earlier revision
+            # scoped only the unfiltered form (`team_id is None and role is
+            # not None`), which left an IDOR: `?team_id=<another Program's
+            # team>` skipped the gate entirely and returned that Team's
+            # players -- and, on this MANAGE_SETUP route, their emails.
+            # `team_id` is a caller-supplied identifier, so it selects WHICH
+            # rows to consider; it can never be evidence of authorization
+            # for them.
+            if scope_resolved:
+                if program is None:
+                    scoped = []
+                else:
+                    # A selected League narrows here too, via the Team's
+                    # REAL permanent competition League (`Team.league_id`,
+                    # #283 -- not any of the legacy `league_id` fields that
+                    # store a Program). Players are League-narrowable in a
+                    # way Clubs/Organizations/Venues are not, and the rest
+                    # of the surface already treats them that way:
+                    # get_setup_progress's "roster" workflow and the Setup
+                    # roster summary both League-filter players, and
+                    # get_setup_overview_v2 League-narrows teams. Leaving
+                    # the Players card Program-wide contradicted its own
+                    # screen.
+                    in_scope = {t.id for t in self.store.all_teams()
+                               if t.program_id == program.id
+                               and (league is None
+                                    or t.league_id == league.id)}
+                    scoped = [p for p in players if p.team_id in in_scope]
+                players = scoped
+            # The default Player DTO carries no email and (#273) no
+            # birthdate or registration number — it reaches coach/roster
+            # views. Only the MANAGE_SETUP-gated operator list opts in
+            # (include_email for the #268 edit drawer; include_identity for
+            # the #273 identity fields), so private values never ride a
+            # coach/public payload.
+            return players, [_player_dto(p, include_identity=include_identity)
+                             for p in players]
+
+        # include_identity's own read is a sensitive read of the BIRTHDATE
+        # and REGISTRATION_NUMBER categories (#424 audit-wiring: this opt-in
+        # built the DTO fields but never routed them through the #426
+        # policy+audit boundary include_email uses two branches below — a
+        # facade-only gap, since no HTTP route reaches this flag yet).
+        # BIRTHDATE and REGISTRATION_NUMBER are checked as two INDEPENDENT
+        # categories, not one combined gate: they happen to resolve
+        # identically per role today (see visibility_policy._POLICY), but
+        # the two enum members exist separately on purpose, and checking
+        # them independently keeps this mechanism correct the day a role's
+        # grants for the two fields diverge. Same mask-not-refuse shape as
+        # include_email (the player LIST itself is not privacy-gated, only
+        # the identity columns are): an allowed category keeps its already-
+        # built field value and gets one ALLOWED audit row per disclosed
+        # player; a denied category is masked back to None on every row and
+        # gets one durable, collection-level DENIED row — never a broken
+        # listing.
+        if include_identity:
+            with self.store.transaction():
+                players, rows = _fetch_rows()
+                request_id = self._safe_request_id(None)
+                identity_role, identity_label = self._privacy_principal(role)
+                identity_categories = (
+                    (SensitiveFieldCategory.BIRTHDATE, "birthdate"),
+                    (SensitiveFieldCategory.REGISTRATION_NUMBER,
+                     "registration_number"))
+                allowed_categories = [
+                    category for category, _field in identity_categories
+                    if self._sensitive_read_allowed(identity_role, category)]
+                denied_categories = [
+                    (category, field) for category, field in
+                    identity_categories if category not in allowed_categories]
+                if allowed_categories:
+                    subjects = [("recipient", f"player:{p.id}")
+                               for p in players] or [("recipient", "*")]
+                    for category in allowed_categories:
+                        self._record_sensitive_read(
+                            category, subjects, "list_players_identity",
+                            user_id, identity_label, ACCESS_ALLOWED,
+                            request_id)
+                for category, field in denied_categories:
+                    for row in rows:
+                        row[field] = None
+                    self._record_sensitive_read(
+                        category, [("recipient", "*")],
+                        "list_players_identity", user_id, identity_label,
+                        ACCESS_DENIED, request_id, durable=True)
+        else:
+            players, rows = _fetch_rows()
+        # include_email's own read below IS a sensitive read of the SAME
+        # CONTACT_DESTINATION category the contacts registry gates (#426
+        # review finding 2: "Player-email reads... also read or return
+        # stored destinations outside this gate") — policy-checked and
+        # audited using the SAME `role`/`user_id` this method already
+        # threads through for Program scoping. Masks rather than refuses on
+        # denial (the player LIST itself is not privacy-gated, only the
+        # email column is), so an unauthorized `include_email=True` caller
+        # still gets the roster, just with every email blanked — one
+        # durable denial row, not a broken listing.
         if include_email:
             request_id = self._safe_request_id(None)
             email_role, email_label = self._privacy_principal(role)
@@ -11976,9 +12127,11 @@ class ApiService:
         """
         kwargs = {key: fields[key]
                   for key in ("name", "position", "jersey_number", "shoots",
-                              "email")
+                              "email", "first_name", "last_name",
+                              "preferred_name", "birthdate",
+                              "registration_number", "skill_rating")
                   if key in fields}
-        return _serialize(self.setup.update_player(
+        return _player_dto(self.setup.update_player(
             player_id, actor_id=actor_id, **kwargs))
 
     @catch
@@ -11986,8 +12139,277 @@ class ApiService:
                           actor_id: Optional[str] = None,
                           reason: Optional[str] = None) -> dict:
         """Deactivate/reactivate a Player without deleting history (#270)."""
-        return _serialize(self.setup.set_player_active(
+        return _player_dto(self.setup.set_player_active(
             player_id, active, actor_id=actor_id, reason=reason))
+
+    # -- athlete identity + age eligibility (#273) -----------------------
+
+    @catch
+    def set_age_eligibility_rule(self, league_season_id: str,
+                                 cutoff_month=None, cutoff_day=None,
+                                 tiers=None, enforcement=None,
+                                 actor_id: Optional[str] = None) -> dict:
+        """Append the next VERSION of a LeagueSeason's cutoff/age-tier rule.
+
+        Warn-first (#273): ``enforcement`` defaults to ``"warn"``; nothing in
+        this slice hard-blocks on it. Rule rows are immutable history — the
+        response carries the version so eligibility answers stay
+        reproducible.
+        """
+        return _serialize(self.setup.set_age_eligibility_rule(
+            league_season_id, cutoff_month, cutoff_day, tiers,
+            enforcement=enforcement, actor_id=actor_id))
+
+    @catch
+    def list_age_eligibility_rules(self,
+                                   league_season_id: str) -> List[dict]:
+        """Every rule version for one LeagueSeason, ascending (audit/history
+        view; rules contain no athlete data)."""
+        return [_serialize(rule) for rule in
+                self.store.age_eligibility_rules_for_league_season(
+                    league_season_id)]
+
+    @catch
+    def evaluate_player_eligibility(self, player_id: str, division_id: str,
+                                    include_details: bool = False,
+                                    actor_role=None,
+                                    actor_user_id=None) -> dict:
+        """Is this athlete age-eligible for this Division? (#273 AC[1])
+
+        The DEFAULT response is the Coach-safe eligibility SUMMARY the
+        bounded-#124 owner ruling requires — status / reason / tier /
+        rule version / enforcement — never the birthdate (which no mode of
+        this method returns). ``include_details`` adds the derived
+        ``age_at_cutoff`` + ``cutoff_date`` for operator surfaces, to be
+        MANAGE_SETUP-gated at the HTTP layer like ``include_email``.
+
+        TWO INDEPENDENT tiers, gated separately (#424 round-N owner review
+        finding 3 — fixes a bug where a single ``may_read_summary`` check
+        covered the WHOLE response, so an authorized ``include_details=True``
+        call from ANY SUMMARY-holding caller — i.e. ``COACH`` — returned the
+        operator-only detail fields too, even though ``COACH`` never holds
+        ``may_read_raw`` for BIRTHDATE):
+
+        * The base SUMMARY response (``status``/``reason``/``tier_code``/
+          ``max_age``/rule identity) is gated on ``visibility_policy.
+          may_read_summary`` — the response is derived SUMMARY-fidelity data
+          (the raw birthdate is never returned by any mode of this method),
+          matching the exact grant ``COACH`` holds for this category. This
+          gate covers the WHOLE method, not just ``include_details`` — the
+          default response is itself derived from a read of the athlete's
+          birthdate, so an unauthorized caller must not reach even the
+          summary shape. Refuses the WHOLE call on denial, the same as
+          ``player_duplicate_report``: there is no separate field to mask
+          here the way ``list_players`` masks identity columns on an
+          otherwise-legitimate roster row — the entire SUMMARY payload IS
+          the gated summary, so a partial result would be meaningless.
+        * ``age_at_cutoff``/``cutoff_date`` — the operator-only detail
+          fields this method's own docstring already called out as "for
+          operator surfaces, to be MANAGE_SETUP-gated" — additionally
+          require ``visibility_policy.may_read_raw`` for BIRTHDATE (the
+          exact grant ``LEAGUE_ADMIN`` holds and ``COACH`` does not). Unlike
+          the SUMMARY gate, this one MASKS rather than refuses: a caller who
+          passes SUMMARY but not RAW still gets its legitimate SUMMARY
+          response, just with the two detail fields omitted — the same
+          mask-not-refuse shape ``list_players`` uses for its own extra
+          columns on an otherwise-legitimate row, since the SUMMARY portion
+          remains meaningful on its own (unlike the whole-call case above,
+          where there is no meaningful SUMMARY-minus-something to return).
+
+        Both outcomes are audited via ``_record_sensitive_read`` — a
+        deliberate decision to keep #426's "audit every sensitive read"
+        posture uniform across fidelity levels rather than carve out a
+        silent exception for SUMMARY reads; if that proves too noisy in
+        practice, dropping either ALLOWED audit is a one-line change. The
+        detail-tier's DENIED row is written ``durable=True`` (like every
+        other masked-field denial in this facade), because the surrounding
+        call still succeeds — there is no enclosing refusal for it to stay
+        atomic with.
+
+        ``actor_role``/``actor_user_id`` are purely additive (no existing
+        caller passed them before this method had a way to).
+
+        The sensitive read (#424 round-N owner review finding 2) —
+        ``self.setup.evaluate_player_age_eligibility``'s internal
+        ``self.store.get_player(player_id)`` — runs INSIDE the SAME
+        ``with self.store.transaction():`` block as the ALLOWED audit
+        write(s) below, not as a separate already-autocommitted statement
+        beforehand, mirroring ``list_contact_destinations``'/
+        ``get_delivery_overview``'s own "read + record in one transaction"
+        shape.
+        """
+        request_id = self._safe_request_id(None)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.BIRTHDATE
+        if not visibility_policy.may_read_summary(role, category):
+            self._refuse_sensitive_read(
+                category, "evaluate_player_eligibility", actor_user_id,
+                label, request_id)
+        raw_allowed = (visibility_policy.may_read_raw(role, category)
+                      if include_details else None)
+        with self.store.transaction():
+            result = self.setup.evaluate_player_age_eligibility(
+                player_id, division_id)
+            self._record_sensitive_read(
+                category, [("recipient", f"player:{player_id}")],
+                "evaluate_player_eligibility", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
+            if include_details:
+                subjects = [("recipient", f"player:{player_id}")]
+                if raw_allowed:
+                    self._record_sensitive_read(
+                        category, subjects,
+                        "evaluate_player_eligibility_details",
+                        actor_user_id, label, ACCESS_ALLOWED, request_id)
+                else:
+                    self._record_sensitive_read(
+                        category, subjects,
+                        "evaluate_player_eligibility_details",
+                        actor_user_id, label, ACCESS_DENIED, request_id,
+                        durable=True)
+        if not include_details or not raw_allowed:
+            for key in ("age_at_cutoff", "cutoff_date"):
+                result.pop(key, None)
+        return result
+
+    @catch
+    def player_duplicate_report(self,
+                                team_id: Optional[str] = None,
+                                actor_role=None, actor_user_id=None,
+                                request_id=None) -> dict:
+        """Duplicate-candidate warnings (#273 AC[4]) — operator tooling.
+
+        Read-only; never merges and never matches by name alone. Carries
+        registration-number values (they are what an operator de-duplicates
+        by), so this is a REGISTRATION_NUMBER sensitive read (#424 audit-
+        wiring), policy-checked and audited like every other sensitive read
+        in this facade — its future HTTP route is MANAGE_SETUP-gated like
+        the include_email/include_identity opt-ins; it is never part of a
+        coach/public payload.
+
+        It is ALSO a BIRTHDATE sensitive read (#424 round-N owner review
+        finding 1): ``SetupService.player_duplicate_report``'s
+        ``same_name_same_team_undisambiguated`` "proven different" check
+        compares ``a.birthdate != b.birthdate`` for every same-name/same-team
+        pair it considers, and its ``same_name_same_birthdate`` warning is
+        keyed on the birthdate itself — never echoed into either warning
+        (see that method's own docstring), but read and compared nonetheless.
+        This codebase's own #426 audit philosophy is "value READ from the
+        store", not "value returned to the caller" (see ``list_players``'s
+        ``include_email`` docstring, which cites #426 review finding 2 for
+        exactly this read-vs-echo distinction) — so BIRTHDATE and
+        REGISTRATION_NUMBER are checked as two INDEPENDENT categories here,
+        mirroring ``list_players``'s ``identity_categories`` tuple, each one
+        refusing the WHOLE call on denial (not list_players's mask-not-
+        refuse shape): the birthdate comparison is intrinsic to every
+        warning shape this method can produce (even a report with zero
+        birthdate-typed warnings reached that verdict BY comparing
+        birthdates), so a caller without BIRTHDATE access would get a report
+        whose completeness it cannot evaluate — a masked/silently-narrowed
+        report here would misrepresent what was actually checked, exactly
+        the same reasoning the REGISTRATION_NUMBER gate below already uses.
+
+        Unlike ``list_players``'s mask-not-refuse identity gate, an
+        unauthorized caller gets the WHOLE call refused (``_refuse_
+        sensitive_read``), not a partial/masked report: this method's own
+        internal ``same_name_same_team_undisambiguated`` disambiguation
+        already compares raw registration_number AND birthdate values
+        across every row it considers (never echoing either into THAT
+        warning, but reading them nonetheless), so there is no warning
+        shape this method can produce without both a REGISTRATION_NUMBER
+        and a BIRTHDATE read — a masked partial result would misrepresent
+        what was actually checked, not just hide one field.
+
+        ``actor_role``/``actor_user_id``/``request_id`` are purely additive
+        (no existing caller passed them before this method had a way to);
+        every existing internal caller is updated to route a real principal
+        through here now that the boundary exists.
+
+        AUDIT SUBJECTS (#424 round-N+1 owner review finding A): every ALLOWED
+        row is audited against the FULL player collection
+        ``SetupService.player_duplicate_report`` actually reads for this
+        ``team_id`` — every player in it, whether or not that player ends up
+        implicated in an emitted warning — never a set inferred from the
+        warnings themselves. ``by_registration``/``by_name_birthdate`` inside
+        that method dereference EVERY row's ``registration_number``/
+        ``birthdate`` unconditionally to build their grouping keys, so a
+        player who is examined but never collides with another row (a
+        singleton registration number, a unique name) is read exactly as
+        much as one who ends up in a warning; deriving subjects only from
+        warning ``player_ids`` (the pre-fix shape) silently dropped every
+        such player from the ledger even though the read happened. The two
+        categories share one ``subjects`` list, mirroring ``list_players``'s
+        own ALLOWED-identity block (lines ~12066-12068 above) exactly rather
+        than the DENIED-only always-``"*"`` shape used elsewhere in this
+        file: this method has no DENIED branch of its own (an unauthorized
+        caller is refused before any row is ever read, immediately above),
+        so every write it makes here is an ALLOWED disclosure and belongs to
+        the same per-subject convention ``list_players`` already established
+        for that case. Falls back to the collection-level ``("recipient",
+        "*")`` subject only when the collection itself is empty — never as a
+        size/convenience shortcut.
+
+        The sensitive read (#424 round-N owner review finding 2) — the SAME
+        ``players_for_team``/``all_players`` collection
+        ``SetupService.player_duplicate_report`` reads internally, fetched
+        here a second time (once for auditing, once inside the setup-service
+        call) against the SAME already-open transaction so both observe one
+        snapshot — runs INSIDE the SAME ``with self.store.transaction():``
+        block as the ALLOWED audit writes below, not as a separate already-
+        autocommitted statement beforehand, mirroring ``list_contact_
+        destinations``'/``get_delivery_overview``'s own "read + record in
+        one transaction" shape.
+
+        ISOLATION (#424 round-N+1 owner review finding B, PostgreSQL two-
+        connection proof): fetching the SAME collection TWICE inside one
+        transaction — once here for ``subjects``, once again inside
+        ``self.setup.player_duplicate_report``'s own call for ``warnings`` —
+        is two SEPARATE statements on the same connection, not one shared
+        read. Under PostgreSQL's default READ COMMITTED (this store's
+        ``transaction()`` default when ``isolation`` is not given), each
+        statement independently sees the latest COMMITTED data as of ITS
+        OWN start, not the transaction's start — so a concurrent INSERT
+        landing between these two statements can make the SECOND read
+        (``warnings``) reference a player the FIRST read (``subjects``)
+        never saw, reproducing a narrower version of finding A's own gap
+        under real contention. ``isolation="REPEATABLE READ"`` closes this:
+        PostgreSQL takes its snapshot at the transaction's first statement
+        and holds it for every later statement in the SAME transaction
+        regardless of what commits afterward, so both reads are
+        guaranteed to observe the identical collection. SQLite already
+        gets this for free (``BEGIN IMMEDIATE``'s file-level RESERVED lock
+        serializes the whole transaction against any other writer, per
+        ``transaction()``'s own docstring); raising this to REPEATABLE
+        READ is a no-op there and on Memory (single global lock for
+        the transaction's duration) — see
+        ``test_sensitive_read_audit_race.PostgresSnapshotConsistencyTest
+        .test_player_duplicate_report_snapshot_consistent_under_race``
+        for the two-real-connection proof this closes.
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        birthdate_category = SensitiveFieldCategory.BIRTHDATE
+        registration_category = SensitiveFieldCategory.REGISTRATION_NUMBER
+        for category in (birthdate_category, registration_category):
+            if not self._sensitive_read_allowed(role, category):
+                self._refuse_sensitive_read(
+                    category, "player_duplicate_report", actor_user_id,
+                    label, request_id)
+        with self.store.transaction(isolation="REPEATABLE READ"):
+            players = (self.store.players_for_team(team_id) if team_id
+                      else self.store.all_players())
+            warnings = self.setup.player_duplicate_report(team_id)
+            subjects = [("recipient", f"player:{p.id}")
+                       for p in players] or [("recipient", "*")]
+            self._record_sensitive_read(
+                registration_category, subjects,
+                "player_duplicate_report", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
+            self._record_sensitive_read(
+                birthdate_category, subjects,
+                "player_duplicate_report", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
+        return {"warnings": warnings}
 
     @catch
     def create_game(self, season_id: str, division_id: str, home_team_id: str,
@@ -12046,7 +12468,10 @@ class ApiService:
             if not isinstance(text, str):
                 raise ValidationError(f"{name}_csv must be a CSV text string.")
             sheets[name] = parse_csv_text(text)
-        return validate_import(sheets, store=self.store)
+        # today (#273): from the setup service's injected clock, so the
+        # dry-run's future-birthdate answer matches the commit's exactly.
+        return validate_import(sheets, store=self.store,
+                               today=self.setup.clock().date())
 
     # ====================================================================
     # Pilot onboarding import — teams + players commit (#93)
