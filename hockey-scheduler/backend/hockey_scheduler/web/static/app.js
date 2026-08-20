@@ -103,9 +103,10 @@ let importOperationSeq = 0;
 // resolve in whatever order the network returns, and the LOSER paints last.
 //
 // The failure that motivated this: demo-lifecycle.js's step (4). The
-// empty-state "Load demo data" click (app.js:11277 -> afterDemoLifecycleChange
-// -> render()) was still awaiting /api/demo/overview when the header menu's
-// reset action fired its own un-awaited render() (app.js:13206). The newer
+// empty-state "Load demo data" click (the [data-demo-load] handler ->
+// afterDemoLifecycleChange -> render()) was still awaiting /api/demo/overview
+// when the header menu's reset action fired its own un-awaited render() (the
+// #demo-dropdown [data-demo-action] handler). The newer
 // pass painted and wired the typed-confirmation modal; the older pass then
 // landed, ran `c.innerHTML = viewHtml` and rebuilt the modal from
 // demoConfirmModalHtml -- whose markup ALWAYS emits an empty
