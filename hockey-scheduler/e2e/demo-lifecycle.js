@@ -58,6 +58,110 @@ function login(page, username, password) {
   }, [username, password]);
 }
 
+async function waitUntil(predicate, message, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(message);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+// --- The #215 per-pass render() completion barrier -----------------------
+//
+// The stale-render leg below holds one response so that a SPECIFIC render()
+// pass is suspended mid-flight while a newer pass paints over it. Before that
+// leg may assert anything, it has to know that THAT pass has ENDED — either
+// stood down at a supersession guard or run all the way through its remaining
+// reads and its paint.
+//
+// Nothing at the document level can say that, and this barrier exists because
+// the obvious candidates are all wrong here:
+//   * `networkidle` is a LOAD-LIFECYCLE flag, not a settle signal. Once the
+//     document has fired it, waitForLoadState returns immediately — with the
+//     held request still held. It proved nothing at all in this leg.
+//   * every delivery-shaped barrier (waitForResponse, route.fulfill()
+//     returning, a `requestfinished` count) fires strictly BEFORE the page's
+//     own `await fetch(...)` continuation resumes — let alone before whatever
+//     that continuation then goes on to do, which in a build without the fix
+//     is one or more further real reads.
+//   * an in-flight-request counter or a microtask flush is a quiet-period
+//     detector, i.e. a fixed delay in costume: it cannot tell "the pass stood
+//     down" from "the pass has not dispatched its next read yet".
+//   * a MutationObserver watches for an EFFECT that the FIXED build must
+//     never produce, so on the build under test it could only ever time out.
+//
+// So the barrier observes the INVOCATION, not any effect of it. app.js is a
+// classic script, so its top-level `async function render()` is a writable own
+// property of window and every one of its internal call sites resolves through
+// that binding. Wrapping it here — from the test, with the shipped app left
+// untouched — numbers each invocation and stamps the number in a `finally`,
+// which runs exactly when that invocation's promise settles: after a guard
+// `return`, or after the last line of a full paint. The wrapper mentions
+// nothing the fix introduced (no `renderPass`, no `myRenderPass`), so it holds
+// identically on a build with the fix reverted, where the superseded pass
+// instead reads on and repaints.
+//
+// Identifying WHICH pass is held needs no guesswork and no heuristic: a pass
+// that is suspended on the held response is, by definition, in flight at the
+// moment the response is held. So the leg snapshots the in-flight set inside
+// its own route handler — necessarily before the release — and the barrier
+// waits for every id in that snapshot. The held pass is provably a member, so
+// the barrier cannot resolve before it has ended. (The snapshot is not always
+// a singleton: an unrelated handler's re-render that is still in flight can be
+// caught in it too. Waiting for those as well is strictly stronger and costs
+// nothing; they are not blocked on anything this leg holds.)
+async function armRenderPassWatch(page) {
+  const wrapped = await page.evaluate(() => {
+    if (window.__renderPassWatch) return true;
+    if (typeof window.render !== "function") return false;
+    const watch = { entered: 0, ended: Object.create(null) };
+    const inner = window.render;
+    window.__renderPassWatch = watch;
+    window.render = async function watchedRender(...args) {
+      const id = ++watch.entered;
+      try {
+        return await inner.apply(this, args);
+      } finally {
+        watch.ended[id] = Date.now();
+      }
+    };
+    return window.render !== inner;
+  });
+  if (!wrapped) {
+    throw new Error("#215: render() could not be wrapped, so no leg can await a "
+      + "specific pass's completion — fix the wrapper rather than falling back "
+      + "to a load-state event or a pause, both of which pass vacuously here");
+  }
+}
+
+// Every pass that has been entered and has not yet ended.
+function renderPassesInFlight(page) {
+  return page.evaluate(() => {
+    const w = window.__renderPassWatch;
+    const live = [];
+    for (let id = 1; id <= w.entered; id += 1) if (!w.ended[id]) live.push(id);
+    return live;
+  });
+}
+
+// Resolves only once EVERY pass in `passIds` has settled — among them the one
+// suspended on the held response. Returns how long it actually had to wait, so
+// a failing assertion can report that the superseded pass had finished before
+// it looked, rather than leaving open the possibility that the two raced.
+async function awaitRenderPassesEnd(page, passIds, label) {
+  const startedWaiting = Date.now();
+  await page.waitForFunction(
+    (ids) => ids.every((id) => !!(window.__renderPassWatch
+      && window.__renderPassWatch.ended[id])),
+    passIds, { timeout: 15000 },
+  ).catch(() => {
+    throw new Error(`${label} render pass(es) #${passIds.join(", #")} never `
+      + `ended: the held response was released but those invocations have not `
+      + `settled, so nothing can be asserted about what they did`);
+  });
+  return Date.now() - startedWaiting;
+}
+
 // Selects the Hierarchy sub-view via the user-visible toggle and confirms it
 // took effect (#345 batch 2: Setup now lands on the six-workflow hub, so a
 // journey asserting against Hierarchy controls has to navigate there). Never
@@ -245,11 +349,18 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".start-league", { timeout: 10000 });
 
     let holdOverview = false;
+    let heldPasses = null;
     let releaseOverview = null;
     const overviewHeld = new Promise((r) => { releaseOverview = r; });
+    // Armed BEFORE the pass that will be held is started, because the barrier
+    // observes that invocation from its entry (see armRenderPassWatch).
+    await armRenderPassWatch(page);
     await page.route("**/api/demo/overview", async (route) => {
       if (!holdOverview) return route.continue();
       holdOverview = false;            // hold exactly one: the Load render's
+      // Armed here, with the request still held: whichever pass is suspended
+      // on it is in flight at this instant and so is in this snapshot.
+      heldPasses = await renderPassesInFlight(page);
       await overviewHeld;
       return route.continue();
     });
@@ -267,6 +378,14 @@ async function checkViewport(browser, viewport) {
     // render still awaiting the overview we are holding.
     await page.waitForSelector(".start-league", { state: "detached", timeout: 10000 });
 
+    // Fail here, not at the barrier, if the hold never happened at all.
+    await waitUntil(() => heldPasses !== null,
+      `[${V}] /api/demo/overview was never held, so no render pass was superseded`);
+    if (!heldPasses.length) {
+      throw new Error(`[${V}] the held /api/demo/overview belonged to no render() `
+        + `pass, so this leg is not exercising a superseded render at all`);
+    }
+
     await page.click("#demo-btn");
     await page.click('[data-demo-action="reset"]');
     await page.waitForSelector(".modal.danger #demo-confirm-input", { timeout: 10000 });
@@ -274,12 +393,21 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(
       () => !document.querySelector("[data-demo-confirm]").disabled, null, { timeout: 5000 });
 
-    // Release the stale render and let it run all the way to its DOM
-    // boundary. networkidle (not a fixed pause) is the settle signal: it means
-    // that render's whole fetch chain has finished, so it has already either
-    // painted or stood down -- there is nothing further in flight to land.
+    // Release the stale render and wait for THAT PASS to end. This is the
+    // positive, per-pass barrier armed above: it resolves when the held
+    // invocation's own promise settles -- whether it stood down at its DOM
+    // guard (the fix) or read on and repainted (without it). It is indifferent
+    // to WHETHER the pass does anything, which is the property this needs:
+    // with the fix the pass's completion is unobservable by construction, and
+    // without it the completion only arrives after another real read.
+    const stillSuspended = (await renderPassesInFlight(page))
+      .filter((id) => heldPasses.includes(id));
     releaseOverview();
-    await page.waitForLoadState("networkidle");
+    const stalePassWaitMs = await awaitRenderPassesEnd(page, heldPasses, `[${V}]`);
+    const barrier = `the superseded pass (render #${(stillSuspended.length
+      ? stillSuspended : heldPasses).join(", #")}, suspended on the held overview `
+      + `right up to the release) had already ended ${stalePassWaitMs}ms after `
+      + `release, so this is what it left behind, not a race`;
 
     const modalState = await page.evaluate(() => {
       const b = document.querySelector("[data-demo-confirm]");
@@ -288,13 +416,15 @@ async function checkViewport(browser, viewport) {
                value: i ? i.value : null };
     });
     if (!modalState.present) {
-      throw new Error(`[${V}] a stale render() destroyed the confirm modal outright`);
+      throw new Error(`[${V}] a stale render() destroyed the confirm modal `
+        + `outright — ${barrier}`);
     }
     if (modalState.disabled || modalState.value !== "RESET") {
       throw new Error(
         `[${V}] a stale render() rebuilt the confirm modal and discarded the typed `
         + `confirmation: expected {disabled:false, value:"RESET"}, got `
-        + `{disabled:${modalState.disabled}, value:${JSON.stringify(modalState.value)}}`);
+        + `{disabled:${modalState.disabled}, value:${JSON.stringify(modalState.value)}} `
+        + `— ${barrier}`);
     }
     // And the click must still dispatch: the whole point is that the lifecycle
     // POST actually happens, which is what the flake denied.

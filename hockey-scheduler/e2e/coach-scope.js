@@ -129,6 +129,109 @@ async function selectRole(page, role) {
   await page.selectOption("#new-account-role", role);
 }
 
+// --- The #215 per-pass render() completion barrier -----------------------
+//
+// (The same barrier is spelled out in e2e/demo-lifecycle.js; each journey is a
+// standalone script, so it is stated in both rather than shared.)
+//
+// The superseded-render leg below holds one response so that a SPECIFIC
+// render() pass is suspended mid-flight while a newer pass paints over it.
+// Before that leg may assert anything, it has to know that THAT pass has
+// ENDED — either stood down at a supersession guard or run all the way
+// through its remaining reads.
+//
+// Nothing at the document level can say that, and this barrier exists because
+// the obvious candidates are all wrong here:
+//   * `networkidle` is a LOAD-LIFECYCLE flag, not a settle signal. Once the
+//     document has fired it, waitForLoadState returns immediately — with the
+//     held request still held.
+//   * every delivery-shaped barrier (waitForResponse, route.fulfill()
+//     returning, the `requestfinished` count this leg already keeps) fires
+//     strictly BEFORE the page's own `await fetch(...)` continuation resumes.
+//     They prove the answer ARRIVED, which is exactly what this leg still
+//     wants them for — but not that it was USED, and here the superseded pass
+//     goes on to make three further real reads before it ends.
+//   * an in-flight-request counter or a microtask flush is a quiet-period
+//     detector, i.e. a fixed delay in costume: it cannot tell "the pass stood
+//     down" from "the pass has not dispatched its next read yet", and that gap
+//     is real — a microtask hop plus a JSON parse sits between the held
+//     response resolving and the next fetch being issued.
+//   * a MutationObserver watches for an EFFECT the FIXED build must never
+//     produce, so on the build under test it could only ever time out.
+//
+// So the barrier observes the INVOCATION, not any effect of it. app.js is a
+// classic script, so its top-level `async function render()` is a writable own
+// property of window and every one of its internal call sites resolves through
+// that binding. Wrapping it here — from the test, with the shipped app left
+// untouched — numbers each invocation and stamps the number in a `finally`,
+// which runs exactly when that invocation's promise settles: after a guard
+// `return`, or after its last line. The wrapper mentions nothing the fix
+// introduced (no `renderPass`, no `myRenderPass`), so it holds identically on
+// a build with the per-await guards removed, where the superseded pass instead
+// tears module state and then reads on.
+//
+// Identifying WHICH pass is held needs no guesswork and no heuristic: a pass
+// that is suspended on the held response is, by definition, in flight at the
+// moment the response is held. So the leg snapshots the in-flight set inside
+// its own route handler — necessarily before the release — and the barrier
+// waits for every id in that snapshot. The held pass is provably a member, so
+// the barrier cannot resolve before it has ended. The snapshot is NOT always a
+// singleton, and assuming otherwise is exactly the mistake to avoid here: the
+// rebind above leaves its own re-render in flight, and it enters AFTER the
+// pass this leg holds. Waiting for those extra passes as well is strictly
+// stronger and costs nothing — none of them is blocked on anything held here.
+async function armRenderPassWatch(page) {
+  const wrapped = await page.evaluate(() => {
+    if (window.__renderPassWatch) return true;
+    if (typeof window.render !== "function") return false;
+    const watch = { entered: 0, ended: Object.create(null) };
+    const inner = window.render;
+    window.__renderPassWatch = watch;
+    window.render = async function watchedRender(...args) {
+      const id = ++watch.entered;
+      try {
+        return await inner.apply(this, args);
+      } finally {
+        watch.ended[id] = Date.now();
+      }
+    };
+    return window.render !== inner;
+  });
+  if (!wrapped) {
+    throw new Error("#215: render() could not be wrapped, so no leg can await a "
+      + "specific pass's completion — fix the wrapper rather than falling back "
+      + "to a load-state event or a pause, both of which pass vacuously here");
+  }
+}
+
+// Every pass that has been entered and has not yet ended.
+function renderPassesInFlight(page) {
+  return page.evaluate(() => {
+    const w = window.__renderPassWatch;
+    const live = [];
+    for (let id = 1; id <= w.entered; id += 1) if (!w.ended[id]) live.push(id);
+    return live;
+  });
+}
+
+// Resolves only once EVERY pass in `passIds` has settled — among them the one
+// suspended on the held response. Returns how long it actually had to wait, so
+// a failing assertion can report that the superseded pass had finished before
+// it looked, rather than leaving open the possibility that the two raced.
+async function awaitRenderPassesEnd(page, passIds, label) {
+  const startedWaiting = Date.now();
+  await page.waitForFunction(
+    (ids) => ids.every((id) => !!(window.__renderPassWatch
+      && window.__renderPassWatch.ended[id])),
+    passIds, { timeout: 15000 },
+  ).catch(() => {
+    throw new Error(`${label} render pass(es) #${passIds.join(", #")} never `
+      + `ended: the held response was released but those invocations have not `
+      + `settled, so nothing can be asserted about what they did`);
+  });
+  return Date.now() - startedWaiting;
+}
+
 // STRUCTURAL half of the #215 module-state contract, next to the behavioural
 // half below.
 //
@@ -286,6 +389,7 @@ async function checkViewport(browser, viewport) {
     let capturedAt = 0;
     let deliveredAt = 0;
     let heldReachedPage = 0;
+    let heldPasses = null;
     let released = false;
     let releaseHeld = null;
     const heldReleased = new Promise((r) => { releaseHeld = r; });
@@ -294,11 +398,17 @@ async function checkViewport(browser, viewport) {
         heldReachedPage += 1;
       }
     });
+    // Armed BEFORE the pass that will be held is started, because the barrier
+    // observes that invocation from its entry (see armRenderPassWatch).
+    await armRenderPassWatch(page);
     await page.route(accountsUrl, async (route) => {
       if (!holdAccounts || route.request().method() !== "GET") {
         return route.continue();
       }
       holdAccounts = false;                 // hold exactly one: the loser's
+      // Armed here, with the request still held: whichever pass is suspended
+      // on it is in flight at this instant and so is in this snapshot.
+      heldPasses = await renderPassesInFlight(page);
       const real = await route.fetch();     // the genuine pre-create answer
       capturedAt = Date.now();
       await heldReleased;
@@ -312,6 +422,10 @@ async function checkViewport(browser, viewport) {
     await page.evaluate(() => switchTab("users"));
     await waitUntil(() => capturedAt > 0,
       `[${L}] the superseded pass never issued its GET /api/accounts`);
+    if (!heldPasses || !heldPasses.length) {
+      throw new Error(`[${L}] the held GET /api/accounts belonged to no render() `
+        + `pass, so this leg is not exercising a superseded render at all`);
+    }
 
     // (b) A newer, unheld pass repaints the surface the loser blanked, so the
     //     create form is on screen for the real click below.
@@ -355,21 +469,36 @@ async function checkViewport(browser, viewport) {
 
     // (e) Release the loser and let it resume. It applies its response — or,
     //     once the fix is in, discards it at the guard that now sits between
-    //     the response and its use. The fulfil + requestfinished barriers plus
-    //     networkidle are the settle signal: the held answer has reached the
-    //     page and the whole chain has drained, so whatever the superseded
-    //     pass was going to do to module state, it has already done.
+    //     the response and its use. The fulfil + requestfinished checks stay,
+    //     but as NON-VACUITY only: they prove the held answer really reached
+    //     the page, and neither is a settle signal. The settle signal is the
+    //     per-pass completion barrier below, which resolves when that
+    //     invocation ends — after its three follow-on reads, on a build whose
+    //     per-await guards have been removed.
+    const stillSuspended = (await renderPassesInFlight(page))
+      .filter((id) => heldPasses.includes(id));
     released = true;
     releaseHeld();
+    // THE settle signal, awaited FIRST so that it — and not the incidental
+    // duration of the node-side polls below — is what orders this leg. The
+    // superseded invocation itself has ended.
+    const losingPassWaitMs = await awaitRenderPassesEnd(page, heldPasses, `[${L}]`);
+    // Non-vacuity, checked after the barrier because both are monotone facts
+    // about the past, not orderings: once the response has been delivered and
+    // has reached the page it stays that way, and a pass suspended on that
+    // response cannot have ended without it. A fix that "worked" only because
+    // the loser never got its answer back would prove nothing at all, so the
+    // leg still insists on both.
     await waitUntil(() => deliveredAt > 0,
       `[${L}] the held accounts response was never delivered`);
-    // Non-vacuity, part 2: the response must actually have reached the page.
-    // A fix that "worked" only because the loser never got its answer back
-    // would prove nothing at all.
     await waitUntil(() => heldReachedPage >= 1,
       `[${L}] the superseded pass's accounts response never reached the page, `
         + `so this leg proved nothing`);
-    await page.waitForLoadState("networkidle");
+    const barrier = `the superseded pass (render #${(stillSuspended.length
+      ? stillSuspended : heldPasses).join(", #")}, suspended on the held `
+      + `GET /api/accounts right up to the release) had already ended `
+      + `${losingPassWaitMs}ms after release, so this is what it left behind, `
+      + `not a race`;
 
     // (f) The winner still owns the DOM — the `renderPass` DOM guarantee.
     const painted = await page.evaluate((id) => {
@@ -380,7 +509,7 @@ async function checkViewport(browser, viewport) {
     }, staleUserId);
     if (!painted.selectedOnScreen || !painted.revokeOnScreen) {
       throw new Error(`[${L}] a superseded render() repainted the Users view: `
-        + `${JSON.stringify(painted)}`);
+        + `${JSON.stringify(painted)} — ${barrier}`);
     }
 
     // (g) THE TEAR, asserted where a user meets it: a real click on a real
@@ -397,7 +526,7 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${L}] a superseded render() left its own module state `
         + `behind: the Users view shows ${staleUser} selected with its session `
         + `listed, but Revoke acted on the superseded pass's value — expected `
-        + `POST ${expectedRevokeUrl}, got POST ${revokeRequest.url()}`);
+        + `POST ${expectedRevokeUrl}, got POST ${revokeRequest.url()} — ${barrier}`);
     }
     // ...and the outcome the operator actually cares about: the session is
     // really signed out, not left active behind a 404 nobody surfaced.
