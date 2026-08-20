@@ -91,6 +91,82 @@ let contextSwitchSeq = 0;
 // token issued."
 let iceOperationSeq = 0;
 let importOperationSeq = 0;
+// Monotonic pass token for render() ITSELF (#215 browser-shard-3 flake) --
+// the same idiom as iceOperationSeq/importOperationSeq above, and for exactly
+// the reason stated there: "a stale response can just as easily be wrong
+// within the SAME context ... firing two of the same kind back to back and
+// having them resolve out of order -- none of which touch contextRevision at
+// all." render() is that surface too, and it was the one that never got a
+// token of its own. It is `async`, the overwhelming majority of its ~170 call
+// sites fire it WITHOUT awaiting, and every one of its DOM writes happens
+// AFTER its fetch chain -- so two renders started back to back in ONE context
+// resolve in whatever order the network returns, and the LOSER paints last.
+//
+// The failure that motivated this: demo-lifecycle.js's step (4). The
+// empty-state "Load demo data" click (the [data-demo-load] handler ->
+// afterDemoLifecycleChange -> render()) was still awaiting /api/demo/overview
+// when the header menu's reset action fired its own un-awaited render() (the
+// #demo-dropdown [data-demo-action] handler). The newer
+// pass painted and wired the typed-confirmation modal; the older pass then
+// landed, ran `c.innerHTML = viewHtml` and rebuilt the modal from
+// demoConfirmModalHtml -- whose markup ALWAYS emits an empty
+// #demo-confirm-input and a `disabled` [data-demo-confirm]. So the operator's
+// typed RESET and the enabled button were destroyed in the window between the
+// enable check and the click: the confirm click could never become
+// actionable, and the lifecycle POST was never issued at all. In CI that read
+// as a bare `page.waitForResponse: Timeout 30000ms exceeded`, because the
+// click promise never settled either.
+//
+// Bumped SYNCHRONOUSLY at the top of render(), before any await, so the
+// newest pass always wins; each pass snapshots it and rechecks it IMMEDIATELY
+// AFTER EVERY await, in render()'s own frame, before that response is applied
+// to anything. Standing down is safe by construction here (unlike the
+// contextRevision guards, which rely on the caller to schedule a follow-up
+// render): the pass that superseded this one is itself in flight and is the
+// one that paints.
+//
+// WHY EVERY await AND NOT ONLY THE DOM BOUNDARIES (#215 owner correction).
+// The first version of this guard was checked at the two DOM boundaries only
+// -- the catch block's banner and the paint below setChrome(). That protected
+// the DOM and, on its own, introduced a failure the pre-token code could not
+// produce. render() writes roughly twenty-five MODULE-level names on its way
+// down (currentGame, usersSelected, usersState, publicState, schedulerState,
+// importState, notifPrefs, feedTokens, deliveryState, officialsPool,
+// playersList, leagueTeams, seasonRegs, ... ), and a superseded pass went on
+// writing all of them before standing down at the paint. Before the token the
+// loser wrote state AND painted: wrong, but DOM and state agreed. After it,
+// the WINNER owns the DOM while the LOSER's writes land last -- a torn
+// combination, and every click handler in this file reads module state rather
+// than the DOM, so the next click acts on the loser's value. Observed as
+// exactly that: the Users view showing an account selected with its live
+// session listed under it, while `usersSelected` had been cleared by a
+// superseded pass, so Revoke posted to /api/accounts/null/... and the session
+// stayed signed in (e2e/coach-scope.js's final leg).
+//
+// So the recheck sits between the RESPONSE and its USE, which is what makes
+// the parity with iceOperationSeq/importOperationSeq above real rather than
+// merely claimed: those recheck before applying a response too (see the
+// Validate/Commit handlers, which set importState only after the check). A
+// per-await check is exact here, not merely conservative: JS is
+// single-threaded, so a newer render() can only claim the token while this
+// pass is SUSPENDED at an await -- the run between two awaits is a critical
+// section during which `renderPass` cannot move. Checking on every resume is
+// therefore both necessary and sufficient for "a superseded pass performs no
+// further module-level write".
+//
+// The alternative shape -- stage everything pass-locally and commit
+// atomically at the boundary -- was rejected for THIS function: at least
+// eight of those names are read back INSIDE render() between their write and
+// the boundary (currentGame by the six game-scoped fetches below it,
+// playersList by commitSetupWorkflowCards, usersState.accounts and
+// usersSelected by the two statements after them, publicState.division by its
+// own standings fetch, standingsDivision by its fetch, schedulerState by
+// reconcileDraftSelection, importState.contextRevision by its own re-seed),
+// several of them through helpers that reach for module state directly. A
+// staged copy would have to be threaded through all of those, changing
+// intra-render behaviour, to buy nothing the per-await check does not already
+// guarantee.
+let renderPass = 0;
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -10361,6 +10437,21 @@ function setChrome(ov) {
 
 async function render() {
   updateToast();
+  // Claim this pass BEFORE anything else (see `renderPass` above): the claim
+  // must be synchronous and must precede the factory-reset early return
+  // below, so that a render already awaiting its fetch chain is superseded by
+  // that synchronous success paint too, not just by a fetching pass.
+  //
+  // From here to the paint boundary the rule is uniform and has no
+  // exceptions: EVERY await in this function is followed immediately by
+  // `if (renderPass !== myRenderPass) return;`, in this frame, before the
+  // response it just took delivery of is applied to any module-level name.
+  // Three reads (`oppDetail`, `guardianHome`, `gOppDetail`) had to be split
+  // into a local read and a separate commit to make that order expressible at
+  // all -- assigning a module name straight out of an await expression lands
+  // the write before any guard can run. Anything added below inherits the
+  // rule; e2e/coach-scope.js's final leg is what fails if it does not.
+  const myRenderPass = ++renderPass;
   const c = document.getElementById("content");
   document.body.dataset.view = view;
   // #367 review: a completed factory reset (#256) already cleared this
@@ -10504,6 +10595,7 @@ async function render() {
       c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     }
     ov = await getJSON("/api/demo/overview");
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     if (ov && ov.error) throw new Error(ov.error.message);
     // Default the working game to the first one this user can actually open —
@@ -10517,15 +10609,18 @@ async function render() {
       currentGame = (acc[0] || ov.schedule[0]).game_id;
     }
     board = (view === "activity" && currentGame) ? await getJSON(`/api/games/${currentGame}/board`) : null;
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     // The roster tab and the game sheet both use both sides' lineups (#25/#48).
     lineups = (["roster", "sheet"].includes(view) && currentGame)
       ? await getJSON(`/api/games/${currentGame}/lineups`) : null;
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     // Availability rollup for the roster screen's selected side (#89).
     availSummary = null;
     if (view === "roster" && lineups && lineups[rosterSide] && !lineups.error) {
       const tid = lineups[rosterSide].team_id;
       const s = await getJSON(
         `/api/games/${currentGame}/availability-summary?team_id=${tid}`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (s && !s.error) availSummary = s;
     }
     // Coach substitute outreach queue for the shown side (#112), operator-only.
@@ -10536,12 +10631,14 @@ async function render() {
       const tid = lineups[rosterSide].team_id;
       const q = await getJSON(
         `/api/games/${currentGame}/substitute-candidates?team_id=${tid}`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (q && !q.error) subCandidates = q;
       // Eligible-but-not-yet-enrolled team players a coach can add directly
       // (#114) — a separate list from the outreach queue above, which only
       // ever shows players who already have some enrollment.
       const a = await getJSON(
         `/api/games/${currentGame}/substitute-addable?team_id=${tid}`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (a && !a.error) addableSubs = a;
     }
     // Coach dashboard action card (#146): the next upcoming game's
@@ -10555,8 +10652,10 @@ async function render() {
       const next = nextUpcomingGame(coachTeamGames(ov, currentUser.scope.team_id));
       if (next) {
         const av = await getJSON(`/api/games/${next.game_id}/availability-summary`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (av && !av.error) dashAvailability = av;
         const sq = await getJSON(`/api/games/${next.game_id}/substitute-candidates`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (sq && !sq.error) dashSubQueue = sq;
       }
     }
@@ -10569,6 +10668,7 @@ async function render() {
         && (hasPerm("manage_roster") || hasPerm("manage_schedule"))
         && currentGame) {
       const rr = await getJSON(`/api/games/${currentGame}/reschedule`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (rr && !rr.error) rescheduleRequests = rr.requests;
     }
     // The Setup view itself isn't permission-hidden (any signed-in role can
@@ -10594,6 +10694,7 @@ async function render() {
     // used to crash for them, since it was fetched only under manage_setup).
     if (view === "setup" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
       const svr = await getJSON("/api/v2/setup/overview");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
       svOk = !!(svr && !svr.error);
       if (svOk) sv = svr;
@@ -10604,6 +10705,7 @@ async function render() {
     // bundled into the public demo overview.
     if (view === "setup" && hasPerm("manage_setup")) {
       const pl = await getJSON("/api/players");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       // #367 owner ruling / observed flake: this generation check was
       // MISSING here, and `playersList` is MODULE-level state read at paint
       // time rather than a local like `ov`/`sv`. So a superseded render()
@@ -10624,6 +10726,7 @@ async function render() {
       // so needs_assignment/teams_without_division match the canonical
       // parentage rules exactly instead of a client-side reinterpretation.
       const hvr = await getJSON("/api/v2/setup/hierarchy");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (contextRevision !== myRenderContext) return;  // superseded
       if (hvr && !hvr.error) hv = hvr;
       // Season participation (#180, cut to v2 canonical #233 Slice B2b): a
@@ -10703,6 +10806,7 @@ async function render() {
       // differ; that was false, and contradicted this PR's own description.
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         // Same reason as the player list above, and more acute: this loop
         // awaits once per Program and twice per Season, so it is the widest
         // window in render() for a context switch to land mid-flight while
@@ -10725,6 +10829,7 @@ async function render() {
         }
         for (const s of (program.seasons || [])) {
           const rr = await getJSON(`/api/v2/setup/seasons/${s.id}/team-registrations`);
+          if (renderPass !== myRenderPass) return;  // superseded (#215)
           if (contextRevision !== myRenderContext) return;  // superseded
           seasonRegs[s.id] = (rr && rr.registrations) || [];
           // The SELECTED Season only -- see the ruling note above. Every other
@@ -10746,6 +10851,7 @@ async function render() {
             const va = await getJSONContextScoped(
               `/api/v2/setup/seasons/${s.id}/venue-access`,
               renderedContextEpoch);
+            if (renderPass !== myRenderPass) return;  // superseded (#215)
             if (contextRevision !== myRenderContext) return;  // superseded
             seasonVenueAccess[s.id] = (va && va.venue_access) || [];
             // Grant CANDIDATES for this Season (#369 review): its own
@@ -10793,6 +10899,7 @@ async function render() {
               const vc = await getJSONContextScoped(
                 `/api/v2/setup/seasons/${s.id}/venue-candidates`,
                 renderedContextEpoch);
+              if (renderPass !== myRenderPass) return;  // superseded (#215)
               if (contextRevision !== myRenderContext) return;  // superseded
               seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
             }
@@ -10844,6 +10951,7 @@ async function render() {
       let progress = setupProgressRead(CARD_READ.UNAUTHORIZED, null);
       if (hasPerm("manage_arena")) {
         const pr = await getJSON("/api/v2/setup/progress");
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (contextRevision !== myRenderContext) return;  // superseded
         progress = setupProgressReadOf(pr);
       }
@@ -10853,14 +10961,17 @@ async function render() {
     // The game sheet also needs the officials pool for its assign control (#30).
     if (view === "sheet") {
       const op = await getJSON("/api/officials");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       officialsPool = (op && op.officials) || [];
     }
     // The signed-in official's inbox (#55).
     if (view === "inbox") inbox = await getJSON("/api/me/assignments");
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     // The official's own availability windows (#88).
     officialAvailability = [];
     if (view === "inbox" && inbox && inbox.official_id) {
       const av = await getJSON(`/api/officials/${inbox.official_id}/availability`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (av && !av.error) officialAvailability = av.availability || [];
     }
     // The signed-in player's own home screen (#107): next game, attendance,
@@ -10869,21 +10980,36 @@ async function render() {
       // Skip the heavy player-home read while an opportunity detail is open —
       // renderPlayerHome short-circuits to the detail and discards playerHome.
       if (!oppDetailGame) playerHome = await getJSON("/api/me/player-home");
-      oppDetail = oppDetailGame
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
+      // Read, CHECK, then commit -- `oppDetail` is module-level, so assigning
+      // straight out of the await expression would land the write before any
+      // guard could run (#215 owner correction).
+      const oppDetailRead = oppDetailGame
         ? await getJSON(`/api/me/substitute-opportunities/${encodeURIComponent(oppDetailGame)}`)
         : null;
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
+      oppDetail = oppDetailRead;
     }
     // The signed-in guardian's linked-junior surface (#26): each verified
     // junior's Player Home payload, plus a junior-scoped opportunity detail
     // when one is open. Same skip-the-list-while-detail-open shape as above.
     if (view === "guardian_home") {
-      if (!gOpp) guardianHome = await getJSON("/api/me/guardian/home");
-      gOppDetail = gOpp
+      // Same read/check/commit split as `oppDetail` above: both names are
+      // module-level (#215 owner correction).
+      if (!gOpp) {
+        const guardianHomeRead = await getJSON("/api/me/guardian/home");
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
+        guardianHome = guardianHomeRead;
+      }
+      const gOppDetailRead = gOpp
         ? await getJSON(`/api/me/guardian/${encodeURIComponent(gOpp.jid)}/substitute-opportunities/${encodeURIComponent(gOpp.game_id)}`)
         : null;
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
+      gOppDetail = gOppDetailRead;
     }
     // Notifications feed drives the bell badge on every view (#32).
     const nf = await getJSON("/api/notifications");
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     if (nf && !nf.error) notifState = nf;
     // Pilot readiness checklist (#104), operator-only. Everything else the
     // card needs (app mode/store/delivery mode, demo data + fixture counts)
@@ -10896,6 +11022,7 @@ async function render() {
     // whenever this operator-only endpoint has a hiccup.
     if (view === "readiness" && hasPerm("manage_setup")) {
       const rd = await getJSON("/api/readiness");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       readinessCheck = (rd && !rd.error) ? rd : null;
     }
     // Self-service channel preferences for the signed-in user (#81).
@@ -10906,6 +11033,7 @@ async function render() {
       if (ref) {
         const pr = await getJSON(
           `/api/notifications/preferences?recipient_ref=${encodeURIComponent(ref)}`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (pr && !pr.error) notifPrefs = pr;
       }
     }
@@ -10917,6 +11045,7 @@ async function render() {
       if (actor) {
         const ft = await getJSON(`/api/calendar-feeds?actor_type=${actor.actor_type}`
           + `&actor_ref=${encodeURIComponent(actor.actor_ref)}`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (ft && !ft.error) feedTokens = (ft.feed_tokens || []).filter((t) => !t.revoked);
       }
     }
@@ -10928,6 +11057,7 @@ async function render() {
         getJSON("/api/notifications/deliveries"),
         getJSON("/api/notifications/device-tokens"),
       ]);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       officialsPool = (op && op.officials) || [];
       deliveryState = {
         contacts: (contacts && contacts.contacts) || [],
@@ -10953,6 +11083,7 @@ async function render() {
         schedulerState.preview = null;
       }
       const dr = await getJSON("/api/scheduler/drafts");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       const drafts = (dr && dr.draft_games) || [];
       const previousDrafts = schedulerState.drafts;
       schedulerState.drafts = drafts;
@@ -10995,12 +11126,14 @@ async function render() {
     // Account/session admin, League-Admin only (#78).
     if (view === "users" && hasPerm("manage_users")) {
       const acc = await getJSON("/api/accounts");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       usersState.accounts = (acc && acc.user_accounts) || [];
       if (usersSelected && !usersState.accounts.some((a) => a.id === usersSelected)) {
         usersSelected = null;
       }
       if (usersSelected) {
         const s = await getJSON(`/api/accounts/${usersSelected}/sessions`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         usersState.sessions = (s && s.sessions) || [];
       } else {
         usersState.sessions = [];
@@ -11010,17 +11143,21 @@ async function render() {
       // (#114); manage_users implies manage_setup for every role that holds
       // it today (only league admin), so this fetch never 403s in practice.
       const gl = await getJSON("/api/guardians/links");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       guardianLinksState = Array.isArray(gl) ? gl : [];
       const pl = await getJSON("/api/players");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       playersList = Array.isArray(pl) ? pl : [];
       // Officials pool for the create-account form's Official scope dropdown
       // (#135) — same data the game sheet's assign control already uses.
       const op = await getJSON("/api/officials");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       officialsPool = (op && op.officials) || [];
     }
     // Public surface (#83): schedule + standings from public-safe endpoints.
     if (view === "public") {
       const sch = await getJSON("/api/public/schedule");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       // A 5xx/non-JSON outage (now surfaced by getJSON as {error}) routes to the
       // shared "Could not load data" + Retry banner below, not an empty schedule.
       if (sch && sch.error) throw new Error(sch.error.message);
@@ -11030,6 +11167,7 @@ async function render() {
       }
       if (publicTab === "standings" && publicState.division) {
         const st = await getJSON(`/api/public/standings/${publicState.division}`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (st && st.error) throw new Error(st.error.message);
         publicState.standings = st;
       }
@@ -11041,11 +11179,13 @@ async function render() {
       }
       standings = standingsDivision
         ? await getJSON(`/api/standings/${standingsDivision}`) : null;
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     }
     // The Dashboard shows a standings snapshot for the first division.
     if (view === "dashboard" && ov.divisions[0]) {
       standings = await getJSON(`/api/standings/${ov.divisions[0].id}`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     }
     // Home/Tasks hub setup-progress card (#330) — only for a role that can
@@ -11059,6 +11199,12 @@ async function render() {
     // held model whose tuple has moved as stale, so blanking it from here
     // would only discard data the stale contract says to keep showing.
   } catch (e) {
+    // Superseded (see `renderPass`): a newer render() owns #content. This
+    // pass's failure is not the current pass's failure -- painting the
+    // backend-error banner here would replace whatever the newer pass has
+    // already put on screen with an error for a question nobody is still
+    // asking, and would settle its focus intent on this pass's behalf.
+    if (renderPass !== myRenderPass) return;
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
       <p>The backend may not be running. ${esc(e.message || e)}</p></div>
@@ -11077,6 +11223,18 @@ async function render() {
     return;
   }
 
+  // THE stale-paint boundary (see `renderPass`) -- the LAST of this pass's
+  // supersession checks, not the only one: every await above already rechecks
+  // the token before applying its response, so a pass that reaches this line
+  // has provably written no module state since a newer pass appeared. What is
+  // left to protect here is the DOM. Everything below this line writes to the
+  // document -- the header chrome, the demo menu, the context switcher, the
+  // Restricted banner, and the `c.innerHTML = viewHtml` paint that rebuilds
+  // the modal from scratch. A pass that a newer render() has already
+  // superseded must write NONE of it: the newer pass is in flight and is the
+  // one that paints, so standing down here leaves the newest state on screen
+  // instead of overwriting it with this pass's older data.
+  if (renderPass !== myRenderPass) return;
   setChrome(ov);
   updateNotifBadge();
   // Keep the header demo control's Load↔Reset label in step with the actual
