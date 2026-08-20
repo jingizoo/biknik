@@ -1256,10 +1256,15 @@ class MembershipBackfillNullSpineKeyTest(unittest.TestCase):
                 with self.subTest(backend=label, spine_key=field):
                     self._run_null_key_case(field, spec, label, url)
                 checked += 1
-        # 4 keys x SQLite (+ PostgreSQL when configured). Pinned so a
-        # backend quietly dropping out of _sql_backends() cannot shrink the
-        # matrix without failing here.
-        self.assertEqual(checked, 4 * len(_sql_backends()))
+        # 4 keys x SQLite (+ PostgreSQL when configured). Pinned against the
+        # ENVIRONMENT, not against len(_sql_backends()) -- that earlier form
+        # could never fire, because `checked` is incremented by a loop over
+        # the very list it was compared to, so both sides moved together and
+        # a backend dropping out shrank the matrix silently. Mirrors
+        # ParkedRevivalSpineTest's pin, which uses this same independent
+        # source.
+        expected = 4 * (2 if os.environ.get("TEST_DATABASE_URL") else 1)
+        self.assertEqual(checked, expected)
 
     def test_both_program_keys_null_is_still_reported(self):
         """Two MISSING keys are not agreement. This is precisely where
@@ -1377,9 +1382,12 @@ class MembershipBackfillNullSpineKeyTest(unittest.TestCase):
         for label, got in results.items():
             self.assertEqual(
                 got, ["a_null", "b_null", "both_null", "differ"], label)
-        if len(results) > 1:
-            self.assertEqual(len(set(map(tuple, results.values()))), 1,
-                             results)
+        # Same independent pin: when PostgreSQL is configured BOTH engines
+        # must have produced a row set, otherwise the cross-engine equality
+        # assertion below would silently evaporate on a one-engine run.
+        if os.environ.get("TEST_DATABASE_URL"):
+            self.assertEqual(sorted(results), ["postgres", "sqlite"], results)
+        self.assertEqual(len(set(map(tuple, results.values()))), 1, results)
 
 
 class MembershipIndexEnforcementTest(unittest.TestCase):
