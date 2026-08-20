@@ -332,9 +332,16 @@ class _SignalOnEnterProxy:
     there is no third gap hiding behind this one. The ONLY thing between
     ``event.set()`` and the true lock attempt is the ``self._cm.__enter__``
     call on the next line: for ``InMemoryStore.transaction`` /
-    ``SqlStore.transaction`` that starts the real generator, whose very
-    first statement is ``with self._lock:`` (for SQLite, followed by
-    ``BEGIN IMMEDIATE``'s RESERVED file lock).
+    ``SqlStore.transaction`` that starts the real generator, which takes
+    ``with self._lock:`` at once -- literally its first statement in
+    ``InMemoryStore``, and in ``SqlStore`` its first statement after a
+    pure argument check (``sql_store.py:913-914`` raises ``ValueError``
+    for an unsupported ``isolation`` before reaching the ``with`` on
+    ``:915``; that check touches no shared state and cannot block). For
+    SQLite a WRITE-CAPABLE transaction then takes ``BEGIN IMMEDIATE``'s
+    RESERVED file lock; ``read_only=True`` takes only SHARED instead --
+    every racer in this module is write-capable, so RESERVED is what they
+    contend for here.
 
     ``__exit__`` delegates verbatim and returns the real context manager's
     own return value, so exception suppression/propagation and
@@ -366,9 +373,12 @@ def _signal_at_transaction_entry(store, event):
     generator functions. CALLING one only constructs a
     ``contextlib._GeneratorContextManager`` around a generator in state
     ``GEN_CREATED``; not one line of either generator body has run, so
-    ``with self._lock:`` -- the very first statement of both, and the real
-    lock take -- has not been reached and ``_txn_depth`` is still 0. The
-    body starts only when the caller later invokes ``__enter__``. The
+    ``with self._lock:`` -- the real lock take, and the first statement of
+    ``InMemoryStore.transaction`` (in ``SqlStore.transaction`` the first
+    after its non-blocking ``isolation`` argument check, ``sql_store.py``
+    ``:913-914`` before the ``with`` on ``:915``) -- has not been reached
+    and ``_txn_depth`` is still 0. The body starts only when the caller
+    later invokes ``__enter__``. The
     previous version of this helper fired ``event`` at that CALL and its
     docstring claimed the calling frame was "about to enter ``real(...)``'s
     own ``with self._lock:``"; that claim was false, and the arbitrary
@@ -472,21 +482,48 @@ def _delay_between_return_and_enter(store, racer_attempted, delay):
 
 def _delay_then_call(racer_attempted, delay, call):
     """Required regression coverage (a), scheduling-delay negative control
-    (#424 round-N+4 owner review): sleeps for ``delay`` BEFORE ``call()``
-    ever runs -- mirroring the owner's own repro (a scheduling/validation
-    delay landing in the gap between the racer's facade call and its real
-    ``store.transaction()`` boundary) -- then asserts ``racer_attempted``
-    is STILL unset at the end of that delay, before finally invoking
-    ``call()`` (which itself fires ``_signal_at_transaction_entry`` at the
-    real boundary). Raising here (via a plain ``assert``, propagated by
-    ``_race``'s ``run_racer`` into ``errors["racer"]``, and then re-raised
-    as an ``AssertionError`` by ``_race`` itself) is the proof that an
-    injected pre-boundary delay genuinely cannot satisfy the signal early
-    under the fixed wiring -- unlike the pre-round-N+4 code, which this
-    exact shape (0.5s injected between the old ``racer_attempted.set()``
-    and the high-level mutating call) demonstrably fooled (see this
-    module's git history / PR discussion for the captured "before"
-    evidence)."""
+    (#424 round-N+4 owner review; REPAIRED in round-N+6 -- it was dead as
+    originally wired, see below): sleeps for ``delay`` BEFORE ``call()``
+    ever runs, asserts ``racer_attempted`` is STILL unset at the end of
+    that delay, and only then invokes ``call()`` -- the racer's high-level
+    mutating call, whose own transaction ``__enter__`` fires the event at
+    the real boundary.
+
+    CALLER CONTRACT, ON WHICH THE ENTIRE CONTROL DEPENDS: the caller MUST
+    already have run ``_signal_at_transaction_entry`` on the racer's store
+    BEFORE calling this. The signal has to be ARMED while the delay
+    elapses. If it is armed later, nothing capable of firing the event
+    exists during the delay, the assertion below cannot fail under ANY
+    wiring, and the control proves nothing. It was dead in exactly that
+    way until round-N+6: all three call sites installed the signal INSIDE
+    ``call``, i.e. after this delay had already run, and all six of these
+    controls passed even against a signal moved back to the facade level
+    -- precisely the bug shape they were written to catch.
+
+    WHAT IT ESTABLISHES, EXACTLY: with the signalling wrapper already
+    installed on the racer's store, ``delay`` seconds of wall clock on the
+    racer thread -- while the target sits paused mid-transaction -- do not
+    fire ``racer_attempted``. So the event cannot be satisfied by the
+    instrumentation merely being in place and the racer thread merely
+    getting scheduled; the racer must actually reach and ENTER its own
+    transaction. Confirmed by mutation: a bare ``event.set()`` at the top
+    of ``_signal_at_transaction_entry`` (the pre-round-N+4 facade-level
+    shape) fails all six of these controls with the message below.
+
+    WHAT IT DOES NOT ESTABLISH: the delay lands ABOVE the facade call, so
+    this says nothing about the stretch BETWEEN the facade call and the
+    ``store.transaction()`` inside it (``update_player``/``add_player``'s
+    own validation and dispatch), and nothing about the gap between that
+    call returning and its ``__enter__``. Both are covered only by
+    ``_delay_between_return_and_enter``, whose assertion point is strictly
+    LATER on the same thread -- which means it catches everything this
+    control catches and those two stretches besides. This control is a
+    genuine, non-vacuous regression, but its detection power is a strict
+    SUBSET of that one's: corroboration, not independent coverage.
+
+    Assertion failures here propagate through ``_race``'s ``run_racer``
+    into ``errors["racer"]`` and are re-raised as an ``AssertionError`` by
+    ``_race`` itself."""
     time.sleep(delay)
     assert not racer_attempted.is_set(), (
         "racer_attempted fired during an injected pre-transaction delay "
@@ -629,13 +666,28 @@ class _GenuineBlockSnapshotTests:
         # real ``__enter__`` whose first statement is ``with self._lock:``
         # (per that helper's docstring), never at the high-level facade
         # call above it, never at the mere ``store.transaction()`` CALL,
-        # and never inferred from timing. Neither remaining gap can satisfy
-        # this wait early: a scheduling/validation stretch ABOVE
-        # ``store.transaction()`` is covered by each call site's own
-        # ``*_racer_attempted_scheduling_delay_negative_control``, and the
-        # gap BELOW it -- between that call returning a context manager and
-        # the ``__enter__`` that takes the lock -- by its
-        # ``*_racer_attempted_return_to_enter_gap_negative_control``.
+        # and never inferred from timing.
+        #
+        # What holds that line is each call site's own
+        # ``*_racer_attempted_return_to_enter_gap_negative_control``. Its
+        # assertion fires at the LAST moment before the real ``__enter__``
+        # -- after the racer's facade call, after that call's validation
+        # and dispatch, and after ``store.transaction()`` has returned its
+        # context manager -- so it catches an event set anywhere at or
+        # above the lock attempt: facade level, mid-validation, or at the
+        # bare ``transaction()`` CALL.
+        #
+        # The companion ``*_racer_attempted_scheduling_delay_negative_
+        # control`` adds only this: 0.5s of scheduled racer-thread time
+        # with the instrumentation already armed does not fire the event.
+        # That is a real control since round-N+6 (mutating the signal back
+        # to the facade level fails all six of them), but its assertion
+        # point is strictly EARLIER on the same thread than the gap
+        # control's, so what it catches is a strict SUBSET of what the gap
+        # control catches. Do NOT read it as covering the stretch between
+        # the facade call and ``store.transaction()`` -- it does not reach
+        # that far, and an earlier revision of this comment wrongly claimed
+        # it did. Only the gap control covers that stretch.
         self.assertTrue(
             racer_attempted.wait(15),
             "racer thread never reached its own mutation/transaction -- "
@@ -808,19 +860,23 @@ class _GenuineBlockSnapshotTests:
     # REQUIRED REGRESSION COVERAGE (#424 round-N+4 owner review): for each  #
     # of the three call sites above, two negative controls --               #
     #                                                                       #
-    # (a) scheduling-delay: an artificial delay injected BEFORE the real    #
-    #     store.transaction() boundary (the exact shape of the owner's own #
-    #     0.5s repro) must NOT be able to satisfy racer_attempted early --  #
-    #     see _delay_then_call.                                            #
+    # (a) scheduling-delay: with the signal ALREADY ARMED on the racer's   #
+    #     store, an artificial delay injected above the racer's facade     #
+    #     call must NOT be able to satisfy racer_attempted early -- see    #
+    #     _delay_then_call, whose docstring records both the arming        #
+    #     contract (the control is dead without it, as it was until        #
+    #     round-N+6) and the strict limit of what it establishes.          #
     # (b) no-lock/broken-store: a racer whose write bypasses the real lock #
     #     entirely (_NoLockTransactionStore) must make _race's own         #
     #     blocking assertion genuinely FAIL -- proof that assertion is     #
     #     load-bearing, not vacuous.                                       #
     #                                                                       #
-    # ...plus, added in round-N+5 (owner review: (a) closed only the gap   #
-    # ABOVE store.transaction(); a second gap remained BELOW it, because   #
-    # both store transaction() methods are @contextmanager generators and  #
-    # CALLING one enters nothing) --                                        #
+    # ...plus, added in round-N+5 (owner review: a gap remained BELOW     #
+    # store.transaction(), because both store transaction() methods are    #
+    # @contextmanager generators and CALLING one enters nothing. Note (a)  #
+    # did NOT close the gap above store.transaction() either -- as wired   #
+    # until round-N+6 it closed nothing at all; (c) is what covers both)   #
+    # --                                                                    #
     #                                                                       #
     # (c) return-to-__enter__ gap: a delay injected between               #
     #     store.transaction() RETURNING its context manager and the real  #
@@ -843,8 +899,18 @@ class _GenuineBlockSnapshotTests:
                 racer_store = self._racer_store(store)
                 racer_api = ApiService(racer_store)
 
+                # ARM THE SIGNAL BEFORE THE DELAY, never inside
+                # ``real_call``. This wiring is what makes the control
+                # discriminating: the wrapper that can fire
+                # ``racer_attempted`` must already be installed on
+                # ``racer_store`` while ``_delay_then_call``'s delay
+                # elapses. Installing it inside ``real_call`` -- i.e.
+                # AFTER the delay -- would leave nothing armed during the
+                # delay, so the assertion at the end of it could never
+                # fail and the control would prove nothing.
+                _signal_at_transaction_entry(racer_store, racer_attempted)
+
                 def real_call():
-                    _signal_at_transaction_entry(racer_store, racer_attempted)
                     racer_api.update_player(
                         p.id, registration_number="REG-DELAYED")
                 _delay_then_call(racer_attempted, 0.5, real_call)
@@ -936,8 +1002,18 @@ class _GenuineBlockSnapshotTests:
                 racer_store = self._racer_store(store)
                 racer_api = ApiService(racer_store)
 
+                # ARM THE SIGNAL BEFORE THE DELAY, never inside
+                # ``real_call``. This wiring is what makes the control
+                # discriminating: the wrapper that can fire
+                # ``racer_attempted`` must already be installed on
+                # ``racer_store`` while ``_delay_then_call``'s delay
+                # elapses. Installing it inside ``real_call`` -- i.e.
+                # AFTER the delay -- would leave nothing armed during the
+                # delay, so the assertion at the end of it could never
+                # fail and the control would prove nothing.
+                _signal_at_transaction_entry(racer_store, racer_attempted)
+
                 def real_call():
-                    _signal_at_transaction_entry(racer_store, racer_attempted)
                     racer_api.setup.add_player(
                         "t1", None, Position.DEFENSE, first_name="Race",
                         last_name="Inserted",
@@ -1031,8 +1107,18 @@ class _GenuineBlockSnapshotTests:
                 racer_store = self._racer_store(store)
                 racer_api = ApiService(racer_store)
 
+                # ARM THE SIGNAL BEFORE THE DELAY, never inside
+                # ``real_call``. This wiring is what makes the control
+                # discriminating: the wrapper that can fire
+                # ``racer_attempted`` must already be installed on
+                # ``racer_store`` while ``_delay_then_call``'s delay
+                # elapses. Installing it inside ``real_call`` -- i.e.
+                # AFTER the delay -- would leave nothing armed during the
+                # delay, so the assertion at the end of it could never
+                # fail and the control would prove nothing.
+                _signal_at_transaction_entry(racer_store, racer_attempted)
+
                 def real_call():
-                    _signal_at_transaction_entry(racer_store, racer_attempted)
                     racer_api.update_player(p.id, birthdate="1990-06-06")
                 _delay_then_call(racer_attempted, 0.5, real_call)
 
