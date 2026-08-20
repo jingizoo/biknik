@@ -90,94 +90,6 @@ async function checkViewport(browser, viewport) {
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
 
-  // Network trace (#215 flake diagnosis). This records BROWSER-SIDE events
-  // only, and every sentence it prints is limited to what those events
-  // actually prove. There is no server-side evidence here, so nothing below
-  // may assert backend receipt: a Playwright `request` event proves the
-  // browser EMITTED a request and nothing more.
-  //
-  // What the events do prove, and it is enough for the question that made
-  // these diagnostics necessary:
-  //
-  //   * `request`  -- the browser EMITTED the request.
-  //   * `response` -- the browser RECEIVED response headers for it.
-  //   * `requestfinished` / `requestfailed` -- the browser finished reading
-  //     the response, or the request failed at the transport with an
-  //     errorText.
-  //
-  // Those two facts cleanly separate the two candidate causes this journey
-  // was flaking between:
-  //
-  //   no `request`             -> the click never issued the fetch. A
-  //                               FRONTEND failure, and the actual root cause
-  //                               of the #215 flake.
-  //   `request`, no `response` -> the request went out and nothing came back.
-  //
-  // The second case is deliberately NOT subdivided. From the browser, a
-  // request the server received and stalled on and a request that never
-  // reached the server are indistinguishable -- both are simply "emitted, no
-  // response". Saying which one it is would require server-side evidence this
-  // journey does not collect.
-  //
-  // Every netLog entry is scoped to the attempt in force when it was observed,
-  // so a counter from an earlier journey step (this journey issues five POSTs
-  // across three lifecycle routes, and re-visits /api/demo/load three times)
-  // can never be read as evidence for the step under test.
-  let currentAttempt = 0;
-  const netLog = [];
-  const record = (type, r, extra) => netLog.push({
-    t: Date.now(), attempt: currentAttempt, type,
-    method: (r.request ? r.request() : r).method(), url: r.url(), ...extra });
-  page.on("request", (r) => record("request", r));
-  page.on("response", (r) => record("response", r, { status: r.status() }));
-  page.on("requestfinished", (r) => record("requestfinished", r));
-  page.on("requestfailed", (r) => record("requestfailed", r,
-    { failure: (r.failure() && r.failure().errorText) || "unknown" }));
-
-  // Click an element and wait for its resulting POST as ONE coordinated
-  // operation (Playwright's recommended pattern: page.waitForResponse
-  // begins listening the instant it's called, which Promise.all makes
-  // unambiguous rather than relying on call-order alone).
-  const clickAndAwaitResponse = async (url, method, clickFn, label) => {
-    currentAttempt += 1;
-    const attempt = currentAttempt;
-    try {
-      const [resp] = await Promise.all([
-        page.waitForResponse((r) => r.url() === url && r.request().method() === method),
-        clickFn(),
-      ]);
-      return resp;
-    } catch (err) {
-      // Scoped by URL, by METHOD (a GET to the same path is not evidence
-      // about the POST under test) and by ATTEMPT.
-      const mine = (e) => e.attempt === attempt && e.url === url
-        && e.method === method;
-      const matched = netLog.filter(mine);
-      const emitted = matched.some((e) => e.type === "request");
-      const responseSeen = matched.some((e) => e.type === "response");
-      const failed = matched.find((e) => e.type === "requestfailed");
-      // Every branch states a BROWSER-SIDE observation only. Where the request
-      // ended up once it left the browser is not observable from here, and is
-      // not claimed.
-      const diagnosis =
-        !emitted
-          ? "the browser NEVER EMITTED this request -- the click did not fire the fetch at all (a frontend/DOM failure)."
-          : failed
-            ? `the browser emitted it and the transport FAILED (${failed.failure}); no response reached the browser.`
-            : !responseSeen
-              ? "the browser EMITTED it but NO RESPONSE reached the browser. Browser-side "
-                + "events cannot tell a server that received it and stalled apart from a "
-                + "request that never arrived -- both look identical from here."
-              : "the browser emitted it AND received a response for it; the wait predicate is what did not match.";
-      const recent = netLog.filter((e) => e.attempt === attempt).slice(-40);
-      throw new Error(
-        `${label}: timed out waiting for ${method} ${url} (attempt ${attempt}).\n` +
-        `Diagnosis (browser-side observation only): ${diagnosis}\n` +
-        `Browser events for ${method} ${url} this attempt: ${JSON.stringify(matched)}\n` +
-        `All browser network activity this attempt: ${JSON.stringify(recent)}`);
-    }
-  };
-
   const V = viewport.label;
   const getJson = (p) => page.evaluate(
     (u) => fetch(u, { credentials: "same-origin" }).then((r) => r.json()), p);
@@ -207,10 +119,10 @@ async function checkViewport(browser, viewport) {
     await page.fill("#demo-confirm-input", word);
     await page.waitForFunction(
       () => !document.querySelector("[data-demo-confirm]").disabled, null, { timeout: 5000 });
-    const resp = await clickAndAwaitResponse(
-      `${base}${route}`, "POST", () => page.click("[data-demo-confirm]"),
-      `[${V}] ${action}`);
-    if (resp.status() !== 200) throw new Error(`[${V}] ${action} returned non-200`);
+    const resp = page.waitForResponse((r) =>
+      r.url() === `${base}${route}` && r.request().method() === "POST");
+    await page.click("[data-demo-confirm]");
+    if ((await resp).status() !== 200) throw new Error(`[${V}] ${action} returned non-200`);
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
   };
 
@@ -238,10 +150,10 @@ async function checkViewport(browser, viewport) {
 
     // (2) Load from the empty-state card: the sample dataset appears, the card
     // is replaced by league trees, and the header flips to Reset.
-    const loadResp = await clickAndAwaitResponse(
-      `${base}/api/demo/load`, "POST", () => page.click("[data-demo-load]"),
-      `[${V}] card Load`);
-    if (loadResp.status() !== 200) throw new Error(`[${V}] card Load returned non-200`);
+    const loadResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/demo/load` && r.request().method() === "POST");
+    await page.click("[data-demo-load]");
+    if ((await loadResp).status() !== 200) throw new Error(`[${V}] card Load returned non-200`);
     await page.waitForSelector(".start-league", { state: "detached", timeout: 10000 });
     if (await leagueCount() === 0) throw new Error(`[${V}] Load did not build the dataset`);
     await waitDemoTitle("Reset demo data").catch(() => {
@@ -286,10 +198,10 @@ async function checkViewport(browser, viewport) {
     });
 
     // Re-load so Reset has a populated dataset to rebuild from.
-    const reload = await clickAndAwaitResponse(
-      `${base}/api/demo/load`, "POST", () => page.click("[data-demo-load]"),
-      `[${V}] second Load`);
-    if (reload.status() !== 200) throw new Error(`[${V}] second Load returned non-200`);
+    const reload = page.waitForResponse((r) =>
+      r.url() === `${base}/api/demo/load` && r.request().method() === "POST");
+    await page.click("[data-demo-load]");
+    if ((await reload).status() !== 200) throw new Error(`[${V}] second Load returned non-200`);
     await page.waitForSelector(".start-league", { state: "detached", timeout: 10000 });
 
     // (4) Reset from the header menu (typed RESET): the canonical dataset.
@@ -305,19 +217,19 @@ async function checkViewport(browser, viewport) {
     // What used to happen, non-deterministically, in step (4) above. render()
     // is `async`, blanks #content SYNCHRONOUSLY and only then awaits its fetch
     // chain, and almost every caller fires it without awaiting. So the Load
-    // click's render (app.js:11277 -> afterDemoLifecycleChange -> render())
-    // could still be mid-fetch when line 256's `.start-league` detached
-    // barrier was satisfied -- that barrier is met by the SYNCHRONOUS BLANK,
-    // not by the paint, so the journey walked on with a render still in
-    // flight. Opening the header menu then started a SECOND render
-    // (app.js:13206, also un-awaited). Whichever landed last won. When the
-    // older one landed last, `c.innerHTML = viewHtml` plus the modal rebuild
-    // wiped the filled, enabled confirm modal and replaced it with a fresh one
-    // -- demoConfirmModalHtml always emits an EMPTY #demo-confirm-input and a
-    // `disabled` [data-demo-confirm]. Landing in the window between the
-    // enable check and the click left Playwright waiting on `enabled`
-    // forever, and the lifecycle POST was never issued at all: the CI symptom
-    // was a bare `page.waitForResponse: Timeout 30000ms exceeded`.
+    // click's render (the [data-demo-load] handler ->
+    // afterDemoLifecycleChange -> render()) could still be mid-fetch when the
+    // re-load's `.start-league` detached barrier above was satisfied -- that
+    // barrier is met by the SYNCHRONOUS BLANK, not by the paint, so the
+    // journey walked on with a render still in flight. Choosing "reset" from
+    // the header menu then started a SECOND render (the #demo-dropdown
+    // handler, also un-awaited). Whichever landed last won. When the older one
+    // landed last, `c.innerHTML = viewHtml` plus the modal rebuild wiped the
+    // filled, enabled confirm modal and replaced it with a fresh one --
+    // demoConfirmModalHtml always emits an EMPTY #demo-confirm-input and a
+    // `disabled` [data-demo-confirm]. Landing in the window between the enable
+    // check and the click left Playwright waiting on `enabled` forever, and
+    // the lifecycle POST was never issued at all.
     //
     // Here that interleaving is FORCED rather than raced, so this leg is
     // deterministic where the flake was not: exactly ONE /api/demo/overview --
@@ -328,7 +240,7 @@ async function checkViewport(browser, viewport) {
     //
     // The fix under test is app.js's `renderPass` token: a superseded render
     // stands down at its DOM boundaries instead of painting. Revert it and
-    // this leg fails with the modal reading {disabled:true, inputValue:""}.
+    // this leg fails with the modal reading {disabled:true, value:""}.
     await runFromMenu("clear", "CLEAR", "/api/demo/clear");
     await page.waitForSelector(".start-league", { timeout: 10000 });
 
@@ -343,9 +255,11 @@ async function checkViewport(browser, viewport) {
     });
 
     holdOverview = true;
-    const staleLoad = await clickAndAwaitResponse(
-      `${base}/api/demo/load`, "POST", () => page.click("[data-demo-load]"),
-      `[${V}] stale-render Load`);
+    const [staleLoad] = await Promise.all([
+      page.waitForResponse((r) =>
+        r.url() === `${base}/api/demo/load` && r.request().method() === "POST"),
+      page.click("[data-demo-load]"),
+    ]);
     if (staleLoad.status() !== 200) {
       throw new Error(`[${V}] stale-render Load returned non-200`);
     }
@@ -382,11 +296,13 @@ async function checkViewport(browser, viewport) {
         + `confirmation: expected {disabled:false, value:"RESET"}, got `
         + `{disabled:${modalState.disabled}, value:${JSON.stringify(modalState.value)}}`);
     }
-    // And the click must still dispatch: the whole point is that the POST
-    // actually leaves the browser, which is what the flake denied.
-    const staleReset = await clickAndAwaitResponse(
-      `${base}/api/demo/reset`, "POST", () => page.click("[data-demo-confirm]"),
-      `[${V}] reset after a stale render landed`);
+    // And the click must still dispatch: the whole point is that the lifecycle
+    // POST actually happens, which is what the flake denied.
+    const [staleReset] = await Promise.all([
+      page.waitForResponse((r) =>
+        r.url() === `${base}/api/demo/reset` && r.request().method() === "POST"),
+      page.click("[data-demo-confirm]"),
+    ]);
     if (staleReset.status() !== 200) {
       throw new Error(`[${V}] reset after a stale render returned non-200`);
     }
