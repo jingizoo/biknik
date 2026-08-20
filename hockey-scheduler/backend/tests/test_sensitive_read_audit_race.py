@@ -275,12 +275,49 @@ class PostgresFailureInjectionTest(_FailureInjectionMatrixTests,
 # =========================================================================== #
 
 def _pause_list_players(store, paused, resume):
+    """Pauses the target's OWN first ``players_for_team()`` read. Only the
+    FIRST call pauses; every later one runs straight through -- the same
+    first-call-only guard ``_pause_duplicate_report`` already carries, and
+    for a sharper reason here (#424 round-N+7 owner review).
+
+    WITHOUT THE GUARD THIS TEST STOPS DISCRIMINATING, on Memory. ``Memory
+    SnapshotConsistencyTest._racer_store`` returns the SAME store object
+    the target is using (there is only one ``InMemoryStore``), so this
+    monkeypatch is visible to the racer thread too -- and the racer's
+    ``update_player(registration_number=...)`` re-enters this very method:
+    ``SetupService._assert_registration_number_available`` calls
+    ``store.players_for_team(team_id)`` for its same-team uniqueness check.
+    An unguarded version therefore parks the RACER on ``resume`` as well,
+    so ``_race``'s "racer has not completed while we are paused" assertion
+    passes because the TEST's own instrumentation held the racer, not
+    because any lock did. Proven by mutation: replacing all three
+    sensitive-read ``with self.store.transaction():`` blocks in
+    ``api/service.py`` with ``nullcontext()`` -- a target holding no
+    transaction at all -- left the unguarded version PASSING (the racer
+    parked 0.31s on ``resume``, which was still unset when it arrived);
+    with this guard the same mutation FAILS it, on the intended
+    "racer completed its write while the target was still paused"
+    assertion, and the racer no longer parks here at all.
+
+    This is the same hazard ``_direct_write_bypassing_lock``'s docstring
+    already anticipates and dodges for the no-lock controls ("calling the
+    SAME (now-instrumented) method here would pause the racer thread too,
+    on the SAME ``resume`` -- an artifact of the test's own
+    instrumentation sharing one store, not of any lock"); the reasoning
+    simply had not been carried across to the racer's own facade path.
+    SQLite is unaffected either way -- ``_racer_store`` there opens a
+    separate connection, so the patch never reaches the racer -- but the
+    guard is what makes Memory's discrimination structural rather than
+    dependent on which store method the racer's path happens to call."""
     orig = store.players_for_team
+    call_count = {"n": 0}
 
     def instrumented(team_id):
+        call_count["n"] += 1
         result = orig(team_id)
-        paused.set()
-        resume.wait(15)
+        if call_count["n"] == 1:
+            paused.set()
+            resume.wait(15)
         return result
     store.players_for_team = instrumented
 
@@ -291,7 +328,17 @@ def _pause_duplicate_report(store, paused, resume):
     report``'s internal second ``all_players()`` call -- the exact
     two-statement gap the PostgreSQL fix (``isolation="REPEATABLE READ"``)
     closes. Only the FIRST call pauses; the second (inside SetupService)
-    runs straight through so the transaction can finish."""
+    runs straight through so the transaction can finish.
+
+    That guard was written for the target's own second read, but it
+    doubles as the racer-re-entry guard the other two helpers now carry
+    explicitly (#424 round-N+7 sweep): on Memory the racer shares this
+    exact store object, and a racer path that reached ``all_players()``
+    would otherwise park on ``resume`` and satisfy ``_race``'s blocking
+    assertion for the test's own sake. Today's racer here
+    (``setup.add_player``) does not -- both its duplicate checks go
+    through ``players_for_team`` -- so the guard is belt and braces on
+    that axis, which is how it should stay."""
     orig = store.all_players
     call_count = {"n": 0}
 
@@ -306,12 +353,39 @@ def _pause_duplicate_report(store, paused, resume):
 
 
 def _pause_eligibility(store, paused, resume):
+    """Pauses the target's OWN first ``get_player()`` read; every later
+    call runs straight through. Same first-call-only guard as the two
+    helpers above, applied here for the same reason and BEFORE it can bite
+    (#424 round-N+7 owner review sweep).
+
+    Unlike ``_pause_list_players``, this one was never actually defeated:
+    its racer calls ``update_player(birthdate=...)``, whose load goes
+    through ``store.get_player_for_update`` (``setup_service.py`` -- a
+    DIFFERENT method from the ``get_player`` patched here), and its
+    ``birthdate``-only edit never reaches
+    ``_assert_registration_number_available``, so nothing on the racer's
+    path re-enters this instrumentation. Confirmed by mutation: with the
+    three sensitive-read transactions replaced by ``nullcontext()``, the
+    unguarded version already FAILED correctly, and a probe recorded the
+    target as the ONLY thread ever entering the instrumented method.
+
+    But that immunity was accidental -- a property of which store method
+    the racer's path happens to call today, not of this helper -- and one
+    field added to that racer's edit, or one ``get_player`` inside the
+    write path, would silently convert this test into ``_pause_list_
+    players``'s failure mode: the racer parked on ``resume`` by the test's
+    own instrumentation, and ``_race``'s blocking assertion passing for
+    that reason instead of the lock's. The guard makes the immunity
+    structural."""
     orig = store.get_player
+    call_count = {"n": 0}
 
     def instrumented(player_id):
+        call_count["n"] += 1
         result = orig(player_id)
-        paused.set()
-        resume.wait(15)
+        if call_count["n"] == 1:
+            paused.set()
+            resume.wait(15)
         return result
     store.get_player = instrumented
 
@@ -698,9 +772,55 @@ class _GenuineBlockSnapshotTests:
         # actually reached its own write attempt, it still cannot COMPLETE
         # while our write-capable transaction holds the store's lock
         # (SQLite RESERVED / Memory's process-wide lock) -- poll a short,
-        # bounded window and assert it has NOT completed. Unlike the old,
-        # unguarded version of this same assertion, a pass here can no
-        # longer be explained by "the racer thread just hadn't run yet".
+        # bounded window and assert it has NOT completed.
+        #
+        # WHAT A PASS HERE ESTABLISHES, EXACTLY (#424 round-N+7 owner
+        # review, which narrowed an earlier overclaim on this comment):
+        #
+        #   1. The racer was not merely unscheduled. ``racer_attempted``
+        #      above fired inside the racer's own transaction ``__enter__``,
+        #      one statement before the real ``__enter__`` that takes the
+        #      lock -- so the racer reached the actual lock-acquisition
+        #      attempt. That much this assertion no longer has to assume.
+        #   2. The racer is not being held by THIS MODULE's own pause
+        #      instrumentation. Every ``_pause_*`` helper now parks only on
+        #      its FIRST call, and the first call is always the target's:
+        #      the racer thread does not start work until ``paused`` is
+        #      set, and ``paused`` is set only from inside that first call.
+        #      So a racer that re-enters an instrumented method -- which
+        #      Memory's racer really does, sharing ONE store object with
+        #      the target -- passes straight through instead of parking on
+        #      ``resume``. Before the guard on ``_pause_list_players``,
+        #      that re-entry was a second, test-owned blocker and this
+        #      assertion passed for its sake: with all three service-layer
+        #      transactions replaced by ``nullcontext()`` -- a target
+        #      holding no lock whatsoever -- ``Memory...test_list_players_
+        #      snapshot_consistent_under_race`` still passed, the racer
+        #      parked 0.31s on ``resume``.
+        #
+        # WHAT IT STILL DOES NOT ESTABLISH, and should not be read as:
+        #
+        #   * "Blocked" is inferred from a BOUNDED 0.3s poll, so this
+        #     cannot distinguish a racer genuinely held on the lock from
+        #     one that is merely slower than the window for some unrelated
+        #     reason (GIL contention, an expensive validation path, a
+        #     starved thread after entry). Nothing INSIDE the test closes
+        #     that gap; what holds the line is falsifiability from
+        #     OUTSIDE -- the mutation above makes all six Memory/SQLite
+        #     snapshot tests fail, which is the evidence that 0.3s is
+        #     actually discriminating against today's code paths. Treat
+        #     that mutation, not this assertion's own text, as the proof
+        #     obligation whenever these paths change.
+        #   * The property in (2) is maintained for Memory by the guard on
+        #     each pause helper, and by nothing else: target and racer are
+        #     literally the same ``InMemoryStore``, so every monkeypatch
+        #     this module installs is visible to both threads. A NEW pause
+        #     helper written without the first-call guard, or a racer path
+        #     newly routed through an already-instrumented method by an
+        #     unguarded helper, reopens exactly this hole. SQLite is
+        #     structurally immune (``_racer_store`` opens a separate
+        #     connection, so the patch never reaches the racer); Memory is
+        #     immune only by that guard.
         #
         # The check itself is wrapped in try/finally (#424 round-N+4 owner
         # review, required negative control b): a deliberately-broken racer
@@ -1367,6 +1487,16 @@ class PostgresSnapshotConsistencyTest(unittest.TestCase):
             # call -- the pause point stays AFTER the read returns, still
             # inside the transaction, matching every other pause helper in
             # this module.
+            #
+            # Deliberately WITHOUT the module-level helpers' first-call
+            # guard, and safe without it (#424 round-N+7 sweep): this
+            # patches the TARGET's own store, and this class's racer runs
+            # on ``ApiService(self._store())`` -- a genuinely separate
+            # psycopg connection -- so the racer can never reach this
+            # instrumentation at all. Nor could it produce a false pass if
+            # it did: this class's ``_race`` asserts the racer COMPLETED
+            # (agreement, not blocking), so a racer parked here would fail
+            # it loudly rather than satisfy it.
             orig = store.players_for_team
 
             def instrumented(team_id):
@@ -1599,6 +1729,11 @@ class PostgresSnapshotConsistencyTest(unittest.TestCase):
         store.add_data_access = spy_add
 
         def pause_fn(paused, resume):
+            # No first-call guard, for the same reason as the pause_fn in
+            # test_list_players_snapshot_consistent_under_race above: the
+            # racer holds a separate psycopg connection, so this patch on
+            # the target's store is unreachable from it (#424 round-N+7
+            # sweep).
             orig = store.get_player
 
             def instrumented(player_id):
