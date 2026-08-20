@@ -316,40 +316,158 @@ def _pause_eligibility(store, paused, resume):
     store.get_player = instrumented
 
 
-def _signal_at_transaction_entry(store, event):
-    """Set ``event`` at the ACTUAL store transaction/lock-acquisition
-    boundary -- ``store.transaction()`` -- not at some earlier facade call
-    several stack frames above it (#424 round-N+4 owner review: the prior
-    ``racer_attempted.set()`` fired immediately before ``ApiService.
-    update_player()``/``setup.add_player()``, high-level calls whose own
-    validation/dispatch can run for an arbitrary stretch BEFORE either one
-    ever reaches ``SetupService._transactional``'s ``with self.store.
-    transaction():`` -- the actual lock take, ``with self._lock:`` as the
-    very first line of both ``InMemoryStore.transaction`` and ``SqlStore.
-    transaction``. A scheduler pause or validation delay in that gap could
-    fire the old signal while the racer was not yet contending for
-    anything, which a bare ``racer_done.wait(0.3) == False`` cannot tell
-    apart from genuine blocking).
+class _SignalOnEnterProxy:
+    """Context-manager proxy that fires ``event`` inside ``__enter__``,
+    on the last statement before the REAL context manager's own
+    ``__enter__`` runs (#424 round-N+5 owner review -- see
+    ``_signal_at_transaction_entry`` for why calling ``store.transaction()``
+    is emphatically NOT that moment).
 
-    Wraps ``store.transaction`` so ``event`` fires immediately before
-    control reaches the real transaction context manager, mirroring the
+    A plain class with ``__enter__``/``__exit__``, deliberately NOT another
+    ``@contextmanager`` generator: a generator-based proxy would have the
+    identical defect it exists to fix -- calling it would build a second
+    ``_GeneratorContextManager`` whose body (and therefore whose
+    ``event.set()``) would again not run until somebody entered THAT. A
+    real ``__enter__`` method runs its body the instant it is invoked, so
+    there is no third gap hiding behind this one. The ONLY thing between
+    ``event.set()`` and the true lock attempt is the ``self._cm.__enter__``
+    call on the next line: for ``InMemoryStore.transaction`` /
+    ``SqlStore.transaction`` that starts the real generator, whose very
+    first statement is ``with self._lock:`` (for SQLite, followed by
+    ``BEGIN IMMEDIATE``'s RESERVED file lock).
+
+    ``__exit__`` delegates verbatim and returns the real context manager's
+    own return value, so exception suppression/propagation and
+    ``InMemoryStore``'s snapshot-restore-on-raise behave exactly as they do
+    unproxied."""
+
+    def __init__(self, cm, event):
+        self._cm = cm
+        self._event = event
+
+    def __enter__(self):
+        # Last statement before the real __enter__ on the very next line.
+        self._event.set()
+        return self._cm.__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._cm.__exit__(exc_type, exc, tb)
+
+
+def _signal_at_transaction_entry(store, event):
+    """Set ``event`` at the ACTUAL lock-acquisition attempt: inside the
+    ``__enter__`` of the context manager ``store.transaction()`` returns,
+    immediately before delegating to that context manager's own
+    ``__enter__``.
+
+    WHY NOT AT THE CALL (#424 round-N+5 owner review, which falsified the
+    previous version of this helper): ``InMemoryStore.transaction`` and
+    ``SqlStore.transaction`` are both ``@contextmanager``-decorated
+    generator functions. CALLING one only constructs a
+    ``contextlib._GeneratorContextManager`` around a generator in state
+    ``GEN_CREATED``; not one line of either generator body has run, so
+    ``with self._lock:`` -- the very first statement of both, and the real
+    lock take -- has not been reached and ``_txn_depth`` is still 0. The
+    body starts only when the caller later invokes ``__enter__``. The
+    previous version of this helper fired ``event`` at that CALL and its
+    docstring claimed the calling frame was "about to enter ``real(...)``'s
+    own ``with self._lock:``"; that claim was false, and the arbitrary
+    scheduler gap it left between the signal and the lock attempt was
+    demonstrated directly -- injecting 0.5s after ``real(...)`` returned
+    but before its ``__enter__`` left all 18 Memory/SQLite snapshot/race
+    tests passing, so the signal was provably not tied to the lock attempt
+    at all.
+
+    (This is the second tightening of the same signal. Round-N+4 moved it
+    off the high-level facade call -- ``ApiService.update_player()`` /
+    ``setup.add_player()``, whose own validation/dispatch runs for an
+    arbitrary stretch before reaching ``SetupService._transactional``'s
+    ``with self.store.transaction():`` -- and onto ``store.transaction``.
+    Round-N+5 moves it the rest of the way, off the CALL and onto the
+    ENTRY. Both gaps mattered for the same reason: a bare
+    ``racer_done.wait(0.3) == False`` cannot tell "the racer is genuinely
+    blocked on the lock" apart from "the racer had not reached the lock
+    yet", so the event must mean the former and nothing weaker.)
+
+    Wraps ``store.transaction`` so every call returns a
+    ``_SignalOnEnterProxy`` around the real context manager, mirroring the
     ``store.transaction = <wrapper>`` monkeypatch convention already used
     elsewhere in this suite for instrumenting store internals (e.g.
     ``test_official_availability.py``'s ``_api_counting``,
     ``test_hierarchy_import.py``, ``test_import_commit.py``). Every one of
     ``update_player``/``setup.add_player``'s own ``@_transactional`` bodies
-    calls ``self.store.transaction()`` exactly once, as their very first
-    executed line -- so this fires at the ONE real entry point, with no
-    earlier call in the chain to leak through first."""
+    enters ``self.store.transaction()`` exactly once, as their very first
+    executed statement -- so this fires at the ONE real entry point, with
+    no earlier entry in the chain to leak through first.
+
+    The permanent regression for exactly the gap this closes is
+    ``*_racer_attempted_return_to_enter_gap_negative_control`` (three call
+    sites x Memory/SQLite), built on ``_delay_between_return_and_enter``."""
     real = store.transaction
 
     def wrapped(*args, **kwargs):
-        # The instant this fires, the calling frame is about to enter
-        # ``real(...)``'s own ``with self._lock:`` -- the genuine
-        # lock-acquisition attempt -- not merely "some Python code ran".
-        event.set()
-        return real(*args, **kwargs)
+        # NOTE: no event.set() here. Calling ``real`` merely builds a
+        # context manager; nothing is locked, entered, or attempted yet.
+        return _SignalOnEnterProxy(real(*args, **kwargs), event)
     store.transaction = wrapped
+
+
+def _delay_between_return_and_enter(store, racer_attempted, delay):
+    """Required regression coverage (c), return-to-``__enter__`` gap
+    (#424 round-N+5 owner review): stacks a SECOND wrapper on top of the
+    one ``_signal_at_transaction_entry`` just installed (call this AFTER
+    it), so that on the racer's outermost ``store.transaction()``:
+
+    1. the signalling wrapper returns its ``_SignalOnEnterProxy``;
+    2. we assert ``racer_attempted`` is STILL unset -- returning a context
+       manager is not entering one;
+    3. we sleep ``delay`` -- the owner's own injected gap, in the exact
+       place they injected it: after the wrapper returned, before the real
+       ``__enter__``;
+    4. we assert ``racer_attempted`` is STILL unset after that whole delay;
+    5. only then do we hand the proxy back, so the caller's ``with``
+       finally enters it and the event fires.
+
+    Against the pre-round-N+5 wiring (``event.set()`` at CALL time) step 2
+    fails on contact, which is what makes this a real regression rather
+    than a restatement. Against the fixed wiring it passes, and ``_race``'s
+    own ``racer_attempted.wait(15)`` then proves the event DID fire at
+    entry -- so the pair is not vacuous in either direction: unset through
+    the whole pre-entry gap, set once entry happens.
+
+    Only the FIRST transaction of the racer is delayed/asserted (the
+    outermost one, and the only one that reaches an unlocked store): once
+    entry has legitimately fired the event, a nested ``transaction()``
+    joining the open unit would find it set, correctly.
+
+    Returns a dict whose ``"gaps"`` counts how many times the gap was
+    actually injected. Callers MUST assert it is non-zero after the race:
+    a racer that never opened a transaction at all would otherwise satisfy
+    every ``is_set()`` assertion above trivially.
+
+    Assertion failures here propagate through ``_race``'s ``run_racer``
+    into ``errors["racer"]`` and are re-raised by ``_race`` itself as an
+    ``AssertionError``."""
+    signalling_wrapper = store.transaction
+    state = {"gaps": 0}
+
+    def delaying(*args, **kwargs):
+        cm = signalling_wrapper(*args, **kwargs)  # the wrapper has RETURNED
+        if state["gaps"] == 0:
+            assert not racer_attempted.is_set(), (
+                "racer_attempted fired when store.transaction() merely "
+                "RETURNED a context manager -- the signal is tied to the "
+                "call, not to the lock attempt inside __enter__")
+            time.sleep(delay)
+            assert not racer_attempted.is_set(), (
+                f"racer_attempted fired during the injected {delay}s gap "
+                "between store.transaction()'s return and the real "
+                "__enter__ -- the signal is not tied to the actual "
+                "lock-acquisition attempt")
+            state["gaps"] += 1
+        return cm
+    store.transaction = delaying
+    return state
 
 
 def _delay_then_call(racer_attempted, delay, call):
@@ -468,19 +586,24 @@ class _GenuineBlockSnapshotTests:
                         "target never reached the pause")
                     return
                 # ``mutate_fn`` is handed ``racer_attempted`` and, via
-                # ``_signal_at_transaction_entry``, sets it itself at the
-                # racer's OWN ``store.transaction()`` call -- the actual
-                # lock-acquisition boundary (#424 round-N+3 owner review
-                # GAP 2; tightened further in round-N+4: the signal used to
-                # fire before the high-level facade call, e.g.
+                # ``_signal_at_transaction_entry``, sets it itself INSIDE
+                # the ``__enter__`` of the racer's OWN transaction context
+                # manager, on the statement before the real ``__enter__``
+                # that runs ``with self._lock:`` -- the actual
+                # lock-acquisition attempt (#424 round-N+3 owner review
+                # GAP 2, tightened twice since). Round-N+4: the signal used
+                # to fire before the high-level facade call, e.g.
                 # ``update_player()``, several frames above the real
-                # ``with self.store.transaction():`` it eventually reaches
-                # -- never here, and never merely "the racer thread got CPU
-                # time at all": setting it any earlier (e.g. right after
-                # ``paused.wait`` returns, or before the facade call's own
-                # validation/dispatch has even run) would only prove the OS
-                # scheduler ran this thread, not that it reached the actual
-                # mutating call that could contend with the target's lock.
+                # ``with self.store.transaction():`` it eventually reaches.
+                # Round-N+5: it then fired when ``store.transaction()`` was
+                # CALLED, which only builds a ``@contextmanager`` object
+                # and enters nothing. Never here, either, and never merely
+                # "the racer thread got CPU time at all": setting it any
+                # earlier (e.g. right after ``paused.wait`` returns, or
+                # before the facade call's own validation/dispatch has even
+                # run) would only prove the OS scheduler ran this thread,
+                # not that it reached the actual lock attempt that could
+                # contend with the target.
                 mutate_fn(racer_attempted)
                 racer_done.set()
             except BaseException as exc:  # noqa: BLE001
@@ -501,15 +624,18 @@ class _GenuineBlockSnapshotTests:
         # within this 0.3s window", and the two are indistinguishable from
         # that assertion alone. This wait is the fix: it blocks (up to 15s)
         # for PROOF the racer thread is now actually contending for the
-        # target's lock -- set by ``_signal_at_transaction_entry`` at the
-        # racer's OWN ``store.transaction()`` call (the real
-        # ``with self._lock:`` acquisition, per that helper's docstring),
-        # never at the high-level facade call above it and never inferred
-        # from timing. A scheduling delay or validation stretch between the
-        # facade call and this real boundary cannot satisfy this wait
-        # early -- see each call site's own
-        # ``*_racer_attempted_scheduling_delay_negative_control`` test
-        # below for the permanent regression proof.
+        # target's lock -- set by ``_signal_at_transaction_entry`` inside
+        # the racer's own transaction ``__enter__``, immediately before the
+        # real ``__enter__`` whose first statement is ``with self._lock:``
+        # (per that helper's docstring), never at the high-level facade
+        # call above it, never at the mere ``store.transaction()`` CALL,
+        # and never inferred from timing. Neither remaining gap can satisfy
+        # this wait early: a scheduling/validation stretch ABOVE
+        # ``store.transaction()`` is covered by each call site's own
+        # ``*_racer_attempted_scheduling_delay_negative_control``, and the
+        # gap BELOW it -- between that call returning a context manager and
+        # the ``__enter__`` that takes the lock -- by its
+        # ``*_racer_attempted_return_to_enter_gap_negative_control``.
         self.assertTrue(
             racer_attempted.wait(15),
             "racer thread never reached its own mutation/transaction -- "
@@ -690,6 +816,19 @@ class _GenuineBlockSnapshotTests:
     #     entirely (_NoLockTransactionStore) must make _race's own         #
     #     blocking assertion genuinely FAIL -- proof that assertion is     #
     #     load-bearing, not vacuous.                                       #
+    #                                                                       #
+    # ...plus, added in round-N+5 (owner review: (a) closed only the gap   #
+    # ABOVE store.transaction(); a second gap remained BELOW it, because   #
+    # both store transaction() methods are @contextmanager generators and  #
+    # CALLING one enters nothing) --                                        #
+    #                                                                       #
+    # (c) return-to-__enter__ gap: a delay injected between               #
+    #     store.transaction() RETURNING its context manager and the real  #
+    #     __enter__ that actually takes the lock must NOT be able to      #
+    #     satisfy racer_attempted early either -- see                     #
+    #     _delay_between_return_and_enter. This is the exact gap that      #
+    #     falsified the round-N+4 head (0.5s there left all 18 Memory/     #
+    #     SQLite tests passing).                                           #
     # ===================================================================== #
 
     def test_list_players_racer_attempted_scheduling_delay_negative_control(self):
@@ -717,6 +856,40 @@ class _GenuineBlockSnapshotTests:
                 return rows[0]
 
             self._race(pause_fn, mutate, go)
+        finally:
+            store.close() if isinstance(store, SqlStore) else None
+
+    def test_list_players_racer_attempted_return_to_enter_gap_negative_control(self):
+        store = self._store()
+        try:
+            api, p = _seed(store)
+
+            def pause_fn(paused, resume):
+                _pause_list_players(store, paused, resume)
+
+            gap = {}
+
+            def mutate(racer_attempted):
+                racer_store = self._racer_store(store)
+                racer_api = ApiService(racer_store)
+                _signal_at_transaction_entry(racer_store, racer_attempted)
+                gap["state"] = _delay_between_return_and_enter(
+                    racer_store, racer_attempted, 0.5)
+                racer_api.update_player(p.id, registration_number="REG-GAP")
+
+            def go():
+                rows = api.list_players(team_id="t1", include_identity=True,
+                                        role=Role.LEAGUE_ADMIN,
+                                        user_id="user_admin")
+                return rows[0]
+
+            self._race(pause_fn, mutate, go)
+            # Non-vacuity: the gap really was injected (a racer that never
+            # opened a transaction would satisfy every is_set() assertion
+            # inside _delay_between_return_and_enter trivially).
+            self.assertEqual(gap["state"]["gaps"], 1,
+                             "the return-to-__enter__ gap was never actually "
+                             "injected -- this control proved nothing")
         finally:
             store.close() if isinstance(store, SqlStore) else None
 
@@ -779,6 +952,41 @@ class _GenuineBlockSnapshotTests:
         finally:
             store.close() if isinstance(store, SqlStore) else None
 
+    def test_player_duplicate_report_racer_attempted_return_to_enter_gap_negative_control(self):
+        store = self._store()
+        try:
+            api, p1 = _seed(store)
+            api.setup.add_player(
+                "t1", None, Position.GOALIE, first_name="Warn",
+                last_name="Pair", registration_number="REG-SHARED")
+
+            def pause_fn(paused, resume):
+                _pause_duplicate_report(store, paused, resume)
+
+            gap = {}
+
+            def mutate(racer_attempted):
+                racer_store = self._racer_store(store)
+                racer_api = ApiService(racer_store)
+                _signal_at_transaction_entry(racer_store, racer_attempted)
+                gap["state"] = _delay_between_return_and_enter(
+                    racer_store, racer_attempted, 0.5)
+                racer_api.setup.add_player(
+                    "t1", None, Position.DEFENSE, first_name="Race",
+                    last_name="Inserted",
+                    registration_number="REG-RACE-GAP")
+
+            def go():
+                return api.player_duplicate_report(
+                    actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+
+            self._race(pause_fn, mutate, go)
+            self.assertEqual(gap["state"]["gaps"], 1,
+                             "the return-to-__enter__ gap was never actually "
+                             "injected -- this control proved nothing")
+        finally:
+            store.close() if isinstance(store, SqlStore) else None
+
     def test_player_duplicate_report_racer_attempted_no_lock_negative_control(self):
         store = self._store()
         try:
@@ -834,6 +1042,36 @@ class _GenuineBlockSnapshotTests:
                     actor_user_id="user_admin", include_details=True)
 
             self._race(pause_fn, mutate, go)
+        finally:
+            store.close() if isinstance(store, SqlStore) else None
+
+    def test_evaluate_player_eligibility_racer_attempted_return_to_enter_gap_negative_control(self):
+        store = self._store()
+        try:
+            api, p = _seed(store)
+
+            def pause_fn(paused, resume):
+                _pause_eligibility(store, paused, resume)
+
+            gap = {}
+
+            def mutate(racer_attempted):
+                racer_store = self._racer_store(store)
+                racer_api = ApiService(racer_store)
+                _signal_at_transaction_entry(racer_store, racer_attempted)
+                gap["state"] = _delay_between_return_and_enter(
+                    racer_store, racer_attempted, 0.5)
+                racer_api.update_player(p.id, birthdate="1990-08-08")
+
+            def go():
+                return api.evaluate_player_eligibility(
+                    p.id, "d", actor_role=Role.LEAGUE_ADMIN,
+                    actor_user_id="user_admin", include_details=True)
+
+            self._race(pause_fn, mutate, go)
+            self.assertEqual(gap["state"]["gaps"], 1,
+                             "the return-to-__enter__ gap was never actually "
+                             "injected -- this control proved nothing")
         finally:
             store.close() if isinstance(store, SqlStore) else None
 
