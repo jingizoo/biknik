@@ -65,17 +65,26 @@ reshaped for the parity dual-write — the facade now opens stints itself —
 so the membershipless player is constructed at the store, as imports do.)
 """
 
+import json
 import os
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
+from http.cookiejar import CookieJar
+from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 from helpers import FakeClock, end_membership_directly, fresh_sql_store
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import AuditAction, SubstituteStatus
+from hockey_scheduler.domain import (
+    AuditAction, MembershipStatus, Player, Position, SeasonRosterMembership,
+    SubstituteStatus)
 from hockey_scheduler.domain.errors import NotEligibleError
 from hockey_scheduler.store import InMemoryStore, SqlStore
+from hockey_scheduler.web import server as srv
 
 ADMIN = "setup_admin"
 UTC = timezone.utc
@@ -539,6 +548,369 @@ class ParityDualWriteOpensStints(_CutoverContract, unittest.TestCase):
                     sorted((m["team_id"], m["status"]) for m in rows),
                     sorted([(teams["third"]["id"], "transferred"),
                             (teams["home"]["id"], "active")]), label)
+
+
+class LeagueSeasonExactnessFixture:
+    """Two Leagues ('Elite', 'House') sharing ONE Season — the ORDINARY
+    shape, not an edge case: ``LeagueSeason``'s own uniqueness is
+    ``(league_id, season_id)``, one row per League *per* Season, so any
+    Season running more than one League produces sibling ``LeagueSeason``
+    rows that share a ``season_id``. This is the exact shape the #205
+    review's resolver-design blocker identified: deriving a game's
+    ``season_id`` and re-matching memberships on THAT column alone accepts
+    a membership scoped to a SIBLING LeagueSeason of the same Season. House
+    fields the two sides of the REGULAR game under test; Elite exists only
+    to hold the conflated membership."""
+
+    def _build_two_league(self, store):
+        api = ApiService(store)
+        api.roster.clock = FakeClock()
+        org = api.create_organization("Org", "O", actor_id=ADMIN)
+        program = api.create_program(
+            "Prog", operator_organization_id=org["id"], actor_id=ADMIN)
+        season = api.create_season(program["id"], "Fall 2026", actor_id=ADMIN)
+        elite = api.create_league(season["id"], "Elite", actor_id=ADMIN)
+        house = api.create_league(season["id"], "House", actor_id=ADMIN)
+        club = api.create_club("Club", actor_id=ADMIN)
+        elite_team = api.create_team(club["id"], None, "Elite Team",
+                                     actor_id=ADMIN, league_id=elite["id"])
+        api.register_team_for_season(season["id"], elite_team["id"],
+                                     actor_id=ADMIN, league_id=elite["id"])
+        house_home = api.create_team(club["id"], None, "House Home",
+                                     actor_id=ADMIN, league_id=house["id"])
+        api.register_team_for_season(season["id"], house_home["id"],
+                                     actor_id=ADMIN, league_id=house["id"])
+        house_away = api.create_team(club["id"], None, "House Away",
+                                     actor_id=ADMIN, league_id=house["id"])
+        api.register_team_for_season(season["id"], house_away["id"],
+                                     actor_id=ADMIN, league_id=house["id"])
+        venue = api.create_venue("V", organization_id=org["id"],
+                                 league_id=program["id"], actor_id=ADMIN)
+        api.grant_season_venue_access(season["id"], venue["id"],
+                                      actor_id=ADMIN)
+        rink = api.create_rink(venue["id"], "R", actor_id=ADMIN)
+        slot = api.create_ice_slot(rink["id"], _at(18).isoformat(),
+                                   _at(19).isoformat(), "game",
+                                   actor_id=ADMIN)
+        house_game = api.create_game(
+            season["id"], None, house_home["id"], house_away["id"],
+            slot["id"], actor_id=ADMIN, league_id=house["id"])
+        assert "error" not in house_game, house_game
+        house_ls_id = house_game["league_season_id"]
+        assert house_ls_id, house_game
+        api.publish_game(house_game["id"], actor_id=ADMIN)
+        elite_ls = api.store.league_season_for(elite["id"], season["id"])
+        house_ls = api.store.get_league_season(house_ls_id)
+        # The fixture's own premise: one shared Season, two DIFFERENT
+        # LeagueSeason rows.
+        assert elite_ls.season_id == house_ls.season_id, (elite_ls, house_ls)
+        assert elite_ls.id != house_ls.id, (elite_ls, house_ls)
+        return {
+            "api": api, "season": season, "elite": elite, "house": house,
+            "elite_team": elite_team, "house_home": house_home,
+            "house_away": house_away, "house_game": house_game,
+            "elite_ls": elite_ls, "house_ls": house_ls,
+        }
+
+    def _conflated_player(self, api, elite_ls, wrong_team_id, name):
+        """A membership scoped to ``elite_ls`` but naming a House team — the
+        shape ``create_season_roster_membership`` itself would refuse
+        (``team.league_id == ls.league_id`` — setup_service.py rule 7
+        analog), constructed directly at the STORE the same way this file's
+        own ``_pointer_only_player`` models an unguarded future writer
+        (store-level bulk import). Uses a store-level ``Player`` too, so no
+        parity dual-write opens a competing (and colliding) stint on
+        ``elite_ls`` for this player."""
+        player = Player(id=api.store.next_id("player"),
+                        team_id=wrong_team_id, name=name,
+                        position=Position.FORWARD)
+        api.store.add_player(player)
+        m = SeasonRosterMembership(
+            id=api.store.next_id("srm"), player_id=player.id,
+            league_season_id=elite_ls.id, season_id=elite_ls.season_id,
+            team_id=wrong_team_id, status=MembershipStatus.ACTIVE)
+        api.store.add_season_roster_membership(m)
+        return {"id": player.id, "name": name}
+
+
+class LeagueSeasonExactness(LeagueSeasonExactnessFixture, unittest.TestCase):
+    """#205 review resolver-design blocker: eligibility must match a game's
+    EXACT ``league_season_id``, never a Season derived from it — proven both
+    directions on Memory + SQLite."""
+
+    def _stores(self):
+        yield "memory", InMemoryStore()
+        yield "sqlite", SqlStore(":memory:")
+
+    def test_sibling_league_season_membership_is_not_eligible(self):
+        for label, store in self._stores():
+            with self.subTest(backend=label):
+                f = self._build_two_league(store)
+                api, house_game = f["api"], f["house_game"]
+                wrong = self._conflated_player(
+                    api, f["elite_ls"], f["house_home"]["id"], "WrongLS")
+                game_obj = api.store.get_game(house_game["id"])
+                player_obj = api.store.get_player(wrong["id"])
+                # THE defect this resolver fixes: a season_id-derived match
+                # would accept this membership (elite_ls and house_ls share
+                # a season_id); the exact league_season_id match must not.
+                self.assertIsNone(
+                    api.roster.team_for_game(game_obj, player_obj), label)
+                self.assertIsNone(
+                    api.roster.resolve_membership(game_obj, player_obj),
+                    label)
+                res = api.enroll_substitute(house_game["id"], wrong["id"])
+                self.assertEqual(res["error"]["code"], "not_eligible", label)
+
+    def test_membership_on_the_games_own_league_season_is_eligible(self):
+        """The mirrored direction, proving the fix isn't simply "reject
+        everyone": a membership scoped to the game's OWN LeagueSeason, on
+        the SAME team a conflated row would have named, resolves normally."""
+        for label, store in self._stores():
+            with self.subTest(backend=label):
+                f = self._build_two_league(store)
+                api, house_game, house_home = (
+                    f["api"], f["house_game"], f["house_home"])
+                right = api.create_player(house_home["id"], "RightLS",
+                                          "forward", actor_id=ADMIN)
+                assert "error" not in right, right
+                game_obj = api.store.get_game(house_game["id"])
+                player_obj = api.store.get_player(right["id"])
+                self.assertEqual(
+                    api.roster.team_for_game(game_obj, player_obj),
+                    house_home["id"], label)
+                res = api.enroll_substitute(house_game["id"], right["id"])
+                self.assertNotIn("error", res, (label, res))
+                self.assertEqual(res["status"], "enrolled", label)
+
+
+@unittest.skipUnless(
+    os.environ.get("TEST_DATABASE_URL"),
+    "PostgreSQL not configured (TEST_DATABASE_URL) — the #205 review "
+    "resolver-design blocker (LeagueSeason exactness) was NOT exercised on "
+    "PostgreSQL. A SKIP HERE IS NOT A PASS.")
+class LeagueSeasonExactnessPostgresTest(LeagueSeasonExactnessFixture,
+                                        unittest.TestCase):
+    """Both directions of the LeagueSeason-exactness fix against real
+    PostgreSQL."""
+
+    def setUp(self):
+        self.store = fresh_sql_store(os.environ["TEST_DATABASE_URL"])
+        self.addCleanup(self.store.close)
+
+    def test_sibling_league_season_conflation_on_postgres(self):
+        f = self._build_two_league(self.store)
+        api, house_game = f["api"], f["house_game"]
+        wrong = self._conflated_player(
+            api, f["elite_ls"], f["house_home"]["id"], "WrongLS")
+        game_obj = api.store.get_game(house_game["id"])
+        player_obj = api.store.get_player(wrong["id"])
+        self.assertIsNone(api.roster.team_for_game(game_obj, player_obj))
+        self.assertEqual(
+            api.enroll_substitute(house_game["id"], wrong["id"]
+                                  )["error"]["code"],
+            "not_eligible")
+        right = api.create_player(f["house_home"]["id"], "RightLS",
+                                  "forward", actor_id=ADMIN)
+        self.assertEqual(
+            api.roster.team_for_game(game_obj, api.store.get_player(right["id"])),
+            f["house_home"]["id"])
+        self.assertEqual(
+            api.enroll_substitute(house_game["id"], right["id"])["status"],
+            "enrolled")
+
+
+class SeasonScopedPositionResolvesCorrectly(_CutoverContract,
+                                            unittest.TestCase):
+    """#205 review resolver-design blocker: every substitute-facing read of
+    a player's position for a LeagueSeason-bound game must use the
+    SEASON-SCOPED ``SeasonRosterMembership.position`` (this stint), never
+    the permanent ``Player.position`` — proven with a player whose
+    permanent position (FORWARD) differs from their corrected season-scoped
+    one (GOALIE)."""
+
+    def _goalie_by_membership(self, api, team_id, ls_id, name):
+        """A player whose PERMANENT position stays FORWARD but whose
+        season-scoped stint is corrected to GOALIE via the governed update
+        path — the shape a team recording "plays goalie this season"
+        without touching the player's permanent record produces."""
+        p = self._player(api, team_id, name, position="forward")
+        stint_id = self._stint_id(api, p["id"], ls_id)
+        upd = api.update_season_roster_membership(
+            stint_id, position="goalie", actor_id=ADMIN)
+        assert "error" not in upd, upd
+        assert upd["position"] == "goalie", upd
+        return p
+
+    def test_block_reason_and_enrollment_use_the_membership_position(self):
+        for label, api, season, league, teams, game, ls_id in self._each():
+            with self.subTest(backend=label):
+                p = self._goalie_by_membership(
+                    api, teams["home"]["id"], ls_id, "Two-Way")
+                # The player's PERMANENT record still says forward.
+                self.assertEqual(
+                    api.store.get_player(p["id"]).position.value,
+                    "forward", label)
+                # substitute_block_reason's needed-slot check must use the
+                # season-scoped GOALIE, not the permanent forward — a
+                # skater-only read would find no reason to block a skater
+                # slot demand that doesn't exist for this player.
+                reason = api.roster.substitute_block_reason(
+                    p["id"], game["id"])
+                self.assertIsNone(reason, (label, reason))
+                sub = api.enroll_substitute(game["id"], p["id"])
+                self.assertNotIn("error", sub, (label, sub))
+                self.assertEqual(sub["position"], "goalie", label)
+                # The outreach queue's position/slot_type pair agrees.
+                cand = api.get_substitute_candidates(
+                    game["id"], teams["home"]["id"])["candidates"]
+                row = [c for c in cand if c["player_id"] == p["id"]][0]
+                self.assertEqual(row["position"], "goalie", label)
+                self.assertEqual(row["slot_type"], "goalie", label)
+
+    def test_addable_pool_reflects_the_membership_position(self):
+        for label, api, season, league, teams, game, ls_id in self._each():
+            with self.subTest(backend=label):
+                p = self._goalie_by_membership(
+                    api, teams["home"]["id"], ls_id, "Bench Goalie")
+                addable = api.get_addable_substitutes(
+                    game["id"], teams["home"]["id"])["addable"]
+                row = [r for r in addable if r["player_id"] == p["id"]][0]
+                self.assertEqual(row["position"], "goalie", label)
+                self.assertEqual(row["slot_type"], "goalie", label)
+
+    def test_http_opportunity_detail_reflects_the_membership_position(self):
+        for label, api, season, league, teams, game, ls_id in self._each():
+            with self.subTest(backend=label):
+                p = self._goalie_by_membership(
+                    api, teams["home"]["id"], ls_id, "Home Goalie")
+                detail = api.get_substitute_opportunity(p["id"], game["id"])
+                self.assertNotIn("error", detail, (label, detail))
+                self.assertEqual(
+                    detail["position_needed"], "goalie", label)
+
+
+@unittest.skipUnless(
+    os.environ.get("TEST_DATABASE_URL"),
+    "PostgreSQL not configured (TEST_DATABASE_URL) — the #205 review "
+    "resolver-design blocker (season-scoped position) was NOT exercised on "
+    "PostgreSQL. A SKIP HERE IS NOT A PASS.")
+class SeasonScopedPositionPostgresTest(_Fixture, unittest.TestCase):
+    """The season-scoped position fix against real PostgreSQL."""
+
+    def setUp(self):
+        self.store = fresh_sql_store(os.environ["TEST_DATABASE_URL"])
+        self.addCleanup(self.store.close)
+        (self.api, self.season, self.league, self.teams, self.game,
+         self.ls_id) = self._build(self.store)
+
+    def test_membership_position_overrides_permanent_on_postgres(self):
+        api, teams, game, ls_id = (
+            self.api, self.teams, self.game, self.ls_id)
+        p = self._player(api, teams["home"]["id"], "Two-Way",
+                         position="forward")
+        stint_id = self._stint_id(api, p["id"], ls_id)
+        upd = api.update_season_roster_membership(
+            stint_id, position="goalie", actor_id=ADMIN)
+        self.assertNotIn("error", upd, upd)
+        sub = api.enroll_substitute(game["id"], p["id"])
+        self.assertNotIn("error", sub, sub)
+        self.assertEqual(sub["position"], "goalie")
+        detail = api.get_substitute_opportunity(p["id"], game["id"])
+        # Already enrolled — detail still reports the position it resolves
+        # for the game, independent of the ENROLLED-vs-not branch.
+        self.assertNotIn("error", detail, detail)
+
+
+class ResolverFixOverHttp(unittest.TestCase):
+    """Both #205 review resolver-design blocker fixes, exercised through a
+    REAL HTTP request against ``web/server.py`` — not just the facade in
+    isolation. Builds its own LeagueSeason-bound fixture on the live demo
+    server state (``srv.STATE``) via the setup facade, so the games under
+    test carry a genuine ``league_season_id`` (the existing HTTP substitute
+    fixtures in ``test_substitute_opportunity.py`` build games directly at
+    the store with no League binding at all, which never reaches the
+    membership-resolution branch under test here)."""
+
+    def setUp(self):
+        srv.STATE.reset(seed=False)
+        self.api = srv.STATE.api
+        f = LeagueSeasonExactnessFixture()
+        self.fx = f._build_two_league(self.api.store)
+        self.goalie = self._goalie_by_membership(self.fx, "HTTP Goalie")
+        self.wrong_ls = f._conflated_player(
+            self.api, self.fx["elite_ls"], self.fx["house_home"]["id"],
+            "HTTP WrongLS")
+        for pid, username in ((self.goalie["id"], "httpgoalie"),
+                              (self.wrong_ls["id"], "httpwrongls")):
+            self.api.accounts.create_account(
+                username, "demo", "player",
+                scope={"team_id": self.fx["house_home"]["id"],
+                      "player_id": pid},
+                actor_id="test_seed")
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._teardown_server)
+
+    def _teardown_server(self):
+        self.httpd.shutdown()
+        self.thread.join(timeout=5)
+        self.httpd.server_close()
+
+    def _goalie_by_membership(self, fx, name):
+        api = self.api
+        p = api.create_player(fx["house_home"]["id"], name, "forward",
+                              actor_id=ADMIN)
+        assert "error" not in p, p
+        rows = api.list_season_roster_memberships(
+            player_id=p["id"])["memberships"]
+        (stint,) = [r for r in rows if r["league_season_id"] == fx["house_ls"].id]
+        upd = api.update_season_roster_membership(
+            stint["id"], position="goalie", actor_id=ADMIN)
+        assert "error" not in upd, upd
+        return p
+
+    def _login(self, username):
+        c = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/auth/login",
+            data=json.dumps({"username": username,
+                            "password": "demo"}).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        with c.open(req) as r:
+            self.assertEqual(r.status, 200)
+        return c
+
+    def _get(self, opener, path):
+        try:
+            with opener.open(
+                    f"http://127.0.0.1:{self.port}{path}") as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def test_position_fix_over_http(self):
+        """The signed-in player's own opportunity detail reports the
+        SEASON-SCOPED position (goalie), not the permanent one (forward)."""
+        c = self._login("httpgoalie")
+        gid = self.fx["house_game"]["id"]
+        status, d = self._get(c, f"/api/me/substitute-opportunities/{gid}")
+        self.assertEqual(status, 200, d)
+        self.assertEqual(d["position_needed"], "goalie")
+
+    def test_leagueseason_exactness_fix_over_http(self):
+        """A player whose ONLY membership sits on a SIBLING LeagueSeason of
+        the game's own Season gets the SAME 404 a genuinely unrelated
+        player would — the exact-match fix, not just a facade-level
+        assertion."""
+        c = self._login("httpwrongls")
+        gid = self.fx["house_game"]["id"]
+        status, d = self._get(c, f"/api/me/substitute-opportunities/{gid}")
+        self.assertEqual(status, 404, d)
 
 
 _PG_SKIP = ("PostgreSQL not configured (TEST_DATABASE_URL) or psycopg "
