@@ -58,7 +58,8 @@ from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
 from .rate_limit import LoginThrottle, RateLimiter
 from .route_registry import REGISTRY
-from .scope import can_read_private_game_data, own_team_id, scope_violation
+from .scope import (
+    can_read_private_game_data, game_scoped_own_team_id, scope_violation)
 from .validation import BodyError, check_body, parse_json_object
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
@@ -2888,11 +2889,20 @@ class Handler(BaseHTTPRequestHandler):
                 # scope when not specified.
                 from urllib.parse import parse_qs, urlparse
                 qs = parse_qs(urlparse(self.path).query)
-                # Resolve the caller's own team authoritatively (#160): a Coach's
-                # stored team_id, a Player's live team from player_id — never a
-                # stale stored team_id — so the opponent-summary block holds for
-                # a Player whose scope is player_id only.
-                own_team = own_team_id(role, scope, api.store) or ""
+                # Resolve the caller's own team authoritatively, AGAINST THIS
+                # GAME (#160, refined by #205 blocker 1): a Coach's stored
+                # team_id (permanent — unchanged); a Player's team resolved
+                # through the SAME game-scoped membership resolver the
+                # substitute workflow uses, never the permanent player.team_id
+                # pointer, which a mid-season transfer can leave stale for
+                # this exact game — so the opponent-summary block holds for a
+                # Mover whose membership has moved, in either direction.
+                sub_game = api.store.get_game(gid)
+                if sub_game is not None:
+                    own_team = game_scoped_own_team_id(
+                        role, scope, sub_game, api.store) or ""
+                else:
+                    own_team = ""
                 team_id = (qs.get("team_id") or [own_team])[0]
                 if role in (Role.COACH, Role.PLAYER) and own_team \
                         and team_id != own_team:

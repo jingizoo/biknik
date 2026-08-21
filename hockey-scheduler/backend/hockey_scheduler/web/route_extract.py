@@ -3216,6 +3216,36 @@ _AUDIT_WAIVERS = {
         "sub-resource (board/roster/etc, all already enumerated as "
         "separate leaves under the SAME `m` match), not which route was "
         "chosen",
+    ("_dispatch_get", "api.store.get_game(gid)", "assign_rhs",
+     "sub == 'availability-summary'"):
+        "#205 blocker 1: re-fetches the SAME already-selected game (`gid`, "
+        "captured by `m`'s own regex match two waivers above) so the "
+        "availability-summary sub-scope can resolve the caller's OWN team "
+        "against THIS game (`game_scoped_own_team_id`) instead of the "
+        "permanent player.team_id pointer -- a data lookup that feeds the "
+        "team-level scope check below, the same 'produces a RESULT, not a "
+        "routing decision' shape as the `can_read_private_game_data` waiver "
+        "immediately above: the route (this sub-resource, this game) was "
+        "already fully decided upstream by `m` and `sub`",
+    ("_dispatch_get", "sub_game is not None", "if_test",
+     "sub == 'availability-summary'"):
+        "#205 blocker 1: guards whether the re-fetched game (waived two "
+        "entries above) still existed to resolve the caller's own team "
+        "against -- a facade not_found case, not a routing decision; the "
+        "route (this sub-resource, this game) was already fully decided "
+        "upstream by `m` and `sub`",
+    ("_dispatch_get",
+     "game_scoped_own_team_id(role, scope, sub_game, api.store)",
+     "boolop", "sub_game is not None"):
+        "#205 blocker 1: the SAME re-fetched game (waived immediately "
+        "above) feeds `game_scoped_own_team_id` to resolve the caller's "
+        "own team for the team-level availability-summary scope check "
+        "below -- a RESULT the waiver above's own docstring notes keeps "
+        "propagating ('a waiver silences the call, not the result'), not a "
+        "second routing decision; the `if sub_game is not None:` guard "
+        "only decides between resolving the caller's team or leaving it "
+        "empty when the already-selected game vanished mid-request (a "
+        "facade not_found case), never which route was chosen",
     ("do_GET", "not is_context_scoped_read(path)", "if_test", ""):
         "do_GET's own PHASE A context-gate arrival ticket (#159): BOTH "
         "arms of this if unconditionally call self._dispatch_get() "

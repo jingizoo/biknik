@@ -14,13 +14,37 @@ from ..domain import Role
 # Single source of truth for "which team does this caller act for" — shared with
 # the active-context selector so the two gates can never drift (#159 review).
 # Re-exported so existing `from .scope import own_team_id` callers are unchanged.
+# NOTE: this is the ACCOUNT-level, game-agnostic resolution (#159 context
+# selection uses it too) — a Player's PERMANENT `team_id` pointer. It is
+# deliberately NOT used below for a game-scoped decision (#205 blocker 1) —
+# see `game_scoped_own_team_id`.
 from ..services.subject_scope import own_team_id, player_team_id  # noqa: F401
+# `RosterService.team_for_game` is THE #205 game-scoped eligibility resolver
+# (`services/roster_service.py`) — the same one substitute enroll/offer/
+# accept already resolve through. No import-cycle risk: roster_service.py
+# depends only on ..domain/..store/.notifier/.season_guard, never on `web/`
+# (confirmed by reading it), so calling it directly from here is the sound
+# layering, not the caller-resolves-then-passes-team_id workaround.
+from ..services.roster_service import RosterService
 
 _SUB_ACTION = re.compile(
     r"^/api/games/[^/]+/substitutes/([^/]+)/(?:offer|accept|decline|add-to-roster)$")
 _ASSIGN_RESPOND = re.compile(
     r"^/api/officials/assignments/([^/]+)/(?:accept|decline)$")
 _GAME_ACTION = re.compile(r"^/api/games/[^/]+/(.+)$")
+# Every coach-initiated HTTP shape of the #205 substitute workflow that
+# targets one player on ONE specific game — captures the game id so the
+# COACH branch of `scope_violation` below can resolve that player's team
+# through the SAME game-scoped membership resolver `team_for_game` provides,
+# instead of the permanent `Player.team_id` pointer (#205 blocker 1: a
+# mid-season transfer left that pointer stale, wrongly denying a coach
+# managing a legitimate Mover already resolved onto their team for this
+# exact game). `accept`/`decline` are included for uniformity with
+# `_SUB_ACTION` above (self-service Player actions; harmless here since the
+# COACH branch is the only consumer).
+_GAME_SUB_ACTION_GID = re.compile(
+    r"^/api/games/([^/]+)/substitutes/(?:add-candidate"
+    r"|[^/]+/(?:offer|accept|decline|add-to-roster))$")
 
 # Game-wide actions a scoped coach may NOT perform — they flip whole-game state
 # (game.locked / game.cancelled) affecting the other team, and carry no target
@@ -72,9 +96,24 @@ def scope_violation(role, scope, path, body, store, *,
         if m and m.group(1) in _GAME_WIDE_COACH_ACTIONS:
             return ("A coach can't lock, unlock, or cancel the whole game "
                     "(that affects the other team) — ask a league admin.")
+        # #205 blocker 1: for a substitute-workflow action on a specific game,
+        # resolve the target player's team through the SAME game-scoped
+        # membership resolver (`team_for_game`) the substitute workflow's own
+        # business logic uses — never the permanent `Player.team_id` pointer,
+        # which a mid-season transfer can leave stale in EITHER direction: it
+        # would otherwise wrongly DENY a coach managing a legitimate Mover
+        # already resolved onto their team for this game, and symmetrically
+        # wrongly ALLOW a coach to manage a player whose membership has since
+        # moved OFF their team even though the stale pointer still matches.
+        sub_match = _GAME_SUB_ACTION_GID.match(path)
+        game = store.get_game(sub_match.group(1)) if sub_match else None
         for pid in _player_ids(path, body):
             player = store.get_player(pid)
-            if player is not None and player.team_id != team:
+            if player is None:
+                continue
+            resolved_team = (RosterService(store).team_for_game(game, player)
+                             if game is not None else player.team_id)
+            if resolved_team != team:
                 return "A coach can only manage their own team's players."
         team_id = body.get("team_id")
         if team_id and team_id != team:
@@ -119,6 +158,63 @@ def scope_violation(role, scope, path, body, store, *,
     return None
 
 
+def _player_team_for_game(scope, game, store):
+    """Which team a Player-scoped caller acts for, in THIS ``game``
+    specifically (#205 blocker 1) — resolved through the SAME game-scoped
+    membership resolver the substitute workflow itself uses
+    (``RosterService.team_for_game``), never the permanent ``Player.team_id``
+    pointer alone, which a mid-season transfer can leave stale for this exact
+    game in either direction (a real Mover wrongly denied, or a player whose
+    membership has since moved off the team wrongly still granted).
+
+    Preserves the #270 fail-closed posture ``player_team_id`` established — a
+    deactivated player's login must not outlive their roster exit — with the
+    SAME ``is_active`` check, so this is a strict refinement of that
+    function's contract, not a loosening of it. Falls back to the permanent
+    pointer only when ``game`` carries no LeagueSeason binding (exhibitions
+    and unbound legacy games), exactly as ``team_for_game`` itself does —
+    byte-for-byte pre-#205 behavior there.
+    """
+    scope = scope or {}
+    player_id = scope.get("player_id")
+    if not player_id:
+        return None
+    player = store.get_player(player_id)
+    if player is None or not player.is_active:
+        return None
+    return RosterService(store).team_for_game(game, player)
+
+
+def game_scoped_own_team_id(role, scope, game, store):
+    """The team the caller acts for, resolved specifically against ``game``
+    (#205 blocker 1) — the game-scoped analogue of ``own_team_id`` above.
+
+    A Coach's team is unchanged: still the permanently-bound
+    ``scope["team_id"]``. There is no ``CoachSeasonMembership`` (or any
+    season-scoped Coach model) anywhere in this codebase — a Coach's team
+    assignment genuinely IS permanent, so no game-scoped resolution applies
+    there. A Player's team is resolved live against ``game`` via
+    ``_player_team_for_game`` (``RosterService.team_for_game``), replacing
+    the permanent ``Player.team_id`` pointer ``own_team_id``/
+    ``player_team_id`` use.
+
+    NOT a drop-in replacement for the generic, game-agnostic
+    ``own_team_id`` — that function is correctly shared with the #159
+    active-context selector (``services/context_scope.py``), a different
+    surface with no single game to resolve against, and stays untouched.
+    This helper is for exactly the two HTTP call sites that must resolve
+    "own team" against ONE particular game's privacy/scope boundary:
+    ``can_read_private_game_data`` and the ``availability-summary``
+    sub-scope in ``web/server.py``.
+    """
+    scope = scope or {}
+    if role == Role.COACH:
+        return scope.get("team_id")
+    if role == Role.PLAYER:
+        return _player_team_for_game(scope, game, store)
+    return None
+
+
 def can_read_private_game_data(role, scope, game_id, store) -> bool:
     """May this signed-in user read a game's private player data? (#73)
 
@@ -134,18 +230,13 @@ def can_read_private_game_data(role, scope, game_id, store) -> bool:
     game = store.get_game(game_id)
     if game is None:
         return True  # let the facade return its normal not_found payload
-    if role == Role.COACH:
-        team_id = scope.get("team_id")
-        return team_id is not None and team_id in (
-            game.home_team_id, game.away_team_id)
-    if role == Role.PLAYER:
-        # A Player account's canonical scope key is ``player_id`` (#135/#160),
-        # but this gate is by team. Resolve the player's team from ``player_id``
-        # live (authoritative, never stale on a transfer), falling back to an
-        # explicit ``scope.team_id`` only when player_id is absent/unresolvable —
-        # so a Player account created with player_id ONLY still reads its own
-        # team's private data, and a teamless player fails closed.
-        team_id = player_team_id(scope, store)
+    if role in (Role.COACH, Role.PLAYER):
+        # #205 blocker 1: resolved against THIS game — see
+        # `game_scoped_own_team_id`. Coach behavior is byte-for-byte
+        # unchanged (still `scope["team_id"]`); Player behavior now resolves
+        # through the game-scoped membership resolver instead of the
+        # permanent pointer.
+        team_id = game_scoped_own_team_id(role, scope, game, store)
         return team_id is not None and team_id in (
             game.home_team_id, game.away_team_id)
     if role == Role.OFFICIAL:
