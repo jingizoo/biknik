@@ -2609,13 +2609,100 @@ class SetupService:
                     league_season_id, team_id)
                 if not m.status.is_terminal]
 
+    def _assert_membership_program_spine(self, team, ls, *,
+                                         membership_id=None) -> None:
+        """The membership spine's PROGRAM leg: the Team's own ``program_id``,
+        the LeagueSeason's League's ``program_id`` and its Season's
+        ``program_id`` must all be present and identical (#205 review round 4,
+        owner ruling).
+
+        This is the exact Python twin of the two PROGRAM checks migration
+        059's preflight already applies to every backfill candidate —
+        ``find_active_players_with_team_program_mismatch`` (``t.program_id``
+        vs ``lg.program_id``) and ``find_active_players_with_program_
+        mismatch`` (``lg.program_id`` vs ``s.program_id``) — compared with
+        the same ``_missing_or_unequal`` rule, so MISSING and UNEQUAL are
+        one violation and two missing keys are never agreement.
+
+        WHY IT HAD TO BE ADDED. ``_assert_membership_spine_valid`` and
+        ``create_season_roster_membership`` had NO Program clause at all —
+        not a falsy-skip, an absence. All six shapes ({Team, League,
+        Season}.program_id x {missing, unequal}) were reproduced on this
+        branch's head 488d1c8 across Memory, SQLite and PostgreSQL: 059's
+        preflight REFUSED every one while the service ACCEPTED create AND
+        all twelve parked revivals, writing a row, an event and an audit
+        entry each time. The migration therefore refused to materialize
+        exactly the rows the live system was still minting.
+
+        WHY IT IS UNCONDITIONAL, despite ``register_team_for_season``'s
+        DELIBERATELY legacy-permissive rule 4 (``if team.program_id and
+        team.program_id != season.program_id``, :1475). That guard tolerates
+        a PROGRAM-LESS Team so pre-#283 legacy data can still be registered.
+        The question this guard had to answer first was whether a SUPPORTED
+        flow can PRODUCE such a Team and then need a membership on it. It
+        cannot — established by execution against every public entry point:
+
+          * ``create_team`` derives the Program from the resolved League and
+            refuses a supplied Program that disagrees with it
+            (``team_program_mismatch``), and refuses a league-less Team
+            outright (``team_league_required``), so it never mints one;
+          * every public League-creating path (``create_league``, the
+            auto-provisioned default League) copies ``season.program_id``,
+            and ``create_season`` requires a real Program — so League and
+            Season always carry one;
+          * ``register_team_for_season``'s legacy branch only PASSES THROUGH
+            a program-less Team, and its non-null disagreement check is
+            exact; the canonical ``league_id`` path refuses one outright;
+          * ``transfer_team_to_league`` HEALS a program-less Team
+            (``team.program_id = team.program_id or league.program_id``,
+            :2231) and refuses a non-null disagreement;
+          * ``roll_forward_registrations`` and its v2 both refuse a
+            program-less Team and refuse a cross-Program rollover;
+          * ``commit_hierarchy_import`` refuses a cross-Program team/league
+            pair (``team_league_program_mismatch``), and BOTH imports heal a
+            pre-existing program-less Team on re-import.
+
+        So the legacy-permissive registration guard is a door for legacy
+        DATA, not a supported producer, and enforcing here refuses no spine
+        any supported flow can build. Registration semantics are left
+        exactly as they were — a legacy program-less Team still registers;
+        it just cannot hold a MEMBERSHIP until its Program is repaired,
+        which is precisely the state 059's preflight already demands before
+        it will backfill one, and which ``transfer_team_to_league`` or
+        either import already repairs."""
+        league = (self.store.get_league(ls.league_id)
+                  if ls.league_id else None)
+        season = (self.store.get_season(ls.season_id)
+                  if ls.season_id else None)
+        league_program = league.program_id if league is not None else None
+        season_program = season.program_id if season is not None else None
+        if (_missing_or_unequal(team.program_id, league_program)
+                or _missing_or_unequal(league_program, season_program)):
+            details = {"reason": "membership_program_mismatch",
+                       "team_id": team.id,
+                       "league_season_id": ls.id,
+                       "team_program_id": team.program_id,
+                       "league_id": ls.league_id,
+                       "league_program_id": league_program,
+                       "season_id": ls.season_id,
+                       "season_program_id": season_program}
+            if membership_id is not None:
+                details["membership_id"] = membership_id
+            raise ValidationError(
+                "A membership must sit on one Program: this Team, its "
+                "League and the Season disagree about which Program they "
+                "belong to (or one of them names none).",
+                details)
+
     def _assert_membership_spine_valid(
             self, membership: SeasonRosterMembership) -> None:
         """Reactivation must recheck the SAME spine ``create_season_roster_
         membership`` required at birth (#205 review round 1 finding 2):
         Player, Team and LeagueSeason still exist, the Team still belongs to
-        the LeagueSeason's League, and the Team still holds an ACTIVE
-        registration there.
+        the LeagueSeason's League, the Team/League/Season still agree about
+        their Program (#205 review round 4 owner ruling — see
+        ``_assert_membership_program_spine``), and the Team still holds an
+        ACTIVE registration there.
 
         Without this, a membership PARKED (inactive/injured) before its
         Team's registration was unregistered, or before the Team was
@@ -2652,6 +2739,11 @@ class SetupService:
                  "membership_id": membership.id, "team_id": team.id,
                  "team_league_id": team.league_id,
                  "league_season_league_id": ls.league_id})
+        # #205 review round 4 (owner ruling) — the PROGRAM leg of the same
+        # spine, the clause this helper never had. See
+        # ``_assert_membership_program_spine``.
+        self._assert_membership_program_spine(
+            team, ls, membership_id=membership.id)
         registration = self.store.registration_for_team_in_league_season(
             membership.league_season_id, membership.team_id)
         if registration is None or not registration.active:
@@ -2727,8 +2819,10 @@ class SetupService:
         row-locked FIRST (canonical Team → Season → Player lock order, so a
         concurrent League transfer can't strand the membership on a foreign
         LeagueSeason), the Team must belong to the LeagueSeason's League
-        (rule 7 analog), hold an ACTIVE SeasonTeamRegistration there, and the
-        Season must not be archived. The player is NOT required to have
+        (rule 7 analog), the Team/League/Season must agree about their
+        Program (#205 review round 4 owner ruling — see
+        ``_assert_membership_program_spine``), the Team must hold an ACTIVE
+        SeasonTeamRegistration there, and the Season must not be archived. The player is NOT required to have
         ``player.team_id == team_id`` — that permanent coupling is exactly
         what memberships replace; legacy consumers keep reading the untouched
         Player fields until the cutover slice.
@@ -2783,6 +2877,13 @@ class SetupService:
                 {"reason": "membership_league_mismatch", "team_id": team_id,
                  "team_league_id": team.league_id,
                  "league_season_league_id": ls.league_id})
+        # #205 review round 4 (owner ruling) — the PROGRAM leg of the spine,
+        # which this method never checked at all while migration 059's
+        # preflight refused every incoherent shape. See
+        # ``_assert_membership_program_spine`` for the six reproduced shapes
+        # and why enforcing here does not collide with
+        # ``register_team_for_season``'s legacy-permissive rule 4.
+        self._assert_membership_program_spine(team, ls)
         registration = self.store.registration_for_team_in_league_season(
             league_season_id, team_id)
         if registration is None or not registration.active:
@@ -2863,8 +2964,9 @@ class SetupService:
 
         REVIVING a PARKED row (``inactive``/``injured``) into ``applicant``,
         ``affiliate`` or ``active`` revalidates the FULL Player/Team/
-        LeagueSeason/active-registration spine first (#205 review round 3
-        blocker 2) — the same spine ``create_season_roster_membership``
+        LeagueSeason/Program/active-registration spine first (#205 review
+        round 3 blocker 2, extended to the Program leg by round 4's owner
+        ruling) — the same spine ``create_season_roster_membership``
         demands for those three statuses, and the same set
         ``_assert_membership_spine_valid`` names in its own contract. The
         UNIQUENESS rules stay ``active``-only: reviving to applicant or
