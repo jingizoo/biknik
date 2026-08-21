@@ -264,6 +264,151 @@ class SlotOverfillPositionBucketing(_OverfillContract, unittest.TestCase):
                 self.assertEqual(status1["confirmed_skaters"], 0, label)
 
 
+class ReconfirmGateUsesGameScopedResolution(_OverfillContract,
+                                            unittest.TestCase):
+    """Round-2 gap closure: ``set_availability``'s re-confirm branch
+    (roster_service.py ~L292-301) feeds ``_require_open_slot`` from
+    ``position_for_game``/``_require_team_for_game`` — the SAME
+    game-scoped resolution ``_side_data`` uses, never the permanent
+    ``player.slot_type``/``player.team_id``. Proven with a Mover-shaped
+    player (permanent pointer THIRD, membership HOME) so a defect reverting
+    to the permanent pointer would consult THIRD's slot state (which this
+    game never configured) instead of HOME's, and get the wrong answer in
+    the wrong direction for each half of this test."""
+
+    def test_reconfirm_after_back_out_is_gated_by_the_real_side(self):
+        for label, api, season, league, teams, game, ls_id in self._each(
+                target_skaters=1, target_goalies=0):
+            with self.subTest(backend=label):
+                mover = self._pointer_only_player(
+                    api, teams["third"]["id"], "Mover")
+                m = self._membership(api, mover["id"], ls_id,
+                                     teams["home"]["id"])
+                assert "error" not in m, (label, m)
+                self.assertNotIn(
+                    "error", api.enroll_substitute(game["id"], mover["id"]))
+                self.assertNotIn(
+                    "error", api.offer_substitute(game["id"], mover["id"]))
+                self.assertNotIn(
+                    "error", api.accept_substitute(game["id"], mover["id"]))
+                status_seated = api.get_roster_status(game["id"])
+                self.assertEqual(status_seated["confirmed_skaters"], 1, label)
+
+                # Back out: the single skater slot re-opens.
+                backed_out = api.set_availability(
+                    game["id"], mover["id"], "unavailable",
+                    actor_id=ADMIN)
+                self.assertNotIn("error", backed_out, (label, backed_out))
+                status_open = api.get_roster_status(game["id"])
+                self.assertEqual(status_open["open_skater_slots"], 1, label)
+
+                # Reconfirm while the slot is genuinely still open (HOME's
+                # perspective) must SUCCEED. Reverted to the permanent
+                # pointer, this would consult THIRD's slot state (no
+                # roster entries, target 0) and could refuse or misbehave
+                # for the wrong reason.
+                reconfirm_ok = api.set_availability(
+                    game["id"], mover["id"], "available",
+                    actor_id=ADMIN)
+                self.assertNotIn(
+                    "error", reconfirm_ok, (label, reconfirm_ok))
+                status_reseated = api.get_roster_status(game["id"])
+                self.assertEqual(
+                    status_reseated["confirmed_skaters"], 1, label)
+                self.assertEqual(
+                    status_reseated["open_skater_slots"], 0, label)
+
+                # Back out again, and this time let a SECOND mover fill the
+                # now-open slot before the first tries to reconfirm.
+                self.assertNotIn("error", api.set_availability(
+                    game["id"], mover["id"], "unavailable", actor_id=ADMIN))
+                filler = self._pointer_only_player(
+                    api, teams["third"]["id"], "Filler")
+                fm = self._membership(api, filler["id"], ls_id,
+                                      teams["home"]["id"])
+                assert "error" not in fm, (label, fm)
+                self.assertNotIn(
+                    "error", api.enroll_substitute(game["id"], filler["id"]))
+                self.assertNotIn(
+                    "error", api.offer_substitute(game["id"], filler["id"]))
+                self.assertNotIn(
+                    "error", api.accept_substitute(game["id"], filler["id"]))
+
+                # The slot is now genuinely filled by HOME's real count.
+                # The original mover reconfirming must be REFUSED — this is
+                # the direction a permanent-pointer defect gets wrong the
+                # OTHER way: THIRD (no roster entries, target 0) would
+                # report an "open" slot and wrongly let this succeed.
+                reconfirm_refused = api.set_availability(
+                    game["id"], mover["id"], "available", actor_id=ADMIN)
+                self.assertEqual(
+                    reconfirm_refused.get("error", {}).get("code"),
+                    "slot_already_filled", (label, reconfirm_refused))
+
+
+class BackOutNotifiesTheRealSideCoach(_OverfillContract, unittest.TestCase):
+    """Round-2 gap closure: ``_back_out_entry``'s post-hoc
+    ``compute_roster_status``/notification resolution (roster_service.py
+    ~L417-431) must use the game-resolved team (HOME), never the permanent
+    ``player.team_id`` pointer (THIRD, not even a side of this game) — for
+    both which side's status gets recomputed and which coach the
+    SLOT_OPEN notification's ``audience_ref`` names."""
+
+    def test_open_slot_notification_names_the_real_side(self):
+        # target_skaters=2: one ORDINARY player stays seated throughout, so
+        # the mover's back-out leaves one occupying entry + one open slot
+        # -- GameStatus.OPEN_SLOT (roster_service.py's _derive_status only
+        # fires it with at least one remaining occupying entry; an
+        # all-vacant roster reports DRAFT instead and never notifies).
+        for label, api, season, league, teams, game, ls_id in self._each(
+                target_skaters=2, target_goalies=0):
+            with self.subTest(backend=label):
+                anchor = self._player(api, teams["home"]["id"], "Anchor")
+                self.assertNotIn(
+                    "error", api.enroll_substitute(game["id"], anchor["id"]))
+                self.assertNotIn(
+                    "error", api.offer_substitute(game["id"], anchor["id"]))
+                self.assertNotIn(
+                    "error", api.accept_substitute(game["id"], anchor["id"]))
+
+                mover = self._pointer_only_player(
+                    api, teams["third"]["id"], "Mover")
+                m = self._membership(api, mover["id"], ls_id,
+                                     teams["home"]["id"])
+                assert "error" not in m, (label, m)
+                self.assertNotIn(
+                    "error", api.enroll_substitute(game["id"], mover["id"]))
+                self.assertNotIn(
+                    "error", api.offer_substitute(game["id"], mover["id"]))
+                self.assertNotIn(
+                    "error", api.accept_substitute(game["id"], mover["id"]))
+                self.assertEqual(
+                    api.get_roster_status(game["id"])["confirmed_skaters"],
+                    2, label)
+
+                before = [(n.kind.value, n.audience_ref) for n in
+                         api.store.all_notifications_feed()]
+
+                backed_out = api.set_availability(
+                    game["id"], mover["id"], "unavailable", actor_id=ADMIN)
+                self.assertNotIn("error", backed_out, (label, backed_out))
+
+                after = [(n.kind.value, n.audience_ref) for n in
+                        api.store.all_notifications_feed()]
+                new_events = [e for e in after if e not in before]
+
+                # A defect reverting to the permanent pointer would resolve
+                # "Third" here -- not a participant in this game at all --
+                # so the open-slot alert would misfire against the wrong
+                # team's coach rather than HOME's.
+                self.assertIn(
+                    ("roster_open_slot", teams["home"]["id"]), new_events,
+                    (label, new_events))
+                self.assertNotIn(
+                    ("roster_open_slot", teams["third"]["id"]), new_events,
+                    (label, new_events))
+
+
 class SlotOverfillOverHttp(unittest.TestCase):
     """The #205 blocker 5 fix exercised through a REAL HTTP request against
     ``web/server.py`` — not just the facade in isolation, matching the
