@@ -426,11 +426,26 @@ class RosterService:
                 message=status.message,
             )
             # Feed notification to that team's coach (#32).
-            _push_notification(
-                self.store, self.clock,
-                NotificationKind.ROSTER_OPEN_SLOT, NotificationAudience.COACH,
-                "Open roster slot", status.message,
-                audience_ref=team_id, game_id=game.id)
+            # #205 blocker 3 (sibling): unlike decline_substitute's offer,
+            # a roster entry has no earlier "offer" moment to have
+            # snapshotted a team onto — the comment above already documents
+            # why team_id is resolved fresh, tolerantly, right here. That
+            # tolerance was incomplete: a None team_id (membership lapsed by
+            # back-out time) was still fed as audience_ref into this
+            # COACH-audience push, which delivery.recipient_ref's #60
+            # fail-closed invariant refuses — raising and rolling the whole
+            # @_transactional back-out back, the same crash-and-revert bug
+            # decline_substitute had. The back-out itself must never be
+            # undone by a notification with no honest audience to reach, so
+            # the push is skipped (never sent to a guessed/broadened
+            # audience — #60 stays intact) rather than attempted with
+            # audience_ref=None.
+            if team_id is not None:
+                _push_notification(
+                    self.store, self.clock,
+                    NotificationKind.ROSTER_OPEN_SLOT, NotificationAudience.COACH,
+                    "Open roster slot", status.message,
+                    audience_ref=team_id, game_id=game.id)
 
     # ====================================================================
     # substitute workflow
@@ -538,11 +553,17 @@ class RosterService:
             raise InvalidTransitionError(
                 "Only an enrolled substitute can be offered a slot."
             )
-        self._require_open_slot(game_id, sub.slot_type,
-                                self._require_team_for_game(game, player))
+        team_id = self._require_team_for_game(game, player)
+        self._require_open_slot(game_id, sub.slot_type, team_id)
         sub.status = SubstituteStatus.OFFERED
         sub.offered_at = self.clock()
         sub.offer_expires_at = offer_expires_at
+        # #205 blocker 3: snapshot the team this offer was validated against
+        # — free, _require_team_for_game already resolved it above — so a
+        # later decline can read a durable value instead of re-resolving
+        # membership that may have ended by then (same pattern `position`
+        # already uses via position_for_game at enroll time).
+        sub.team_id = team_id
         self.store.save_substitute(sub)
         self._audit(
             game_id,
@@ -665,17 +686,34 @@ class RosterService:
         )
         # Notify the team's coach so they can advance to the next candidate
         # (#112) — the pre-#112 decline path emitted no notification at all.
-        # Tolerant resolution (never a raise): declining stays possible even
-        # for a player whose membership has since ended, so the audience may
-        # honestly be nobody rather than a permanent-pointer guess.
-        _push_notification(
-            self.store, self.clock,
-            NotificationKind.SUBSTITUTE_DECLINED, NotificationAudience.COACH,
-            "Substitute declined",
-            "A substitute declined the offer — you can offer the next candidate.",
-            audience_ref=self.team_for_game(
-                game, self.store.get_player(player_id)),
-            game_id=game_id)
+        # #205 blocker 3: read the team offer_substitute already snapshotted
+        # onto `sub.team_id` at offer time instead of re-deriving it fresh
+        # here. A membership ending between offer and decline can no longer
+        # turn this into audience_ref=None feeding a COACH-audience push —
+        # delivery.recipient_ref's #60 fail-closed invariant would raise on
+        # that and roll the whole decline back (the bug this snapshot
+        # fixes), and silently widening that invariant to tolerate None is
+        # exactly the misdirected-notification risk #60 closed, so it is
+        # not the right fix either. team_for_game is kept ONLY as a fallback
+        # for a sub OFFERED before this column existed (team_id is NULL on
+        # migration; every new offer sets it) — byte-for-byte today's
+        # resolution for that narrow transitional case. If even THAT can't
+        # resolve a team (membership already gone at the time of that
+        # legacy offer too), the push is skipped rather than handed a None
+        # audience_ref — the decline itself, already committed above, must
+        # never roll back over a notification that has no honest audience
+        # to reach; same "skip the targeted push, keep the outcome" posture
+        # as the sibling fix in _back_out_entry below.
+        audience_ref = sub.team_id or self.team_for_game(
+            game, self.store.get_player(player_id))
+        if audience_ref is not None:
+            _push_notification(
+                self.store, self.clock,
+                NotificationKind.SUBSTITUTE_DECLINED, NotificationAudience.COACH,
+                "Substitute declined",
+                "A substitute declined the offer — you can offer the next candidate.",
+                audience_ref=audience_ref,
+                game_id=game_id)
         return sub
 
     @_transactional

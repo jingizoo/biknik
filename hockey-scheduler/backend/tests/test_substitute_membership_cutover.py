@@ -414,6 +414,78 @@ class EligibilityIsLiveNotFrozen(_CutoverContract, unittest.TestCase):
                 row = api.store.substitute_for_player(game["id"], p["id"])
                 self.assertEqual(row.status, SubstituteStatus.ENROLLED, label)
 
+    def test_decline_after_release_succeeds_and_notifies_the_real_team(self):
+        """#205 blocker 3: unlike offer (a gate, fails closed above),
+        decline is a transition on an ALREADY-offered substitute — the
+        player must still be able to walk away from a dead offer even
+        though their membership ended after it was made. Before the fix,
+        ``decline_substitute`` re-derived the coach notification's audience
+        from ``team_for_game`` fresh at decline time, got ``None`` (the
+        membership resolving it no longer exists), fed that into a
+        COACH-audience push, and delivery's #60 fail-closed invariant
+        raised — rolling the whole ``@_transactional`` decline back (the
+        substitute row stayed ``OFFERED`` forever). Demonstrated fresh,
+        tri-store, on the pre-fix code (see PR description): identical
+        ``validation_error``/``A coach notification needs an audience_ref``
+        on Memory, SQLite AND PostgreSQL (``MembershipCutoverPostgresTest``
+        below carries the PostgreSQL half).
+
+        The fix snapshots the team ``offer_substitute`` already resolved
+        onto ``SubstituteEnrollment.team_id`` (migration 060) — durable by
+        construction, so a membership ending afterward can't undo it — and
+        ``decline_substitute`` reads that instead of re-resolving."""
+        for label, api, season, league, teams, game, ls_id in self._each():
+            with self.subTest(backend=label):
+                p = self._player(api, teams["home"]["id"], "Offered")
+                self.assertNotIn(
+                    "error", api.enroll_substitute(game["id"], p["id"]),
+                    label)
+                offer = api.offer_substitute(game["id"], p["id"])
+                self.assertNotIn("error", offer, (label, offer))
+                end_membership_directly(
+                    api.store, self._stint_id(api, p["id"], ls_id),
+                    "released")
+
+                before = [(n.kind.value, n.audience_ref) for n in
+                         api.store.all_notifications_feed()]
+                res = api.decline_substitute(game["id"], p["id"])
+                self.assertNotIn("error", res, (label, res))
+                self.assertEqual(res["status"], "declined", label)
+                after = [(n.kind.value, n.audience_ref) for n in
+                        api.store.all_notifications_feed()]
+                new_events = [e for e in after if e not in before]
+                # The notification names HOME — the team the now-dead
+                # membership used to resolve to — not a crash, and not a
+                # silently-dropped notification.
+                self.assertIn(
+                    ("substitute_declined", teams["home"]["id"]),
+                    new_events, (label, new_events))
+
+                row = api.store.substitute_for_player(game["id"], p["id"])
+                self.assertEqual(row.status, SubstituteStatus.DECLINED, label)
+                self.assertEqual(row.team_id, teams["home"]["id"], label)
+
+    def test_ordinary_decline_with_live_membership_is_unaffected(self):
+        """The common case — membership still ACTIVE at decline time — is
+        byte-for-byte unchanged: the snapshot taken at offer time and a
+        fresh ``team_for_game`` resolution agree, so this passing before
+        the fix is not evidence the fix does nothing; it is the fix's own
+        regression guard against 'only helps the lapsed case, breaks the
+        live one'."""
+        for label, api, season, league, teams, game, ls_id in self._each():
+            with self.subTest(backend=label):
+                p = self._player(api, teams["home"]["id"], "StillHere")
+                api.enroll_substitute(game["id"], p["id"])
+                api.offer_substitute(game["id"], p["id"])
+                res = api.decline_substitute(game["id"], p["id"])
+                self.assertNotIn("error", res, (label, res))
+                new_events = [
+                    (n.kind.value, n.audience_ref)
+                    for n in api.store.all_notifications_feed()]
+                self.assertIn(
+                    ("substitute_declined", teams["home"]["id"]),
+                    new_events, (label, new_events))
+
 
 class UnboundGamesKeepThePermanentGate(_Fixture, unittest.TestCase):
     """No LeagueSeason binding -> no Season to resolve against: the
@@ -950,6 +1022,109 @@ class MembershipCutoverPostgresTest(_Fixture, unittest.TestCase):
         self.assertNotIn("error", entry, entry)
         row = self.store.substitute_for_player(game["id"], mover["id"])
         self.assertEqual(row.status, SubstituteStatus.ACCEPTED)
+
+    def test_decline_after_release_succeeds_on_postgres(self):
+        """#205 blocker 3 against real PostgreSQL — see
+        ``EligibilityIsLiveNotFrozen.test_decline_after_release_succeeds_
+        and_notifies_the_real_team`` for the Memory/SQLite half and the
+        full defect narrative. Demonstrated pre-fix on this exact class'
+        fixture: ``validation_error`` / ``A coach notification needs an
+        audience_ref``, substitute row stuck ``OFFERED``."""
+        api, game, teams, ls_id = self.api, self.game, self.teams, self.ls_id
+        p = self._player(api, teams["home"]["id"], "PG Offered")
+        self.assertNotIn(
+            "error", api.enroll_substitute(game["id"], p["id"]))
+        offer = api.offer_substitute(game["id"], p["id"])
+        self.assertNotIn("error", offer, offer)
+        end_membership_directly(
+            api.store, self._stint_id(api, p["id"], ls_id), "released")
+
+        res = api.decline_substitute(game["id"], p["id"])
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["status"], "declined")
+
+        row = self.store.substitute_for_player(game["id"], p["id"])
+        self.assertEqual(row.status, SubstituteStatus.DECLINED)
+        self.assertEqual(row.team_id, teams["home"]["id"])
+
+        new_events = [(n.kind.value, n.audience_ref) for n in
+                      self.store.all_notifications_feed()]
+        self.assertIn(
+            ("substitute_declined", teams["home"]["id"]), new_events,
+            new_events)
+
+
+class DeclineAfterMembershipEndOverHttp(unittest.TestCase):
+    """The #205 blocker 3 fix exercised through a REAL HTTP request against
+    ``web/server.py`` — enroll/offer/decline all go through a real socket
+    request, matching the pattern ``ResolverFixOverHttp``/
+    ``SlotOverfillOverHttp`` established for the other #205 review
+    blockers. The membership-ending step has no HTTP surface worth
+    exercising (it is a store-level-only precondition — see
+    ``end_membership_directly``'s own docstring for why even the setup
+    facade cannot reach a terminal transition), so it is seeded directly
+    at the live demo server state (``srv.STATE``), like the other HTTP
+    fixtures in this file do for their own setup steps."""
+
+    def setUp(self):
+        srv.STATE.reset(seed=False)
+        self.api = srv.STATE.api
+        fx = _Fixture()
+        (self.api, self.season, self.league, self.teams, self.game,
+         self.ls_id) = fx._build(self.api.store)
+        self.fx = fx
+        self.player = fx._player(self.api, self.teams["home"]["id"],
+                                 "HTTP Offered")
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._teardown_server)
+
+    def _teardown_server(self):
+        self.httpd.shutdown()
+        self.thread.join(timeout=5)
+        self.httpd.server_close()
+
+    def _req(self, method, path, body=None, role="league_admin"):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        if role is not None:
+            req.add_header("X-Demo-Role", role)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read() or b"{}")
+
+    def test_decline_after_release_succeeds_over_http(self):
+        gid = self.game["id"]
+        pid = self.player["id"]
+
+        status, r = self._req(
+            "POST", f"/api/games/{gid}/substitutes/enroll",
+            {"player_id": pid})
+        self.assertEqual(status, 200, r)
+        status, r = self._req(
+            "POST", f"/api/games/{gid}/substitutes/{pid}/offer", {})
+        self.assertEqual(status, 200, r)
+
+        stint_id = self.fx._stint_id(self.api, pid, self.ls_id)
+        end_membership_directly(self.api.store, stint_id, "released")
+
+        status, r = self._req(
+            "POST", f"/api/games/{gid}/substitutes/{pid}/decline", {})
+        self.assertEqual(status, 200, r)
+        self.assertEqual(r["status"], "declined", r)
+
+        status, row = self._req(
+            "GET", f"/api/games/{gid}/roster-status")
+        self.assertEqual(status, 200, row)
 
 
 if __name__ == "__main__":  # pragma: no cover

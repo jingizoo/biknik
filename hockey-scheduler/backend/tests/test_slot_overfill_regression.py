@@ -51,7 +51,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND, FakeClock  # noqa: F401  (sets up sys.path)
-from helpers import fresh_sql_store
+from helpers import end_membership_directly, fresh_sql_store
 
 from test_substitute_membership_cutover import ADMIN, _at, _Fixture
 
@@ -409,6 +409,75 @@ class BackOutNotifiesTheRealSideCoach(_OverfillContract, unittest.TestCase):
                     (label, new_events))
 
 
+class BackOutSurvivesLapsedMembership(_OverfillContract, unittest.TestCase):
+    """#205 blocker 3 sibling (found alongside decline_substitute's own
+    identical defect — see test_substitute_membership_cutover.py's
+    ``EligibilityIsLiveNotFrozen``): ``_back_out_entry``'s comment above
+    (roster_service.py ~L410-417) already documents that it resolves
+    ``team_for_game`` "tolerantly" so a lapsed membership degrades to
+    ``team_id=None`` rather than blocking the back-out. That tolerance was
+    incomplete — ``team_id=None`` still reached a COACH-audience
+    ``_push_notification``, and delivery's #60 fail-closed invariant
+    ("a coach notification needs an audience_ref") raised on exactly that,
+    rolling the whole ``@_transactional`` back-out back. Reachable via the
+    ordinary confirm/back-out surface (``PATCH roster/{playerId}/status``
+    or ``set_availability``) for any confirmed player whose membership
+    ends before they back out — no substitute enrollment involved at all.
+    Demonstrated fresh, tri-store, on the pre-fix code (see PR
+    description): identical ``validation_error`` crash and roll-back
+    (entry status still ``CONFIRMED``, not ``UNAVAILABLE``) on Memory,
+    SQLite AND PostgreSQL.
+
+    Unlike the substitute case there is no earlier "offer" moment to
+    snapshot a team onto, so the fix is different in shape: the targeted
+    push is skipped (never sent to a guessed/broadened audience — #60
+    stays intact) when no team can be honestly resolved, rather than
+    crashing the back-out that already happened."""
+
+    def test_back_out_after_release_succeeds_and_skips_the_dead_push(self):
+        for label, api, season, league, teams, game, ls_id in self._each(
+                target_skaters=2, target_goalies=0):
+            with self.subTest(backend=label):
+                anchor = self._player(api, teams["home"]["id"], "Anchor2")
+                mover = self._player(api, teams["home"]["id"], "Mover2")
+                sel = api.select_roster(
+                    game["id"], [anchor["id"], mover["id"]], actor_id=ADMIN)
+                self.assertNotIn("error", sel, (label, sel))
+                for p in (anchor, mover):
+                    av = api.set_availability(
+                        game["id"], p["id"], "available", actor_id=p["id"])
+                    self.assertNotIn("error", av, (label, av))
+                self.assertEqual(
+                    api.get_roster_status(game["id"])["confirmed_skaters"],
+                    2, label)
+
+                end_membership_directly(
+                    api.store, self._stint_id(api, mover["id"], ls_id),
+                    "released")
+
+                before = [(n.kind.value, n.audience_ref) for n in
+                         api.store.all_notifications_feed()]
+                res = api.set_availability(
+                    game["id"], mover["id"], "unavailable",
+                    actor_id=mover["id"])
+                self.assertNotIn("error", res, (label, res))
+
+                entry = api.store.roster_entry_for_player(
+                    game["id"], mover["id"])
+                self.assertEqual(entry.status.value, "unavailable", label)
+
+                after = [(n.kind.value, n.audience_ref) for n in
+                        api.store.all_notifications_feed()]
+                new_events = [e for e in after if e not in before]
+                # The targeted push (which would have had no honest
+                # audience_ref to name — mover's membership is gone) never
+                # fired; it was skipped, not misdirected, and nothing about
+                # the back-out itself was rolled back over it.
+                self.assertNotIn(
+                    "roster_open_slot", [k for k, _ in new_events],
+                    (label, new_events))
+
+
 class SlotOverfillOverHttp(unittest.TestCase):
     """The #205 blocker 5 fix exercised through a REAL HTTP request against
     ``web/server.py`` — not just the facade in isolation, matching the
@@ -559,6 +628,153 @@ class SlotOverfillPostgresTest(_OverfillFixture, unittest.TestCase):
         seated = [e.player_id for e in api.store.roster_for_game(game["id"])
                  if e.status.occupies_slot]
         self.assertEqual(seated, [p1["id"]])
+
+    def test_back_out_after_release_succeeds_on_postgres(self):
+        """#205 blocker 3 sibling against real PostgreSQL — see
+        ``BackOutSurvivesLapsedMembership`` for the Memory/SQLite half and
+        the full defect narrative. Demonstrated pre-fix on this exact
+        class' fixture: ``validation_error`` crash, entry rolled back to
+        ``CONFIRMED``.
+
+        Builds its OWN ``target_skaters=2`` game rather than reusing
+        ``self.game`` (``target_skaters=1`` from ``setUp``, for the
+        second-accept-refused recipe above) — with only 1 target, backing
+        the mover out of a 2-CONFIRMED roster leaves 1 confirmed against a
+        target of 1, which is a MET target, not ``OPEN_SLOT``, so
+        ``_back_out_entry``'s notification branch would never even run and
+        this test would pass whether or not the bug it exists to catch was
+        present. Caught by falsifiability (see PR description): with the
+        production fix reverted, ``test_second_accept_is_refused_on_
+        postgres`` and every OTHER new regression case still failed with
+        the expected crash, but THIS one silently passed on the shared
+        ``target_skaters=1`` fixture — exactly the false-negative building
+        its own game now closes."""
+        api, teams = self.api, self.teams
+        # A second ice slot on the fixture's own rink (self.game already
+        # occupies the first one) — same pattern as
+        # ``UnboundGamesKeepThePermanentGate._exhibition``.
+        rink_id = api.store.get_ice_slot(self.game["ice_slot_id"]).rink_id
+        slot = api.create_ice_slot(
+            rink_id, _at(20).isoformat(), _at(21).isoformat(), "game",
+            actor_id=ADMIN)
+        game = api.create_game(
+            self.season["id"], None, teams["home"]["id"],
+            teams["away"]["id"], slot["id"],
+            target_goalies=0, target_skaters=2, actor_id=ADMIN,
+            league_id=self.league["id"])
+        assert "error" not in game, game
+        api.publish_game(game["id"], actor_id=ADMIN)
+        ls_id = self.ls_id
+        anchor = self._player(api, teams["home"]["id"], "PG Anchor")
+        mover = self._player(api, teams["home"]["id"], "PG Mover")
+        sel = api.select_roster(
+            game["id"], [anchor["id"], mover["id"]], actor_id=ADMIN)
+        self.assertNotIn("error", sel, sel)
+        for p in (anchor, mover):
+            av = api.set_availability(
+                game["id"], p["id"], "available", actor_id=p["id"])
+            self.assertNotIn("error", av, av)
+
+        end_membership_directly(
+            api.store, self._stint_id(api, mover["id"], ls_id), "released")
+
+        res = api.set_availability(
+            game["id"], mover["id"], "unavailable", actor_id=mover["id"])
+        self.assertNotIn("error", res, res)
+
+        entry = api.store.roster_entry_for_player(game["id"], mover["id"])
+        self.assertEqual(entry.status.value, "unavailable")
+
+
+class DeclineAndBackOutAfterMembershipEndOverHttp(unittest.TestCase):
+    """#205 blocker 3 (decline_substitute) and its sibling
+    (``_back_out_entry``), both exercised through a REAL HTTP request
+    against ``web/server.py`` — matching the pattern
+    ``SlotOverfillOverHttp`` established for blocker 5. The membership-
+    ending step has no HTTP surface worth exercising (a store-level-only
+    precondition — see ``end_membership_directly``'s docstring), so it is
+    seeded directly at the live demo server state (``srv.STATE``), like
+    ``SlotOverfillOverHttp``'s own setup steps."""
+
+    def setUp(self):
+        srv.STATE.reset(seed=False)
+        self.api = srv.STATE.api
+        fx = _OverfillFixture()
+        (self.api, self.season, self.league, self.teams, self.game,
+         self.ls_id) = fx._build(self.api.store, target_skaters=2,
+                                 target_goalies=0)
+        self.fx = fx
+        self.sub_player = fx._player(
+            self.api, self.teams["home"]["id"], "HTTP Sub Offered")
+        self.anchor = fx._player(
+            self.api, self.teams["home"]["id"], "HTTP Anchor")
+        self.mover = fx._player(
+            self.api, self.teams["home"]["id"], "HTTP Mover")
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._teardown_server)
+
+    def _teardown_server(self):
+        self.httpd.shutdown()
+        self.thread.join(timeout=5)
+        self.httpd.server_close()
+
+    def _req(self, method, path, body=None, role="league_admin"):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        if role is not None:
+            req.add_header("X-Demo-Role", role)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read() or b"{}")
+
+    def test_decline_after_release_succeeds_over_http(self):
+        gid, pid = self.game["id"], self.sub_player["id"]
+        status, r = self._req(
+            "POST", f"/api/games/{gid}/substitutes/enroll",
+            {"player_id": pid})
+        self.assertEqual(status, 200, r)
+        status, r = self._req(
+            "POST", f"/api/games/{gid}/substitutes/{pid}/offer", {})
+        self.assertEqual(status, 200, r)
+
+        stint_id = self.fx._stint_id(self.api, pid, self.ls_id)
+        end_membership_directly(self.api.store, stint_id, "released")
+
+        status, r = self._req(
+            "POST", f"/api/games/{gid}/substitutes/{pid}/decline", {})
+        self.assertEqual(status, 200, r)
+        self.assertEqual(r["status"], "declined", r)
+
+    def test_back_out_after_release_succeeds_over_http(self):
+        gid = self.game["id"]
+        aid, mid = self.anchor["id"], self.mover["id"]
+        status, r = self._req(
+            "POST", f"/api/games/{gid}/roster/select",
+            {"player_ids": [aid, mid]})
+        self.assertEqual(status, 200, r)
+        for who in (aid, mid):
+            status, r = self._req(
+                "POST", f"/api/games/{gid}/availability",
+                {"player_id": who, "availability_status": "available"})
+            self.assertEqual(status, 200, r)
+
+        stint_id = self.fx._stint_id(self.api, mid, self.ls_id)
+        end_membership_directly(self.api.store, stint_id, "released")
+
+        status, r = self._req(
+            "POST", f"/api/games/{gid}/availability",
+            {"player_id": mid, "availability_status": "unavailable"})
+        self.assertEqual(status, 200, r)
 
 
 if __name__ == "__main__":  # pragma: no cover

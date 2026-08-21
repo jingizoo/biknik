@@ -173,6 +173,16 @@ class SubstituteEnrollment:
     offer_expires_at: Optional[datetime] = None
     accepted_at: Optional[datetime] = None
     declined_at: Optional[datetime] = None
+    # #205 blocker 3: the team the offer was validated against, snapshotted
+    # by offer_substitute at the moment _require_team_for_game resolved it
+    # (same pattern position_for_game already established for `position`
+    # above — resolve once, at the point the context is genuinely valid,
+    # and store it). decline_substitute reads this instead of re-resolving
+    # membership that may have ended since the offer, so a lapsed
+    # membership can no longer make the COACH notification's audience_ref
+    # come back None. None until an offer has been made (or for any row
+    # enrolled/offered before this migration — see 060_substitute_team_id.sql).
+    team_id: Optional[str] = None
 
     @property
     def slot_type(self) -> SlotType:

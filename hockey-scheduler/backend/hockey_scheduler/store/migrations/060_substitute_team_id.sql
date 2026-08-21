@@ -1,0 +1,38 @@
+-- Snapshot the offer's team on SubstituteEnrollment (#205 blocker 3).
+--
+-- decline_substitute re-derived the offer's coach audience with a FRESH
+-- team_for_game(game, player) lookup at decline time instead of reading a
+-- value fixed when the offer was made. If the player's SeasonRosterMembership
+-- ended between offer and decline (the exact "eligibility is live, not
+-- frozen" posture #205's own EligibilityIsLiveNotFrozen suite established
+-- for accept_substitute/offer_substitute), team_for_game returns None,
+-- audience_ref=None is fed into a COACH-audience _push_notification, and
+-- delivery.recipient_ref's #60 fail-closed invariant ("a COACH notification
+-- needs an audience_ref") raises -- rolling the whole @_transactional
+-- decline back. The player is left holding a dead offer they can neither
+-- decline nor accept. _back_out_entry (a normal roster player backing out
+-- of a confirmed slot, no substitute involved) had the identical defect for
+-- the same reason and is fixed in the same change, but it has no "offer" to
+-- snapshot a value onto -- see roster_service.py's _back_out_entry for how
+-- that sibling is closed instead.
+--
+-- Fix (this migration + services/roster_service.py): resolve the team ONCE,
+-- at the moment offer_substitute's existing _require_team_for_game call
+-- already proves the context is genuinely valid -- the same "resolve once
+-- where it's valid, then store it" pattern #205 blocker 2 already
+-- established for `position` via position_for_game -- and read that
+-- snapshot at decline time instead of re-resolving membership that may have
+-- since ended. This is durable by construction: once an offer is made, a
+-- membership ending afterward can no longer make the decline notification
+-- crash or misfire.
+--
+-- Additive and portable: a nullable TEXT column, no rebuild, no index. NULL
+-- for every pre-existing enrolled-but-never-offered row (there is nothing
+-- to snapshot yet -- offer_substitute fills it in when the offer is made)
+-- and for any row enrolled/offered by code that predates this migration;
+-- decline_substitute still fails closed exactly as before if it ever finds
+-- team_id unset on an OFFERED row, rather than guessing.
+--
+-- Forward-only. Rollback reality: reverting application code does not drop
+-- this column; dropping it is a separate manual database operation.
+ALTER TABLE substitute_enrollments ADD COLUMN team_id TEXT;

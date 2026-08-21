@@ -271,7 +271,7 @@ SPECS = {
                                 "status": _enum(SubstituteStatus),
                                 "enrolled_at": _dt(), "offered_at": _dt(),
                                 "offer_expires_at": _dt(), "accepted_at": _dt(),
-                                "declined_at": _dt()}),
+                                "declined_at": _dt()}),  # team_id: plain TEXT, no codec
     AuditLog: Spec(AuditLog, "audit_logs",
                    {"action": _enum(AuditAction), "at": _dt(), "detail": _jsonc()}),
     NotificationEvent: Spec(NotificationEvent, "notification_events",
