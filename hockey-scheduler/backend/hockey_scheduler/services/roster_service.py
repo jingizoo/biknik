@@ -686,26 +686,26 @@ class RosterService:
         )
         # Notify the team's coach so they can advance to the next candidate
         # (#112) — the pre-#112 decline path emitted no notification at all.
-        # #205 blocker 3: read the team offer_substitute already snapshotted
-        # onto `sub.team_id` at offer time instead of re-deriving it fresh
-        # here. A membership ending between offer and decline can no longer
-        # turn this into audience_ref=None feeding a COACH-audience push —
-        # delivery.recipient_ref's #60 fail-closed invariant would raise on
-        # that and roll the whole decline back (the bug this snapshot
-        # fixes), and silently widening that invariant to tolerate None is
-        # exactly the misdirected-notification risk #60 closed, so it is
-        # not the right fix either. team_for_game is kept ONLY as a fallback
-        # for a sub OFFERED before this column existed (team_id is NULL on
-        # migration; every new offer sets it) — byte-for-byte today's
-        # resolution for that narrow transitional case. If even THAT can't
-        # resolve a team (membership already gone at the time of that
-        # legacy offer too), the push is skipped rather than handed a None
-        # audience_ref — the decline itself, already committed above, must
-        # never roll back over a notification that has no honest audience
-        # to reach; same "skip the targeted push, keep the outcome" posture
+        # #205 blocker 3 (re-derived, round 2): resolve LIVE first, exactly
+        # the order _accept_offered_substitute uses (its
+        # `_require_team_for_game` above) — a team reassignment that
+        # happens between offer and decline, with membership never lapsing,
+        # must notify the CURRENT team, not the stale offer-time snapshot.
+        # `sub.team_id` is consulted only as the FALLBACK, for the two cases
+        # live resolution can't answer: (a) membership genuinely ended since
+        # the offer (team_for_game returns None — the original crash this
+        # snapshot exists to survive) and (b) a sub OFFERED before this
+        # column existed (team_id is NULL on migration; every new offer
+        # sets it, so this is a narrow transitional case only). If even the
+        # snapshot can't resolve a team, the push is skipped rather than
+        # handed a None audience_ref — delivery.recipient_ref's #60 fail-
+        # closed invariant would otherwise raise and roll the whole decline
+        # back; the decline itself, already committed above, must never
+        # roll back over a notification that has no honest audience to
+        # reach — same "skip the targeted push, keep the outcome" posture
         # as the sibling fix in _back_out_entry below.
-        audience_ref = sub.team_id or self.team_for_game(
-            game, self.store.get_player(player_id))
+        audience_ref = self.team_for_game(
+            game, self.store.get_player(player_id)) or sub.team_id
         if audience_ref is not None:
             _push_notification(
                 self.store, self.clock,

@@ -192,6 +192,29 @@ class _Fixture:
         assert "error" not in m, m
         return m
 
+    def _exhibition(self, api, season, league, teams):
+        """A game with NO LeagueSeason binding — shared by
+        ``UnboundGamesKeepThePermanentGate`` and any other fixture that
+        needs the permanent-pointer-only eligibility path (e.g. the
+        offer-time-team-reassignment precedence test, which needs a
+        constructible route to "team changed, membership never ended" —
+        infeasible through ``SeasonRosterMembership`` under the one-open-
+        membership-per-player/league_season rule)."""
+        rink_id = api.store.get_ice_slot(
+            api.store.get_game(  # the regular game's slot -> its rink
+                api.store.all_games()[0].id).ice_slot_id).rink_id
+        slot = api.create_ice_slot(
+            rink_id, _at(20).isoformat(), _at(21).isoformat(), "game",
+            actor_id=ADMIN)
+        game = api.create_game(season["id"], None, teams["home"]["id"],
+                               teams["away"]["id"], slot["id"],
+                               actor_id=ADMIN, league_id=league["id"],
+                               game_type="exhibition")
+        assert "error" not in game, game
+        assert game["league_season_id"] is None, game
+        api.publish_game(game["id"], actor_id=ADMIN)
+        return game
+
 
 class _CutoverContract(_Fixture):
     """Shared Memory + SQLite contract body."""
@@ -493,23 +516,6 @@ class UnboundGamesKeepThePermanentGate(_Fixture, unittest.TestCase):
     (This is also why the pre-existing substitute suites pass unchanged:
     every game they build directly carries no league_season_id.)"""
 
-    def _exhibition(self, api, season, league, teams):
-        # Second slot on the fixture's own season-accessible rink.
-        rink_id = api.store.get_ice_slot(
-            api.store.get_game(  # the regular game's slot -> its rink
-                api.store.all_games()[0].id).ice_slot_id).rink_id
-        slot = api.create_ice_slot(
-            rink_id, _at(20).isoformat(), _at(21).isoformat(), "game",
-            actor_id=ADMIN)
-        game = api.create_game(season["id"], None, teams["home"]["id"],
-                               teams["away"]["id"], slot["id"],
-                               actor_id=ADMIN, league_id=league["id"],
-                               game_type="exhibition")
-        assert "error" not in game, game
-        assert game["league_season_id"] is None, game
-        api.publish_game(game["id"], actor_id=ADMIN)
-        return game
-
     def test_exhibition_uses_pointer_and_stays_cross_team_closed(self):
         for store in (InMemoryStore(), SqlStore(":memory:")):
             label = type(store).__name__
@@ -542,6 +548,80 @@ class UnboundGamesKeepThePermanentGate(_Fixture, unittest.TestCase):
         del api.store.league_seasons[ls_id]
         res = api.enroll_substitute(game["id"], p["id"])
         self.assertEqual(res["error"]["code"], "not_eligible")
+
+    def test_decline_notifies_the_current_team_after_reassignment(self):
+        """#205 blocker 3, ROUND 2: the round-1 snapshot fix
+        (``SubstituteEnrollment.team_id``, migration 060) closed the
+        membership-lapsed crash, but its precedence — ``sub.team_id or
+        self.team_for_game(...)`` — ALWAYS preferred the offer-time
+        snapshot when one existed, even when the player's LIVE team had
+        legitimately changed since via an ordinary ``assign_player_team``
+        call. That is a plain reassignment, not a membership ending —
+        nothing "terminal" happens at all — yet the stale snapshot still
+        won and decline notified the WRONG (former) team.
+
+        This needs a route where the player's team changes but eligibility
+        resolution never goes through ``SeasonRosterMembership`` (the
+        governed-transfer model has exactly one open membership per
+        player/league_season, so "reassigned but not terminal" has no
+        membership-side construction) — an UNBOUND game judged by the
+        permanent ``player.team_id`` pointer, exactly like
+        ``UnboundGamesKeepThePermanentGate``'s other tests, moved by the
+        ordinary ``assign_player_team`` facade call (the store-level
+        primitive that deliberately does NOT touch membership — see the
+        module docstring's "parity dual-write" section).
+
+        ``_accept_offered_substitute`` (``roster_service.py``, ~639-641)
+        never had this bug: it always calls ``_require_team_for_game``
+        fresh, never consulting a snapshot at all. The fix mirrors that
+        exact live-first order in ``decline_substitute``, falling back to
+        ``sub.team_id`` only when live resolution is genuinely ``None``
+        (see ``EligibilityIsLiveNotFrozen.test_decline_after_release_
+        succeeds_and_notifies_the_real_team`` for that companion case,
+        confirmed unaffected below and by this file's own suite)."""
+        for store in (InMemoryStore(), SqlStore(":memory:")):
+            label = type(store).__name__
+            api, season, league, teams, _, ls_id = self._build(store)
+            with self.subTest(backend=label):
+                exhibition = self._exhibition(api, season, league, teams)
+                sam = self._player(api, teams["home"]["id"], "Sam")
+                self.assertNotIn(
+                    "error",
+                    api.enroll_substitute(exhibition["id"], sam["id"]),
+                    label)
+                offer = api.offer_substitute(exhibition["id"], sam["id"])
+                self.assertNotIn("error", offer, (label, offer))
+                row = api.store.substitute_for_player(
+                    exhibition["id"], sam["id"])
+                # The offer-time snapshot names HOME — Sam's team when the
+                # offer was validated.
+                self.assertEqual(row.team_id, teams["home"]["id"], label)
+
+                # An ORDINARY reassignment — no membership involved, no
+                # release, nothing terminal — moves Sam's permanent pointer
+                # to AWAY after the offer.
+                moved = api.assign_player_team(
+                    sam["id"], teams["away"]["id"], actor_id=ADMIN)
+                self.assertNotIn("error", moved, (label, moved))
+                self.assertEqual(
+                    api.store.get_player(sam["id"]).team_id,
+                    teams["away"]["id"], label)
+
+                before = [(n.kind.value, n.audience_ref) for n in
+                         api.store.all_notifications_feed()]
+                res = api.decline_substitute(exhibition["id"], sam["id"])
+                self.assertNotIn("error", res, (label, res))
+                after = [(n.kind.value, n.audience_ref) for n in
+                        api.store.all_notifications_feed()]
+                new_events = [e for e in after if e not in before]
+                # LIVE resolution must win: AWAY, Sam's CURRENT team — not
+                # the stale HOME snapshot recorded at offer time.
+                self.assertIn(
+                    ("substitute_declined", teams["away"]["id"]),
+                    new_events, (label, new_events))
+                self.assertNotIn(
+                    ("substitute_declined", teams["home"]["id"]),
+                    new_events, (label, new_events))
 
 
 class ParityDualWriteOpensStints(_CutoverContract, unittest.TestCase):
@@ -1050,6 +1130,44 @@ class MembershipCutoverPostgresTest(_Fixture, unittest.TestCase):
         new_events = [(n.kind.value, n.audience_ref) for n in
                       self.store.all_notifications_feed()]
         self.assertIn(
+            ("substitute_declined", teams["home"]["id"]), new_events,
+            new_events)
+
+    def test_decline_notifies_current_team_after_reassignment_on_postgres(
+        self,
+    ):
+        """#205 blocker 3, round 2, against real PostgreSQL — see
+        ``UnboundGamesKeepThePermanentGate.test_decline_notifies_the_
+        current_team_after_reassignment`` for the Memory/SQLite half and
+        the full defect narrative."""
+        api, season, league, teams = (
+            self.api, self.season, self.league, self.teams)
+        exhibition = self._exhibition(api, season, league, teams)
+        sam = self._player(api, teams["home"]["id"], "PG Sam")
+        self.assertNotIn(
+            "error", api.enroll_substitute(exhibition["id"], sam["id"]))
+        offer = api.offer_substitute(exhibition["id"], sam["id"])
+        self.assertNotIn("error", offer, offer)
+        row = self.store.substitute_for_player(exhibition["id"], sam["id"])
+        self.assertEqual(row.team_id, teams["home"]["id"])
+
+        moved = api.assign_player_team(
+            sam["id"], teams["away"]["id"], actor_id=ADMIN)
+        self.assertNotIn("error", moved, moved)
+        self.assertEqual(
+            self.store.get_player(sam["id"]).team_id, teams["away"]["id"])
+
+        before = [(n.kind.value, n.audience_ref) for n in
+                 self.store.all_notifications_feed()]
+        res = api.decline_substitute(exhibition["id"], sam["id"])
+        self.assertNotIn("error", res, res)
+        after = [(n.kind.value, n.audience_ref) for n in
+                self.store.all_notifications_feed()]
+        new_events = [e for e in after if e not in before]
+        self.assertIn(
+            ("substitute_declined", teams["away"]["id"]), new_events,
+            new_events)
+        self.assertNotIn(
             ("substitute_declined", teams["home"]["id"]), new_events,
             new_events)
 
