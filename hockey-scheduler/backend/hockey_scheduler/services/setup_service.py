@@ -2653,9 +2653,12 @@ class SetupService:
           * ``register_team_for_season``'s legacy branch only PASSES THROUGH
             a program-less Team, and its non-null disagreement check is
             exact; the canonical ``league_id`` path refuses one outright;
-          * ``transfer_team_to_league`` HEALS a program-less Team
-            (``team.program_id = team.program_id or league.program_id``,
-            :2231) and refuses a non-null disagreement;
+          * ``transfer_team_to_league`` heals a program-less Team ONLY when
+            the target League actually differs -- ``team.program_id =
+            team.program_id or league.program_id`` sits below an
+            ``if old == new_league_id: return team`` no-op, so calling it
+            with the Team's current League repairs nothing. It refuses a
+            non-null disagreement either way;
           * ``roll_forward_registrations`` and its v2 both refuse a
             program-less Team and refuse a cross-Program rollover;
           * ``commit_hierarchy_import`` refuses a cross-Program team/league

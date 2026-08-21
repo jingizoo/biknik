@@ -1039,8 +1039,9 @@ class MembershipProgramSpineTest(unittest.TestCase):
     season.program_id``): that branch tolerates a PROGRAM-LESS Team, but no
     supported flow PRODUCES one. Established by execution over every public
     entry point — ``create_team`` derives the Program from the resolved
-    League and refuses a disagreeing one; ``transfer_team_to_league`` HEALS
-    a program-less Team; ``roll_forward_registrations`` (both v1 and v2)
+    League and refuses a disagreeing one; ``transfer_team_to_league`` heals
+    a program-less Team only when the target League actually differs (its
+    ``old == new_league_id`` no-op returns first otherwise); ``roll_forward_registrations`` (both v1 and v2)
     refuse one outright; ``commit_hierarchy_import`` refuses a cross-Program
     team/league pair and both imports heal a program-less Team on re-import;
     and the canonical ``league_id`` registration path refuses one. See
@@ -1297,9 +1298,11 @@ class MembershipProgramSpineTest(unittest.TestCase):
         unconditional ``terminal_transition_not_authorized`` refusal — NOT a
         Program error — even on an incoherent Program spine. Adding the
         Program clause must not reorder those two."""
+        checked = 0
         for label, store in self._stores():
             try:
                 for target in ("released", "transferred"):
+                    checked += 1
                     with self.subTest(backend=label, target=target):
                         api = ApiService(store)
                         fx = _fixture(api)
@@ -1319,6 +1322,11 @@ class MembershipProgramSpineTest(unittest.TestCase):
                             (label, target))
             finally:
                 self._close(label, store)
+        # 2 terminal targets per store. Pinned against the ENVIRONMENT, not
+        # against len(self._stores()) -- a pin compared to the list its own
+        # loop iterates can never fire (fixed twice already in this PR).
+        expected = 2 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
 
     def test_missing_program_keys_are_a_violation_not_agreement(self):
         """MISSING keys are never agreement — ``_missing_or_unequal`` treats
@@ -1340,12 +1348,14 @@ class MembershipProgramSpineTest(unittest.TestCase):
         the sole load-bearing difference between the two spellings at this
         layer, so it is asserted explicitly; with it present the mutation
         reddens, per store."""
+        checked = 0
         for label, store in self._stores():
             try:
                 for pair in (("Team.program_id", "League.program_id"),
                              ("League.program_id", "Season.program_id"),
                              ("Team.program_id", "League.program_id",
                               "Season.program_id")):
+                    checked += 1
                     with self.subTest(backend=label, pair=pair):
                         api = ApiService(store)
                         fx = _fixture(api)
@@ -1365,6 +1375,12 @@ class MembershipProgramSpineTest(unittest.TestCase):
                             (label, pair))
             finally:
                 self._close(label, store)
+        # 3 key-groups per store. Pinned against the ENVIRONMENT for the same
+        # reason -- and this test matters most: it is the ONLY one in the
+        # module that discriminates _missing_or_unequal from a plain !=, so a
+        # silently dropped backend here is the costliest to lose.
+        expected = 3 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
 
 _PG_SKIP = ("PostgreSQL not configured (TEST_DATABASE_URL) or psycopg "
             "missing — the #205 review round 1 finding 2 parent-mutation "
