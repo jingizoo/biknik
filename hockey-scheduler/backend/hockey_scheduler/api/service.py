@@ -6325,7 +6325,11 @@ class ApiService:
             "start_time": g.start_time.isoformat() if g.start_time else None,
             "venue_name": self._venue_name_for_game(g),
             "rink_name": g.rink,
-            "position_needed": player.position.slot_type.value,
+            # #205 review blocker 2: the season-scoped position for THIS
+            # game, not the permanent Player row — see
+            # RosterService.position_for_game.
+            "position_needed": self.roster.position_for_game(
+                g, player).slot_type.value,
         }
 
     @catch

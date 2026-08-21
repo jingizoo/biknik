@@ -25,9 +25,11 @@ from ..domain import (
     MembershipStatus,
     NotificationEvent,
     Player,
+    Position,
     RosterEntryStatus,
     RosterRole,
     RosterStatus,
+    SeasonRosterMembership,
     SelectionSource,
     SlotStatus,
     SlotSummary,
@@ -453,7 +455,9 @@ class RosterService:
             id=self.store.next_id("sub"),
             game_id=game_id,
             player_id=player_id,
-            position=player.position,
+            # #205 review blocker 2: the season-scoped position for THIS
+            # stint, not the permanent Player row — see position_for_game.
+            position=self.position_for_game(game, player),
             status=SubstituteStatus.ENROLLED,
             enrolled_at=self.clock(),
         )
@@ -747,59 +751,110 @@ class RosterService:
     _ELIGIBLE_MEMBERSHIP_STATUSES = (MembershipStatus.ACTIVE,
                                      MembershipStatus.AFFILIATE)
 
-    def _game_season_id(self, game) -> Optional[str]:
-        """Season a LeagueSeason-bound game belongs to, or ``None`` — either
-        because the game carries no ``league_season_id`` at all (exhibitions
-        by design, plus unbound legacy rows) or because the pointer dangles.
-        Callers distinguish those two via ``game.league_season_id``."""
-        if not game.league_season_id:
+    def resolve_membership(
+        self, game, player
+    ) -> Optional[SeasonRosterMembership]:
+        """THE #205 eligibility primitive: the ``SeasonRosterMembership``
+        that makes ``player`` eligible for ``game``, or ``None``.
+
+        Matched EXACTLY on ``game.league_season_id`` — never derived to a
+        Season and re-compared through the shared ``season_id`` column.
+        ``LeagueSeason``'s own uniqueness is ``(league_id, season_id)``, one
+        row per League *per* Season: a Season with two Leagues ("Elite" and
+        "House" both running in "Fall 2026") is the ordinary shape, not an
+        edge case, and produces two different ``LeagueSeason`` rows that
+        share one ``season_id``. Deriving the game's ``season_id`` and
+        matching memberships on that column alone therefore accepts a
+        membership scoped to a SIBLING LeagueSeason of the same Season —
+        e.g. an Elite-side membership satisfying a House-side game — with no
+        guard of its own; today's callers only stay safe by coincidence, via
+        invariants this resolver does not own (Team.league_id permanence, a
+        REGULAR game's same-League requirement, transfer's stranding block).
+        Comparing ``league_season_id`` directly needs no Season lookup at
+        all and cannot conflate siblings.
+
+        Returns ``None`` for a game with no LeagueSeason binding at all
+        (exhibitions by design, plus unbound legacy rows — nothing to
+        resolve; see ``team_for_game`` for the permanent-pointer fallback)
+        or when no eligible membership names one of the game's two teams
+        under this exact ``league_season_id`` — including a bound game
+        whose LeagueSeason row itself dangles (fail closed, never silently
+        reverting to permanent ownership). ACTIVE outranks AFFILIATE (the
+        governed call-up exception), home side before away, for determinism
+        in the pathological both-sides case — the same ordering
+        ``team_for_game`` has always provided.
+        """
+        if player is None or not game.league_season_id:
             return None
-        ls = self.store.get_league_season(game.league_season_id)
-        return ls.season_id if ls is not None else None
+        # Existence check ONLY — never re-derive season_id from this row and
+        # compare THAT (the conflation defect this method fixes). A dangling
+        # pointer (the LeagueSeason itself deleted/never existed while the
+        # game still names it) fails closed rather than silently matching
+        # any membership that happens to carry the same id string.
+        if self.store.get_league_season(game.league_season_id) is None:
+            return None
+        sides = tuple(t for t in (game.home_team_id, game.away_team_id) if t)
+        if not sides:
+            return None
+        matched = {}
+        for m in self.store.memberships_for_player(player.id):
+            if (m.league_season_id == game.league_season_id
+                    and m.team_id in sides
+                    and m.status in self._ELIGIBLE_MEMBERSHIP_STATUSES):
+                matched.setdefault(m.status, {}).setdefault(m.team_id, m)
+        for status in self._ELIGIBLE_MEMBERSHIP_STATUSES:
+            by_team = matched.get(status, {})
+            for side in sides:
+                m = by_team.get(side)
+                if m is not None:
+                    return m
+        return None
 
     def team_for_game(self, game, player) -> Optional[str]:
         """Which of ``game``'s two teams ``player`` belongs to, or ``None``.
 
-        THE eligibility resolution of the #205 substitute cutover, shared by
-        every substitute surface (enroll gate, block-reason, outreach queue,
-        addable pool, offer/accept slot accounting, view scoping). For a
-        game bound to a LeagueSeason it resolves
-        ``game.league_season_id -> Season -> SeasonRosterMembership``: the
-        player's eligible memberships in that Season are matched against the
-        game's two teams — ACTIVE outranking AFFILIATE, home side before
-        away for determinism in the pathological both-sides case. A player
-        whose only eligible memberships name OTHER teams resolves ``None``:
-        cross-boundary substitution stays CLOSED (fail-closed, the same
-        posture the permanent gate had; #287 open question 4 — who may
-        substitute across League/Division boundaries — is an unruled owner
-        question this cutover does not answer).
+        THE team-eligibility resolution of the #205 substitute cutover,
+        shared by every substitute surface (enroll gate, block-reason,
+        outreach queue, addable pool, offer/accept slot accounting, view
+        scoping). For a game bound to a LeagueSeason this is
+        ``resolve_membership(game, player).team_id`` — see that method for
+        the exact-match rule. A player whose only eligible memberships name
+        OTHER teams resolves ``None``: cross-boundary substitution stays
+        CLOSED (fail-closed, the same posture the permanent gate had; #287
+        open question 4 — who may substitute across League/Division
+        boundaries — is an unruled owner question this cutover does not
+        answer).
 
-        For a game with NO LeagueSeason binding there is no Season to
-        resolve memberships against, so the permanent ``player.team_id``
-        pointer remains the only source — exhibitions and unbound legacy
-        games keep pre-#205 behavior exactly. A bound game whose
-        LeagueSeason row is missing resolves NOBODY (fail closed), never
-        silently reverting to permanent ownership.
+        For a game with NO LeagueSeason binding there is no membership to
+        resolve, so the permanent ``player.team_id`` pointer remains the
+        only source — exhibitions and unbound legacy games keep pre-#205
+        behavior exactly.
         """
         if player is None:
             return None
-        sides = tuple(t for t in (game.home_team_id, game.away_team_id) if t)
         if not game.league_season_id:
+            sides = tuple(t for t in (game.home_team_id, game.away_team_id)
+                          if t)
             return player.team_id if player.team_id in sides else None
-        season_id = self._game_season_id(game)
-        if season_id is None:
-            return None
-        matched = {}
-        for m in self.store.memberships_for_player(player.id):
-            if (m.season_id == season_id and m.team_id in sides
-                    and m.status in self._ELIGIBLE_MEMBERSHIP_STATUSES):
-                matched.setdefault(m.status, set()).add(m.team_id)
-        for status in self._ELIGIBLE_MEMBERSHIP_STATUSES:
-            teams = matched.get(status, ())
-            for side in sides:
-                if side in teams:
-                    return side
-        return None
+        m = self.resolve_membership(game, player)
+        return m.team_id if m is not None else None
+
+    def position_for_game(self, game, player) -> Position:
+        """The position ``player`` plays FOR ``game`` (#205 review blocker
+        2): the resolved ``SeasonRosterMembership.position`` — SEASON-
+        SCOPED, describing this stint, not the permanent Player row — for a
+        LeagueSeason-bound game, falling back to the permanent
+        ``Player.position`` when the game is unbound (no membership to
+        resolve, pre-#205 behavior) or the resolved membership itself
+        carries no position of its own (a legacy/backfilled row may be
+        ``None``; substituting a wrong season-scoped value would be worse
+        than the permanent fallback, and every substitute-facing read needs
+        SOME position to compute a slot type from)."""
+        if game.league_season_id:
+            m = self.resolve_membership(game, player)
+            if m is not None and m.position is not None:
+                return m.position
+        return player.position
 
     def _require_team_for_game(self, game, player) -> str:
         """``team_for_game`` or a NotEligibleError — the raising form the
@@ -817,17 +872,18 @@ class RosterService:
     def _players_for_game_team(self, game, team_id) -> List[Player]:
         """The candidate pool "players of ``team_id`` for ``game``" (#205
         cutover): for a LeagueSeason-bound game, every player holding an
-        eligible membership with that team in the game's Season; for an
-        unbound game, the permanent roster. Ordering is the caller's job."""
+        eligible membership with that team under the game's EXACT
+        ``league_season_id`` (the same primitive ``setup_service.py``'s
+        registration-scoped reads already use — never a Season-wide
+        derive-then-filter, which would conflate a sibling LeagueSeason of
+        the same Season); for an unbound game, the permanent roster.
+        Ordering is the caller's job."""
         if not game.league_season_id:
             return self.store.players_for_team(team_id)
-        season_id = self._game_season_id(game)
-        if season_id is None:
-            return []
         player_ids = {
-            m.player_id for m in self.store.memberships_for_season(season_id)
-            if (m.team_id == team_id
-                and m.status in self._ELIGIBLE_MEMBERSHIP_STATUSES)}
+            m.player_id for m in self.store.memberships_for_league_season_team(
+                game.league_season_id, team_id)
+            if m.status in self._ELIGIBLE_MEMBERSHIP_STATUSES}
         players = (self.store.get_player(pid) for pid in sorted(player_ids))
         return [p for p in players if p is not None]
 
@@ -968,7 +1024,9 @@ class RosterService:
             return "The roster for this game is locked."
         if self.store.roster_entry_for_player(game_id, player_id) is not None:
             return "You are already on the roster for this game."
-        needed = player.position.slot_type
+        # #205 review blocker 2: the season-scoped position for THIS game,
+        # not the permanent Player row — see position_for_game.
+        needed = self.position_for_game(game, player).slot_type
         if rstatus is None:
             rstatus = self.compute_roster_status(game_id, team_id)
         open_slots = (rstatus.open_goalie_slots if needed == SlotType.GOALIE
@@ -1087,7 +1145,12 @@ class RosterService:
                          and open_for.get(sub.slot_type, 0) > 0)
             rows.append({
                 "player_id": sub.player_id, "name": player.name,
-                "position": player.position.value,
+                # #205 review blocker 2: the position/slot_type PAIR must
+                # agree — read both off the enrolled SubstituteEnrollment
+                # itself (already season-scoped at enroll time, see
+                # enroll_substitute), never re-derive one from the
+                # permanent Player row and the other from the stint.
+                "position": sub.position.value,
                 "slot_type": sub.slot_type.value,
                 "status": sub.status.value,
                 "priority_rank": sub.priority_rank,
@@ -1126,10 +1189,13 @@ class RosterService:
             if self.substitute_block_reason(
                     player.id, game_id, rstatus=rstatus) is not None:
                 continue
+            # #205 review blocker 2: the season-scoped position for THIS
+            # game, not the permanent Player row — see position_for_game.
+            pos = self.position_for_game(game, player)
             rows.append({
                 "player_id": player.id, "name": player.name,
-                "position": player.position.value,
-                "slot_type": player.position.slot_type.value,
+                "position": pos.value,
+                "slot_type": pos.slot_type.value,
             })
         rows.sort(key=lambda r: (r["name"], r["player_id"]))
         return rows
