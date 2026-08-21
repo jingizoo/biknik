@@ -170,6 +170,38 @@ class CoachSubstituteActionsResolveThroughMembership(_CutoverContract,
                 Role.COACH, coach_scope,
                 f"/api/games/{gid}/substitutes/{pid}/add-to-roster", {},
                 api.store),
+            # #205 blocker 1 round-2 review finding: the first pass here
+            # only covered the (pid)-in-PATH substitute actions and the
+            # separate literal "add-candidate" -- enroll/withdraw take
+            # player_id in the BODY with no {pid} path segment at all
+            # (`/api/games/{gid}/substitutes/enroll`), a different URL
+            # shape the original whitelist regex never matched, so these
+            # two fell through to the stale-pointer fallback exactly like
+            # the pre-fix defect on every other action here.
+            "enroll": scope_violation(
+                Role.COACH, coach_scope,
+                f"/api/games/{gid}/substitutes/enroll",
+                {"player_id": pid}, api.store),
+            "withdraw": scope_violation(
+                Role.COACH, coach_scope,
+                f"/api/games/{gid}/substitutes/withdraw",
+                {"player_id": pid}, api.store),
+            # Same body-only-player_id shape, MANAGE_ROSTER instead of
+            # RESPOND_AVAILABILITY, but the identical fallback -- swept in
+            # alongside enroll/withdraw rather than left for a next round.
+            "roster/remove": scope_violation(
+                Role.COACH, coach_scope,
+                f"/api/games/{gid}/roster/remove",
+                {"player_id": pid}, api.store),
+            "roster/select": scope_violation(
+                Role.COACH, coach_scope,
+                f"/api/games/{gid}/roster/select",
+                {"player_ids": [pid]}, api.store),
+            "availability": scope_violation(
+                Role.COACH, coach_scope,
+                f"/api/games/{gid}/availability",
+                {"player_id": pid, "availability_status": "available"},
+                api.store),
         }
 
     def test_false_denial_on_a_legitimate_mover_is_fixed(self):
@@ -279,6 +311,28 @@ class ScopeAuthorizationPostgresTest(_Fixture, unittest.TestCase):
         self.assertIsNotNone(scope_violation(
             Role.COACH, coach_scope,
             f"/api/games/{game['id']}/substitutes/add-candidate",
+            {"player_id": over["id"]}, api.store))
+
+        # #205 blocker 1 round-2 review finding: enroll/withdraw take
+        # player_id in the BODY with no {pid} path segment
+        # (`/api/games/{gid}/substitutes/enroll`), a URL shape the
+        # substitute-action whitelist regex never matched -- pinned
+        # directly against real PostgreSQL, not just Memory/SQLite.
+        self.assertIsNone(scope_violation(
+            Role.COACH, coach_scope,
+            f"/api/games/{game['id']}/substitutes/enroll",
+            {"player_id": under["id"]}, api.store))
+        self.assertIsNotNone(scope_violation(
+            Role.COACH, coach_scope,
+            f"/api/games/{game['id']}/substitutes/enroll",
+            {"player_id": over["id"]}, api.store))
+        self.assertIsNone(scope_violation(
+            Role.COACH, coach_scope,
+            f"/api/games/{game['id']}/substitutes/withdraw",
+            {"player_id": under["id"]}, api.store))
+        self.assertIsNotNone(scope_violation(
+            Role.COACH, coach_scope,
+            f"/api/games/{game['id']}/substitutes/withdraw",
             {"player_id": over["id"]}, api.store))
 
 
@@ -416,6 +470,96 @@ class ScopeAuthorizationOverHttp(unittest.TestCase):
         status, body = self._post(
             c, f"/api/games/{self.game['id']}/substitutes/add-candidate",
             {"player_id": left["id"]})
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["error"]["code"], "forbidden", body)
+        self.assertEqual(body["error"]["message"],
+                         "A coach can only manage their own team's players.",
+                         body)
+
+    def test_coach_enroll_false_denial_is_fixed_over_http(self):
+        # #205 blocker 1 round-2 review finding: substitutes/enroll takes
+        # player_id in the BODY, no {pid} path segment -- a URL shape the
+        # first-pass whitelist regex never matched, so a coach managing a
+        # legitimate Mover (real membership HOME, stale pointer THIRD) was
+        # wrongly denied here exactly like the already-fixed actions.
+        mover = self.f._pointer_only_player(
+            self.api, self.teams["third"]["id"], "HTTP EnrollMover")
+        self.f._membership(self.api, mover["id"], self.ls_id,
+                           self.teams["home"]["id"])
+        self.api.accounts.create_account(
+            "httpenroll1", "demo", "coach",
+            scope={"team_id": self.teams["home"]["id"]}, actor_id="test_seed")
+        c = self._login("httpenroll1")
+        status, body = self._post(
+            c, f"/api/games/{self.game['id']}/substitutes/enroll",
+            {"player_id": mover["id"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body.get("status"), "enrolled", body)
+
+    def test_coach_enroll_symmetric_over_grant_is_closed_over_http(self):
+        # The reconfirmed pre-fix bypass: HOME coach, target player's
+        # permanent pointer HOME (stale), real membership AWAY (the genuine
+        # OPPOSING side of the same game) -- pre-fix this was HTTP 200,
+        # silently enrolling the player as an AWAY substitute on a HOME
+        # coach's say-so. enroll_substitute's own eligibility check
+        # (team_for_game is not None) does NOT catch this on its own --
+        # AWAY is a real, eligible side of the game -- so this is a pure
+        # scope_violation gap, not masked by a downstream business refusal.
+        mover = self.f._pointer_only_player(
+            self.api, self.teams["home"]["id"], "HTTP EnrollOverGrant")
+        self.f._membership(self.api, mover["id"], self.ls_id,
+                           self.teams["away"]["id"])
+        self.api.accounts.create_account(
+            "httpenroll2", "demo", "coach",
+            scope={"team_id": self.teams["home"]["id"]}, actor_id="test_seed")
+        c = self._login("httpenroll2")
+        status, body = self._post(
+            c, f"/api/games/{self.game['id']}/substitutes/enroll",
+            {"player_id": mover["id"]})
+        self.assertEqual(status, 403, body)
+        self.assertEqual(body["error"]["code"], "forbidden", body)
+        self.assertEqual(body["error"]["message"],
+                         "A coach can only manage their own team's players.",
+                         body)
+
+    def test_coach_withdraw_false_denial_is_fixed_over_http(self):
+        mover = self.f._pointer_only_player(
+            self.api, self.teams["third"]["id"], "HTTP WithdrawMover")
+        self.f._membership(self.api, mover["id"], self.ls_id,
+                           self.teams["home"]["id"])
+        # Facade enroll (unscoped, matches the existing false-denial cross-
+        # check pattern) to give this Mover something to withdraw.
+        enrolled = self.api.enroll_substitute(self.game["id"], mover["id"])
+        self.assertEqual(enrolled.get("status"), "enrolled", enrolled)
+        self.api.accounts.create_account(
+            "httpwithdraw1", "demo", "coach",
+            scope={"team_id": self.teams["home"]["id"]}, actor_id="test_seed")
+        c = self._login("httpwithdraw1")
+        status, body = self._post(
+            c, f"/api/games/{self.game['id']}/substitutes/withdraw",
+            {"player_id": mover["id"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body.get("status"), "withdrawn", body)
+
+    def test_coach_withdraw_symmetric_over_grant_is_closed_over_http(self):
+        # Same reconfirmed bypass as enroll, on withdraw: withdraw_substitute
+        # itself checks NOTHING about which team the caller represents --
+        # only that an active enrollment exists -- so pre-fix a HOME coach
+        # could unilaterally withdraw an AWAY player's real substitute
+        # enrollment on the strength of a stale HOME pointer alone.
+        mover = self.f._pointer_only_player(
+            self.api, self.teams["home"]["id"], "HTTP WithdrawOverGrant")
+        self.f._membership(self.api, mover["id"], self.ls_id,
+                           self.teams["away"]["id"])
+        enrolled = self.api.enroll_substitute(self.game["id"], mover["id"])
+        self.assertEqual(enrolled.get("status"), "enrolled", enrolled)
+        self.api.accounts.create_account(
+            "httpwithdraw2", "demo", "coach",
+            scope={"team_id": self.teams["home"]["id"]}, actor_id="test_seed")
+        c = self._login("httpwithdraw2")
+        status, body = self._post(
+            c, f"/api/games/{self.game['id']}/substitutes/withdraw",
+            {"player_id": mover["id"]})
         self.assertEqual(status, 403, body)
         self.assertEqual(body["error"]["code"], "forbidden", body)
         self.assertEqual(body["error"]["message"],

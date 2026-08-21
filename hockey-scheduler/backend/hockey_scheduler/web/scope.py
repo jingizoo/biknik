@@ -32,19 +32,31 @@ _SUB_ACTION = re.compile(
 _ASSIGN_RESPOND = re.compile(
     r"^/api/officials/assignments/([^/]+)/(?:accept|decline)$")
 _GAME_ACTION = re.compile(r"^/api/games/[^/]+/(.+)$")
-# Every coach-initiated HTTP shape of the #205 substitute workflow that
-# targets one player on ONE specific game — captures the game id so the
-# COACH branch of `scope_violation` below can resolve that player's team
-# through the SAME game-scoped membership resolver `team_for_game` provides,
-# instead of the permanent `Player.team_id` pointer (#205 blocker 1: a
-# mid-season transfer left that pointer stale, wrongly denying a coach
-# managing a legitimate Mover already resolved onto their team for this
-# exact game). `accept`/`decline` are included for uniformity with
-# `_SUB_ACTION` above (self-service Player actions; harmless here since the
-# COACH branch is the only consumer).
-_GAME_SUB_ACTION_GID = re.compile(
-    r"^/api/games/([^/]+)/substitutes/(?:add-candidate"
-    r"|[^/]+/(?:offer|accept|decline|add-to-roster))$")
+# EVERY coach-initiated HTTP action on a specific game — captures the game
+# id so the COACH branch of `scope_violation` below can resolve a target
+# player's team through the SAME game-scoped membership resolver
+# `team_for_game` provides, instead of the permanent `Player.team_id`
+# pointer (#205 blocker 1: a mid-season transfer left that pointer stale,
+# wrongly denying a coach managing a legitimate Mover already resolved onto
+# their team for this exact game — and symmetrically wrongly allowing a
+# coach to manage a player whose membership has since moved off their team).
+#
+# Deliberately matches ANY `/api/games/{gid}/...` action, not a curated list
+# of substitute-workflow verbs: a first pass here only listed
+# substitutes/add-candidate and substitutes/{pid}/(offer|accept|decline|
+# add-to-roster), which missed substitutes/enroll and substitutes/withdraw
+# (same COACH branch, same player_id-in-body shape, RESPOND_AVAILABILITY
+# permission — a live bypass an independent review round caught: a HOME
+# coach could enroll/withdraw an AWAY player's real Mover membership on the
+# stale HOME pointer) — and would have kept missing `roster/remove` and
+# `roster/select` too (also player_id/player_ids-in-body, MANAGE_ROSTER,
+# same gate, same fallback). `team_for_game` itself already degrades
+# correctly for a game with NO LeagueSeason binding (falls back to the
+# permanent pointer scoped to the game's two sides — see its own
+# docstring), so widening this match costs nothing on that path; it only
+# stops the fallback from firing on real, bound games where a whitelist
+# entry was simply never added.
+_GAME_ACTION_GID = re.compile(r"^/api/games/([^/]+)/.+$")
 
 # Game-wide actions a scoped coach may NOT perform — they flip whole-game state
 # (game.locked / game.cancelled) affecting the other team, and carry no target
@@ -105,8 +117,8 @@ def scope_violation(role, scope, path, body, store, *,
         # already resolved onto their team for this game, and symmetrically
         # wrongly ALLOW a coach to manage a player whose membership has since
         # moved OFF their team even though the stale pointer still matches.
-        sub_match = _GAME_SUB_ACTION_GID.match(path)
-        game = store.get_game(sub_match.group(1)) if sub_match else None
+        gid_match = _GAME_ACTION_GID.match(path)
+        game = store.get_game(gid_match.group(1)) if gid_match else None
         for pid in _player_ids(path, body):
             player = store.get_player(pid)
             if player is None:
