@@ -561,12 +561,29 @@ def _break_team_league_mismatch(api, fx, m):
     return "membership_league_mismatch"
 
 
+def _break_team_league_missing(api, fx, m):
+    """#205 review round 3 blocker 3 — the Team's permanent League is GONE,
+    not merely different. The guard used to read ``if team.league_id and
+    ls.league_id != team.league_id``, so this shape SKIPPED the coherence
+    check instead of failing it, and every revival below succeeded on it."""
+    team = api.store.get_team(fx["team"]["id"])
+    team.league_id = None
+    if isinstance(api.store, SqlStore):
+        with api.store.transaction():
+            api.store.save_team(team)
+    else:
+        api.store.save_team(team)
+    assert api.store.get_team(fx["team"]["id"]).league_id is None
+    return "membership_league_mismatch"
+
+
 _BREAKERS = {
     "registration_inactive": _break_registration_inactive,
     "missing_parent_team": _break_team_missing,
     "missing_parent_league_season": _break_league_season_missing,
     "missing_parent_player": _break_player_missing,
     "team_league_mismatch": _break_team_league_mismatch,
+    "team_league_missing": _break_team_league_missing,
 }
 
 
@@ -591,8 +608,8 @@ class ParkedRevivalSpineTest(unittest.TestCase):
 
     THE MATRIX, in full — the owner asked for the whole thing, not a sample:
     3 stores (Memory, SQLite, PostgreSQL) x 2 parked sources (inactive,
-    injured) x 3 targets (applicant, affiliate, active) x 5 broken-spine
-    shapes = 90 refusals, each asserting the stable reason AND zero writes
+    injured) x 3 targets (applicant, affiliate, active) x 6 broken-spine
+    shapes = 108 refusals, each asserting the stable reason AND zero writes
     across ALL THREE write surfaces (the membership row, the per-membership
     event history, and the global audit log) — a caught exception alone does
     not prove nothing was written, this module's own standing rule.
@@ -671,10 +688,13 @@ class ParkedRevivalSpineTest(unittest.TestCase):
                             checked += 1
             finally:
                 self._close(label, store)
-        # 2 parked x 3 targets x 5 spines = 30 per store. Memory + SQLite
-        # always; PostgreSQL when configured. Pinned so a store silently
-        # dropping out of self._stores() cannot shrink the matrix unnoticed.
-        expected = 30 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        # 2 parked x 3 targets x 6 spines = 36 per store (the sixth spine is
+        # blocker 3's MISSING Team.league_id). Memory + SQLite always;
+        # PostgreSQL when configured. Pinned against the ENVIRONMENT so a
+        # store silently dropping out of self._stores() cannot shrink the
+        # matrix unnoticed -- never against len(_BREAKERS) or the store
+        # list, which would move with the loop and could not fire.
+        expected = 36 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
         self.assertEqual(checked, expected)
 
     def test_intact_spine_revival_succeeds_from_every_parked_status(self):
@@ -785,6 +805,157 @@ class ParkedRevivalSpineTest(unittest.TestCase):
                             (label, target, conflict))
             finally:
                 self._close(label, store)
+
+
+class CreateSpineMissingLeagueTest(unittest.TestCase):
+    """#205 review round 3 blocker 3 — ``create_season_roster_membership``
+    must REFUSE to mint a membership on a Team with NO permanent League,
+    not skip the check.
+
+    Both membership League guards were spelled ``if team.league_id and
+    ls.league_id != team.league_id``. The leading conjunct is a FALSY-SKIP:
+    a league-less Team never reached the comparison, so the guard passed by
+    omission. That is the service-layer twin of the NULL evasion blocker 1
+    fixed in migration 059's preflight, where ``a != b`` evaluated UNKNOWN
+    (not TRUE) against NULL and the row was filtered out — and it left the
+    two layers openly disagreeing: 059 REFUSES to backfill a league-less
+    Team while the live service happily minted memberships on one.
+
+    Reproduced on this branch's prior head 3ee1952 with ``Team.league_id``
+    NULLed out of band: 12/12 probes succeeded across Memory, SQLite and
+    PostgreSQL — ``create``, and revival of a parked membership into
+    applicant, affiliate AND active — each writing a status, a membership
+    event and an audit row onto a League-less spine.
+
+    The REVIVAL half of that matrix lives in ParkedRevivalSpineTest above
+    (its ``team_league_missing`` breaker). This class covers the CREATE
+    half: 3 stores x 3 spine-validated statuses, each asserting the stable
+    ``membership_league_mismatch`` reason and ZERO writes on all three
+    surfaces (no membership row, no event, no audit) — plus the intact-
+    spine controls proving create still SUCCEEDS when the spine is whole.
+    A guard that refused everything would pass the refusal half alone.
+    """
+
+    def _stores(self):
+        yield "memory", InMemoryStore()
+        yield "sqlite", SqlStore(":memory:")
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            store = SqlStore(url)
+            store.reset_schema()
+            yield "postgres", store
+
+    def _close(self, label, store):
+        if label == "postgres":
+            store.reset_schema()
+        if isinstance(store, SqlStore):
+            store.close()
+
+    def _strip_league(self, api, fx):
+        team = api.store.get_team(fx["team"]["id"])
+        team.league_id = None
+        if isinstance(api.store, SqlStore):
+            with api.store.transaction():
+                api.store.save_team(team)
+        else:
+            api.store.save_team(team)
+        self.assertIsNone(api.store.get_team(fx["team"]["id"]).league_id)
+
+    def _surfaces(self, api, fx):
+        """All THREE write surfaces, keyed to this fixture's player: any
+        membership row for them, every event on any such row, and the
+        global setup audit log."""
+        rows = [m for m in api.store.all_season_roster_memberships()
+                if m.player_id == fx["player"]["id"]]
+        events = sum(len(api.store.events_for_membership(m.id)) for m in rows)
+        return (len(rows), events, len(api.store.all_setup_audit()))
+
+    def test_league_less_team_refuses_create_zero_write(self):
+        checked = 0
+        for label, store in self._stores():
+            try:
+                for status in _REVIVE_TARGETS:
+                    with self.subTest(backend=label, status=status):
+                        api = ApiService(store)
+                        fx = _fixture(api)
+                        self._strip_league(api, fx)
+                        before = self._surfaces(api, fx)
+                        self.assertEqual(before[0], 0, (label, status))
+                        res = api.create_season_roster_membership(
+                            fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
+                            status=status, jersey_number=None, actor_id=ADMIN)
+                        self.assertIn("error", res, (label, status, res))
+                        self.assertEqual(res["error"]["details"]["reason"],
+                                         "membership_league_mismatch",
+                                         (label, status, res))
+                        # The details name the missing key honestly rather
+                        # than omitting it.
+                        self.assertIsNone(
+                            res["error"]["details"]["team_league_id"],
+                            (label, status, res))
+                        # ZERO WRITE on all three surfaces.
+                        self.assertEqual(self._surfaces(api, fx), before,
+                                         (label, status))
+                    checked += 1
+            finally:
+                self._close(label, store)
+        # 3 statuses per store. Pinned against the ENVIRONMENT, the way
+        # ParkedRevivalSpineTest pins its own matrix -- never against the
+        # length of the list the loop iterates, which moves with it and
+        # could never fire.
+        expected = 3 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
+
+    def test_intact_spine_create_still_succeeds(self):
+        """The control: the guard must refuse a BROKEN spine, not refuse
+        everything. With the Team's League untouched, create still succeeds
+        for every spine-validated status and writes its event + audit row."""
+        checked = 0
+        for label, store in self._stores():
+            try:
+                for status in _REVIVE_TARGETS:
+                    with self.subTest(backend=label, status=status):
+                        api = ApiService(store)
+                        fx = _fixture(api)
+                        res = api.create_season_roster_membership(
+                            fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
+                            status=status, jersey_number=None, actor_id=ADMIN)
+                        self.assertNotIn("error", res, (label, status, res))
+                        self.assertEqual(res["status"], status,
+                                         (label, status))
+                        rows, events, _ = self._surfaces(api, fx)
+                        self.assertEqual((rows, events), (1, 1),
+                                         (label, status))
+                    checked += 1
+            finally:
+                self._close(label, store)
+        expected = 3 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
+
+    def test_both_sides_missing_is_a_violation_not_agreement(self):
+        """Team.league_id AND LeagueSeason.league_id both missing is TWO
+        absent scope keys, not agreement — the exact case ``IS DISTINCT
+        FROM`` would wave through, and the reason
+        ``integrity_checks._MISSING_OR_UNEQUAL`` is spelled out longhand
+        (see its docstring). MEMORY ONLY, deliberately: SQLite and
+        PostgreSQL both declare ``league_seasons.league_id`` NOT NULL, so
+        this shape is unreachable there — the probe that established that
+        got ``IntegrityConflictError: A required value is missing`` from
+        both engines rather than a planted row."""
+        api = ApiService(InMemoryStore())
+        fx = _fixture(api)
+        self._strip_league(api, fx)
+        ls = api.store.get_league_season(fx["ls_id"])
+        ls.league_id = None
+        api.store.save_league_season(ls)
+        before = self._surfaces(api, fx)
+        res = api.create_season_roster_membership(
+            fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
+            status="applicant", jersey_number=None, actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "membership_league_mismatch", res)
+        self.assertEqual(self._surfaces(api, fx), before)
+
 
 _PG_SKIP = ("PostgreSQL not configured (TEST_DATABASE_URL) or psycopg "
             "missing — the #205 review round 1 finding 2 parent-mutation "

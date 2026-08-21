@@ -123,6 +123,32 @@ def _blank(value) -> bool:
     return value is None or not str(value).strip()
 
 
+def _missing_or_unequal(a, b) -> bool:
+    """A scope-spine key is BROKEN when EITHER side is MISSING or the two
+    DISAGREE (#205 review round 3 blocker 3) — the Python twin of
+    ``integrity_checks._MISSING_OR_UNEQUAL``, the SQL predicate migration
+    059's preflight applies to this very invariant.
+
+    The membership spine guards used to be spelled ``if team.league_id and
+    ls.league_id != team.league_id``. The leading conjunct is a FALSY-SKIP:
+    a Team with NO permanent League skipped the coherence check entirely
+    rather than failing it — the exact service-layer analogue of the NULL
+    evasion blocker 1 fixed in the preflight, where ``a != b`` evaluated
+    UNKNOWN (not TRUE) against a NULL and the row was filtered out. The two
+    layers then disagreed: 059 REFUSED to backfill a league-less Team while
+    the live service happily minted and revived memberships on one.
+
+    ``not a`` rather than ``a is None`` deliberately: the guards this
+    replaces were truthiness gates, so an empty-string id was skipped too.
+    Treating both shapes as MISSING is strictly stronger than what shipped
+    and keeps one rule for "this key is not there".
+
+    Both-missing is a violation, not agreement — the same conclusion
+    ``_MISSING_OR_UNEQUAL``'s own docstring reaches about why
+    ``IS DISTINCT FROM`` is the wrong operator for a scope spine."""
+    return not a or not b or a != b
+
+
 def _clean(value) -> str:
     return str(value).strip()
 
@@ -2615,10 +2641,13 @@ class SetupService:
                 {"reason": "membership_league_season_missing",
                  "membership_id": membership.id,
                  "league_season_id": membership.league_season_id})
-        if team.league_id and ls.league_id != team.league_id:
+        # #205 review round 3 blocker 3 — a MISSING ``team.league_id`` is a
+        # spine violation, not an exemption. See ``_missing_or_unequal``.
+        if _missing_or_unequal(team.league_id, ls.league_id):
             raise ValidationError(
-                "This membership's Team has since moved to a different "
-                "League; it can no longer be reactivated as-is.",
+                "This membership's Team no longer sits in this League "
+                "season's League (its League is missing, or has changed); "
+                "it can no longer be reactivated as-is.",
                 {"reason": "membership_league_mismatch",
                  "membership_id": membership.id, "team_id": team.id,
                  "team_league_id": team.league_id,
@@ -2745,9 +2774,12 @@ class SetupService:
         player = self.store.get_player_for_update(player_id)
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
-        if team.league_id and ls.league_id != team.league_id:
+        # #205 review round 3 blocker 3 — a MISSING ``team.league_id`` is a
+        # spine violation, not an exemption. See ``_missing_or_unequal``.
+        if _missing_or_unequal(team.league_id, ls.league_id):
             raise ValidationError(
-                "A membership must sit on the Team's own League's season.",
+                "A membership must sit on the Team's own League's season; "
+                "the Team's League is missing, or is a different one.",
                 {"reason": "membership_league_mismatch", "team_id": team_id,
                  "team_league_id": team.league_id,
                  "league_season_league_id": ls.league_id})
