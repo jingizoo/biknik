@@ -25,6 +25,7 @@ from ..domain import (
     GameType,
     IceSlotStatus,
     IceSlotType,
+    MembershipStatus,
     NotificationAudience,
     NotificationChannel,
     NotificationKind,
@@ -94,6 +95,11 @@ from ..services.setup_service import (
     _blank as _import_blank,
     _clean as _import_clean,
     _no_club as _import_no_club,
+    # #205 Slice A: the membership partial-update facade passes the service's
+    # own omitted-argument sentinel through verbatim, so "field not provided"
+    # and "explicit None clears the field" can never be conflated between the
+    # two layers (same contract update_player already uses).
+    _UNSET as _SETUP_UNSET,
 )
 from ..services.scheduler import (
     _active_game_slot_pairs,
@@ -11508,6 +11514,89 @@ class ApiService:
             row["venue_name"] = names.get(a.venue_id)
             rows.append(row)
         return {"venue_access": rows}
+
+    # -- season roster memberships (#205 Slice A) ---------------------------
+    # Facade only: these are not yet wired to HTTP routes. Endpoint wiring —
+    # routes, authz/scope resolution per #202's contract, and the
+    # api-contract.md entries — lands with the consumer-cutover slice, per
+    # the project layering rule (api/ maps 1:1 to future REST endpoints and
+    # a web framework is wired on top later without touching domain logic).
+
+    @catch
+    def create_season_roster_membership(
+            self, player_id: str, league_season_id: str, team_id: str,
+            status: str = MembershipStatus.ACTIVE.value,
+            position: Optional[str] = None,
+            jersey_number=_SETUP_UNSET, shoots=_SETUP_UNSET,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_season_roster_membership(
+            player_id, league_season_id, team_id, status=status,
+            position=position, jersey_number=jersey_number, shoots=shoots,
+            reason=reason, actor_id=actor_id))
+
+    @catch
+    def set_season_roster_membership_status(
+            self, membership_id: str, status: str,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> dict:
+        # #205 review round 2 (owner product ruling, overriding round 1
+        # finding 5's shipped "actor_id + reason" floor): a terminal target
+        # (released/transferred) is UNCONDITIONALLY refused here — a
+        # NotAuthorizedError @catch turns into {"error": {"code":
+        # "forbidden", ...}} below, never satisfiable by any actor_id or
+        # reason value. The authorized transfer/release/deadline-policy/
+        # override workflow #212 places in a later #205 slice is what will
+        # eventually replace this refusal. See SetupService.
+        # set_season_roster_membership_status's docstring.
+        return _serialize(self.setup.set_season_roster_membership_status(
+            membership_id, status, reason=reason, actor_id=actor_id))
+
+    @catch
+    def update_season_roster_membership(
+            self, membership_id: str, *, position=_SETUP_UNSET,
+            jersey_number=_SETUP_UNSET, shoots=_SETUP_UNSET,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.update_season_roster_membership(
+            membership_id, position=position, jersey_number=jersey_number,
+            shoots=shoots, reason=reason, actor_id=actor_id))
+
+    @catch
+    def get_season_roster_membership(self, membership_id: str) -> dict:
+        membership = self.store.get_season_roster_membership(membership_id)
+        if membership is None:
+            raise NotFoundError(f"Membership {membership_id} not found.")
+        return _serialize(membership)
+
+    @catch
+    def list_season_roster_memberships(
+            self, season_id: Optional[str] = None,
+            league_season_id: Optional[str] = None,
+            team_id: Optional[str] = None,
+            player_id: Optional[str] = None) -> dict:
+        """Memberships by exactly one scope axis: a Season, a
+        (LeagueSeason, Team) pair, or a player. An unfiltered dump of every
+        membership across all Seasons is deliberately not offered."""
+        if season_id:
+            rows = self.store.memberships_for_season(season_id)
+        elif league_season_id and team_id:
+            rows = self.store.memberships_for_league_season_team(
+                league_season_id, team_id)
+        elif player_id:
+            rows = self.store.memberships_for_player(player_id)
+        else:
+            raise ValidationError(
+                "Provide season_id, player_id, or league_season_id + team_id.",
+                {"reason": "membership_filter_required"})
+        return {"memberships": [_serialize(m) for m in rows]}
+
+    @catch
+    def list_season_roster_membership_events(self, membership_id: str) -> dict:
+        if self.store.get_season_roster_membership(membership_id) is None:
+            raise NotFoundError(f"Membership {membership_id} not found.")
+        return {"events": [_serialize(e) for e in
+                           self.store.events_for_membership(membership_id)]}
 
     @catch
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,

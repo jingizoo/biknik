@@ -34,6 +34,7 @@ from ..domain import (
     FactoryResetLock,
     League,
     LeagueSeason,
+    MembershipStatus,
     Program,
     Notification,
     NotificationDelivery,
@@ -50,6 +51,8 @@ from ..domain import (
     ScheduleScenario,
     Season,
     SeasonCopyForwardCommit,
+    SeasonRosterMembership,
+    SeasonRosterMembershipEvent,
     SeasonTeamRegistration,
     SeasonVenueAccess,
     SensitiveFieldCategory,
@@ -88,6 +91,9 @@ class InMemoryStore:
         self.season_team_registrations: Dict[str, SeasonTeamRegistration] = {}
         self.season_copy_forward_commits: Dict[
             str, SeasonCopyForwardCommit] = {}
+        self.season_roster_memberships: Dict[str, SeasonRosterMembership] = {}
+        self.season_roster_membership_events: Dict[
+            str, SeasonRosterMembershipEvent] = {}
         self.team_league_migration_decisions: Dict[
             str, TeamLeagueMigrationDecision] = {}
         self.season_venue_access: Dict[str, SeasonVenueAccess] = {}
@@ -326,16 +332,25 @@ class InMemoryStore:
                 "current": True}
 
     # -- id generation -----------------------------------------------------
+    def next_seq(self, prefix: str) -> int:
+        """Increment and return the RAW per-prefix counter (#205 review round
+        1 finding 4) — the same counter :meth:`next_id` formats into a
+        string id, exposed here so a caller that also needs a genuinely
+        sortable integer (e.g. ``SeasonRosterMembershipEvent.seq``) can mint
+        both from ONE atomic step rather than drawing two different
+        numbers."""
+        with self._lock:
+            value = self._counters.get(prefix, 0) + 1
+            self._counters[prefix] = value
+            return value
+
     def next_id(self, prefix: str) -> str:
         # itertools.count's next() was a single atomic step; a plain
         # read-modify-write is not, and next_id() may be called outside a
         # transaction on the threaded server, so serialize it to avoid two
         # requests handing out the same id. The lock is the same re-entrant one
         # transaction() holds, so calling this from within a transaction is safe.
-        with self._lock:
-            value = self._counters.get(prefix, 0) + 1
-            self._counters[prefix] = value
-            return f"{prefix}_{value}"
+        return f"{prefix}_{self.next_seq(prefix)}"
 
     # -- teams / players ---------------------------------------------------
     def add_team(self, team: Team) -> Team:
@@ -828,6 +843,91 @@ class InMemoryStore:
         back-compat convenience)."""
         return next((r for r in self.registrations_for_season(season_id)
                      if r.team_id == team_id), None)
+
+    # -- season roster memberships (#205 Slice A) --------------------------
+    def add_season_roster_membership(
+            self, m: SeasonRosterMembership) -> SeasonRosterMembership:
+        self.season_roster_memberships[m.id] = m
+        return m
+
+    def get_season_roster_membership(
+            self, membership_id: str) -> Optional[SeasonRosterMembership]:
+        return self.season_roster_memberships.get(membership_id)
+
+    def get_season_roster_membership_for_update(
+            self, membership_id: str) -> Optional[SeasonRosterMembership]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.season_roster_memberships.get(membership_id)
+
+    def save_season_roster_membership(
+            self, m: SeasonRosterMembership) -> SeasonRosterMembership:
+        self.season_roster_memberships[m.id] = m
+        return m
+
+    def all_season_roster_memberships(self) -> List[SeasonRosterMembership]:
+        return list(self.season_roster_memberships.values())
+
+    def memberships_for_player(
+            self, player_id: str) -> List[SeasonRosterMembership]:
+        return [m for m in self.season_roster_memberships.values()
+                if m.player_id == player_id]
+
+    def memberships_for_season(
+            self, season_id: str) -> List[SeasonRosterMembership]:
+        return [m for m in self.season_roster_memberships.values()
+                if m.season_id == season_id]
+
+    def memberships_for_league_season_team(
+            self, league_season_id: str,
+            team_id: str) -> List[SeasonRosterMembership]:
+        return [m for m in self.season_roster_memberships.values()
+                if m.league_season_id == league_season_id
+                and m.team_id == team_id]
+
+    def active_memberships_for_player_in_season(
+            self, player_id: str,
+            season_id: str) -> List[SeasonRosterMembership]:
+        """Every AUTHORITATIVE (active) membership at this (player, Season)
+        key. Normally 0 or 1 — SQL's ``ux_srm_active_player_season`` partial
+        unique index (migration 059) guarantees it there — but this store has
+        no equivalent enforcement on add/save, so returning the list lets
+        callers detect legacy/corrupted multiplicity instead of assuming a
+        bare lookup is unambiguous (``registrations_for_team_in_league_season``
+        precedent, #331 round 19)."""
+        return [m for m in self.season_roster_memberships.values()
+                if m.player_id == player_id and m.season_id == season_id
+                and m.status is MembershipStatus.ACTIVE]
+
+    def open_memberships_for_player_in_league_season(
+            self, player_id: str,
+            league_season_id: str) -> List[SeasonRosterMembership]:
+        """Every NON-terminal membership at this (player, LeagueSeason) key —
+        the open stint(s); released/transferred rows are history."""
+        return [m for m in self.season_roster_memberships.values()
+                if m.player_id == player_id
+                and m.league_season_id == league_season_id
+                and not m.status.is_terminal]
+
+    # Append-only (#205): events have add + list only — no update, no delete.
+    def add_season_roster_membership_event(
+            self, event: SeasonRosterMembershipEvent
+    ) -> SeasonRosterMembershipEvent:
+        self.season_roster_membership_events[event.id] = event
+        return event
+
+    def events_for_membership(
+            self, membership_id: str) -> List[SeasonRosterMembershipEvent]:
+        # Ordered by the real monotonic ``seq`` (#205 review round 1 finding
+        # 4), not dict insertion order: the two happen to coincide today, but
+        # sorting explicitly makes this store's contract match SqlStore's
+        # (``ORDER BY seq``) instead of relying on an incidental Python
+        # dict-ordering guarantee no docstring here actually promised.
+        return sorted(
+            (e for e in self.season_roster_membership_events.values()
+             if e.membership_id == membership_id),
+            key=lambda e: e.seq)
 
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(

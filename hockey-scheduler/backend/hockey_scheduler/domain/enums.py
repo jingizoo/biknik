@@ -36,6 +36,37 @@ class SeasonStatus(str, Enum):
     ARCHIVED = "archived"
 
 
+class MembershipStatus(str, Enum):
+    """Lifecycle state of a :class:`SeasonRosterMembership` (#205 Slice A).
+
+    ``active`` is the AUTHORITATIVE state: at most one active membership per
+    (player, Season) exists — enforced by the service layer and by migration
+    059's partial unique index. ``affiliate`` is the governed call-up
+    exception the epic names: it marks secondary participation and is
+    deliberately outside that uniqueness rule. ``applicant`` is a pending
+    request that occupies no roster place yet; ``inactive`` (parked, the
+    membership-scoped successor of #270's ``Player.is_active``) and
+    ``injured`` (temporarily unavailable) keep the stint open without being
+    authoritative-active. ``released`` and ``transferred`` are TERMINAL: the
+    stint ended, the row becomes immutable history (a later stint is a new
+    row), and only the future #205 correction workflow — with reason + audit
+    — may ever revisit one.
+    """
+    APPLICANT = "applicant"
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    INJURED = "injured"
+    RELEASED = "released"
+    TRANSFERRED = "transferred"
+    AFFILIATE = "affiliate"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True when the stint has ended and the row is immutable history."""
+        return self in {MembershipStatus.RELEASED,
+                        MembershipStatus.TRANSFERRED}
+
+
 class SlotStatus(str, Enum):
     FULL = "full"
     OPEN = "open"

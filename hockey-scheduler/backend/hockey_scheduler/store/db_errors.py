@@ -63,6 +63,11 @@ _CONCURRENCY_MESSAGE = (
 
 _CONCURRENCY_REASONS = frozenset(_PG_CONCURRENCY.values())
 _ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_players_active_team_jersey"
+# Migration 059 (#205 Slice A) partial unique indexes.
+_SRM_ACTIVE_PLAYER_SEASON_CONSTRAINT = "ux_srm_active_player_season"
+_SRM_ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_srm_active_team_jersey"
+# #205 review round 1 finding 1.
+_SRM_OPEN_PLAYER_LEAGUE_SEASON_CONSTRAINT = "ux_srm_open_player_league_season"
 _ACTIVE_ICE_SLOT_CONSTRAINT = "ux_games_active_ice_slot"
 _ICE_SLOT_TIME_CONSTRAINT = "ux_ice_slots_rink_time"
 _COPY_FORWARD_FINGERPRINT_CONSTRAINT = \
@@ -117,6 +122,54 @@ def translate_registration_number_exception(
         "registration_number is already used by another player on this team.",
         details={"reason": "duplicate_registration_number",
                  "team_id": team_id, "registration_number": registration_number})
+
+
+def translate_membership_conflict_exception(
+        exc: BaseException, membership) -> Optional[DomainError]:
+    """Translate migration 059's partial-unique violations with domain-safe
+    context (#205 Slice A).
+
+    The membership store write site knows the attempted row, so a race lost to
+    any of the three indexes — one authoritative active membership per
+    (player, Season); one active jersey per (LeagueSeason, Team); one OPEN
+    (non-terminal) stint per (player, LeagueSeason), #205 review round 1
+    finding 1 — surfaces as the SAME stable conflict the service pre-checks
+    raise, without exposing driver text, SQL, or constraint names. Mirrors
+    :func:`translate_player_jersey_exception`.
+    """
+    if isinstance(exc, DomainError):
+        return None
+    if _is_unique_violation_on(
+            exc, _SRM_ACTIVE_PLAYER_SEASON_CONSTRAINT,
+            ("season_roster_memberships.player_id",
+             "season_roster_memberships.season_id")):
+        return IntegrityConflictError(
+            "Player already has an active membership this season.",
+            details={"reason": "membership_active_conflict",
+                     "player_id": membership.player_id,
+                     "season_id": membership.season_id})
+    if _is_unique_violation_on(
+            exc, _SRM_ACTIVE_TEAM_JERSEY_CONSTRAINT,
+            ("season_roster_memberships.team_id",
+             "season_roster_memberships.jersey_number")):
+        return IntegrityConflictError(
+            f"Jersey number {membership.jersey_number} is already worn by an "
+            "active membership on this team this season.",
+            details={"reason": "duplicate_membership_jersey_number",
+                     "league_season_id": membership.league_season_id,
+                     "team_id": membership.team_id,
+                     "jersey_number": membership.jersey_number})
+    if _is_unique_violation_on(
+            exc, _SRM_OPEN_PLAYER_LEAGUE_SEASON_CONSTRAINT,
+            ("season_roster_memberships.player_id",
+             "season_roster_memberships.league_season_id")):
+        return IntegrityConflictError(
+            "Player already has an open membership on this league season; "
+            "update or end it instead of creating another.",
+            details={"reason": "membership_open_conflict",
+                     "player_id": membership.player_id,
+                     "league_season_id": membership.league_season_id})
+    return None
 
 
 def translate_reassignment_fk_exception(
@@ -402,6 +455,25 @@ def _is_named_fk_violation(exc: BaseException, constraint: str) -> bool:
         return getattr(diag, "constraint_name", None) == constraint
     if isinstance(exc, sqlite3.IntegrityError):
         return "FOREIGN KEY constraint failed" in str(exc)
+    return False
+
+
+def _is_unique_violation_on(exc: BaseException, constraint: str,
+                            sqlite_columns) -> bool:
+    """A unique violation for one specific partial index (#205 Slice A).
+
+    PostgreSQL carries the index name authoritatively on ``.diag``; SQLite
+    names only the columns, so the caller supplies the column list that
+    identifies its index unambiguously within the table. Same detection split
+    as :func:`_is_active_team_jersey_violation`, generalized."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate == "23505":
+        diag = getattr(exc, "diag", None)
+        return getattr(diag, "constraint_name", None) == constraint
+    if isinstance(exc, sqlite3.IntegrityError):
+        text = str(exc)
+        return ("UNIQUE constraint failed" in text
+                and all(col in text for col in sqlite_columns))
     return False
 
 
