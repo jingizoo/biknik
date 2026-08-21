@@ -10,7 +10,7 @@ use case calls for it, emits a :class:`NotificationEvent`.
 
 import functools
 from datetime import datetime, timezone
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from ..domain import (
     AuditAction,
@@ -288,8 +288,18 @@ class RosterService:
                 )
             if reconfirming:
                 # Re-confirming after a back-out only works while the slot is
-                # still open (a substitute may have already filled it).
-                self._require_open_slot(game_id, player.slot_type, player.team_id)
+                # still open (a substitute may have already filled it). Both
+                # the slot type and the team it counts against must come
+                # from the game-scoped resolution (#205 blocker 5) — the
+                # permanent player.slot_type/team_id pointers are exactly
+                # the wrong-attribution defect this fix closes, and this
+                # call site fed them straight into the slot engine. Fails
+                # closed (mirrors the #270 deactivation gate / the
+                # accept_substitute re-resolution) if the player's
+                # membership has since lapsed for a bound game.
+                self._require_open_slot(
+                    game_id, self.position_for_game(game, player).slot_type,
+                    self._require_team_for_game(game, player))
 
         existing = self.store.availability_for_player(game_id, player_id)
         av = GameAvailability(
@@ -397,8 +407,16 @@ class RosterService:
                 subject_player_id=entry.player_id,
             )
         # Recalculate and, if a slot is now open with no substitutes, alert.
+        # #205 blocker 5: the side this feeds compute_roster_status/the
+        # notification audience is the game-resolved team, not the
+        # permanent player.team_id pointer (which, for a Mover-shaped
+        # player, may not even be one of this game's two sides at all).
+        # Tolerant (never raises): this is a post-hoc read for a
+        # notification, not a gate, so a lapsed membership degrades to
+        # compute_roster_status's own team_id=None default rather than
+        # blocking the back-out that already happened.
         player = self.store.get_player(entry.player_id)
-        team_id = player.team_id if player else None
+        team_id = self.team_for_game(game, player) if player else None
         status = self.compute_roster_status(game.id, team_id)
         if status.status == GameStatus.OPEN_SLOT:
             self._notify(
@@ -796,19 +814,85 @@ class RosterService:
         sides = tuple(t for t in (game.home_team_id, game.away_team_id) if t)
         if not sides:
             return None
-        matched = {}
+        matched: Dict[MembershipStatus, Dict[str, SeasonRosterMembership]] = {}
         for m in self.store.memberships_for_player(player.id):
             if (m.league_season_id == game.league_season_id
                     and m.team_id in sides
                     and m.status in self._ELIGIBLE_MEMBERSHIP_STATUSES):
                 matched.setdefault(m.status, {}).setdefault(m.team_id, m)
-        for status in self._ELIGIBLE_MEMBERSHIP_STATUSES:
+        return self._pick_eligible_membership(matched, sides)
+
+    @classmethod
+    def _pick_eligible_membership(
+        cls,
+        matched: Dict[MembershipStatus, Dict[str, SeasonRosterMembership]],
+        sides: Tuple[str, ...],
+    ) -> Optional[SeasonRosterMembership]:
+        """ACTIVE-over-AFFILIATE, home-before-away precedence over a
+        ``{status: {team_id: membership}}`` dict already narrowed to ONE
+        player's eligible-status memberships against ``sides`` — the exact
+        tie-break both ``resolve_membership`` (per player) and
+        ``resolve_memberships_for_game`` (batched, #205 blocker 5) need,
+        factored once here so the batch form is a thin wrapper over the
+        same rule rather than a parallel reimplementation."""
+        for status in cls._ELIGIBLE_MEMBERSHIP_STATUSES:
             by_team = matched.get(status, {})
             for side in sides:
                 m = by_team.get(side)
                 if m is not None:
                     return m
         return None
+
+    def resolve_memberships_for_game(
+        self, game
+    ) -> Dict[str, SeasonRosterMembership]:
+        """Batch form of :meth:`resolve_membership` (#205 blocker 5): every
+        player eligible for EITHER of ``game``'s two sides, resolved to AT
+        MOST ONE side, in a single pass — ``{player_id: SeasonRosterMembership}``.
+
+        ``_slot_summaries``/``compute_roster_status`` need to attribute a
+        whole roster + substitute pool to "this side" without paying one
+        ``resolve_membership`` call — and its ``memberships_for_player`` +
+        ``get_league_season`` reads — PER ROW, which would be an N+1 for a
+        SQL store. This is backed by ``memberships_for_league_season_team``,
+        called ONCE PER SIDE (two queries total, independent of roster
+        size) — the same batch-friendly primitive ``_players_for_game_team``
+        already uses.
+
+        Precedence is applied ONCE PER PLAYER, across BOTH sides together
+        (via ``_pick_eligible_membership``) — never as two independently
+        computed side-scoped sets. A player pathologically eligible on both
+        sides at once (e.g. ACTIVE on home AND AFFILIATE on away in the
+        same LeagueSeason) must resolve to exactly ONE side, or a single
+        occupied roster row could get counted into BOTH sides' summaries —
+        inflating both, not just misattributing one.
+
+        Returns ``{}`` for a game with no LeagueSeason binding (see
+        ``team_for_game`` for the permanent-pointer fallback such a game
+        keeps) or a bound game whose LeagueSeason row itself dangles (fail
+        closed, same posture as ``resolve_membership``).
+        """
+        result: Dict[str, SeasonRosterMembership] = {}
+        if not game.league_season_id:
+            return result
+        if self.store.get_league_season(game.league_season_id) is None:
+            return result
+        sides = tuple(t for t in (game.home_team_id, game.away_team_id) if t)
+        if not sides:
+            return result
+        per_player: Dict[str, Dict[MembershipStatus, Dict[str, SeasonRosterMembership]]] = {}
+        for side in sides:
+            for m in self.store.memberships_for_league_season_team(
+                    game.league_season_id, side):
+                if m.status not in self._ELIGIBLE_MEMBERSHIP_STATUSES:
+                    continue
+                per_player.setdefault(m.player_id, {}).setdefault(
+                    m.status, {}).setdefault(m.team_id, m)
+        for player_id, matched in per_player.items():
+            m = self._pick_eligible_membership(matched, sides)
+            if m is not None:
+                result[player_id] = m
+        return result
 
     def team_for_game(self, game, player) -> Optional[str]:
         """Which of ``game``'s two teams ``player`` belongs to, or ``None``.
@@ -1316,10 +1400,59 @@ class RosterService:
     # ====================================================================
     # roster status engine
     # ====================================================================
-    def _slot_summaries(self, game_id: str, team_id: str):
+    def _side_data(self, game_id: str, team_id: str):
+        """Everything ``_slot_summaries``/``compute_roster_status`` need for
+        ONE side of a game, resolved through the SAME game-scoped
+        membership context as the rest of the #205 substitute workflow
+        (#205 blocker 5) — never the permanent ``player.team_id`` pointer,
+        which is what let two players whose season membership names one
+        team, but whose permanent pointer still names a THIRD team, both
+        seat past a ``target_skaters`` cap that should have refused the
+        second one.
+
+        Resolution runs ONCE per call, batched via
+        ``resolve_memberships_for_game`` (two queries total, home + away,
+        never one query per roster row) — so ``_slot_summaries`` and
+        ``compute_roster_status`` share one resolution pass instead of
+        each re-deriving its own (previously wrong) filter independently.
+
+        Returns ``(summaries, matched_entries, matched_subs)`` — the
+        ``SlotType -> SlotSummary`` dict, the list of
+        ``(GameRosterEntry, Player, Optional[SeasonRosterMembership])``
+        triples resolved to ``team_id``, and the list of
+        ``SubstituteEnrollment`` rows resolved to ``team_id``.
+        """
         game = self._require_game(game_id)
         entries = self.store.roster_for_game(game_id)
         subs = self.store.substitutes_for_game(game_id)
+        bound = bool(game.league_season_id)
+        memberships = self.resolve_memberships_for_game(game) if bound else {}
+
+        def side_of(player_id, player):
+            if bound:
+                m = memberships.get(player_id)
+                return (m.team_id if m is not None else None), m
+            # Unbound game: no membership to resolve — the permanent
+            # pointer is the only source, exactly team_for_game's fallback.
+            return self.team_for_game(game, player), None
+
+        matched_entries = []
+        for entry in entries:
+            player = self.store.get_player(entry.player_id)
+            if player is None:
+                continue
+            side, membership = side_of(entry.player_id, player)
+            if side == team_id:
+                matched_entries.append((entry, player, membership))
+
+        matched_subs = []
+        for sub in subs:
+            player = self.store.get_player(sub.player_id)
+            if player is None:
+                continue
+            side, _membership = side_of(sub.player_id, player)
+            if side == team_id:
+                matched_subs.append(sub)
 
         targets = {
             SlotType.GOALIE: game.target_goalies,
@@ -1327,21 +1460,26 @@ class RosterService:
         }
         occupied = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
         confirmed = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
-        for entry in entries:
-            player = self.store.get_player(entry.player_id)
-            if player is None or player.team_id != team_id:
-                continue  # each side is counted independently (home vs away)
-            st = player.slot_type
+        for entry, player, membership in matched_entries:
+            # #205 review blocker 2 continuation: bucket by the SEASON-
+            # scoped position for THIS game (the resolved membership's),
+            # falling back to the permanent Player row only when unbound
+            # or the membership itself carries no position — see
+            # position_for_game, whose exact fallback rule this mirrors
+            # without a second resolve_membership call.
+            position = (
+                membership.position
+                if membership is not None and membership.position is not None
+                else player.position
+            )
+            st = position.slot_type
             if entry.status.occupies_slot:
                 occupied[st] += 1
             if entry.status.is_confirmed_body:
                 confirmed[st] += 1
 
         subs_available = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
-        for sub in subs:
-            player = self.store.get_player(sub.player_id)
-            if player is None or player.team_id != team_id:
-                continue
+        for sub in matched_subs:
             if sub.status == SubstituteStatus.ENROLLED:
                 subs_available[sub.slot_type] += 1
 
@@ -1363,7 +1501,11 @@ class RosterService:
                 substitutes_available=subs_available[st],
                 status=slot_status,
             )
-        return result
+        return result, matched_entries, matched_subs
+
+    def _slot_summaries(self, game_id: str, team_id: str):
+        summaries, _entries, _subs = self._side_data(game_id, team_id)
+        return summaries
 
     def compute_roster_status(
         self, game_id: str, team_id: Optional[str] = None
@@ -1372,21 +1514,14 @@ class RosterService:
         # Home and away lineups are computed independently (#25). Default to the
         # home side so existing callers/behaviour are unchanged.
         team_id = team_id or game.home_team_id
-        entries = [
-            e for e in self.store.roster_for_game(game_id)
-            if (p := self.store.get_player(e.player_id)) is not None
-            and p.team_id == team_id
-        ]
-        summaries = self._slot_summaries(game_id, team_id)
+        summaries, matched_entries, matched_subs = self._side_data(
+            game_id, team_id)
+        entries = [e for (e, _player, _membership) in matched_entries]
         goalie = summaries[SlotType.GOALIE]
         skater = summaries[SlotType.SKATER]
 
         subs_enrolled = sum(
-            1
-            for s in self.store.substitutes_for_game(game_id)
-            if s.status == SubstituteStatus.ENROLLED
-            and (p := self.store.get_player(s.player_id)) is not None
-            and p.team_id == team_id
+            1 for s in matched_subs if s.status == SubstituteStatus.ENROLLED
         )
 
         open_total = goalie.open_count + skater.open_count
