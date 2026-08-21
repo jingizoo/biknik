@@ -891,7 +891,8 @@ class ResolverFixOverHttp(unittest.TestCase):
                     f"http://127.0.0.1:{self.port}{path}") as r:
                 return r.status, json.loads(r.read() or b"{}")
         except urllib.error.HTTPError as e:
-            return e.code, json.loads(e.read() or b"{}")
+            with e:
+                return e.code, json.loads(e.read() or b"{}")
 
     def test_position_fix_over_http(self):
         """The signed-in player's own opportunity detail reports the
