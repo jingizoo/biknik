@@ -1525,6 +1525,187 @@ class NullLeagueLayerAgreementTest(unittest.TestCase):
         expected = 2 if os.environ.get("TEST_DATABASE_URL") else 1
         self.assertEqual(checked, expected)
 
+# #205 review round 4 (owner ruling) — the three PROGRAM keys of the spine,
+# each broken two ways. Sibling of _NULL_SPINE_KEYS above, but parameterised
+# over MISSING *and* UNEQUAL, because ``_missing_or_unequal`` /
+# ``_MISSING_OR_UNEQUAL`` deliberately treat the two identically.
+_PROGRAM_SPINE_SHAPES = {
+    "teams.program_id": {
+        "table": "teams",
+        "target": lambda api, ids: ids["team"],
+        "original": lambda api, ids: api.store.get_team(
+            ids["team"]).program_id,
+    },
+    "leagues.program_id": {
+        "table": "leagues",
+        "target": lambda api, ids: api.store.get_league_season(
+            ids["ls"]).league_id,
+        "original": lambda api, ids: api.store.get_league(
+            api.store.get_league_season(ids["ls"]).league_id).program_id,
+    },
+    "seasons.program_id": {
+        "table": "seasons",
+        "target": lambda api, ids: ids["season"],
+        "original": lambda api, ids: api.store.get_season(
+            ids["season"]).program_id,
+    },
+}
+_PROGRAM_SPINE_MODES = ("missing", "unequal")
+
+
+class ProgramLayerAgreementTest(unittest.TestCase):
+    """#205 review round 4, owner ruling — migration 059 and the LIVE
+    SERVICE must agree about EVERY Program-spine shape, on the SAME
+    database, in BOTH directions. The sibling of
+    ``NullLeagueLayerAgreementTest`` above, for the leg that had no service
+    clause at all.
+
+    THE ASYMMETRY THIS CLOSES. 059's preflight has refused an incoherent
+    Program spine since round 2/round 3 —
+    ``find_active_players_with_team_program_mismatch`` compares
+    ``t.program_id`` to ``lg.program_id`` and
+    ``find_active_players_with_program_mismatch`` compares ``lg.program_id``
+    to ``s.program_id``, both under ``_MISSING_OR_UNEQUAL``. The membership
+    service checked NEITHER: not a falsy-skip like blocker 3's League
+    guard, but an outright absence —
+    ``_assert_membership_spine_valid``'s contract was Player/Team/
+    LeagueSeason existence + Team<->League coherence + active registration,
+    with no Program clause anywhere. Measured on head 488d1c8 across
+    Memory, SQLite and PostgreSQL: for all six shapes below the preflight
+    REFUSED while the service ACCEPTED create and all twelve parked
+    revivals.
+
+    THE MATRIX: 3 Program keys x {missing, unequal} x {SQLite, PostgreSQL},
+    each cell running BOTH layers against ONE store —
+
+      * SERVICE, with 059 applied: create is refused with
+        ``membership_program_mismatch``, and so is reviving a membership
+        parked BEFORE the Program went wrong, into each of applicant,
+        affiliate and active. Zero audit writes across every refusal.
+      * MIGRATION, on the same rows: downgrade 059 and re-run it; the
+        preflight aborts with a bounded diagnostic naming the same Team's
+        active player.
+      * THE CONVERSE, so "agreement" is not just "both refuse everything":
+        repair the one field and BOTH layers accept — 059 backfills the
+        exact expected membership set and the service creates.
+    """
+
+    def _cleanup(self, store):
+        if store.backend != "sqlite":
+            store.reset_schema()
+        store.close()
+
+    def _write(self, store, sql, params):
+        cur = store.conn.cursor()
+        cur.execute(store.dialect.sql(sql), params)
+        if store.backend == "sqlite":
+            store.conn.commit()
+
+    def _membership_rows(self, store, player_id):
+        return [m for m in store.all_season_roster_memberships()
+                if m.player_id == player_id]
+
+    def _run_case(self, label, url, key, mode):
+        case = (label, key, mode)
+        spec = _PROGRAM_SPINE_SHAPES[key]
+        store = _fresh(url)
+        try:
+            api = ApiService(store)
+            ids = _seed_legacy(api)
+            target = spec["target"](api, ids)
+            original = spec["original"](api, ids)
+            self.assertIsNotNone(original, case)
+            broken = (None if mode == "missing"
+                      else api.create_program("Other Program",
+                                              actor_id=ADMIN)["id"])
+            self.assertNotEqual(broken, original, case)
+            sql = f"UPDATE {spec['table']} SET program_id = ? WHERE id = ?"
+
+            # A membership parked while the Program spine was still WHOLE.
+            parked = api.create_season_roster_membership(
+                ids["active"], ids["ls"], ids["team"],
+                status="applicant", jersey_number=None, actor_id=ADMIN)
+            self.assertNotIn("error", parked, (case, parked))
+            self.assertNotIn(
+                "error", api.set_season_roster_membership_status(
+                    parked["id"], "inactive", actor_id=ADMIN), case)
+
+            # The Program key goes wrong out of band.
+            self._write(store, sql, (broken, target))
+
+            # --- LAYER 1: the live service refuses to MINT one...
+            audits_before = len(store.all_setup_audit())
+            res = api.create_season_roster_membership(
+                ids["inactive"], ids["ls"], ids["team"],
+                status="applicant", jersey_number=None, actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "membership_program_mismatch", (case, res))
+            self.assertEqual(
+                self._membership_rows(store, ids["inactive"]), [], case)
+
+            # ...and refuses to REVIVE the parked one, into every target
+            # ``create`` validates a spine for.
+            for target_status in ("applicant", "affiliate", "active"):
+                revived = api.set_season_roster_membership_status(
+                    parked["id"], target_status, actor_id=ADMIN)
+                self.assertEqual(
+                    revived["error"]["details"]["reason"],
+                    "membership_program_mismatch",
+                    (case, target_status, revived))
+                self.assertEqual(
+                    store.get_season_roster_membership(
+                        parked["id"]).status.value, "inactive",
+                    (case, target_status))
+            # Zero writes across every refusal above.
+            self.assertEqual(len(store.all_setup_audit()), audits_before, case)
+
+            # --- LAYER 2: migration 059 refuses to BACKFILL it, on the very
+            # same rows.
+            found = (find_active_players_with_team_program_mismatch(store.conn)
+                     + find_active_players_with_program_mismatch(store.conn))
+            self.assertIn(ids["active"], [row[0] for row in found],
+                          (case, found))
+            _downgrade_059(store)
+            with self.assertRaises(MigrationDataError, msg=case) as ctx:
+                migrate(store.conn, store.dialect)
+            self.assertIn(ids["active"], str(ctx.exception), case)
+            self.assertNotIn(ids["inactive"], str(ctx.exception), case)
+
+            # --- THE CONVERSE: repair the ONE field and BOTH layers accept.
+            # Agreement, not mutual paralysis.
+            self._write(store, sql, (original, target))
+            assert_season_roster_membership_backfill_ready(store.conn)
+            migrate(store.conn, store.dialect)
+            self.assertEqual(
+                sorted((m.player_id, m.league_season_id)
+                       for m in store.all_season_roster_memberships()),
+                [(ids["active"], ids["ls"])], case)
+            # The service accepts the repaired spine too. (The backfill above
+            # already holds the active player's open stint, so this uses the
+            # OTHER player, exactly as the refusal did.)
+            ok = ApiService(store).create_season_roster_membership(
+                ids["inactive"], ids["ls"], ids["team"],
+                status="applicant", jersey_number=None, actor_id=ADMIN)
+            self.assertNotIn("error", ok, (case, ok))
+            self.assertEqual(ok["status"], "applicant", case)
+        finally:
+            self._cleanup(store)
+
+    def test_service_and_migration_agree_on_every_program_shape(self):
+        checked = 0
+        for key in _PROGRAM_SPINE_SHAPES:
+            for mode in _PROGRAM_SPINE_MODES:
+                for label, url in _sql_backends():
+                    with self.subTest(backend=label, key=key, mode=mode):
+                        self._run_case(label, url, key, mode)
+                    checked += 1
+        # 3 keys x 2 modes x SQLite (+ PostgreSQL when configured). Pinned
+        # against the ENVIRONMENT -- an INDEPENDENT source -- never against
+        # len(_sql_backends()), which moves with the loop and could never
+        # fire.
+        expected = 6 * (2 if os.environ.get("TEST_DATABASE_URL") else 1)
+        self.assertEqual(checked, expected)
+
 
 class MembershipIndexEnforcementTest(unittest.TestCase):
     """Migration 059's partial unique indexes hold when the service layer is

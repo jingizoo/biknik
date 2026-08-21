@@ -956,6 +956,415 @@ class CreateSpineMissingLeagueTest(unittest.TestCase):
                          "membership_league_mismatch", res)
         self.assertEqual(self._surfaces(api, fx), before)
 
+# --- #205 review round 4 (owner ruling): the PROGRAM leg of the spine -----
+#
+# The membership guards validated Player/Team/LeagueSeason existence, Team
+# <-> League coherence and an active registration -- and had NO Program
+# clause at all (an absence, not a falsy-skip), while migration 059's
+# preflight refused every incoherent Program shape via
+# ``integrity_checks._MISSING_OR_UNEQUAL``. Reproduced on this branch's head
+# 488d1c8: all six shapes below, on Memory, SQLite AND PostgreSQL, had 059's
+# preflight REFUSING while the service ACCEPTED create and all twelve parked
+# revivals -- 126 accepted probes, each writing a row/status, an event and an
+# audit entry onto a spine whose Team, League and Season disagreed about
+# which Program they belong to.
+
+
+def _plant_program(api, obj, kind, value):
+    obj.program_id = value
+    saver = getattr(api.store, f"save_{kind}")
+    if isinstance(api.store, SqlStore):
+        with api.store.transaction():
+            saver(obj)
+    else:
+        saver(obj)
+
+
+def _break_team_program(api, fx, value):
+    _plant_program(api, api.store.get_team(fx["team"]["id"]), "team", value)
+    return api.store.get_team(fx["team"]["id"]).program_id
+
+
+def _break_league_program(api, fx, value):
+    _plant_program(api, api.store.get_league(fx["league_id"]), "league", value)
+    return api.store.get_league(fx["league_id"]).program_id
+
+
+def _break_season_program(api, fx, value):
+    _plant_program(api, api.store.get_season(fx["season"]["id"]), "season",
+                   value)
+    return api.store.get_season(fx["season"]["id"]).program_id
+
+
+# The three Program keys the spine is made of, each broken two ways. MISSING
+# and UNEQUAL are ONE rule (``_missing_or_unequal`` / ``_MISSING_OR_UNEQUAL``),
+# so both halves must produce the same refusal.
+_PROGRAM_KEYS = {
+    "Team.program_id": _break_team_program,
+    "League.program_id": _break_league_program,
+    "Season.program_id": _break_season_program,
+}
+_PROGRAM_MODES = ("missing", "unequal")
+_PROGRAM_SHAPES = tuple((key, mode) for key in _PROGRAM_KEYS
+                        for mode in _PROGRAM_MODES)
+# The columns each shape writes, for the reachability probe below.
+_PROGRAM_COLUMNS = {"Team.program_id": ("teams", "program_id"),
+                    "League.program_id": ("leagues", "program_id"),
+                    "Season.program_id": ("seasons", "program_id")}
+
+
+class MembershipProgramSpineTest(unittest.TestCase):
+    """#205 review round 4, owner ruling — a membership may only be MINTED
+    or REVIVED on a spine whose Team, League and Season all name the SAME
+    Program.
+
+    THE MATRIX, in full: 6 shapes ({Team, League, Season}.program_id x
+    {missing, unequal}) x 3 stores (Memory, SQLite, PostgreSQL) x both
+    paths the ruling names — ``create_season_roster_membership``, and parked
+    revival through ``set_season_roster_membership_status`` for each of 2
+    parked sources (inactive, injured) into each of 3 targets (applicant,
+    affiliate, active). 6 create + 36 revival = 42 refusals per store, each
+    asserting the stable ``membership_program_mismatch`` reason AND zero
+    writes across ALL THREE write surfaces (the membership row/status, the
+    append-only per-membership event history, and the global audit log) — a
+    caught exception alone does not prove nothing was written.
+
+    INTACT-SPINE CONTROLS ride alongside: with the Program leg untouched,
+    create still succeeds for every spine-validated status and every parked
+    -> revival transition still succeeds and still writes its event + audit
+    row. A guard that refused everything would pass the refusal half alone.
+
+    WHY UNCONDITIONAL, given ``register_team_for_season``'s deliberately
+    legacy-permissive rule 4 (``if team.program_id and team.program_id !=
+    season.program_id``): that branch tolerates a PROGRAM-LESS Team, but no
+    supported flow PRODUCES one. Established by execution over every public
+    entry point — ``create_team`` derives the Program from the resolved
+    League and refuses a disagreeing one; ``transfer_team_to_league`` HEALS
+    a program-less Team; ``roll_forward_registrations`` (both v1 and v2)
+    refuse one outright; ``commit_hierarchy_import`` refuses a cross-Program
+    team/league pair and both imports heal a program-less Team on re-import;
+    and the canonical ``league_id`` registration path refuses one. See
+    ``SetupService._assert_membership_program_spine``'s docstring for the
+    full finding. Registration semantics are untouched by this guard.
+    """
+
+    def _stores(self):
+        yield "memory", InMemoryStore()
+        yield "sqlite", SqlStore(":memory:")
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            store = SqlStore(url)
+            store.reset_schema()
+            yield "postgres", store
+
+    def _close(self, label, store):
+        if label == "postgres":
+            store.reset_schema()
+        if isinstance(store, SqlStore):
+            store.close()
+
+    def _break(self, api, fx, key, mode):
+        """Plant one shape and PROVE the write stuck. A store whose column
+        is NOT NULL would make the shape unreachable; this asserts that
+        rather than skipping it silently (see
+        ``test_no_program_shape_is_unreachable_on_any_store``)."""
+        wanted = (None if mode == "missing"
+                  else api.create_program("OtherProg", actor_id=ADMIN)["id"])
+        got = _PROGRAM_KEYS[key](api, fx, wanted)
+        self.assertEqual(got, wanted, (key, mode))
+        return wanted
+
+    def _surfaces(self, api, player_id):
+        """All THREE write surfaces for this player: any membership row,
+        every event on any such row, and the global setup audit log."""
+        rows = [m for m in api.store.all_season_roster_memberships()
+                if m.player_id == player_id]
+        events = sum(len(api.store.events_for_membership(m.id)) for m in rows)
+        return (len(rows), events, len(api.store.all_setup_audit()))
+
+    def _membership_surfaces(self, api, membership_id):
+        row = api.store.get_season_roster_membership(membership_id)
+        return (row.status.value,
+                len(api.store.events_for_membership(membership_id)),
+                len([a for a in api.store.all_setup_audit()
+                     if a.entity_id == membership_id]))
+
+    def _parked(self, api, fx, parked):
+        m = _make_membership(api, fx, "applicant")
+        self.assertNotIn("error", m, m)
+        res = api.set_season_roster_membership_status(
+            m["id"], parked, actor_id=ADMIN)
+        self.assertNotIn("error", res, res)
+        return m
+
+    # -- CREATE ----------------------------------------------------------
+    def test_incoherent_program_refuses_create_zero_write(self):
+        checked = 0
+        for label, store in self._stores():
+            try:
+                for key, mode in _PROGRAM_SHAPES:
+                    with self.subTest(backend=label, key=key, mode=mode):
+                        api = ApiService(store)
+                        fx = _fixture(api)
+                        planted = self._break(api, fx, key, mode)
+                        before = self._surfaces(api, fx["player"]["id"])
+                        self.assertEqual(before[0], 0, (label, key, mode))
+                        res = api.create_season_roster_membership(
+                            fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
+                            status="applicant", jersey_number=None,
+                            actor_id=ADMIN)
+                        self.assertIn("error", res, (label, key, mode, res))
+                        details = res["error"]["details"]
+                        self.assertEqual(details["reason"],
+                                         "membership_program_mismatch",
+                                         (label, key, mode, res))
+                        # The details name the offending key honestly —
+                        # including a MISSING one, rather than omitting it.
+                        field = {"Team.program_id": "team_program_id",
+                                 "League.program_id": "league_program_id",
+                                 "Season.program_id": "season_program_id"}[key]
+                        self.assertEqual(details[field], planted,
+                                         (label, key, mode, res))
+                        # ZERO WRITE on all three surfaces.
+                        self.assertEqual(
+                            self._surfaces(api, fx["player"]["id"]), before,
+                            (label, key, mode))
+                    checked += 1
+            finally:
+                self._close(label, store)
+        # 6 shapes per store. Pinned against the ENVIRONMENT -- an
+        # INDEPENDENT source -- never against the length of the list the
+        # loop iterates, which moves with it and could never fire.
+        expected = 6 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
+
+    def test_intact_program_spine_create_still_succeeds(self):
+        """The control: refuse an INCOHERENT Program spine, not every
+        spine. With Team/League/Season agreeing, create still succeeds for
+        every spine-validated status and writes its event + audit row."""
+        checked = 0
+        for label, store in self._stores():
+            try:
+                for status in _REVIVE_TARGETS:
+                    with self.subTest(backend=label, status=status):
+                        api = ApiService(store)
+                        fx = _fixture(api)
+                        res = api.create_season_roster_membership(
+                            fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
+                            status=status, jersey_number=None, actor_id=ADMIN)
+                        self.assertNotIn("error", res, (label, status, res))
+                        self.assertEqual(res["status"], status,
+                                         (label, status))
+                        rows, events, _ = self._surfaces(
+                            api, fx["player"]["id"])
+                        self.assertEqual((rows, events), (1, 1),
+                                         (label, status))
+                    checked += 1
+            finally:
+                self._close(label, store)
+        expected = 3 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
+
+    # -- PARKED REVIVAL ---------------------------------------------------
+    def test_incoherent_program_refuses_every_revival_zero_write(self):
+        checked = 0
+        for label, store in self._stores():
+            try:
+                for parked in _PARKED:
+                    for key, mode in _PROGRAM_SHAPES:
+                        for target in _REVIVE_TARGETS:
+                            case = (label, parked, target, key, mode)
+                            with self.subTest(backend=label, parked=parked,
+                                              target=target, key=key,
+                                              mode=mode):
+                                # A FRESH fixture per cell, deliberately: one
+                                # leaked write must not contaminate the cells
+                                # after it, or a falsification run could not
+                                # say WHICH cell the guard covers.
+                                api = ApiService(store)
+                                fx = _fixture(api)
+                                m = self._parked(api, fx, parked)
+                                self._break(api, fx, key, mode)
+                                before = self._membership_surfaces(
+                                    api, m["id"])
+                                self.assertEqual(before[0], parked, case)
+                                res = api.set_season_roster_membership_status(
+                                    m["id"], target, actor_id=ADMIN)
+                                self.assertIn("error", res, (case, res))
+                                self.assertEqual(
+                                    res["error"]["details"]["reason"],
+                                    "membership_program_mismatch", (case, res))
+                                self.assertEqual(
+                                    res["error"]["details"]["membership_id"],
+                                    m["id"], (case, res))
+                                # ZERO WRITE on all three surfaces.
+                                self.assertEqual(
+                                    self._membership_surfaces(api, m["id"]),
+                                    before, case)
+                            checked += 1
+            finally:
+                self._close(label, store)
+        # 2 parked x 6 shapes x 3 targets = 36 per store. Pinned against the
+        # ENVIRONMENT, the same independent source ParkedRevivalSpineTest
+        # uses -- never against len(_PROGRAM_SHAPES) or the store list.
+        expected = 36 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
+
+    def test_intact_program_spine_revival_still_succeeds(self):
+        """The revival control: with the Program leg whole, every parked ->
+        revival transition still succeeds and writes its event + audit."""
+        checked = 0
+        for label, store in self._stores():
+            try:
+                for parked in _PARKED:
+                    for target in _REVIVE_TARGETS:
+                        with self.subTest(backend=label, parked=parked,
+                                          target=target):
+                            api = ApiService(store)
+                            fx = _fixture(api)
+                            m = self._parked(api, fx, parked)
+                            before = self._membership_surfaces(api, m["id"])
+                            res = api.set_season_roster_membership_status(
+                                m["id"], target, actor_id=ADMIN)
+                            self.assertNotIn("error", res,
+                                             (label, parked, target, res))
+                            self.assertEqual(res["status"], target,
+                                             (label, parked, target))
+                            self.assertEqual(
+                                self._membership_surfaces(api, m["id"]),
+                                (target, before[1] + 1, before[2] + 1),
+                                (label, parked, target))
+                        checked += 1
+            finally:
+                self._close(label, store)
+        expected = 6 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
+
+    # -- REACHABILITY -----------------------------------------------------
+    def test_no_program_shape_is_unreachable_on_any_store(self):
+        """Every one of the six shapes must be REACHABLE on every store, so
+        no matrix cell above is silently vacuous.
+
+        A NOT NULL column would make the ``missing`` half of a shape
+        unplantable — the way ``league_seasons.league_id`` makes
+        ``CreateSpineMissingLeagueTest``'s both-sides-missing case
+        Memory-only. All three Program columns are currently NULLABLE on
+        both engines (``teams.program_id`` and ``seasons.program_id`` are
+        migration 028 renames of the nullable legacy ``league_id``;
+        ``leagues.program_id`` is migration 035's ``ADD COLUMN ... TEXT``),
+        so all six shapes are reachable everywhere. This asserts that
+        explicitly against the live catalogue rather than assuming it: if a
+        future migration adds NOT NULL, this fails and NAMES the shape,
+        instead of the matrix quietly shrinking."""
+        checked = 0
+        for label, store in self._stores():
+            try:
+                if isinstance(store, SqlStore):
+                    cur = store.conn.cursor()
+                    for key, (table, column) in _PROGRAM_COLUMNS.items():
+                        if store.backend == "sqlite":
+                            cur.execute(f"PRAGMA table_info({table})")
+                            notnull = {r["name"]: r["notnull"]
+                                       for r in cur.fetchall()}[column]
+                            self.assertEqual(
+                                notnull, 0,
+                                (label, key, "NOT NULL -- the 'missing' half "
+                                 "of this shape is now unreachable"))
+                        else:
+                            cur.execute(
+                                "SELECT is_nullable FROM "
+                                "information_schema.columns WHERE "
+                                "table_name = %s AND column_name = %s",
+                                (table, column))
+                            self.assertEqual(
+                                cur.fetchone()["is_nullable"], "YES",
+                                (label, key, "NOT NULL -- the 'missing' half "
+                                 "of this shape is now unreachable"))
+                for key, mode in _PROGRAM_SHAPES:
+                    with self.subTest(backend=label, key=key, mode=mode):
+                        api = ApiService(store)
+                        fx = _fixture(api)
+                        # _break asserts the planted value actually stuck.
+                        self._break(api, fx, key, mode)
+                    checked += 1
+            finally:
+                self._close(label, store)
+        expected = 6 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
+
+    def test_terminal_refusal_still_precedes_the_program_check(self):
+        """A parked row targeting a TERMINAL status still gets the
+        unconditional ``terminal_transition_not_authorized`` refusal — NOT a
+        Program error — even on an incoherent Program spine. Adding the
+        Program clause must not reorder those two."""
+        for label, store in self._stores():
+            try:
+                for target in ("released", "transferred"):
+                    with self.subTest(backend=label, target=target):
+                        api = ApiService(store)
+                        fx = _fixture(api)
+                        m = self._parked(api, fx, "inactive")
+                        self._break(api, fx, "Team.program_id", "missing")
+                        before = self._membership_surfaces(api, m["id"])
+                        res = api.set_season_roster_membership_status(
+                            m["id"], target, actor_id=ADMIN)
+                        self.assertEqual(res["error"]["code"], "forbidden",
+                                         (label, target, res))
+                        self.assertEqual(
+                            res["error"]["details"]["reason"],
+                            "terminal_transition_not_authorized",
+                            (label, target, res))
+                        self.assertEqual(
+                            self._membership_surfaces(api, m["id"]), before,
+                            (label, target))
+            finally:
+                self._close(label, store)
+
+    def test_missing_program_keys_are_a_violation_not_agreement(self):
+        """MISSING keys are never agreement — ``_missing_or_unequal`` treats
+        ``not a or not b`` as a violation, matching the preflight's
+        ``_MISSING_OR_UNEQUAL`` rather than the null-safe operators (SQL's
+        ``IS DISTINCT FROM`` calls NULL/NULL agreement; so does a plain
+        Python ``==``).
+
+        THE THIRD GROUP IS THE ONE THAT DISCRIMINATES, and it was added
+        because the first two did not. Falsifier, measured: replacing both
+        ``_missing_or_unequal`` calls in
+        ``_assert_membership_program_spine`` with plain ``!=`` left the
+        ENTIRE rest of this module GREEN, because Python's ``!=`` — unlike
+        SQL's ``!=`` — already reports ``None != 'program_1'`` as True, so
+        every SINGLE missing key is still caught, and in each ADJACENT PAIR
+        the other leg still compares NULL to a real Program and fires. Only
+        when ALL THREE keys are missing do both legs degenerate to
+        ``None != None`` and an equality-only guard ACCEPTS. That cell is
+        the sole load-bearing difference between the two spellings at this
+        layer, so it is asserted explicitly; with it present the mutation
+        reddens, per store."""
+        for label, store in self._stores():
+            try:
+                for pair in (("Team.program_id", "League.program_id"),
+                             ("League.program_id", "Season.program_id"),
+                             ("Team.program_id", "League.program_id",
+                              "Season.program_id")):
+                    with self.subTest(backend=label, pair=pair):
+                        api = ApiService(store)
+                        fx = _fixture(api)
+                        for key in pair:
+                            self.assertIsNone(
+                                _PROGRAM_KEYS[key](api, fx, None), (label, key))
+                        before = self._surfaces(api, fx["player"]["id"])
+                        res = api.create_season_roster_membership(
+                            fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
+                            status="applicant", jersey_number=None,
+                            actor_id=ADMIN)
+                        self.assertEqual(res["error"]["details"]["reason"],
+                                         "membership_program_mismatch",
+                                         (label, pair, res))
+                        self.assertEqual(
+                            self._surfaces(api, fx["player"]["id"]), before,
+                            (label, pair))
+            finally:
+                self._close(label, store)
 
 _PG_SKIP = ("PostgreSQL not configured (TEST_DATABASE_URL) or psycopg "
             "missing — the #205 review round 1 finding 2 parent-mutation "
