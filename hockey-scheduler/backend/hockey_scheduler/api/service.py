@@ -6304,17 +6304,31 @@ class ApiService:
             return "The roster for this game is locked."
         return None
 
-    def _opportunity_base_dict(self, g, player) -> dict:
+    def _opportunity_base_dict(self, g, player, ctx=None) -> dict:
         """The fields a substitute opportunity carries in both the Home list
         (#107) and the detail view (#110) — kept in one place so the two
         surfaces can't drift on the shared shape.
 
-        The surfaced team is the side the player RESOLVES to for THIS game
-        (#205 cutover — membership for a LeagueSeason-bound game, permanent
-        pointer for an unbound one); the pointer is only the label fallback
-        for the never-eligible edge (callers list eligible games, so it is
-        ordinarily unreachable)."""
-        team_id = self.roster.team_for_game(g, player) or player.team_id
+        Both the surfaced TEAM and the surfaced POSITION come off ONE
+        :class:`~hockey_scheduler.services.roster_service.GameMembershipContext`
+        — membership-resolved for a LeagueSeason-bound game, permanent
+        pointer for an unbound one — resolved here or handed in by a caller
+        that already has it (#205 review blocker 2: never two independent
+        reads).
+
+        A BOUND game whose context does NOT resolve raises ``NotFoundError``
+        rather than labelling the row from the permanent pointer. It used to
+        fall back (``team_for_game(...) or player.team_id``), which could
+        name a team that is not even in this game and then read a
+        permanent-pointer position beside it. Every caller reaches this with
+        an eligible game (the Home lists are pre-filtered;
+        ``get_substitute_opportunity`` resolves the context itself and 404s
+        first), so the raise is the guard, not a new user-visible state."""
+        if ctx is None:
+            ctx = self.roster.resolve_membership_context(g, player)
+        if ctx is None:
+            raise NotFoundError("Opportunity not found.")
+        team_id = ctx.team_id
         team = self.store.get_team(team_id) if team_id else None
         opp_id = self._opponent_team_id(g, team_id)
         opp_team = self.store.get_team(opp_id) if opp_id else None
@@ -6326,10 +6340,8 @@ class ApiService:
             "venue_name": self._venue_name_for_game(g),
             "rink_name": g.rink,
             # #205 review blocker 2: the season-scoped position for THIS
-            # game, not the permanent Player row — see
-            # RosterService.position_for_game.
-            "position_needed": self.roster.position_for_game(
-                g, player).slot_type.value,
+            # game, off the SAME context that named the team above.
+            "position_needed": ctx.slot_type.value,
         }
 
     @catch
@@ -6464,10 +6476,11 @@ class ApiService:
         # non-participant. Resolution is membership-based for a
         # LeagueSeason-bound game and permanent-pointer for an unbound one
         # (#205 cutover, RosterService.team_for_game).
-        team_id = (self.roster.team_for_game(game, player)
-                   if game is not None else None)
-        if game is None or team_id is None:
+        ctx = (self.roster.resolve_membership_context(game, player)
+               if game is not None else None)
+        if game is None or ctx is None:
             raise NotFoundError("Opportunity not found.")
+        team_id = ctx.team_id
         rstatus = self.roster.compute_roster_status(game_id, team_id)
         enrollment = self.store.substitute_for_player(game_id, player_id)
         status = enrollment.status if enrollment else None
@@ -6480,7 +6493,7 @@ class ApiService:
             # predicate so this pre-disable can't drift from accept_substitute;
             # decline only needs a mutable game.
             offer_block = self.roster.substitute_offer_block_reason(
-                player_id, game_id, enrollment, rstatus)
+                player_id, game_id, enrollment, rstatus, ctx=ctx)
             can_accept_offer = offer_block is None
             can_decline_offer = self._mutable_block(game) is None
             blocked = offer_block
@@ -6490,10 +6503,11 @@ class ApiService:
             withdraw_block = self._mutable_block(game)
             can_withdraw, blocked = withdraw_block is None, withdraw_block
         else:
-            reason = self.roster.substitute_block_reason(player_id, game_id, rstatus)
+            reason = self.roster.substitute_block_reason(
+                player_id, game_id, rstatus, ctx=ctx)
             can_accept, blocked = reason is None, reason
         return {
-            **self._opportunity_base_dict(game, player),
+            **self._opportunity_base_dict(game, player, ctx=ctx),
             "roster_status": rstatus.status.value,
             "team_status": self._PLAYER_TEAM_STATUS.get(
                 rstatus.status.value, "not_responded"),

@@ -104,6 +104,14 @@ from .league_scope import (
     team_registration_valid,
     team_season_participation,
 )
+from .membership_spine import (
+    # ONE spine rule, shared with the READ-time resolver (#205 review blocker
+    # 2). This predicate used to be defined right here, private to the
+    # write-time guards below, while ``RosterService`` had no spine check at
+    # all; it now lives in ``membership_spine`` so a read-time refusal and a
+    # write-time refusal can never disagree about what a broken key is.
+    missing_or_unequal as _missing_or_unequal,
+)
 from .notifier import push as _push_notification
 
 
@@ -121,32 +129,6 @@ _UNSET = object()
 
 def _blank(value) -> bool:
     return value is None or not str(value).strip()
-
-
-def _missing_or_unequal(a, b) -> bool:
-    """A scope-spine key is BROKEN when EITHER side is MISSING or the two
-    DISAGREE (#205 review round 3 blocker 3) — the Python twin of
-    ``integrity_checks._MISSING_OR_UNEQUAL``, the SQL predicate migration
-    059's preflight applies to this very invariant.
-
-    The membership spine guards used to be spelled ``if team.league_id and
-    ls.league_id != team.league_id``. The leading conjunct is a FALSY-SKIP:
-    a Team with NO permanent League skipped the coherence check entirely
-    rather than failing it — the exact service-layer analogue of the NULL
-    evasion blocker 1 fixed in the preflight, where ``a != b`` evaluated
-    UNKNOWN (not TRUE) against a NULL and the row was filtered out. The two
-    layers then disagreed: 059 REFUSED to backfill a league-less Team while
-    the live service happily minted and revived memberships on one.
-
-    ``not a`` rather than ``a is None`` deliberately: the guards this
-    replaces were truthiness gates, so an empty-string id was skipped too.
-    Treating both shapes as MISSING is strictly stronger than what shipped
-    and keeps one rule for "this key is not there".
-
-    Both-missing is a violation, not agreement — the same conclusion
-    ``_MISSING_OR_UNEQUAL``'s own docstring reaches about why
-    ``IS DISTINCT FROM`` is the wrong operator for a scope spine."""
-    return not a or not b or a != b
 
 
 def _clean(value) -> str:
