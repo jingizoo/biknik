@@ -442,6 +442,11 @@ class _SpineHarness(_Fixture):
         expected = {"memory", "sqlite"}
         if os.environ.get("TEST_DATABASE_URL"):
             expected.add("postgres")
+        else:
+            # Say so out loud. A run that silently covers only Memory/SQLite
+            # reads as tri-store parity in a summary line, which is precisely
+            # the vacuous-coverage failure open against this PR elsewhere.
+            print("\n[SPINE MATRIX] " + _PG_SKIP)
         self.assertEqual(backends, expected, sorted(backends))
         for backend in expected:
             edges = {e for b, _k, e in ran if b == backend}
@@ -468,7 +473,13 @@ class _SpineHarness(_Fixture):
                 for e in store.roster_for_game(game_id)),
             "audit": sorted(
                 (a.id, a.action.value) for a in store.audit_for_game(game_id)),
-            "setup_audit": len(store.all_setup_audit()),
+            # Identity, not a count: a count-only snapshot is satisfied by a
+            # same-cardinality row SWAP (one row deleted, another written in
+            # the same unit), which is exactly the write a fail-closed path
+            # must not perform.
+            "setup_audit": sorted(
+                (a.id, a.action, a.entity_type, a.entity_id)
+                for a in store.all_setup_audit()),
             "notification_events": sorted(
                 (n.id, n.type.value)
                 for n in store.notifications_for_game(game_id)),
