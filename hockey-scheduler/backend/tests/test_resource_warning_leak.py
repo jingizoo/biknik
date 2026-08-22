@@ -192,17 +192,42 @@ assert set(_REVIEW_NAMED_CASES) <= set(_CONTRACT_CASES), (
 #   PostgreSQL's blowup ate the budget and killed the child mid-PostgreSQL —
 #   taking Memory's and SQLite's verdicts down with it and naming nothing.
 #
-# Hence: generous, separately-justified bounds, biggest where the variance
-# actually is. Memory/SQLite get 120s (~7x their unloaded cost, ~3.1x their
-# measured 16-spinner cost). PostgreSQL gets 300s (~12x unloaded, ~5.8x its
-# 8-spinner cost). These are deliberately not a blanket enlargement of the old
-# 180s: each covers a third of the work, is tied to a measurement above, and —
-# the part that matters — a breach is now a NAMED failure identifying the
-# backend and the last case reached, which _HangingProbe pins, rather than the
-# anonymous traceback CI produced.
+# A BOUND HERE IS A CEILING, NOT A COST. Nothing waits for it in the normal
+# case: unloaded, the whole matrix costs ~57s (Memory 17.1s, SQLite 15.8s,
+# PostgreSQL 25.1s). The number only binds when something is already wrong,
+# and its job is to be generous enough not to invent a flake while still
+# firing on genuine pathology -- with a name attached.
+#
+# Load figures, measured under TRUE 2x oversubscription (36 busy-loop spinners
+# on 18 cores, host at 1715% of 1800% CPU). An earlier revision of this comment
+# justified the bounds from a "16 spinner" run that was semaphore-bound at
+# ~558% CPU -- i.e. not oversubscribed at all -- and therefore understated the
+# degradation badly. The real numbers:
+#
+#     Memory      17.1s -> 94.8s   (5.5x)
+#     SQLite      15.8s -> 83.1s   (5.3x)
+#     PostgreSQL  25.1s -> 914.6s  (36.4x)
+#
+# Only PostgreSQL's superlinearity was ever right; Memory/SQLite degrade ~5x,
+# not the ~2.3x previously claimed. So Memory/SQLite get 180s (~10x unloaded,
+# ~1.9x their real oversubscribed cost) rather than the 120s a bad measurement
+# suggested -- 120s left Memory at 1.27x headroom, putting the flake risk in
+# the opposite place from where the comment asserted it was.
+#
+# PostgreSQL stays at 300s (~12x unloaded) DELIBERATELY, even though 914.6s
+# would breach it: at genuine 2x oversubscription this probe SHOULD fail. The
+# owner's correction forbids clearing this by enlarging a timeout, and a bound
+# so large it can never fire would do exactly that. 300s is ~3.7x the ~80s
+# PostgreSQL would cost at the ~3.2x degradation CI actually exhibited (it
+# breached 180s for work costing 57s unloaded), so it is comfortable for real
+# CI load and still fires under true pathology.
+#
+# The part that matters is independent of every number above: a breach is now
+# a NAMED failure identifying the backend and the last case reached (pinned by
+# _HangingProbe), not the anonymous traceback CI produced.
 _PROBE_MATRIX = {
-    "MemorySensitiveReadHttpTest": 120,
-    "SqliteSensitiveReadHttpTest": 120,
+    "MemorySensitiveReadHttpTest": 180,
+    "SqliteSensitiveReadHttpTest": 180,
     "PostgresSensitiveReadHttpTest": 300,
 }
 
