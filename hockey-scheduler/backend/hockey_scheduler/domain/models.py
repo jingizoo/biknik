@@ -173,15 +173,28 @@ class SubstituteEnrollment:
     offer_expires_at: Optional[datetime] = None
     accepted_at: Optional[datetime] = None
     declined_at: Optional[datetime] = None
-    # #205 blocker 3: the team the offer was validated against, snapshotted
-    # by offer_substitute at the moment _require_team_for_game resolved it
-    # (same pattern position_for_game already established for `position`
-    # above — resolve once, at the point the context is genuinely valid,
-    # and store it). decline_substitute reads this instead of re-resolving
-    # membership that may have ended since the offer, so a lapsed
-    # membership can no longer make the COACH notification's audience_ref
-    # come back None. None until an offer has been made (or for any row
-    # enrolled/offered before this migration — see 060_substitute_team_id.sql).
+    # #205 blocker 3: THE OFFER'S OWNING TEAM — the side offer_substitute
+    # validated the offer against, snapshotted at the moment
+    # _require_team_for_game resolved it (same pattern position_for_game
+    # already established for `position` above — resolve once, at the point
+    # the context is genuinely valid, and store it).
+    #
+    # AUTHORITATIVE FOR THE OFFER'S WHOLE LIFETIME. decline_substitute
+    # addresses its coach notification from this value and ONLY this value:
+    # decline is the terminal response to an already-issued offer, so its
+    # audience is whoever OWNS that offer, never a team re-resolved at
+    # decline time (which, after a reassignment or a transfer, is the
+    # OPPONENT — see roster_service.decline_substitute and
+    # 060_substitute_team_id.sql for why accept's live re-resolution is not
+    # a precedent here). It is also durable by construction, so a membership
+    # ending after the offer can no longer make that audience_ref come back
+    # None and crash the decline.
+    #
+    # None until an offer has been made, and for any row enrolled/offered
+    # before migration 060 (which is additive with no backfill — there is no
+    # honest historical source to backfill FROM). decline_substitute commits
+    # and suppresses its targeted push for such a legacy row rather than
+    # guessing an audience.
     team_id: Optional[str] = None
 
     @property

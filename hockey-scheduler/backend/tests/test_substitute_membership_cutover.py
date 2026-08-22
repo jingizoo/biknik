@@ -80,8 +80,8 @@ from helpers import FakeClock, end_membership_directly, fresh_sql_store
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    AuditAction, MembershipStatus, Player, Position, SeasonRosterMembership,
-    SubstituteStatus)
+    AuditAction, MembershipStatus, NotificationAudience, NotificationKind,
+    Player, Position, SeasonRosterMembership, SubstituteStatus)
 from hockey_scheduler.domain.errors import NotEligibleError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web import server as srv
@@ -510,7 +510,279 @@ class EligibilityIsLiveNotFrozen(_CutoverContract, unittest.TestCase):
                     new_events, (label, new_events))
 
 
-class UnboundGamesKeepThePermanentGate(_Fixture, unittest.TestCase):
+class _DeclineAudienceContract(_Fixture):
+    """THE offer-owner contract for ``decline_substitute``'s coach
+    notification, written ONCE and invoked verbatim by the Memory/SQLite
+    classes, the PostgreSQL class and the real-HTTP class below, so no
+    backend's assertions can drift away from another's (#205 blocker 3,
+    round-3 owner ruling).
+
+    THE RULE. ``SubstituteEnrollment.team_id`` — the side
+    ``offer_substitute``'s own ``_require_team_for_game`` validated the offer
+    against, snapshotted there (migration 060) — is AUTHORITATIVE for the
+    whole lifetime of that offer. Decline is the TERMINAL RESPONSE to an
+    already-issued offer, so its audience is the coach/team that OWNS the
+    offer and is waiting to advance their queue. A team resolved fresh at
+    decline time never overrides it and never stands in for it.
+
+    WHY ``accept`` IS NOT A PRECEDENT. ``_accept_offered_substitute``
+    deliberately re-resolves live because acceptance REVALIDATES current
+    eligibility and seats the player in a slot that must count against
+    whichever side they are genuinely on now. Decline revalidates nothing
+    and seats nobody. Mirroring accept's order here is not consistency, it
+    is a leak: it hands one team's outstanding-offer state to their
+    OPPONENT and leaves the offering coach silent.
+
+    WHAT THE ASSERTIONS INSPECT. Not "some audience_ref equals HOME" — the
+    real emitted rows: exactly ONE ``substitute_declined`` COACH
+    :class:`Notification`, its ``audience_ref``, and every
+    :class:`NotificationDelivery` fanned out from it, asserted by COUNT and
+    by ``recipient_ref``. Zero rows may reach the other side.
+
+    Each scenario runner takes an optional ``decline`` callable
+    ``(game_id, player_id) -> response dict``, defaulting to
+    ``api.decline_substitute``. ``DeclineAudienceOverHttp`` passes a callable
+    that dispatches a REAL request at a real socket instead, so the HTTP
+    surface is held to the byte-identical contract rather than a paraphrase
+    of it."""
+
+    def _declined_since(self, store, before_ids):
+        """The ``substitute_declined`` feed rows created since ``before_ids``
+        and the delivery rows fanned out from exactly those notifications."""
+        new = [n for n in store.all_notifications_feed()
+               if n.id not in before_ids]
+        declined = [n for n in new
+                    if n.kind == NotificationKind.SUBSTITUTE_DECLINED]
+        ids = {n.id for n in declined}
+        deliveries = [d for d in store.all_notification_deliveries()
+                      if d.notification_id in ids]
+        return new, declined, deliveries
+
+    def _assert_declined_reaches_only(self, store, before_ids, owner_team_id,
+                                      other_team_id, label):
+        """EXACTLY ONE coach notification, addressed to the offer owner, whose
+        deliveries ALL name the offer owner and NONE name the other side."""
+        new, declined, deliveries = self._declined_since(store, before_ids)
+        self.assertEqual(
+            len(declined), 1,
+            (label, "expected exactly one substitute_declined notification",
+             [(n.id, n.audience.value, n.audience_ref) for n in declined]))
+        note = declined[0]
+        self.assertEqual(note.audience, NotificationAudience.COACH, label)
+        self.assertEqual(
+            note.audience_ref, owner_team_id,
+            (label, "the offer owner must be the audience",
+             note.audience_ref))
+        # Every delivery fanned out from it names the offer owner — asserted
+        # on the rows themselves, by count AND recipient.
+        recipients = [d.recipient_ref for d in deliveries]
+        self.assertEqual(
+            set(recipients), {"team:" + owner_team_id},
+            (label, "delivery recipients", recipients))
+        self.assertEqual(
+            len(recipients), 2,
+            (label, "one delivery per DEFAULT_CHANNELS channel", recipients))
+        self.assertEqual(
+            sorted(d.channel.value for d in deliveries), ["email", "push"],
+            (label, [d.channel.value for d in deliveries]))
+        self.assertEqual(
+            [d.id for d in deliveries
+             if d.recipient_ref == "team:" + other_team_id], [],
+            (label, "no delivery may reach the other side", recipients))
+        self._assert_nothing_reaches(store, before_ids, other_team_id, label)
+
+    def _assert_nothing_reaches(self, store, before_ids, team_id, label):
+        """No notification emitted since ``before_ids`` — of ANY kind — and no
+        delivery fanned out from one, may name ``team_id``."""
+        new = [n for n in store.all_notifications_feed()
+               if n.id not in before_ids]
+        self.assertEqual(
+            [(n.id, n.kind.value) for n in new if n.audience_ref == team_id],
+            [], (label, "a notification leaked to the wrong side"))
+        new_ids = {n.id for n in new}
+        self.assertEqual(
+            [d.id for d in store.all_notification_deliveries()
+             if d.notification_id in new_ids
+             and d.recipient_ref == "team:" + team_id],
+            [], (label, "a delivery leaked to the wrong side"))
+
+    def _assert_no_coach_notification(self, store, before_ids, teams, label):
+        """The suppressed-push posture: the decline committed, and NO coach
+        ``substitute_declined`` notification (hence no delivery) was emitted
+        to ANY team — never a guess, never the opponent."""
+        new, declined, deliveries = self._declined_since(store, before_ids)
+        self.assertEqual(
+            declined, [],
+            (label, "a legacy NULL-team_id offer has no honest audience, so "
+                    "the targeted push must be suppressed entirely",
+             [(n.id, n.audience_ref) for n in declined]))
+        self.assertEqual(deliveries, [], label)
+        for side in ("home", "away", "third"):
+            self._assert_nothing_reaches(
+                store, before_ids, teams[side]["id"], (label, side))
+
+    # -- the three required scenarios ------------------------------------
+    def _reassignment_case(self, api, season, league, teams, label,
+                           decline=None):
+        """(a) HOME enroll/offer -> ordinary team MOVE to AWAY -> decline.
+
+        Needs a route where the player's team changes but eligibility never
+        resolves through ``SeasonRosterMembership`` (the governed-transfer
+        model allows one open membership per player/league_season, so
+        "reassigned but nothing terminal" has no membership-side
+        construction) — an UNBOUND exhibition judged by the permanent
+        ``player.team_id`` pointer, moved by the ordinary
+        ``assign_player_team`` facade call."""
+        store = api.store
+        exhibition = self._exhibition(api, season, league, teams)
+        sam = self._player(api, teams["home"]["id"], "Sam")
+        self.assertNotIn(
+            "error", api.enroll_substitute(exhibition["id"], sam["id"]), label)
+        offer = api.offer_substitute(exhibition["id"], sam["id"])
+        self.assertNotIn("error", offer, (label, offer))
+        row = store.substitute_for_player(exhibition["id"], sam["id"])
+        # The offer-time snapshot names HOME — Sam's team when the offer was
+        # validated, and therefore the offer's owner forever after.
+        self.assertEqual(row.team_id, teams["home"]["id"], label)
+
+        moved = api.assign_player_team(
+            sam["id"], teams["away"]["id"], actor_id=ADMIN)
+        self.assertNotIn("error", moved, (label, moved))
+        self.assertEqual(
+            store.get_player(sam["id"]).team_id, teams["away"]["id"], label)
+        # Live resolution now answers AWAY — the value the defect used.
+        self.assertEqual(
+            api.roster.team_for_game(store.get_game(exhibition["id"]),
+                                     store.get_player(sam["id"])),
+            teams["away"]["id"], label)
+
+        before = {n.id for n in store.all_notifications_feed()}
+        res = (decline or api.decline_substitute)(
+            exhibition["id"], sam["id"])
+        self.assertNotIn("error", res, (label, res))
+        self.assertEqual(res["status"], "declined", label)
+        self.assertEqual(
+            store.substitute_for_player(exhibition["id"], sam["id"]).status,
+            SubstituteStatus.DECLINED, label)
+        self._assert_declined_reaches_only(
+            store, before, teams["home"]["id"], teams["away"]["id"], label)
+
+    def _membership_end_case(self, api, teams, game, ls_id, label,
+                             decline=None):
+        """(b) The same assertion for a membership END followed by a NEW AWAY
+        membership, on the LeagueSeason-BOUND game — the membership-side
+        route to "live resolution now answers the opponent"."""
+        store = api.store
+        p = self._player(api, teams["home"]["id"], "Ended")
+        self.assertNotIn(
+            "error", api.enroll_substitute(game["id"], p["id"]), label)
+        offer = api.offer_substitute(game["id"], p["id"])
+        self.assertNotIn("error", offer, (label, offer))
+        self.assertEqual(
+            store.substitute_for_player(game["id"], p["id"]).team_id,
+            teams["home"]["id"], label)
+
+        # End the HOME stint, then open a NEW ACTIVE one on AWAY (see
+        # ``_transfer``/``end_membership_directly`` for why the terminal
+        # transition is constructed at the store).
+        end_membership_directly(
+            store, self._stint_id(api, p["id"], ls_id), "transferred")
+        self.assertNotIn(
+            "error",
+            self._membership(api, p["id"], ls_id, teams["away"]["id"]), label)
+        self.assertEqual(
+            api.roster.team_for_game(store.get_game(game["id"]),
+                                     store.get_player(p["id"])),
+            teams["away"]["id"], label)
+
+        before = {n.id for n in store.all_notifications_feed()}
+        res = (decline or api.decline_substitute)(game["id"], p["id"])
+        self.assertNotIn("error", res, (label, res))
+        self.assertEqual(res["status"], "declined", label)
+        self.assertEqual(
+            store.substitute_for_player(game["id"], p["id"]).status,
+            SubstituteStatus.DECLINED, label)
+        self._assert_declined_reaches_only(
+            store, before, teams["home"]["id"], teams["away"]["id"], label)
+
+    def _legacy_null_case(self, api, season, league, teams, label,
+                          decline=None):
+        """(c) A LEGACY OFFERED row whose ``team_id`` migration 060 left NULL
+        (it is additive with no backfill), player then moved to AWAY.
+
+        Nothing written at offer time records the offer owner (the offer-time
+        push is PLAYER-audience, the SUBSTITUTE_OFFERED AuditLog detail is
+        empty, no SetupAuditLog row is written) and nothing reconstructs it
+        honestly afterwards, so there is no historically safe source to
+        consult. The decline must still COMMIT — the player's terminal act is
+        never undone by a notification with no audience — while the targeted
+        push is SUPPRESSED. It must emphatically NOT fall through to a live
+        lookup and tell AWAY."""
+        store = api.store
+        exhibition = self._exhibition(api, season, league, teams)
+        p = self._player(api, teams["home"]["id"], "Legacy")
+        self.assertNotIn(
+            "error", api.enroll_substitute(exhibition["id"], p["id"]), label)
+        offer = api.offer_substitute(exhibition["id"], p["id"])
+        self.assertNotIn("error", offer, (label, offer))
+        # Seed the pre-060 shape at the store: an OFFERED row with no
+        # snapshot. (The service can no longer produce one — every offer sets
+        # it — which is exactly why it is constructed here.)
+        row = store.substitute_for_player(exhibition["id"], p["id"])
+        row.team_id = None
+        store.save_substitute(row)
+        self.assertIsNone(
+            store.substitute_for_player(exhibition["id"], p["id"]).team_id,
+            label)
+
+        self.assertNotIn(
+            "error",
+            api.assign_player_team(p["id"], teams["away"]["id"],
+                                   actor_id=ADMIN), label)
+        self.assertEqual(
+            api.roster.team_for_game(store.get_game(exhibition["id"]),
+                                     store.get_player(p["id"])),
+            teams["away"]["id"], label)
+
+        before = {n.id for n in store.all_notifications_feed()}
+        res = (decline or api.decline_substitute)(
+            exhibition["id"], p["id"])
+        self.assertNotIn("error", res, (label, res))
+        self.assertEqual(res["status"], "declined", label)
+        row = store.substitute_for_player(exhibition["id"], p["id"])
+        self.assertEqual(row.status, SubstituteStatus.DECLINED, label)
+        self.assertIsNone(row.team_id, label)
+        self._assert_no_coach_notification(store, before, teams, label)
+
+
+class DeclineAudienceIsTheOfferOwner(_DeclineAudienceContract,
+                                     unittest.TestCase):
+    """Cases (b) and (c) of the offer-owner matrix on Memory + SQLite.
+
+    Case (a) — the ordinary team MOVE — is carried by the inverted
+    ``UnboundGamesKeepThePermanentGate.test_decline_notifies_the_offer_owner_
+    not_the_new_team`` below, which needs that class' unbound-exhibition
+    premise; it calls the SAME shared runner this class does."""
+
+    def _stores(self):
+        yield "memory", InMemoryStore()
+        yield "sqlite", SqlStore(":memory:")
+
+    def test_membership_end_then_away_membership_notifies_the_offer_owner(self):
+        for label, store in self._stores():
+            with self.subTest(backend=label):
+                api, season, league, teams, game, ls_id = self._build(store)
+                self._membership_end_case(api, teams, game, ls_id, label)
+
+    def test_legacy_null_team_id_commits_and_notifies_nobody(self):
+        for label, store in self._stores():
+            with self.subTest(backend=label):
+                api, season, league, teams, game, ls_id = self._build(store)
+                self._legacy_null_case(api, season, league, teams, label)
+
+
+class UnboundGamesKeepThePermanentGate(_DeclineAudienceContract,
+                                       unittest.TestCase):
     """No LeagueSeason binding -> no Season to resolve against: the
     permanent pointer stays the only source, exactly today's behavior.
     (This is also why the pre-existing substitute suites pass unchanged:
@@ -549,79 +821,49 @@ class UnboundGamesKeepThePermanentGate(_Fixture, unittest.TestCase):
         res = api.enroll_substitute(game["id"], p["id"])
         self.assertEqual(res["error"]["code"], "not_eligible")
 
-    def test_decline_notifies_the_current_team_after_reassignment(self):
-        """#205 blocker 3, ROUND 2: the round-1 snapshot fix
-        (``SubstituteEnrollment.team_id``, migration 060) closed the
-        membership-lapsed crash, but its precedence — ``sub.team_id or
-        self.team_for_game(...)`` — ALWAYS preferred the offer-time
-        snapshot when one existed, even when the player's LIVE team had
-        legitimately changed since via an ordinary ``assign_player_team``
-        call. That is a plain reassignment, not a membership ending —
-        nothing "terminal" happens at all — yet the stale snapshot still
-        won and decline notified the WRONG (former) team.
+    def test_decline_notifies_the_offer_owner_not_the_new_team(self):
+        """Case (a) of the offer-owner matrix: HOME enroll/offer -> ordinary
+        team MOVE to AWAY -> decline notifies HOME, the OFFER OWNER.
 
-        This needs a route where the player's team changes but eligibility
-        resolution never goes through ``SeasonRosterMembership`` (the
-        governed-transfer model has exactly one open membership per
-        player/league_season, so "reassigned but not terminal" has no
-        membership-side construction) — an UNBOUND game judged by the
-        permanent ``player.team_id`` pointer, exactly like
-        ``UnboundGamesKeepThePermanentGate``'s other tests, moved by the
-        ordinary ``assign_player_team`` facade call (the store-level
-        primitive that deliberately does NOT touch membership — see the
-        module docstring's "parity dual-write" section).
+        THIS TEST USED TO ASSERT THE OPPOSITE. A round-2 pass inverted
+        ``decline_substitute``'s precedence to ``team_for_game(...) or
+        sub.team_id`` — resolve LIVE first — arguing symmetry with
+        ``_accept_offered_substitute``, and pinned that behavior here as
+        "LIVE resolution must win: AWAY, Sam's CURRENT team". The owner's
+        exact-head review REJECTED that symmetry argument and the behavior
+        with it, so the assertions are inverted rather than deleted: this is
+        now the regression that keeps live-first from coming back.
 
-        ``_accept_offered_substitute`` (``roster_service.py``, ~639-641)
-        never had this bug: it always calls ``_require_team_for_game``
-        fresh, never consulting a snapshot at all. The fix mirrors that
-        exact live-first order in ``decline_substitute``, falling back to
-        ``sub.team_id`` only when live resolution is genuinely ``None``
-        (see ``EligibilityIsLiveNotFrozen.test_decline_after_release_
-        succeeds_and_notifies_the_real_team`` for that companion case,
-        confirmed unaffected below and by this file's own suite)."""
-        for store in (InMemoryStore(), SqlStore(":memory:")):
-            label = type(store).__name__
-            api, season, league, teams, _, ls_id = self._build(store)
+        WHY ACCEPT IS NOT A PRECEDENT. Acceptance REVALIDATES current
+        eligibility and attributes the new roster seat to the live side, so
+        it must resolve fresh. Decline revalidates nothing and seats nobody:
+        it is the TERMINAL RESPONSE to an already-issued offer, whose
+        audience is the coach/team that OWNS that offer. Live-first leaked
+        one team's outstanding-offer state to their OPPONENT and left the
+        offering coach — the one who must now advance their queue —
+        unaware. ``sub.team_id`` is authoritative for the offer's lifetime,
+        full stop.
+
+        The reproduction on the previous head, tri-store, was exactly the
+        owner's: offer while HOME (row snapshots HOME), reassign to AWAY,
+        decline — every ``substitute_declined`` delivery row named
+        ``team:<AWAY>`` and none named HOME.
+
+        The route matters: the player's team must change WITHOUT eligibility
+        resolving through ``SeasonRosterMembership`` (the governed-transfer
+        model allows one open membership per player/league_season, so
+        "reassigned but nothing terminal" has no membership-side
+        construction) — hence an UNBOUND exhibition judged by the permanent
+        ``player.team_id`` pointer, exactly like this class' other tests,
+        moved by the ordinary ``assign_player_team`` facade call. The
+        membership-side route to the same wrong-side resolution is case (b),
+        ``DeclineAudienceIsTheOfferOwner.test_membership_end_then_away_
+        membership_notifies_the_offer_owner``."""
+        for label, store in (("memory", InMemoryStore()),
+                             ("sqlite", SqlStore(":memory:"))):
             with self.subTest(backend=label):
-                exhibition = self._exhibition(api, season, league, teams)
-                sam = self._player(api, teams["home"]["id"], "Sam")
-                self.assertNotIn(
-                    "error",
-                    api.enroll_substitute(exhibition["id"], sam["id"]),
-                    label)
-                offer = api.offer_substitute(exhibition["id"], sam["id"])
-                self.assertNotIn("error", offer, (label, offer))
-                row = api.store.substitute_for_player(
-                    exhibition["id"], sam["id"])
-                # The offer-time snapshot names HOME — Sam's team when the
-                # offer was validated.
-                self.assertEqual(row.team_id, teams["home"]["id"], label)
-
-                # An ORDINARY reassignment — no membership involved, no
-                # release, nothing terminal — moves Sam's permanent pointer
-                # to AWAY after the offer.
-                moved = api.assign_player_team(
-                    sam["id"], teams["away"]["id"], actor_id=ADMIN)
-                self.assertNotIn("error", moved, (label, moved))
-                self.assertEqual(
-                    api.store.get_player(sam["id"]).team_id,
-                    teams["away"]["id"], label)
-
-                before = [(n.kind.value, n.audience_ref) for n in
-                         api.store.all_notifications_feed()]
-                res = api.decline_substitute(exhibition["id"], sam["id"])
-                self.assertNotIn("error", res, (label, res))
-                after = [(n.kind.value, n.audience_ref) for n in
-                        api.store.all_notifications_feed()]
-                new_events = [e for e in after if e not in before]
-                # LIVE resolution must win: AWAY, Sam's CURRENT team — not
-                # the stale HOME snapshot recorded at offer time.
-                self.assertIn(
-                    ("substitute_declined", teams["away"]["id"]),
-                    new_events, (label, new_events))
-                self.assertNotIn(
-                    ("substitute_declined", teams["home"]["id"]),
-                    new_events, (label, new_events))
+                api, season, league, teams, _, ls_id = self._build(store)
+                self._reassignment_case(api, season, league, teams, label)
 
 
 class ParityDualWriteOpensStints(_CutoverContract, unittest.TestCase):
@@ -1076,12 +1318,23 @@ _PG_SKIP = ("PostgreSQL not configured (TEST_DATABASE_URL) or psycopg "
 
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), _PG_SKIP)
-class MembershipCutoverPostgresTest(_Fixture, unittest.TestCase):
+class MembershipCutoverPostgresTest(_DeclineAudienceContract,
+                                    unittest.TestCase):
     """Both cutover directions plus the full arc against real PostgreSQL."""
 
     def setUp(self):
         self.store = fresh_sql_store(os.environ["TEST_DATABASE_URL"])
         self.addCleanup(self.store.close)
+        # PROVE the backend, do not assume it (#205 review, sibling blocker:
+        # two classes advertised as "tri-store" silently ran Memory+SQLite
+        # only, because their shared ``_stores()`` never built a PostgreSQL
+        # store — TEST_DATABASE_URL was accepted and then ignored, so the
+        # PostgreSQL claim was vacuous). A skipUnless on the env var proves
+        # only that a URL was SET. This asserts the store actually in hand is
+        # a SqlStore speaking the ``postgres`` dialect, so a PostgreSQL claim
+        # made by any test in this class is checkable at runtime.
+        self.assertIsInstance(self.store, SqlStore)
+        self.assertEqual(self.store.backend, "postgres", self.store.backend)
         (self.api, self.season, self.league, self.teams, self.game,
          self.ls_id) = self._build(self.store)
 
@@ -1133,43 +1386,31 @@ class MembershipCutoverPostgresTest(_Fixture, unittest.TestCase):
             ("substitute_declined", teams["home"]["id"]), new_events,
             new_events)
 
-    def test_decline_notifies_current_team_after_reassignment_on_postgres(
+    def test_decline_notifies_the_offer_owner_after_reassignment_on_postgres(
         self,
     ):
-        """#205 blocker 3, round 2, against real PostgreSQL — see
-        ``UnboundGamesKeepThePermanentGate.test_decline_notifies_the_
-        current_team_after_reassignment`` for the Memory/SQLite half and
-        the full defect narrative."""
-        api, season, league, teams = (
-            self.api, self.season, self.league, self.teams)
-        exhibition = self._exhibition(api, season, league, teams)
-        sam = self._player(api, teams["home"]["id"], "PG Sam")
-        self.assertNotIn(
-            "error", api.enroll_substitute(exhibition["id"], sam["id"]))
-        offer = api.offer_substitute(exhibition["id"], sam["id"])
-        self.assertNotIn("error", offer, offer)
-        row = self.store.substitute_for_player(exhibition["id"], sam["id"])
-        self.assertEqual(row.team_id, teams["home"]["id"])
+        """Case (a) against REAL PostgreSQL — see the Memory/SQLite half,
+        ``UnboundGamesKeepThePermanentGate.test_decline_notifies_the_offer_
+        owner_not_the_new_team``, for the full narrative and for why this
+        test's assertions were INVERTED rather than deleted (it previously
+        pinned the live-first behavior the owner's exact-head review
+        rejected). Runs the SAME shared ``_reassignment_case`` runner, so the
+        three backends cannot drift apart."""
+        self._reassignment_case(
+            self.api, self.season, self.league, self.teams, "postgres")
 
-        moved = api.assign_player_team(
-            sam["id"], teams["away"]["id"], actor_id=ADMIN)
-        self.assertNotIn("error", moved, moved)
-        self.assertEqual(
-            self.store.get_player(sam["id"]).team_id, teams["away"]["id"])
+    def test_membership_end_then_away_membership_on_postgres(self):
+        """Case (b) against REAL PostgreSQL — same shared runner as
+        ``DeclineAudienceIsTheOfferOwner``'s Memory/SQLite half."""
+        self._membership_end_case(
+            self.api, self.teams, self.game, self.ls_id, "postgres")
 
-        before = [(n.kind.value, n.audience_ref) for n in
-                 self.store.all_notifications_feed()]
-        res = api.decline_substitute(exhibition["id"], sam["id"])
-        self.assertNotIn("error", res, res)
-        after = [(n.kind.value, n.audience_ref) for n in
-                self.store.all_notifications_feed()]
-        new_events = [e for e in after if e not in before]
-        self.assertIn(
-            ("substitute_declined", teams["away"]["id"]), new_events,
-            new_events)
-        self.assertNotIn(
-            ("substitute_declined", teams["home"]["id"]), new_events,
-            new_events)
+    def test_legacy_null_team_id_commits_and_notifies_nobody_on_postgres(self):
+        """Case (c) against REAL PostgreSQL: a legacy OFFERED row whose
+        ``team_id`` is a genuine SQL NULL (not a Python ``None`` living only
+        in a dict), the player then moved to AWAY. Same shared runner."""
+        self._legacy_null_case(
+            self.api, self.season, self.league, self.teams, "postgres")
 
 
 class DeclineAfterMembershipEndOverHttp(unittest.TestCase):
@@ -1243,6 +1484,157 @@ class DeclineAfterMembershipEndOverHttp(unittest.TestCase):
         status, row = self._req(
             "GET", f"/api/games/{gid}/roster-status")
         self.assertEqual(status, 200, row)
+
+
+class DeclineAudienceOverHttp(_DeclineAudienceContract, unittest.TestCase):
+    """The offer-owner rule through the REAL HTTP surface: a genuine request
+    over a real socket to ``web/server.py`` performs the DECLINE in every
+    case below, and the SAME shared runners/assertions the Memory, SQLite and
+    PostgreSQL classes use then inspect the emitted notification and delivery
+    rows. Nothing about the contract is restated here, so the transport
+    cannot drift away from the service.
+
+    All THREE decline surfaces the server exposes are exercised, because all
+    three reach ``decline_substitute`` and therefore all three could leak to
+    the opponent:
+
+      * ``POST /api/games/{gid}/substitutes/{pid}/decline`` — the coach/
+        operator route (role header);
+      * ``POST /api/me/substitute-opportunities/{gid}/decline-offer`` — the
+        signed-in player's own self-service route, player id resolved from
+        the SESSION (#110), so it needs a real player-scoped account;
+      * ``POST /api/me/guardian/{jid}/substitute-opportunities/{gid}/
+        decline-offer`` — a verified guardian acting for a junior (#26),
+        which needs a guardian account AND a verified link.
+
+    The last two are reached with real logins through ``/api/auth/login``,
+    not by calling the facade — a route whose identity gate is bypassed is
+    not the HTTP surface."""
+
+    PASSWORD = "Passw0rd!x205"
+
+    def setUp(self):
+        srv.STATE.reset(seed=False)
+        (self.api, self.season, self.league, self.teams, self.game,
+         self.ls_id) = self._build(srv.STATE.api.store)
+        self.store = self.api.store
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._teardown_server)
+
+    def _teardown_server(self):
+        self.httpd.shutdown()
+        self.thread.join(timeout=5)
+        self.httpd.server_close()
+
+    def _post(self, path, body=None, opener=None, headers=None):
+        data = json.dumps(body or {}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=data, method="POST",
+            headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with (opener.open(req) if opener
+                  else urllib.request.urlopen(req)) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read() or b"{}")
+
+    def _login(self, username):
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+        status, body = self._post(
+            "/api/auth/login",
+            {"username": username, "password": self.PASSWORD},
+            opener=opener)
+        self.assertEqual(status, 200, body)
+        return opener
+
+    # -- the three real decline surfaces, as injectable callables ---------
+    def _coach_route_decline(self, game_id, player_id):
+        status, body = self._post(
+            f"/api/games/{game_id}/substitutes/{player_id}/decline", {},
+            headers={"X-Demo-Role": "league_admin"})
+        self.assertEqual(status, 200, body)
+        return body
+
+    def _player_route_decline(self, game_id, player_id):
+        """The signed-in player declines their OWN offer. The route takes no
+        player_id — it comes from the session — so the account is created
+        scoped to this player and logged in for real."""
+        username = f"selfserve{player_id}"
+        acct = self.api.create_user_account(
+            username, self.PASSWORD, "player",
+            scope={"player_id": player_id}, actor_id=ADMIN)
+        self.assertNotIn("error", acct, acct)
+        opener = self._login(username)
+        status, body = self._post(
+            f"/api/me/substitute-opportunities/{game_id}/decline-offer", {},
+            opener=opener)
+        self.assertEqual(status, 200, body)
+        return body
+
+    def _guardian_route_decline(self, game_id, player_id):
+        """A VERIFIED guardian declines on the junior's behalf."""
+        username = f"guardian{player_id}"
+        acct = self.api.create_user_account(
+            username, self.PASSWORD, "guardian", actor_id=ADMIN)
+        self.assertNotIn("error", acct, acct)
+        link = self.api.create_guardian_link(
+            acct["id"], player_id, actor_id=ADMIN)
+        self.assertNotIn("error", link, link)
+        verified = self.api.verify_guardian_link(
+            link["id"], "signed_form", actor_id=ADMIN)
+        self.assertNotIn("error", verified, verified)
+        self.assertTrue(verified["verified"], verified)
+        opener = self._login(username)
+        status, body = self._post(
+            f"/api/me/guardian/{player_id}/substitute-opportunities/"
+            f"{game_id}/decline-offer", {}, opener=opener)
+        self.assertEqual(status, 200, body)
+        return body
+
+    # -- (a) move to AWAY, over each of the three routes ------------------
+    def test_coach_route_reassignment_notifies_the_offer_owner(self):
+        self._reassignment_case(
+            self.api, self.season, self.league, self.teams, "http/coach",
+            decline=self._coach_route_decline)
+
+    def test_player_route_reassignment_notifies_the_offer_owner(self):
+        self._reassignment_case(
+            self.api, self.season, self.league, self.teams, "http/player",
+            decline=self._player_route_decline)
+
+    def test_guardian_route_reassignment_notifies_the_offer_owner(self):
+        self._reassignment_case(
+            self.api, self.season, self.league, self.teams, "http/guardian",
+            decline=self._guardian_route_decline)
+
+    # -- (b) membership end -> new AWAY membership ------------------------
+    def test_coach_route_membership_end_notifies_the_offer_owner(self):
+        self._membership_end_case(
+            self.api, self.teams, self.game, self.ls_id, "http/coach",
+            decline=self._coach_route_decline)
+
+    def test_player_route_membership_end_notifies_the_offer_owner(self):
+        self._membership_end_case(
+            self.api, self.teams, self.game, self.ls_id, "http/player",
+            decline=self._player_route_decline)
+
+    # -- (c) legacy OFFERED row with NULL team_id -------------------------
+    def test_coach_route_legacy_null_commits_and_notifies_nobody(self):
+        self._legacy_null_case(
+            self.api, self.season, self.league, self.teams, "http/coach",
+            decline=self._coach_route_decline)
+
+    def test_player_route_legacy_null_commits_and_notifies_nobody(self):
+        self._legacy_null_case(
+            self.api, self.season, self.league, self.teams, "http/player",
+            decline=self._player_route_decline)
+
 
 
 if __name__ == "__main__":  # pragma: no cover

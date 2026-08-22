@@ -686,26 +686,57 @@ class RosterService:
         )
         # Notify the team's coach so they can advance to the next candidate
         # (#112) — the pre-#112 decline path emitted no notification at all.
-        # #205 blocker 3 (re-derived, round 2): resolve LIVE first, exactly
-        # the order _accept_offered_substitute uses (its
-        # `_require_team_for_game` above) — a team reassignment that
-        # happens between offer and decline, with membership never lapsing,
-        # must notify the CURRENT team, not the stale offer-time snapshot.
-        # `sub.team_id` is consulted only as the FALLBACK, for the two cases
-        # live resolution can't answer: (a) membership genuinely ended since
-        # the offer (team_for_game returns None — the original crash this
-        # snapshot exists to survive) and (b) a sub OFFERED before this
-        # column existed (team_id is NULL on migration; every new offer
-        # sets it, so this is a narrow transitional case only). If even the
-        # snapshot can't resolve a team, the push is skipped rather than
-        # handed a None audience_ref — delivery.recipient_ref's #60 fail-
-        # closed invariant would otherwise raise and roll the whole decline
-        # back; the decline itself, already committed above, must never
-        # roll back over a notification that has no honest audience to
-        # reach — same "skip the targeted push, keep the outcome" posture
-        # as the sibling fix in _back_out_entry below.
-        audience_ref = self.team_for_game(
-            game, self.store.get_player(player_id)) or sub.team_id
+        #
+        # THE OFFER OWNER IS THE AUDIENCE (#205 blocker 3, round-3 owner
+        # ruling). ``sub.team_id`` — the side ``offer_substitute``'s own
+        # ``_require_team_for_game`` validated this offer against, snapshotted
+        # there (migration 060) — is AUTHORITATIVE for the ENTIRE LIFETIME of
+        # the offer. It is never overridden by, and never yields precedence
+        # to, a team resolved fresh at decline time.
+        #
+        # WHY ``accept`` IS NOT A PRECEDENT, and the symmetry argument is
+        # wrong. ``_accept_offered_substitute`` deliberately re-resolves live
+        # (``_require_team_for_game``) because acceptance REVALIDATES current
+        # eligibility and seats the player in a roster slot that must be
+        # counted against whichever side they are genuinely on NOW. Decline
+        # revalidates nothing and seats nobody: it is the TERMINAL RESPONSE to
+        # an offer that was already issued, and the audience of a response is
+        # whoever OWNS the thing being responded to — the coach/team that made
+        # the offer and is waiting to advance their queue. The two transitions
+        # have different contracts, so mirroring accept's order here is not
+        # "consistency", it is a leak.
+        #
+        # What live-first actually did (the defect this replaces, reproduced
+        # tri-store on the previous head): offer an exhibition substitute
+        # while on HOME (row snapshots HOME), reassign the player to AWAY,
+        # decline the still-HOME offer — ``team_for_game(...) or sub.team_id``
+        # resolved AWAY and short-circuited the snapshot, so AWAY's coach
+        # received ``substitute_declined`` for an offer that was never theirs
+        # (leaking the opponent's outstanding-offer state) and HOME's coach,
+        # who is the one that must now offer the next candidate, was told
+        # nothing at all.
+        #
+        # LEGACY ROWS. Migration 060 is additive with NO backfill, so a row
+        # OFFERED by pre-060 code has ``team_id`` NULL and there is nothing to
+        # read. No historically safe substitute exists to consult in that case
+        # (investigated and ruled out: NOTHING written at offer time records
+        # the offer-owner team — the offer-time push is PLAYER-audience with
+        # ``audience_ref=player_id``, the SUBSTITUTE_OFFERED AuditLog row
+        # carries an EMPTY detail, and no SetupAuditLog row is written at all;
+        # replaying the permanent ``player.team_id`` pointer answers a team
+        # that was never the offer owner on a LeagueSeason-bound game, and
+        # membership history cannot be time-travelled either — backfilled
+        # memberships carry no ``effective_from`` and no events by design, and
+        # terminal rows do not record an ``effective_to``). A live
+        # ``team_for_game`` lookup is emphatically NOT such a source; it is
+        # the very substitution this rule forbids. So the decline COMMITS and
+        # the targeted push is SUPPRESSED: never a guessed audience, and never
+        # a ``None`` audience_ref handed to a COACH push — delivery.
+        # recipient_ref's #60 fail-closed invariant stays intact (it would
+        # raise and roll the whole @_transactional decline back, leaving the
+        # player holding an undeclinable offer). Same "skip the targeted push,
+        # keep the outcome" posture as the sibling in ``_back_out_entry``.
+        audience_ref = sub.team_id
         if audience_ref is not None:
             _push_notification(
                 self.store, self.clock,
