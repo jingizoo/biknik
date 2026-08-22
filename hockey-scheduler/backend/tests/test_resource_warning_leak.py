@@ -57,10 +57,55 @@ This module proves the fix two ways, neither of which trusts an exit code:
   :class:`LeakProbeRegressionTest` for the forced-hang test that pins that
   naming, and for the two deliberate-leak tests that pin the detection
   itself.
+
+WHICH HALF OF THIS CONTRACT THE RUNNING INTERPRETER CAN ACTUALLY ENFORCE
+-----------------------------------------------------------------------
+#205 review, measured directly with ``-W error::ResourceWarning``, a real HTTP
+server and ``gc.collect()``:
+
+    unclosed HTTPError (body read, never closed)    3.12: NO WARNING  3.14: WARNS
+    unclosed HTTPError (never read, never closed)   3.12: NO WARNING  3.14: WARNS
+    unclosed raw socket                             3.12: WARNS      3.14: WARNS
+    unclosed raw file                               3.12: WARNS      3.14: WARNS
+
+On 3.14 ``urllib.response.addbase`` became a ``tempfile._TemporaryFileWrapper``
+subclass, so an abandoned ``HTTPError`` -- which IS an ``addbase`` -- is
+reported by ``tempfile._TemporaryFileCloser.__del__`` as "Implicitly cleaning
+up <HTTPError 403: 'Forbidden'>". On 3.12, and on the 3.11 CI runs
+(``.github/workflows/hockey-scheduler-ci.yml``, ``python-version: "3.11"``),
+an abandoned ``HTTPError`` produces NO ``ResourceWarning`` of any kind.
+
+So the HTTPError half of this file's contract is a NO-OP on the interpreter
+that actually gates this repository. That is not something to paper over with
+a skip -- A SKIP IS NOT A PASS -- so:
+
+* the capability is PROBED AT RUNTIME by behaviour, never by comparing version
+  numbers (:func:`_httperror_leak_warning`): a version check would silently rot
+  the day a future CPython changes this again, in either direction;
+* on an interpreter that cannot warn, the regression still RUNS, still proves
+  the deliberate-leak fixture really executed, asserts what is TRUE there, and
+  prints a loud banner naming the interpreter and saying this half is
+  unenforceable by ResourceWarning (:func:`_announce_unenforceable`);
+* the replacement protection is VERSION-INDEPENDENT and lives in
+  ``httperror_close_check.py`` / ``test_httperror_close_guard.py``: an unclosed
+  ``HTTPError`` is a property of the SOURCE, so it is checked by parsing the
+  source. :meth:`LeakProbeRegressionTest.
+  test_the_unenforceable_half_is_covered_by_the_source_guard` ties the two
+  together on the SAME fixture, so the handover cannot silently lapse.
+
+The psycopg half is unaffected -- psycopg emits its own "connection was
+deleted while still open" ``ResourceWarning`` on every interpreter measured
+(and the original CI failure log shows it firing on 3.11), so
+:meth:`LeakProbeRegressionTest.
+test_probe_still_fails_when_a_psycopg_resource_is_left_unclosed` keeps its
+full, unconditional strength.
 """
 
+import email.message
 import gc
+import io
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -68,20 +113,105 @@ import tempfile
 import textwrap
 import time
 import unittest
+import urllib.error
 import warnings
 
 from helpers import BACKEND  # noqa: F401
 
 import hockey_scheduler.web.server as srv
+import httperror_close_check as source_guard
 import test_sensitive_read_audit_http as audit_http
 from test_sensitive_read_audit_http import PERSONA, SensitiveReadHttpContract
 
 _LEAK_MARKERS = ("resourcewarning", "exception ignored", "unraisable")
 
+#: The exact text CPython prints for an abandoned ``HTTPError``, on the
+#: interpreters that print anything at all. Asserted as a SHAPE, not merely as
+#: "some marker appeared": the point of the deliberate-leak fixture is that the
+#: HTTPError specifically is what leaked.
+_HTTP_ERROR_LEAK_SIGNATURE = "Implicitly cleaning up <HTTPError 403"
+
 
 def _leak_markers_in(text):
     lowered = text.lower()
     return [m for m in _LEAK_MARKERS if m in lowered]
+
+
+_httperror_leak_probe_result = []
+
+
+def _httperror_leak_warning():
+    """Probe THIS interpreter, by BEHAVIOUR, for whether abandoning an
+    ``HTTPError`` emits a ``ResourceWarning`` at all. Returns the warning's
+    text, or ``None`` when the interpreter stays silent.
+
+    Deliberately not a version comparison. ``sys.version_info >= (3, 14)``
+    would be a claim about CPython's future as well as its past: the day the
+    behaviour changes again -- restored on a 3.11 patch release, removed again,
+    moved to a different warning category -- a version check keeps answering
+    with yesterday's truth and the regression around it goes quietly wrong in
+    whichever direction the change went. Running the experiment cannot rot.
+
+    Deliberately not an HTTP round trip either: no server, no socket, no port.
+    ``HTTPError`` IS ``urllib.response.addbase``, and it is that inheritance --
+    not the network -- that decides whether ``__del__`` warns, so constructing
+    one over an in-memory body reproduces the interpreter difference exactly
+    (verified against the real-server fixture below: on any interpreter, this
+    probe's answer and the deliberate-leak child's captured output must agree,
+    which is asserted, not assumed, in
+    :meth:`LeakProbeRegressionTest.test_probe_still_fails_when_an_httperror_is
+    _left_unclosed`).
+
+    The 403/"Forbidden" shape matches ``_HTTP_ERROR_LEAK_SIGNATURE`` so the
+    probe answers with the very text the subprocess contract looks for.
+
+    Cached in a module-level list rather than recomputed: ``catch_warnings``
+    mutates process-global filter state, so it is run exactly once.
+    """
+    if not _httperror_leak_probe_result:
+        headers = email.message.Message()
+        headers["Content-Length"] = "2"
+
+        def abandon_one():
+            err = urllib.error.HTTPError(
+                "http://127.0.0.1/leak-capability-probe", 403, "Forbidden",
+                headers, io.BytesIO(b"{}"))
+            err.read()  # read it, then drop it WITHOUT closing -- #426's shape
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            abandon_one()
+            gc.collect()
+        seen = [str(w.message) for w in caught
+                if issubclass(w.category, ResourceWarning)]
+        _httperror_leak_probe_result.append(seen[0] if seen else None)
+    return _httperror_leak_probe_result[0]
+
+
+def _announce_unenforceable(label):
+    """Print the loud, unmissable notice that half of this file's contract
+    cannot be enforced by ``ResourceWarning`` on THIS interpreter.
+
+    Written to stderr, which unittest passes through untouched, so it shows up
+    in a plain ``python -m unittest`` run, in ``run_parallel.py``'s captured
+    per-module output, and in CI logs. The alternative -- ``skipTest`` -- would
+    report the case as "skipped" and let a reader conclude the contract was
+    checked. It was not, and this says so, in the same place the verdict is.
+    """
+    version = platform.python_version()
+    print(
+        "\n" + "!" * 74 +
+        f"\n!! UNENFORCEABLE CONTRACT on CPython {version}: {label}"
+        "\n!! An unclosed urllib.error.HTTPError emits NO ResourceWarning on"
+        "\n!! this interpreter, so the ResourceWarning probe CANNOT catch the"
+        "\n!! #426 leak here. The case below still runs and asserts what IS"
+        "\n!! true here, but it is NOT proving the leak would be detected."
+        "\n!! The version-independent replacement is the source guard in"
+        "\n!! httperror_close_check.py / test_httperror_close_guard.py, which"
+        "\n!! parses every `except urllib.error.HTTPError as e:` and requires"
+        "\n!! it to close what it binds. THAT is what protects CI (3.11)."
+        "\n" + "!" * 74,
+        file=sys.stderr, flush=True)
 
 
 def _check_no_leak_markers(combined, label):
@@ -618,7 +748,15 @@ class LeakProbeRegressionTest(unittest.TestCase):
             handle.write(textwrap.dedent(source))
         return tmp.name
 
-    def _assert_probe_reports_a_leak(self, name, source, signature, label):
+    def _run_leak_fixture(self, name, source, label, case):
+        """Run one deliberate-leak fixture and return its captured text, having
+        first proved the fixture REALLY RAN.
+
+        That anti-vacuity step matters more than usual here: on an interpreter
+        that does not warn for an unclosed HTTPError, "no leak marker" and "the
+        child never got as far as leaking anything" produce identical output,
+        and only one of them is the interpreter fact this file records.
+        """
         cwd = self._fixture_dir(name, source)
         proc, _elapsed = _run_probe_or_fail(
             name, _REGRESSION_BOUND, label, cwd, expected_cases=1)
@@ -629,6 +767,13 @@ class LeakProbeRegressionTest(unittest.TestCase):
         # against a live leak rather than asserted in prose.
         self.assertEqual(proc.returncode, 0, combined)
         self.assertIn("OK", combined)
+        self.assertIn(case, combined, combined)
+        self.assertIn("Ran 1 test", combined, combined)
+        return combined
+
+    def _assert_probe_reports_a_leak(self, name, source, signature, label,
+                                     case):
+        combined = self._run_leak_fixture(name, source, label, case)
         self.assertIn(signature, combined, combined)
         # ...and the TEXT contract catches it anyway.
         with self.assertRaises(AssertionError) as caught:
@@ -638,18 +783,98 @@ class LeakProbeRegressionTest(unittest.TestCase):
         self.assertIn("exception ignored", message)
 
     def test_probe_still_fails_when_an_httperror_is_left_unclosed(self):
-        self._assert_probe_reports_a_leak(
-            "_deliberate_httperror_leak", _HTTP_ERROR_LEAK_SOURCE,
-            "Implicitly cleaning up <HTTPError 403",
-            "deliberate-HTTPError-leak fixture")
+        """Assert what is TRUE on the interpreter actually running this.
+
+        Both branches below are real assertions about a real deliberate leak
+        that really executed; neither is a skip, and neither is weakened into
+        "some marker appeared" (which would stop testing the HTTPError SHAPE
+        and start passing on any unrelated warning). Which branch is taken is
+        decided by :func:`_httperror_leak_warning`'s behavioural probe -- and
+        the two are cross-checked against each other, so a probe that lied in
+        either direction fails this test rather than silently choosing the
+        wrong branch.
+        """
+        label = "deliberate-HTTPError-leak fixture"
+        case = "test_reads_an_httperror_and_never_closes_it"
+        observed = _httperror_leak_warning()
+        combined = self._run_leak_fixture(
+            "_deliberate_httperror_leak", _HTTP_ERROR_LEAK_SOURCE, label, case)
+
+        if observed is None:
+            _announce_unenforceable(
+                "the #426 unclosed-HTTPError half of test_resource_warning_"
+                "leak.py")
+            # The interpreter fact, asserted rather than assumed: a real
+            # unclosed HTTPError, in a real child, under -W
+            # error::ResourceWarning, produced NOTHING. If a future CPython
+            # starts warning again, this fails and forces the branch to be
+            # re-derived instead of quietly staying on the weak path.
+            self.assertNotIn(_HTTP_ERROR_LEAK_SIGNATURE, combined, combined)
+            self.assertEqual(
+                _leak_markers_in(combined), [],
+                f"{label}: this interpreter emits no ResourceWarning for an "
+                f"abandoned HTTPError (probed), yet the child produced leak "
+                f"marker text anyway -- the probe and the real fixture "
+                f"disagree:\n{combined}")
+            _check_no_leak_markers(combined, label)  # must NOT raise here
+            return
+
+        # The interpreter CAN see it: the probe must have seen the same shape
+        # the child prints, and the TEXT contract must fire on it.
+        self.assertIn(_HTTP_ERROR_LEAK_SIGNATURE, observed, observed)
+        self.assertIn(_HTTP_ERROR_LEAK_SIGNATURE, combined, combined)
+        with self.assertRaises(AssertionError) as caught:
+            _check_no_leak_markers(combined, label)
+        message = str(caught.exception)
+        self.assertIn("resourcewarning", message)
+        self.assertIn("exception ignored", message)
+
+    def test_the_unenforceable_half_is_covered_by_the_source_guard(self):
+        """The handover, pinned on the SAME fixture source.
+
+        Whatever this interpreter can or cannot observe at runtime, the source
+        guard reads the deliberate-leak fixture's ``except urllib.error.
+        HTTPError as e:`` and reports it -- and reports the ``with e:`` version
+        of the same fixture as clean. That is the protection CI (3.11) actually
+        has, so it is proved here, next to the probe it replaces, rather than
+        only in its own module where a future edit could sever the two.
+        """
+        source = textwrap.dedent(_HTTP_ERROR_LEAK_SOURCE)
+        leaking = source_guard.violations(
+            source_guard.scan_source(source, "<deliberate-leak-fixture>"))
+        self.assertEqual(
+            [h.evidence for h in leaking], ["e is never closed"],
+            f"the source guard must report the deliberate-leak fixture on "
+            f"every interpreter: {[h.describe() for h in leaking]}")
+        self.assertEqual(
+            leaking[0].qualname,
+            "DeliberateHttpErrorLeakTest.test_reads_an_httperror_and_never_"
+            "closes_it")
+
+        fixed = source.replace("            e.read()  # read it, then drop it "
+                               "WITHOUT the `with e:` fix\n",
+                               "            with e:\n"
+                               "                e.read()\n")
+        self.assertNotEqual(fixed, source, "the fixture's leaking line moved")
+        self.assertEqual(
+            source_guard.violations(
+                source_guard.scan_source(fixed, "<fixed-fixture>")), [],
+            "and it must report the SAME fixture as clean once `with e:` is "
+            "restored -- otherwise it reports every handler and proves "
+            "nothing")
 
     @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                          "PostgreSQL suite only (TEST_DATABASE_URL not set)")
     def test_probe_still_fails_when_a_psycopg_resource_is_left_unclosed(self):
+        # NOT capability-gated, and must stay that way: psycopg emits its own
+        # ResourceWarning on every interpreter measured (3.12 and 3.14 here,
+        # 3.11 in CI run 32568130004's own failure log), so this half of the
+        # contract is enforceable everywhere and keeps its full strength.
         self._assert_probe_reports_a_leak(
             "_deliberate_psycopg_leak", _PSYCOPG_LEAK_SOURCE,
             "was deleted while still open",
-            "deliberate-psycopg-leak fixture")
+            "deliberate-psycopg-leak fixture",
+            "test_opens_a_connection_and_never_closes_it")
 
     def test_timeout_names_the_backend_and_the_last_case_reached(self):
         cwd = self._fixture_dir("_deliberate_hang", _HANG_SOURCE)
