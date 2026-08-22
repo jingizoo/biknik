@@ -49,6 +49,14 @@ shape therefore proves the REPORTING half (the slot must not reopen) plus a
 refusal, not a slot-gate refusal. Both are asserted; the expected code is
 carried per shape in :data:`SHAPES` so neither can silently become the other.
 
+WHAT A RE-SEAT DOES, section 6. Sections 1-5 pin that an attribution, once
+written, SURVIVES. They say nothing about what happens when the same row is
+seated AGAIN, nor about which side a re-confirm asks about — three behaviours
+this commit introduces that were measurably pinned by nothing (the product
+code was mutated at head 84ecd90 and the full 227-module suite stayed green
+each time). Section 6 closes that, and states the rule the three share: a
+SEATING decides an attribution and a READ never does.
+
 TRI-STORE, PROVEN. ``_stores`` yields Memory, SQLite and — when
 TEST_DATABASE_URL is set — real PostgreSQL; ``_assert_backend`` proves each
 one rather than trusting the env var, and ``_assert_matrix_ran`` fails if any
@@ -698,6 +706,458 @@ class BackOutNotifiesTheSeatedSideAfterParticipationEnds(
             finally:
                 self._close(label, store)
         self._assert_matrix_ran(ran, shapes=SHAPES[:1])
+
+
+# ======================================================================
+# 6. a RE-SEAT re-attributes the row; a RE-CONFIRM does not
+# ======================================================================
+# Three behaviours this commit introduces that NOTHING pinned. Each was
+# measured unpinned before these tests were written: the product code was
+# mutated in place at head 84ecd90 and the FULL suite (227 modules, -j 3,
+# Memory/SQLite) stayed green in all three cases.
+#
+#   * ``select_roster``'s revive branch re-writes ``team_side``/
+#     ``seated_position`` from the freshly-validated context.
+#   * ``_add_to_roster_entry``'s revive branch re-writes them from the
+#     (side, bucket) pair its caller just fed to ``_require_open_slot``.
+#   * ``set_availability``'s re-confirm gate reads ``entry.attribution``
+#     and NOT a fresh resolution. (The NULL half of that branch is already
+#     pinned by ``test_reconfirm_after_back_out_refuses_on_a_null_row``;
+#     the durable-versus-live half was not.)
+#
+# THE RULE THE THREE SHARE, and the reason they split the way they do:
+# a SEATING decides an attribution, and a READ never does. Re-seating a
+# backed-out row IS a seating -- it is authorized by a context resolved
+# right then, and the row must record THAT context, or the slot the gate
+# checked and the slot the row is counted in are two different slots.
+# Re-confirming is not a seating: it puts THIS ROW back into the slot it
+# already held, so it must ask about that slot -- the row's own durable
+# value -- even when a live lookup would now answer differently.
+#
+# WHY THESE ARE NOT VACUOUS. A test that re-seats a player whose live
+# resolution still answers the same side cannot tell "re-written from the
+# context" apart from "left alone": both leave HOME on the row. So every
+# case below moves the player to the OPPOSING side of the SAME game
+# between the two seatings (``_move_to_the_other_side``), which makes the
+# durable value and the live answer disagree by construction -- and
+# asserts that disagreement before exercising anything.
+
+
+class _Case(NamedTuple):
+    """A single-case matrix label for ``_assert_matrix_ran``, which needs
+    only ``.name``. These cases do not vary a membership-lifecycle shape
+    the way :data:`SHAPES` does -- they vary WHICH SIDE resolves -- so
+    borrowing a ``Shape`` name for them would misreport what ran."""
+    name: str
+
+
+RESEAT = (_Case("mover_reseated_on_the_opposing_side"),)
+
+
+class _ReseatHarness(_DurabilityHarness):
+    """The move that makes every case below falsifiable, plus the two-side
+    fixture they share. Built on ``_DurabilityHarness`` so the tri-store
+    loop, the PROVEN ``store.backend`` check and the loud
+    ``_assert_matrix_ran`` are the same ones the rest of this file uses --
+    there is exactly one harness here."""
+
+    def _two_sided(self, store, target_skaters=1):
+        """HOME and AWAY each with ``target_skaters`` skater slots (targets
+        are per-side), and a Mover-shaped candidate: permanent pointer
+        THIRD, ACTIVE membership on HOME. The pointer names a team that is
+        not a side of this game at all, so nothing below can accidentally
+        be reading it."""
+        api, season, league, teams, game, ls_id = self._build(
+            store, target_skaters=target_skaters, target_goalies=0)
+        return {"api": api, "gid": game["id"], "ls_id": ls_id,
+                "home": teams["home"]["id"], "away": teams["away"]["id"],
+                "third": teams["third"]["id"], "teams": teams}
+
+    def _mover(self, fx, name, side=None):
+        p = self._pointer_only_player(fx["api"], fx["third"], name)
+        m = self._membership(fx["api"], p["id"], fx["ls_id"],
+                             side or fx["home"])
+        assert "error" not in m, m
+        return p
+
+    def _live_side(self, fx, player_id):
+        """What a FRESH resolution answers right now -- the value the
+        durable one must be provably different from."""
+        api = fx["api"]
+        ctx = api.roster.resolve_membership_context(
+            api.store.get_game(fx["gid"]), api.store.get_player(player_id))
+        return None if ctx is None else ctx.team_id
+
+    def _open(self, fx, team_id):
+        return fx["api"].roster.compute_roster_status(
+            fx["gid"], team_id).to_dict()["open_skater_slots"]
+
+    def _move_to_the_other_side(self, fx, player_id, to_team, label):
+        """End the player's stint terminally and open an ACTIVE one on the
+        OPPOSING side of the same game, then PROVE the two answers now
+        disagree.
+
+        This is the anti-vacuity device for this whole section, so its
+        premise is asserted rather than assumed: after the move the LIVE
+        resolution must answer ``to_team`` while the already-seated row
+        must still name the side it was seated on. If a future change ever
+        made the move a no-op (one-membership-per-season tightened, the
+        terminal row still resolving, precedence reordered), these
+        assertions fail LOUDLY here instead of quietly turning the three
+        regressions below into tautologies.
+
+        The terminal transition is constructed at the STORE
+        (``end_membership_directly``) because the facade refuses every
+        terminal transition unconditionally until the governed transfer
+        slice ships -- the same pattern ``_end_participation`` and the
+        Slice A tests already use."""
+        api = fx["api"]
+        seated_before = api.store.roster_entry_for_player(
+            fx["gid"], player_id)
+        self.assertIsNotNone(seated_before, label)
+        from_team = seated_before.team_side
+        self.assertIsNotNone(from_team, label)
+        self.assertNotEqual(from_team, to_team, label)
+
+        end_membership_directly(
+            api.store, self._stint_id(api, player_id, fx["ls_id"]),
+            "transferred")
+        m = api.create_season_roster_membership(
+            player_id, fx["ls_id"], to_team, status="active", actor_id=ADMIN)
+        self.assertNotIn("error", m, (label, m))
+
+        # THE DISAGREEMENT, asserted: live says the new side...
+        self.assertEqual(self._live_side(fx, player_id), to_team,
+                         (label, "live resolution did not move"))
+        # ...while the row still names the old one.
+        seated_after = api.store.roster_entry_for_player(fx["gid"], player_id)
+        self.assertEqual(seated_after.team_side, from_team,
+                         (label, "durable attribution moved on its own"))
+        return from_team
+
+    def _each(self, target_skaters=1):
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                yield label, self._two_sided(store,
+                                             target_skaters=target_skaters)
+            finally:
+                self._close(label, store)
+
+
+class SelectRosterReviveReAttributesTheRow(_ReseatHarness, unittest.TestCase):
+    """``select_roster``'s revive branch (roster_service.py ~L315-329):
+    re-selecting a backed-out or coach-removed row is a RE-SEAT, so it
+    must record the context that authorized THAT seating -- not the one
+    the row happened to be seated with the first time.
+
+    MUTATION-PROVEN: deleting the two attribution writes from that branch
+    (so the revived row keeps its original ``team_side``/
+    ``seated_position``) leaves the whole 227-module suite green at head
+    84ecd90, and fails both tests here."""
+
+    def test_a_backed_out_row_is_re_attributed_when_it_is_re_selected(self):
+        ran = []
+        for label, fx in self._each():
+            with self.subTest(backend=label):
+                api, gid = fx["api"], fx["gid"]
+                home, away = fx["home"], fx["away"]
+                p = self._mover(fx, "Mover")
+
+                self.assertNotIn("error", api.select_roster(
+                    gid, [p["id"]], actor_id=ADMIN), label)
+                seated = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(seated.team_side, home, label)
+                self.assertEqual(seated.seated_position, Position.FORWARD,
+                                 label)
+                self.assertEqual(self._open(fx, home), 0, label)
+                self.assertEqual(self._open(fx, away), 1, label)
+
+                self.assertNotIn("error", api.set_availability(
+                    gid, p["id"], "unavailable", actor_id=p["id"]), label)
+                out = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(out.status.value, "unavailable", label)
+                self.assertFalse(out.status.occupies_slot, label)
+                self.assertEqual(self._open(fx, home), 1, label)
+
+                self._move_to_the_other_side(fx, p["id"], away, label)
+
+                self.assertNotIn("error", api.select_roster(
+                    gid, [p["id"]], actor_id=ADMIN), label)
+
+                # THE ASSERTION. The re-seat was authorized by a context
+                # naming AWAY, so the row names AWAY. Keeping HOME here is
+                # the mutation, and it is exactly the shape the blocker is
+                # about: gated against one side, counted on another.
+                back = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(back.team_side, away, (label, back.team_side))
+                self.assertEqual(back.seated_position, Position.FORWARD, label)
+                self.assertEqual(back.status.value, "selected", label)
+
+                # ...and the slot arithmetic AGREES with the row, on both
+                # sides, so enforcement and reporting are one answer.
+                self.assertEqual(self._open(fx, away), 0, label)
+                self.assertEqual(self._open(fx, home), 1, label)
+            ran.append((label, RESEAT[0].name))
+        self._assert_matrix_ran(ran, shapes=RESEAT)
+
+    def test_a_coach_removed_row_is_re_attributed_when_it_is_re_selected(self):
+        """The other way into the same branch: ``remove_player`` leaves the
+        row REMOVED rather than UNAVAILABLE, and re-selecting it is the
+        coach's own re-seat."""
+        ran = []
+        for label, fx in self._each():
+            with self.subTest(backend=label):
+                api, gid = fx["api"], fx["gid"]
+                home, away = fx["home"], fx["away"]
+                p = self._mover(fx, "Mover")
+
+                self.assertNotIn("error", api.select_roster(
+                    gid, [p["id"]], actor_id=ADMIN), label)
+                self.assertNotIn("error", api.remove_player(
+                    gid, p["id"], actor_id=ADMIN), label)
+                removed = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(removed.status.value, "removed", label)
+                self.assertEqual(removed.team_side, home, label)
+
+                self._move_to_the_other_side(fx, p["id"], away, label)
+
+                self.assertNotIn("error", api.select_roster(
+                    gid, [p["id"]], actor_id=ADMIN), label)
+                back = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(back.team_side, away, (label, back.team_side))
+                self.assertEqual(back.status.value, "selected", label)
+                self.assertEqual(self._open(fx, away), 0, label)
+                self.assertEqual(self._open(fx, home), 1, label)
+            ran.append((label, RESEAT[0].name))
+        self._assert_matrix_ran(ran, shapes=RESEAT)
+
+
+class SubstituteReseatIsAttributedToTheSideItWasGatedAgainst(
+        _ReseatHarness, unittest.TestCase):
+    """``_add_to_roster_entry``'s revive branch (roster_service.py
+    ~L940-947) -- the one the exact-head review called the most
+    consequential of the three.
+
+    Its caller gates on ``_require_open_slot(game_id, slot_type,
+    ctx.team_id)`` and then hands THAT SAME ``ctx.team_id`` down to be
+    written. If the revive kept the row's old side instead, the re-seat
+    would be gated against the side it was validated for and counted
+    against a different one -- two bodies reachable in the counted side's
+    slot, and a phantom body in the gated one. So these tests assert the
+    written value AND the enforcement/reporting coherence around it: after
+    the re-seat, the side that was gated is the side that is full, and the
+    side the row LEFT is genuinely takeable again.
+
+    The enrollment is opened BEFORE any roster row exists, because
+    ``enroll_substitute`` refuses a player who already has one (backed out
+    or not) -- so this is the real production shape: a substitute-pool
+    candidate the coach seated directly, who then backed out, and whose
+    still-live candidacy re-seats them.
+
+    MUTATION-PROVEN: deleting the two attribution writes from that branch
+    leaves the whole suite green at head 84ecd90, and fails both tests
+    here."""
+
+    def _seated_then_backed_out(self, fx, label, offer=False):
+        api, gid = fx["api"], fx["gid"]
+        p = self._mover(fx, "Mover")
+        self.assertNotIn("error", api.enroll_substitute(gid, p["id"]), label)
+        if offer:
+            # Offered while HOME's slot is genuinely open, so the offer is
+            # not standing on a gate it never passed.
+            self.assertNotIn("error", api.offer_substitute(gid, p["id"]),
+                             label)
+        self.assertNotIn("error", api.select_roster(
+            gid, [p["id"]], actor_id=ADMIN), label)
+        seated = api.store.roster_entry_for_player(gid, p["id"])
+        self.assertEqual(seated.team_side, fx["home"], label)
+        self.assertNotIn("error", api.set_availability(
+            gid, p["id"], "unavailable", actor_id=p["id"]), label)
+        return p
+
+    def _assert_coherent(self, fx, p, label):
+        """The written side, the reported counts and the ENFORCED gate all
+        name AWAY; HOME is genuinely free again. Under the mutation every
+        one of these is exactly reversed."""
+        api, gid = fx["api"], fx["gid"]
+        home, away = fx["home"], fx["away"]
+
+        row = api.store.roster_entry_for_player(gid, p["id"])
+        self.assertEqual(row.team_side, away, (label, row.team_side))
+        self.assertEqual(row.status.value, "accepted", label)
+        self.assertTrue(row.status.occupies_slot, label)
+
+        # Reporting.
+        self.assertEqual(self._open(fx, away), 0, label)
+        self.assertEqual(self._open(fx, home), 1, label)
+
+        # Enforcement, through the slot-gated substitute surface (coach
+        # SELECTION is not slot-gated, so it could not show this): a HOME
+        # candidate may be offered the reopened slot...
+        h = self._mover(fx, "Home Candidate", side=home)
+        self.assertNotIn("error", api.enroll_substitute(gid, h["id"]), label)
+        self.assertNotIn("error", api.offer_substitute(gid, h["id"]), label)
+        # ...and an AWAY candidate may NOT, because the re-seated row is
+        # holding AWAY's only slot -- the same side its gate checked.
+        a = self._mover(fx, "Away Candidate", side=away)
+        self.assertNotIn("error", api.enroll_substitute(gid, a["id"]), label)
+        refused = api.offer_substitute(gid, a["id"])
+        self.assertEqual(refused.get("error", {}).get("code"),
+                         "slot_already_filled", (label, refused))
+
+        # And no overfill anywhere: one occupying body, on AWAY.
+        occupying = sorted(e.player_id
+                           for e in api.store.roster_for_game(gid)
+                           if e.status.occupies_slot)
+        self.assertEqual(occupying, [p["id"]], label)
+
+    def test_coach_add_re_seats_on_the_side_it_resolved(self):
+        ran = []
+        for label, fx in self._each():
+            with self.subTest(backend=label):
+                api, gid = fx["api"], fx["gid"]
+                p = self._seated_then_backed_out(fx, label)
+                self._move_to_the_other_side(fx, p["id"], fx["away"], label)
+                self.assertNotIn("error", api.add_substitute_to_roster(
+                    gid, p["id"], actor_id=ADMIN), label)
+                self._assert_coherent(fx, p, label)
+            ran.append((label, RESEAT[0].name))
+        self._assert_matrix_ran(ran, shapes=RESEAT)
+
+    def test_accept_re_seats_on_the_side_it_resolved(self):
+        """The player-driven entry point into the same branch: an offer
+        made while the player was still HOME, accepted after the move.
+        ``_accept_offered_substitute`` re-resolves and gates on AWAY, so
+        the row it revives must say AWAY."""
+        ran = []
+        for label, fx in self._each():
+            with self.subTest(backend=label):
+                api, gid = fx["api"], fx["gid"]
+                p = self._seated_then_backed_out(fx, label, offer=True)
+                self._move_to_the_other_side(fx, p["id"], fx["away"], label)
+                self.assertNotIn("error", api.accept_substitute(
+                    gid, p["id"], actor_id=p["id"]), label)
+                self._assert_coherent(fx, p, label)
+            ran.append((label, RESEAT[0].name))
+        self._assert_matrix_ran(ran, shapes=RESEAT)
+
+
+class ReconfirmGatesOnTheRowsOwnAttribution(_ReseatHarness,
+                                            unittest.TestCase):
+    """``set_availability``'s re-confirm branch (roster_service.py
+    ~L398-418) asks about the slot THIS ROW holds -- ``entry.attribution``
+    -- not about whatever slot a fresh resolution would name now.
+
+    Re-confirming is not a seating: the row never left its slot, so the
+    only honest question is whether THAT slot is still free. A live
+    lookup can answer about a different side entirely, which would both
+    admit an overfill on the durable side and refuse a legitimate
+    re-confirm because an unrelated side is full.
+
+    Both directions are asserted, because a live-resolution defect gets
+    them wrong in OPPOSITE ways and either one alone would let the other
+    through.
+
+    The pre-061 NULL half of this branch is pinned separately by
+    ``test_reconfirm_after_back_out_refuses_on_a_null_row``; these two
+    keep the attribution intact and vary only which side is full, so a
+    mutation that swaps the durable value for a live one -- leaving the
+    NULL fail-closed branch untouched -- is caught HERE and only here.
+
+    MUTATION-PROVEN: replacing ``side, st = entry.attribution`` with the
+    live context's ``team_id``/``slot_type`` (NULL branch left exactly as
+    it is) leaves the whole suite green at head 84ecd90, and fails both
+    tests here."""
+
+    def _backed_out_on_home(self, fx, label):
+        api, gid = fx["api"], fx["gid"]
+        p = self._mover(fx, "Mover")
+        self.assertNotIn("error", api.select_roster(
+            gid, [p["id"]], actor_id=ADMIN), label)
+        self.assertNotIn("error", api.set_availability(
+            gid, p["id"], "available", actor_id=p["id"]), label)
+        self.assertNotIn("error", api.set_availability(
+            gid, p["id"], "unavailable", actor_id=p["id"]), label)
+        entry = api.store.roster_entry_for_player(gid, p["id"])
+        self.assertEqual(entry.status.value, "unavailable", label)
+        self.assertEqual(entry.team_side, fx["home"], label)
+        return p
+
+    def _fill(self, fx, side, label, name):
+        """Seat a body in ``side``'s only skater slot."""
+        f = self._mover(fx, name, side=side)
+        self.assertNotIn("error", fx["api"].select_roster(
+            fx["gid"], [f["id"]], actor_id=ADMIN), label)
+        self.assertEqual(self._open(fx, side), 0, label)
+        return f
+
+    def test_reconfirm_succeeds_when_the_durable_side_is_open(self):
+        """Durable HOME is open; live AWAY is FULL. The re-confirm must
+        SUCCEED -- it is retaking HOME's slot, and AWAY's occupancy is
+        none of its business."""
+        ran = []
+        for label, fx in self._each():
+            with self.subTest(backend=label):
+                api, gid = fx["api"], fx["gid"]
+                home, away = fx["home"], fx["away"]
+                p = self._backed_out_on_home(fx, label)
+                self._fill(fx, away, label, "Away Filler")
+                self._move_to_the_other_side(fx, p["id"], away, label)
+
+                self.assertEqual(self._open(fx, home), 1, label)
+                self.assertEqual(self._open(fx, away), 0, label)
+                self.assertEqual(self._live_side(fx, p["id"]), away, label)
+
+                res = api.set_availability(gid, p["id"], "available",
+                                           actor_id=p["id"])
+                self.assertNotIn("error", res, (label, res))
+                row = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(row.status.value, "confirmed", label)
+                # Re-confirming re-takes the slot it held; it does not
+                # re-seat, so the attribution is untouched.
+                self.assertEqual(row.team_side, home, (label, row.team_side))
+                self.assertEqual(self._open(fx, home), 0, label)
+                self.assertEqual(
+                    api.roster.compute_roster_status(
+                        gid, home).to_dict()["confirmed_skaters"], 1, label)
+            ran.append((label, RESEAT[0].name))
+        self._assert_matrix_ran(ran, shapes=RESEAT)
+
+    def test_reconfirm_is_refused_when_the_durable_side_is_full(self):
+        """The mirror: durable HOME is FULL (someone took the slot while
+        the player was out); live AWAY is open. The re-confirm must be
+        REFUSED -- gating on the live side would seat a second body in
+        HOME's single slot, which is the overfill this whole blocker
+        exists to close."""
+        ran = []
+        for label, fx in self._each():
+            with self.subTest(backend=label):
+                api, gid = fx["api"], fx["gid"]
+                home, away = fx["home"], fx["away"]
+                p = self._backed_out_on_home(fx, label)
+                filler = self._fill(fx, home, label, "Home Filler")
+                self._move_to_the_other_side(fx, p["id"], away, label)
+
+                self.assertEqual(self._open(fx, home), 0, label)
+                self.assertEqual(self._open(fx, away), 1, label)
+                self.assertEqual(self._live_side(fx, p["id"]), away, label)
+
+                res = api.set_availability(gid, p["id"], "available",
+                                           actor_id=p["id"])
+                self.assertEqual(res.get("error", {}).get("code"),
+                                 "slot_already_filled", (label, res))
+                # Refused with nothing half-written.
+                row = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(row.status.value, "unavailable", label)
+                self.assertEqual(row.team_side, home, label)
+                occupying = sorted(e.player_id
+                                   for e in api.store.roster_for_game(gid)
+                                   if e.status.occupies_slot)
+                self.assertEqual(occupying, [filler["id"]], label)
+            ran.append((label, RESEAT[0].name))
+        self._assert_matrix_ran(ran, shapes=RESEAT)
 
 
 if __name__ == "__main__":
