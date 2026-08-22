@@ -193,10 +193,26 @@ def _announce_unenforceable(label):
     cannot be enforced by ``ResourceWarning`` on THIS interpreter.
 
     Written to stderr, which unittest passes through untouched, so it shows up
-    in a plain ``python -m unittest`` run, in ``run_parallel.py``'s captured
-    per-module output, and in CI logs. The alternative -- ``skipTest`` -- would
-    report the case as "skipped" and let a reader conclude the contract was
-    checked. It was not, and this says so, in the same place the verdict is.
+    in a plain ``python -m unittest`` run.
+
+    IT DOES NOT REACH CI. ``run_parallel.py`` captures each shard's output and
+    prints only ``_summary_line()`` for a shard that passes (see its result
+    loop); the full text is retained solely for FAILING shards. So on a green
+    CI run -- which is every run where this notice would matter -- no human
+    sees it. Measured, not assumed: ``grep -c UNENFORCEABLE`` over a green
+    full run's log is 0.
+
+    Do not "fix" that by making this fail, and do not read the notice as the
+    protection. It is a marker for someone running this file directly. The
+    thing that actually protects CI is the source guard in
+    ``httperror_close_check.py`` / ``test_httperror_close_guard.py``, which
+    fails the build on a new unclosed handler regardless of interpreter --
+    which is exactly why the handover to it is pinned by a test rather than
+    left to this docstring.
+
+    The alternative -- ``skipTest`` -- would report the case as "skipped" and
+    let a reader conclude the contract was checked. It was not, and this says
+    so, in the same place the verdict is.
     """
     version = platform.python_version()
     print(
