@@ -116,6 +116,15 @@ One row per player selected for / added to the game.
 | selected_by | str? | actor id |
 | selected_at | datetime | |
 | updated_at | datetime | |
+| team_side | str? | **durable** game-side attribution — the Team id this row was seated against, written at creation/re-seat from the validated `GameMembershipContext` (migration 061) |
+| seated_position | Position? | **durable** — the position this row was seated to occupy; buckets into `GOALIE`/`SKATER` via `seated_slot_type` |
+
+`team_side`/`seated_position` are what the slot engine counts a seated row
+against — never the player's *current* membership, and never the permanent
+`Player.team_id` pointer. They are `NULL` only for rows written before
+migration 061; such a row is charged as occupying on **every** side and in
+**both** buckets (fail closed — it can reduce an open count but never reopen
+one, and it never names a side). See migration 061 for the full rationale.
 
 A roster entry **occupies a slot** when its status is one of `SELECTED`,
 `CONFIRMED`, `OFFERED`, `ACCEPTED`. It frees the slot when `UNAVAILABLE` or

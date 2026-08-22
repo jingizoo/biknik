@@ -177,7 +177,8 @@ class Migration059SortsAfterEveryMainMigrationTest(unittest.TestCase):
     # next time a #205 slice adds a migration after 059 — a new version NOT
     # listed here still fails the test below, so an accidental collision
     # (or an unreviewed addition) cannot pass silently.
-    _KNOWN_FOLLOWERS = frozenset({"060_substitute_team_id"})
+    _KNOWN_FOLLOWERS = frozenset({"060_substitute_team_id",
+                                  "061_roster_entry_durable_attribution"})
 
     def test_migration_sorts_after_every_other_shipped_migration(self):
         versions = [v for v, _ in _sql_store_module._load_migrations()]

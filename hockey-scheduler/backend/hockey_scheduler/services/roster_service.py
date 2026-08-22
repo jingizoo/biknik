@@ -252,12 +252,49 @@ class RosterService:
         locked_players = {pid: self.store.get_player_for_update(pid)
                           for pid in sorted(set(player_ids))}
 
+        # #205 blocker 5 round 2: coach selection now resolves the SAME ONE
+        # membership context every other seating surface resolves, because
+        # the row it writes must carry a DURABLE side/bucket and there is no
+        # honest source for that but the context which authorized the
+        # seating.
+        #
+        # THIS TIGHTENS THE COACH-SELECTION GATE, deliberately. The old gate
+        # was `player.team_id in (home, away)` — the permanent pointer, the
+        # very authority #205 is retiring. It admitted two wrong shapes at
+        # once on a LeagueSeason-BOUND game: a "Mover" whose pointer still
+        # names a team in this game but whose seasonal record names the
+        # OTHER side (seated on the wrong side), and a membership-LESS
+        # player whose pointer matches (seated on NO side at all — measured
+        # tri-store at head 580a09f: two occupying rows against
+        # target_skaters=2 and `open_skater_slots=2` reported, i.e. the
+        # owner's "occupying in storage and absent from the governed count"
+        # reached with no membership mutation whatsoever). ``enroll_
+        # substitute`` — the substitute entry point — has resolved a context
+        # and refused both shapes since the step-1 cutover; this makes the
+        # coach entry point agree with it instead of being strictly weaker
+        # than the list (``list_addable_players``) that feeds it.
+        #
+        # UNBOUND GAMES ARE UNCHANGED: for a game with no LeagueSeason the
+        # context IS the permanent pointer (see resolve_membership_context),
+        # so exhibitions and unbound legacy rows keep exactly the old gate
+        # and the old attribution.
+        #
+        # Resolved ONCE for the whole selection (two queries, home + away)
+        # rather than per player, so a 20-player roster does not pay 20
+        # membership lookups — the same batching _side_data uses, and the
+        # same precedence, via the shared _pick_eligible_membership.
+        bound = bool(game.league_season_id)
+        contexts = (self.resolve_membership_contexts_for_game(game)
+                    if bound else {})
+
         entries: List[GameRosterEntry] = []
         for player_id in player_ids:
             player = locked_players[player_id]
             if player is None:
                 raise NotFoundError(f"Player {player_id} not found.")
-            if player.team_id not in (game.home_team_id, game.away_team_id):
+            ctx = (contexts.get(player_id) if bound
+                   else self.resolve_membership_context(game, player))
+            if ctx is None:
                 raise NotEligibleError(
                     f"{player.name} is not on either team in this game."
                 )
@@ -268,17 +305,25 @@ class RosterService:
             existing = self.store.roster_entry_for_player(game_id, player_id)
             if existing is not None:
                 if existing.status.occupies_slot:
-                    # idempotent: already selected
+                    # idempotent: already selected. The attribution it is
+                    # ALREADY seated on stands — re-selecting an occupying
+                    # row is a no-op, not a re-seat, so it must not silently
+                    # re-attribute a row (including a pre-061 row, whose
+                    # NULL attribution stays NULL and stays fail-closed).
                     entries.append(existing)
                     continue
                 # Revive a removed/unavailable row instead of inserting a
                 # duplicate — one row per (game_id, player_id), now also enforced
-                # by a unique index (#201 Slice 3B, migration 023).
+                # by a unique index (#201 Slice 3B, migration 023). A revive IS
+                # a re-seat, so it re-writes the durable attribution from the
+                # context that just authorized it.
                 existing.roster_role = RosterRole.SELECTED
                 existing.selection_source = SelectionSource.COACH_SELECTED
                 existing.status = RosterEntryStatus.SELECTED
                 existing.selected_by = actor_id
                 existing.updated_at = now
+                existing.team_side = ctx.team_id
+                existing.seated_position = ctx.position
                 self.store.save_roster_entry(existing)
                 entries.append(existing)
                 continue
@@ -293,6 +338,8 @@ class RosterService:
                 selected_at=now,
                 updated_at=now,
                 selected_by=actor_id,
+                team_side=ctx.team_id,
+                seated_position=ctx.position,
             )
             self.store.add_roster_entry(entry)
             entries.append(entry)
@@ -341,18 +388,34 @@ class RosterService:
                 )
             if reconfirming:
                 # Re-confirming after a back-out only works while the slot is
-                # still open (a substitute may have already filled it). Both
-                # the slot type and the team it counts against must come
-                # from the game-scoped resolution (#205 blocker 5) — the
-                # permanent player.slot_type/team_id pointers are exactly
-                # the wrong-attribution defect this fix closes, and this
-                # call site fed them straight into the slot engine. Fails
-                # closed (mirrors the #270 deactivation gate / the
-                # accept_substitute re-resolution) if the player's
-                # membership has since lapsed for a bound game.
-                ctx = self._require_membership_context(game, player)
-                self._require_open_slot(
-                    game_id, ctx.slot_type, ctx.team_id)
+                # still open (a substitute may have already filled it).
+                #
+                # ELIGIBILITY is live and fails closed: a player whose
+                # membership lapsed since the back-out may not retake a slot
+                # at all (mirrors the #270 deactivation gate / the
+                # accept_substitute re-resolution).
+                self._require_membership_context(game, player)
+                # WHICH slot they are retaking is NOT re-resolved (#205
+                # blocker 5 round 2). Re-confirming puts THIS ROW back into
+                # the slot it was seated on, so the gate has to ask about
+                # that slot — the row's own durable attribution. Asking a
+                # freshly resolved context instead could gate against a
+                # different bucket (a season-scoped position that changed)
+                # or a different side than the row will actually be counted
+                # in, which is precisely the incoherence between enforcement
+                # and reporting this blocker is about.
+                attribution = entry.attribution
+                if attribution is None:
+                    # Pre-061 row: its side is unknown and must never be
+                    # guessed (owner ruling). Re-confirming is "take a slot
+                    # back", and a slot whose side is unknown must not be
+                    # taken. Refuse rather than re-derive.
+                    raise NotEligibleError(
+                        f"{player.name} cannot re-confirm: this roster row "
+                        f"predates durable game-side attribution, so the "
+                        f"slot it holds cannot be identified.")
+                side, st = attribution
+                self._require_open_slot(game_id, st, side)
 
         existing = self.store.availability_for_player(game_id, player_id)
         av = GameAvailability(
@@ -460,16 +523,22 @@ class RosterService:
                 subject_player_id=entry.player_id,
             )
         # Recalculate and, if a slot is now open with no substitutes, alert.
-        # #205 blocker 5: the side this feeds compute_roster_status/the
-        # notification audience is the game-resolved team, not the
-        # permanent player.team_id pointer (which, for a Mover-shaped
-        # player, may not even be one of this game's two sides at all).
-        # Tolerant (never raises): this is a post-hoc read for a
-        # notification, not a gate, so a lapsed membership degrades to
-        # compute_roster_status's own team_id=None default rather than
-        # blocking the back-out that already happened.
-        player = self.store.get_player(entry.player_id)
-        team_id = self.team_for_game(game, player) if player else None
+        # #205 blocker 5 round 2: the side that just LOST a player is the
+        # side the row was SEATED on — read straight off the row's durable
+        # attribution, never re-resolved. The previous version called
+        # team_for_game(game, player) here, a LIVE lookup, so the moment the
+        # player's membership ended the open-slot alert was addressed to
+        # None (push suppressed — the real coach who now has a hole in the
+        # roster heard nothing) or, after a move, could name the OPPOSITE
+        # team. The slot that just reopened belongs to whoever was holding
+        # it, which is exactly what team_side records.
+        #
+        # Still tolerant, never raising: this is a post-hoc read for a
+        # notification, not a gate. A pre-061 row carries no attribution, so
+        # team_id is None, the message falls back to compute_roster_status's
+        # own home default, and the TARGETED push is skipped below rather
+        # than sent to a guessed audience.
+        team_id = entry.team_side
         status = self.compute_roster_status(game.id, team_id)
         if status.status == GameStatus.OPEN_SLOT:
             self._notify(
@@ -701,7 +770,11 @@ class RosterService:
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
         self.store.save_substitute(sub)
-        entry = self._add_to_roster_entry(game, player_id)
+        # #205 blocker 5 round 2: the row records the EXACT (side, bucket)
+        # pair the gate one line above just accepted — never a second
+        # resolution that could answer differently.
+        entry = self._add_to_roster_entry(game, player_id, team_id,
+                                          sub.position)
         self._audit(
             game_id,
             AuditAction.SUBSTITUTE_ACCEPTED,
@@ -821,13 +894,16 @@ class RosterService:
             raise NotEnrolledError(
                 "Player must be an enrolled/offered substitute to be added."
             )
-        self._require_open_slot(
-            game_id, sub.slot_type,
-            self._require_membership_context(game, player).team_id)
+        # ONE resolution, held in a name, so the gate below and the durable
+        # attribution written into the row are provably the same decision
+        # (#205 blocker 5 round 2) rather than two independent lookups.
+        ctx = self._require_membership_context(game, player)
+        self._require_open_slot(game_id, sub.slot_type, ctx.team_id)
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
         self.store.save_substitute(sub)
-        entry = self._add_to_roster_entry(game, player_id)
+        entry = self._add_to_roster_entry(game, player_id, ctx.team_id,
+                                          sub.position)
         self._audit(
             game_id,
             AuditAction.SUBSTITUTE_ADDED_TO_ROSTER,
@@ -844,7 +920,21 @@ class RosterService:
         )
         return entry
 
-    def _add_to_roster_entry(self, game: Game, player_id: str) -> GameRosterEntry:
+    def _add_to_roster_entry(
+        self, game: Game, player_id: str, team_side: str, position: Position
+    ) -> GameRosterEntry:
+        """Seat a substitute, recording the DURABLE attribution it occupies.
+
+        ``team_side``/``position`` are NOT resolved here — they are handed
+        down by the caller, and they must be THE PAIR that caller just fed
+        to :meth:`_require_open_slot` (``ctx.team_id`` from the validated
+        :class:`GameMembershipContext`, and the ENROLLMENT's own
+        season-scoped ``position``). Resolving them a second time inside
+        this method would reintroduce exactly the two-reads-that-can-
+        disagree defect #205 blocker 2 closed: the slot the gate checked and
+        the slot the row is counted in have to be one slot, provably, not
+        two answers that usually agree.
+        """
         now = self.clock()
         existing = self.store.roster_entry_for_player(game.id, player_id)
         if existing:
@@ -852,6 +942,8 @@ class RosterService:
             existing.selection_source = SelectionSource.SUBSTITUTE_POOL
             existing.status = RosterEntryStatus.ACCEPTED
             existing.updated_at = now
+            existing.team_side = team_side
+            existing.seated_position = position
             return self.store.save_roster_entry(existing)
         entry = GameRosterEntry(
             id=self.store.next_id("entry"),
@@ -862,6 +954,8 @@ class RosterService:
             status=RosterEntryStatus.ACCEPTED,
             selected_at=now,
             updated_at=now,
+            team_side=team_side,
+            seated_position=position,
         )
         return self.store.add_roster_entry(entry)
 
@@ -1698,28 +1792,56 @@ class RosterService:
     # ====================================================================
     def _side_data(self, game_id: str, team_id: str):
         """Everything ``_slot_summaries``/``compute_roster_status`` need for
-        ONE side of a game, resolved through the SAME game-scoped
-        membership context as the rest of the #205 substitute workflow
-        (#205 blocker 5) — never the permanent ``player.team_id`` pointer,
-        which is what let two players whose season membership names one
-        team, but whose permanent pointer still names a THIRD team, both
-        seat past a ``target_skaters`` cap that should have refused the
-        second one.
+        ONE side of a game.
 
-        Resolution runs ONCE per call, batched via
-        ``resolve_membership_contexts_for_game`` (two queries total, home +
-        away, never one query per roster row) — so ``_slot_summaries`` and
-        ``compute_roster_status`` share one resolution pass instead of
-        each re-deriving its own (previously wrong) filter independently.
-        The SIDE a row counts against and the POSITION it is bucketed by
-        both come off that ONE context (#205 review blocker 2), never from
-        two reads that could disagree.
+        A SEATED ROW'S SIDE AND BUCKET COME OFF THE ROW (#205 blocker 5,
+        round 2 — owner comment 5370391045). Round 1 moved this method off
+        the permanent ``player.team_id`` pointer and onto the game-scoped
+        membership resolution, which fixed the pointer-THIRD/current-HOME
+        happy path but left the blocker open in a second direction: it
+        re-derived the side of EVERY historical/accepted row from the
+        player's CURRENT eligible membership, on every read. A legitimate
+        status change (``set_season_roster_membership_status`` to inactive/
+        injured/applicant, a release/transfer, or the loss of the Team's
+        registration) therefore ERASED a seated row's attribution without
+        removing or transitioning the row — the row stayed ACCEPTED and
+        occupying in storage while dropping out of the governed count, the
+        side degraded to ``draft``/"No players selected yet.", and a second
+        player's offer AND accept then both succeeded past the target.
+
+        So ``entry.attribution`` — written at seating time from the
+        validated context that authorized it (migration 061) — decides both
+        the SIDE this row counts against and the BUCKET it counts in.
+        Nothing is re-derived here, which is what makes the gate
+        (``_require_open_slot`` via ``_slot_summaries``) and the report
+        (``compute_roster_status``) ONE rule rather than two that can
+        disagree.
+
+        SUBSTITUTE ENROLLMENTS STAY LIVE, deliberately. An enrollment is a
+        CANDIDACY, not a seating: a player whose participation just ended
+        must drop out of the outreach queue immediately, which is exactly
+        what re-resolving does. Only bodies already in a slot became
+        durable. So ``matched_subs`` still resolves through
+        ``resolve_membership_contexts_for_game`` (batched, two queries,
+        never one per row).
+
+        NULL ATTRIBUTION FAILS CLOSED, WITHOUT GUESSING (owner ruling,
+        2026-08-22). A row written before migration 061 has no attribution
+        and there is no honest way to reconstruct one — see that migration's
+        header for why neither the permanent pointer nor membership history
+        can answer. Such a row is charged as occupying on EVERY side of its
+        game and in BOTH buckets, for as long as its status occupies a slot.
+        That names no side (so it can never attribute the row to the WRONG
+        one), consults no live state at all (so no lookup can answer the
+        opposite team), and can only ever REDUCE an open count — so it is
+        incapable of reopening a slot and therefore incapable of admitting
+        the overfill this blocker is about. It over-refuses instead, which
+        is loud and recoverable; silently reopening the slot is neither.
 
         Returns ``(summaries, matched_entries, matched_subs)`` — the
         ``SlotType -> SlotSummary`` dict, the list of
-        ``(GameRosterEntry, Player, Optional[GameMembershipContext])``
-        triples resolved to ``team_id``, and the list of
-        ``SubstituteEnrollment`` rows resolved to ``team_id``.
+        ``(GameRosterEntry, Player)`` pairs charged to ``team_id``, and the
+        list of ``SubstituteEnrollment`` rows resolved to ``team_id``.
         """
         game = self._require_game(game_id)
         entries = self.store.roster_for_game(game_id)
@@ -1736,14 +1858,32 @@ class RosterService:
             # resolve_membership_context itself applies there.
             return self.resolve_membership_context(game, player)
 
+        targets = {
+            SlotType.GOALIE: game.target_goalies,
+            SlotType.SKATER: game.target_skaters,
+        }
+        occupied = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
+        confirmed = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
+        both = (SlotType.GOALIE, SlotType.SKATER)
+
         matched_entries = []
         for entry in entries:
             player = self.store.get_player(entry.player_id)
             if player is None:
                 continue
-            ctx = context_of(entry.player_id, player)
-            if ctx is not None and ctx.team_id == team_id:
-                matched_entries.append((entry, player, ctx))
+            attribution = entry.attribution
+            if attribution is None:
+                buckets = both          # pre-061 row: fail closed everywhere
+            elif attribution[0] == team_id:
+                buckets = (attribution[1],)
+            else:
+                continue                # seated on the other side
+            matched_entries.append((entry, player))
+            for st in buckets:
+                if entry.status.occupies_slot:
+                    occupied[st] += 1
+                if entry.status.is_confirmed_body:
+                    confirmed[st] += 1
 
         matched_subs = []
         for sub in subs:
@@ -1753,23 +1893,6 @@ class RosterService:
             ctx = context_of(sub.player_id, player)
             if ctx is not None and ctx.team_id == team_id:
                 matched_subs.append(sub)
-
-        targets = {
-            SlotType.GOALIE: game.target_goalies,
-            SlotType.SKATER: game.target_skaters,
-        }
-        occupied = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
-        confirmed = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
-        for entry, _player, ctx in matched_entries:
-            # #205 review blocker 2 continuation: bucket by the position of
-            # the SAME context that decided this row belongs to this side —
-            # season-scoped for a bound game, permanent for an unbound one,
-            # resolved once, never twice.
-            st = ctx.slot_type
-            if entry.status.occupies_slot:
-                occupied[st] += 1
-            if entry.status.is_confirmed_body:
-                confirmed[st] += 1
 
         subs_available = {SlotType.GOALIE: 0, SlotType.SKATER: 0}
         for sub in matched_subs:
@@ -1809,7 +1932,7 @@ class RosterService:
         team_id = team_id or game.home_team_id
         summaries, matched_entries, matched_subs = self._side_data(
             game_id, team_id)
-        entries = [e for (e, _player, _ctx) in matched_entries]
+        entries = [e for (e, _player) in matched_entries]
         goalie = summaries[SlotType.GOALIE]
         skater = summaries[SlotType.SKATER]
 

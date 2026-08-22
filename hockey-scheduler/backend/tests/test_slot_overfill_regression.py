@@ -104,18 +104,73 @@ class _OverfillFixture(_Fixture):
 
 
 class _OverfillContract(_OverfillFixture):
-    """Shared Memory + SQLite contract body."""
+    """Shared TRI-STORE contract body: Memory, SQLite and — whenever
+    TEST_DATABASE_URL is configured — real PostgreSQL.
+
+    PostgreSQL used to be absent from this loop, covered only by the two
+    hand-written cases in ``SlotOverfillPostgresTest`` below, so most of
+    this file's contract ran on two backends while the header claimed
+    tri-store. Every contract case now runs on all three
+    (``_assert_backend`` PROVES which one is in hand rather than trusting
+    the env var, and ``_assert_ran`` fails a loop that silently covered
+    fewer backends than were configured — a vacuous tri-store claim is
+    itself an open blocker against this PR).
+
+    ``SlotOverfillPostgresTest`` is deliberately KEPT: it exercises the
+    same arc against a PostgreSQL store built by ``setUp`` rather than by
+    this generator, so a bug in this harness cannot silently take
+    PostgreSQL coverage down with it."""
 
     def _stores(self):
         yield "memory", InMemoryStore()
         yield "sqlite", SqlStore(":memory:")
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            yield "postgres", fresh_sql_store(url)
+
+    def _assert_backend(self, label, store):
+        """PROVE the backend. ``skipUnless`` on the env var proves only that
+        a URL was SET, never that any statement reached PostgreSQL."""
+        if label == "postgres":
+            self.assertIsInstance(store, SqlStore, label)
+            self.assertEqual(store.backend, "postgres", store.backend)
+        elif label == "sqlite":
+            self.assertIsInstance(store, SqlStore, label)
+            self.assertEqual(store.backend, "sqlite", store.backend)
+        else:
+            self.assertIsInstance(store, InMemoryStore, label)
+
+    def _assert_ran(self, labels):
+        """The loop is never silently empty, and PostgreSQL is never
+        silently absent when it WAS configured."""
+        expected = {"memory", "sqlite"}
+        if os.environ.get("TEST_DATABASE_URL"):
+            expected.add("postgres")
+        else:
+            print("\n[SLOT OVERFILL CONTRACT] " + _PG_SKIP)
+        self.assertEqual(set(labels), expected, sorted(labels))
 
     def _each(self, target_skaters=1, target_goalies=0):
+        ran = []
         for label, store in self._stores():
-            api, season, league, teams, game, ls_id = self._build(
-                store, target_skaters=target_skaters,
-                target_goalies=target_goalies)
-            yield label, api, season, league, teams, game, ls_id
+            try:
+                self._assert_backend(label, store)
+                # A PostgreSQL store is a REAL database reused across every
+                # case in this module's worker, so each case starts from a
+                # wiped one rather than inheriting the previous fixture's
+                # rows.
+                store.clear_all_data()
+                api, season, league, teams, game, ls_id = self._build(
+                    store, target_skaters=target_skaters,
+                    target_goalies=target_goalies)
+                ran.append(label)
+                yield label, api, season, league, teams, game, ls_id
+            finally:
+                if isinstance(store, SqlStore):
+                    if label == "postgres":
+                        store.reset_schema()
+                    store.close()
+        self._assert_ran(ran)
 
 
 class SlotOverfillIsRefused(_OverfillContract, unittest.TestCase):
@@ -428,13 +483,35 @@ class BackOutSurvivesLapsedMembership(_OverfillContract, unittest.TestCase):
     (entry status still ``CONFIRMED``, not ``UNAVAILABLE``) on Memory,
     SQLite AND PostgreSQL.
 
-    Unlike the substitute case there is no earlier "offer" moment to
-    snapshot a team onto, so the fix is different in shape: the targeted
-    push is skipped (never sent to a guessed/broadened audience — #60
-    stays intact) when no team can be honestly resolved, rather than
-    crashing the back-out that already happened."""
+    ADAPTED IN BLOCKER 5 ROUND 2 — the assertion got STRONGER, not weaker.
 
-    def test_back_out_after_release_succeeds_and_skips_the_dead_push(self):
+    BEFORE: this test asserted the targeted push was SKIPPED. That was the
+    best available answer at the time, because ``_back_out_entry`` resolved
+    the audience with a LIVE ``team_for_game(game, player)`` lookup: once
+    the mover's membership ended that returned ``None``, and the only
+    choices left were "crash the back-out" (the #60 invariant raising, the
+    original defect) or "send nothing". Skipping was correct relative to
+    the alternatives — but it is a real product hole, and the test was
+    pinning the hole: the HOME coach, who now genuinely has a skater slot
+    open, was told NOTHING.
+
+    AFTER: ``_back_out_entry`` reads ``entry.team_side`` — the side the row
+    was SEATED on, recorded at selection time and unaffected by anything
+    that happened to the membership since (#205 blocker 5 round 2, migration
+    061). There is now an honest audience for every seated row, so the push
+    FIRES and names exactly HOME. The test asserts that, plus everything it
+    asserted before: the back-out still commits (entry ``unavailable``, no
+    rollback), so the #60 crash this class exists to pin stays closed.
+
+    "There is no earlier offer moment to snapshot a team onto" — the reason
+    the original fix had to differ in shape from ``decline_substitute``'s —
+    is no longer true: the SELECTION is that moment, and it now records the
+    attribution. The skip path still exists and is still correct, but only
+    for a row that carries NO durable attribution at all (a pre-061 row);
+    see ``LegacyRowsWithNoAttributionFailClosed`` in
+    test_roster_attribution_durability.py, which pins it there."""
+
+    def test_back_out_after_release_notifies_the_seated_side(self):
         for label, api, season, league, teams, game, ls_id in self._each(
                 target_skaters=2, target_goalies=0):
             with self.subTest(backend=label):
@@ -465,16 +542,28 @@ class BackOutSurvivesLapsedMembership(_OverfillContract, unittest.TestCase):
                 entry = api.store.roster_entry_for_player(
                     game["id"], mover["id"])
                 self.assertEqual(entry.status.value, "unavailable", label)
+                # The back-out did NOT rewrite the row's attribution — a
+                # status change is not a re-seat. The side it was seated on
+                # is still recorded, which is the whole reason the push
+                # below has an honest audience.
+                self.assertEqual(entry.team_side, teams["home"]["id"], label)
 
                 after = [(n.kind.value, n.audience_ref) for n in
                         api.store.all_notifications_feed()]
                 new_events = [e for e in after if e not in before]
-                # The targeted push (which would have had no honest
-                # audience_ref to name — mover's membership is gone) never
-                # fired; it was skipped, not misdirected, and nothing about
-                # the back-out itself was rolled back over it.
-                self.assertNotIn(
-                    "roster_open_slot", [k for k, _ in new_events],
+                # The targeted push FIRES and names the side that actually
+                # lost the player — read off entry.team_side, not
+                # re-resolved from a membership that has since ended (which
+                # is what used to answer None and silence this alert).
+                self.assertIn(
+                    ("roster_open_slot", teams["home"]["id"]), new_events,
+                    (label, new_events))
+                # ...and to exactly ONE audience: never broadened, never the
+                # opposing coach (#60 stays intact).
+                open_slot = [e for e in new_events
+                             if e[0] == "roster_open_slot"]
+                self.assertEqual(
+                    open_slot, [("roster_open_slot", teams["home"]["id"])],
                     (label, new_events))
 
 

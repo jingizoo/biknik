@@ -262,6 +262,9 @@ SPECS = {
                           {"roster_role": _enum(RosterRole),
                            "selection_source": _enum(SelectionSource),
                            "status": _enum(RosterEntryStatus),
+                           # #205 blocker 5 durable attribution (migration
+                           # 061). team_side: plain TEXT, no codec.
+                           "seated_position": _enum(Position),
                            "selected_at": _dt(), "updated_at": _dt()}),
     GameAvailability: Spec(GameAvailability, "game_availability",
                            {"availability_status": _enum(AvailabilityStatus),

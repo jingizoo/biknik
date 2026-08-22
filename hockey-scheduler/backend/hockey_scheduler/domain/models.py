@@ -6,7 +6,7 @@ so the models stay easy to serialize and test.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 from .enums import (
     AuditAction,
@@ -147,6 +147,49 @@ class GameRosterEntry:
     selected_at: datetime
     updated_at: datetime
     selected_by: Optional[str] = None
+    # ---- DURABLE game-side attribution (#205 blocker 5, migration 061) ----
+    # WHAT THIS ROW OCCUPIES, recorded when the row was created or re-seated,
+    # from the SAME validated GameMembershipContext that authorized the
+    # seating. Round 1 of blocker 5 re-derived both values from the player's
+    # CURRENT eligible membership on every read, so a legitimate membership
+    # status change erased a seated row's attribution without removing or
+    # transitioning the row — the row stayed ACCEPTED and occupying in
+    # storage while vanishing from the governed count, and a second player
+    # then seated past the target. These columns are the record, not a
+    # cache: nothing re-derives them, and only a re-seat rewrites them.
+    #
+    # ``seated_position`` is stored alongside ``team_side`` because the
+    # GOALIE/SKATER bucket had the identical defect (it was read off the
+    # live context too), so a row whose context vanished had no bucket at
+    # all. For a substitute seating it is the ENROLLMENT's position — the
+    # very bucket ``_require_open_slot`` was called with — so the slot the
+    # gate checked and the slot the row is counted in are always one slot.
+    #
+    # Both are NULL for — and only for — rows written before migration 061.
+    # See :meth:`attribution` and migration 061 for the fail-closed rule
+    # that applies to those, which never guesses a side.
+    team_side: Optional[str] = None
+    seated_position: Optional[Position] = None
+
+    @property
+    def seated_slot_type(self) -> Optional[SlotType]:
+        """The durable GOALIE/SKATER bucket, or ``None`` for a pre-061 row."""
+        return (None if self.seated_position is None
+                else self.seated_position.slot_type)
+
+    @property
+    def attribution(self) -> Optional[Tuple[str, SlotType]]:
+        """``(team_side, slot_type)`` this row occupies, or ``None`` when the
+        row carries no durable attribution at all (pre-061).
+
+        ONE accessor, so slot enforcement and reporting can never read the
+        pair from two different places and disagree about what a seated row
+        holds. Treats a half-written pair as unattributed: the two columns
+        are only ever written together, so one of them missing is not a
+        partial answer to be salvaged."""
+        if self.team_side is None or self.seated_position is None:
+            return None
+        return self.team_side, self.seated_position.slot_type
 
 
 @dataclass
