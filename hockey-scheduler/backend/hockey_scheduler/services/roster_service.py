@@ -387,23 +387,39 @@ class RosterService:
                     "Player was removed by the coach and cannot self re-confirm."
                 )
             if reconfirming:
-                # Re-confirming after a back-out only works while the slot is
-                # still open (a substitute may have already filled it).
+                # RE-CONFIRM ASKS TWO DIFFERENT QUESTIONS, AND THEY HAVE TWO
+                # DIFFERENT ANSWERERS (#205 blocker 5 round 3 — owner ruling
+                # on PR #427, comment 5379885403). Round 2 conflated them and
+                # shipped a hole: it proved the player had SOME valid context
+                # and then gated the ROW's durable side, so a player whose
+                # membership had moved HOME->AWAY passed the eligibility call
+                # on their AWAY context and self-confirmed straight back onto
+                # the HOME row they were no longer eligible for.
                 #
-                # ELIGIBILITY is live and fails closed: a player whose
-                # membership lapsed since the back-out may not retake a slot
-                # at all (mirrors the #270 deactivation gate / the
-                # accept_substitute re-resolution).
-                self._require_membership_context(game, player)
-                # WHICH slot they are retaking is NOT re-resolved (#205
-                # blocker 5 round 2). Re-confirming puts THIS ROW back into
-                # the slot it was seated on, so the gate has to ask about
-                # that slot — the row's own durable attribution. Asking a
-                # freshly resolved context instead could gate against a
-                # different bucket (a season-scoped position that changed)
-                # or a different side than the row will actually be counted
-                # in, which is precisely the incoherence between enforcement
-                # and reporting this blocker is about.
+                #   IDENTIFY — "WHICH slot is being taken back?" is answered
+                #   by the ROW'S DURABLE ATTRIBUTION and by nothing else. A
+                #   re-confirm is not a seating: the row never left its slot,
+                #   so the only slot in question is the one it holds. That is
+                #   what keeps enforcement (_require_open_slot via
+                #   _slot_summaries) and reporting (compute_roster_status)
+                #   ONE rule, and it must not be re-resolved — a fresh
+                #   context could name a different bucket (a season-scoped
+                #   position that changed) or a different side than the row
+                #   is actually counted in.
+                #
+                #   AUTHORIZE — "MAY THIS PLAYER re-occupy that slot's SIDE?"
+                #   is answered by the LIVE context and by nothing else.
+                #   Durable attribution records what the row holds; it says
+                #   nothing about who is still entitled to hold it. A stored
+                #   value can never authorize its own re-use, or the row
+                #   would be a standing permission that outlives the
+                #   participation that granted it.
+                #
+                # So: resolve LIVE (fails closed exactly as before — the #270
+                # deactivation gate / the accept_substitute re-resolution),
+                # read the slot off the ROW, and refuse unless the live
+                # context's team IS the side that row occupies.
+                ctx = self._require_membership_context(game, player)
                 attribution = entry.attribution
                 if attribution is None:
                     # Pre-061 row: its side is unknown and must never be
@@ -413,8 +429,33 @@ class RosterService:
                     raise NotEligibleError(
                         f"{player.name} cannot re-confirm: this roster row "
                         f"predates durable game-side attribution, so the "
-                        f"slot it holds cannot be identified.")
+                        f"slot it holds cannot be identified.",
+                        details={"reason": "attribution_missing"})
                 side, st = attribution
+                if ctx.team_id != side:
+                    # AUTHORIZATION, not occupancy — deliberately raised
+                    # BEFORE the slot gate and with its own code/reason so
+                    # the two refusals can never be mistaken for each other.
+                    # "That side's slot happens to be free" is not a licence
+                    # to take it; a player who now plays for the other side
+                    # has no claim on this row's slot whether it is open or
+                    # full. (Their route back onto a roster is a coach
+                    # re-selection or a substitute accept — both of which
+                    # RE-SEAT the row from the live context that authorized
+                    # them, so identify and authorize agree by construction.)
+                    raise NotEligibleError(
+                        f"{player.name} cannot re-confirm: this roster row "
+                        f"holds a slot on a side they are no longer eligible "
+                        f"for.",
+                        details={"reason": "seated_side_not_live_eligible",
+                                 "seated_team_id": side,
+                                 "eligible_team_id": ctx.team_id})
+                # ...and only once the player is authorized for that side do
+                # we ask whether the slot itself is still free (a substitute
+                # may have filled it while they were out). The BUCKET is the
+                # durable one, never ctx.position: re-confirming puts THIS
+                # ROW back in the slot it held, so a season-scoped position
+                # change must not silently move it to a different bucket.
                 self._require_open_slot(game_id, st, side)
 
         existing = self.store.availability_for_player(game_id, player_id)
