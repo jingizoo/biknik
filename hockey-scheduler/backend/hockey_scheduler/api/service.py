@@ -4210,9 +4210,9 @@ class ApiService:
         the coach-friendly short-roster classification.
 
         The response is the batch result MERGED WITH that status, so
-        ``seated``/``skipped``/``deferred``/``candidate_count`` are ADDITIVE
-        — every existing caller reading ``status``/``open_*_slots``/
-        ``short_roster`` is unaffected."""
+        ``seated``/``skipped``/``deferred``/``already_seated``/
+        ``candidate_count`` are ADDITIVE — every existing caller reading
+        ``status``/``open_*_slots``/``short_roster`` is unaffected."""
         result = self.roster.auto_build_roster(game_id, team_id, actor_id)
         status = self.roster.compute_roster_status(
             game_id, result["team_id"]).to_dict()

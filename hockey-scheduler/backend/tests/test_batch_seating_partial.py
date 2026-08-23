@@ -2177,5 +2177,465 @@ class TheRulingDidNotRelaxIndividualMutations(_BatchHarness,
                          list(sig.parameters))
 
 
+# ======================================================================
+# 6. AUTO-FILL TOPS UP THE REMAINING ROOM — it never overfills a
+#    partially occupied roster
+# ======================================================================
+# OWNER RULING, PR #427, comment 5385783876 (exact head 04a4b11):
+#
+#   "auto-fill currently overfills a partially occupied roster. Concrete
+#    Memory + SQLite reproduction: configure HOME with target_skaters=2;
+#    pre-select 'Zulu Existing'; add eligible 'Alpha New' and 'Beta New';
+#    call auto_build_roster. The response reports both new players in
+#    seated and the existing player as deferred, while storage contains
+#    all three occupying rows. The defect is at
+#    RosterService.auto_build_roster: it passes the full targets as limits
+#    (target_skaters=2) rather than the remaining durable capacity. […]
+#    derive each bucket's remaining capacity from the current durable
+#    side/bucket occupancy, exclude or explicitly treat already-occupying
+#    rows idempotently, and cap only genuinely new seats against that
+#    remaining room. Do not infer capacity from confirmed counts or live
+#    membership; existing durable occupants still consume their recorded
+#    slot."
+#
+# RED AT HEAD 04a4b11, measured on Memory, SQLite AND real PostgreSQL —
+# the owner's recipe, run byte-for-byte, answered IDENTICALLY on all
+# three:
+#
+#   [memory]   PRE  rows=[('Zulu','selected','team_1','forward')]
+#   [memory]   PRE  open_skater_slots=1 confirmed=0 target=2
+#   [memory]   RESPONSE seated=['Alpha','Beta']
+#              deferred=[('Zulu','roster_target_met')] skipped=[]
+#   [memory]   RESPONSE open_skater_slots=0 short_roster=False
+#   [memory]   STORAGE occupying=['Alpha','Beta','Zulu'] count=3
+#              vs target_skaters=2
+#   [memory]   AFTER open_skater_slots=0 confirmed_skaters=2
+#   [sqlite]   ...identical...
+#   [postgres] ...identical...
+#
+# i.e. THREE occupying rows against a target of two, the occupant
+# reported as deferred while it was in fact seated, and
+# ``open_skater_slots`` clipping at zero (``max(0, 2 - 3)``) so the extra
+# row never appeared in the report.
+#
+# WHY THE NAMES ARE LOAD-BEARING. ``_ordered_candidates`` sorts by
+# ``(name, player_id)``, and the old truncation kept the FIRST N of the
+# pool. "Zulu" sorts after "Alpha"/"Beta", so the occupant was the one
+# truncated away — which is what turns a mis-report into a real overfill.
+# ``ExistingOccupantSortingFirst`` below runs the mirror image, where the
+# ordering would have hidden the defect, and pins the reporting and
+# write-suppression halves that survive it.
+#
+# EVERY OCCUPANCY ASSERTION HERE READS STORAGE, never the response's own
+# counts — the response is the thing that was wrong.
+
+
+class AutoFillTopsUpTheRemainingRoom(_BatchHarness, unittest.TestCase):
+    """The ruling's four enumerated shapes, tri-store."""
+
+    # -- fixture ---------------------------------------------------------
+    def _side(self, store, target_skaters=2, target_goalies=0):
+        """One published, LeagueSeason-bound game and its HOME side. No
+        prior game: auto-fill's cohort is the team's bench, so the
+        copy-previous fixture would only add noise."""
+        api, season, league, teams, game, ls_id = self._build(
+            store, target_skaters=target_skaters,
+            target_goalies=target_goalies)
+        return api, {"api": api, "gid": game["id"], "ls_id": ls_id,
+                     "home": teams["home"]["id"],
+                     "away": teams["away"]["id"],
+                     "third": teams["third"]["id"]}
+
+    def _preseat(self, api, fx, player):
+        """Pre-select an occupant the way a coach does, and PROVE the row
+        is durably attributed to HOME before the batch runs — the
+        occupancy the capacity derivation must read."""
+        res = api.select_roster(fx["gid"], [player["id"]], actor_id=ADMIN)
+        self.assertNotIn("error", res if isinstance(res, dict) else {}, res)
+        entry = api.store.roster_entry_for_player(fx["gid"], player["id"])
+        self.assertEqual(entry.team_side, fx["home"], entry)
+        self.assertTrue(entry.status.occupies_slot, entry)
+        return entry
+
+    # -- assertions ------------------------------------------------------
+    def _rows(self, result, key):
+        return [(r["player_id"], r["reason"]) for r in result[key]]
+
+    def _occupancy(self, api, fx, bucket="skater"):
+        """DURABLE occupancy for HOME, counted OFF THE ROWS — never from
+        ``compute_roster_status``, whose ``open_count`` clips at zero and
+        was hiding the extra row in the first place."""
+        want = bucket
+        n = 0
+        for e in api.store.roster_for_game(fx["gid"]):
+            if not e.status.occupies_slot:
+                continue
+            if e.team_side != fx["home"]:
+                continue
+            if e.seated_position.slot_type.value != want:
+                continue
+            n += 1
+        return n
+
+    def _new_roster_rows(self, before, after):
+        """The roster row IDENTITIES that appear in ``after`` and not in
+        ``before`` — "exactly one new roster write" as identity, not as a
+        count (a count is satisfied by a same-cardinality swap)."""
+        return sorted(set(after) - set(before))
+
+    def _assert_no_trace_of(self, api, fx, player_id, label):
+        """No availability row and no audit row NAMING this player —
+        the ruling's "no availability/audit write for the deferred
+        player". The batch's own single audit row names every candidate
+        in its detail and is asserted separately; what must not exist is
+        a per-player write."""
+        self.assertIsNone(
+            api.store.availability_for_player(fx["gid"], player_id), label)
+        named = [(a.id, a.action.value) for a in
+                 api.store.audit_for_game(fx["gid"])
+                 if a.subject_player_id == player_id]
+        self.assertEqual(named, [], (label, named))
+
+    # -- 1. the owner's exact recipe --------------------------------------
+    def _run_owner_recipe(self, label, api, fx):
+        zulu = self._player(api, fx["home"], "Zulu Existing")
+        alpha = self._player(api, fx["home"], "Alpha New")
+        beta = self._player(api, fx["home"], "Beta New")
+        self._preseat(api, fx, zulu)
+        # THE PREMISE, asserted rather than assumed: the occupant sorts
+        # LAST, which is what made the old truncation drop it.
+        self.assertEqual(
+            sorted(p["name"] for p in (zulu, alpha, beta))[-1],
+            "Zulu Existing", label)
+        before = self._writes(api, fx["gid"])
+
+        result = api.auto_build_roster(fx["gid"], team_id=fx["home"],
+                                       actor_id=ADMIN)
+        self.assertNotIn("error", result, (label, result))
+
+        # ONE new seat, and it is the newcomer that fitted.
+        self.assertEqual(result["seated"], [alpha["id"]], (label, result))
+        self.assertEqual(self._rows(result, "deferred"),
+                         [(beta["id"], RosterService.TARGET_MET)],
+                         (label, result))
+        self.assertEqual(self._rows(result, "already_seated"),
+                         [(zulu["id"], RosterService.ALREADY_SEATED)],
+                         (label, result))
+        self.assertEqual(result["skipped"], [], (label, result))
+
+        after = self._writes(api, fx["gid"])
+        new_rows = self._new_roster_rows(before[f"roster:{fx['gid']}"],
+                                         after[f"roster:{fx['gid']}"])
+        self.assertEqual(len(new_rows), 1, (label, new_rows))
+        self.assertEqual(new_rows[0][1], alpha["id"], (label, new_rows))
+        self.assertEqual(new_rows[0][3], fx["home"], (label, new_rows))
+
+        # TOTAL DURABLE OCCUPANCY IS EXACTLY THE TARGET — read off the
+        # rows, which is where the overfill lived.
+        self.assertEqual(sorted(self._occupying(api, fx["gid"])),
+                         sorted([zulu["id"], alpha["id"]]), label)
+        self.assertEqual(self._occupancy(api, fx), 2, label)
+
+        # AUDIT: the same identity, durably, in the one batch row.
+        detail = self._batch_audit(api, fx["gid"]).detail
+        self.assertEqual(detail["selected_player_ids"], [alpha["id"]],
+                         (label, detail))
+        self.assertEqual(detail["deferred"],
+                         [{"player_id": beta["id"],
+                           "reason": RosterService.TARGET_MET}],
+                         (label, detail))
+        self.assertEqual(detail["already_seated"],
+                         [{"player_id": zulu["id"],
+                           "reason": RosterService.ALREADY_SEATED}],
+                         (label, detail))
+        self.assertEqual(detail["candidate_count"], 3, (label, detail))
+
+        # The deferred newcomer was not touched in any way...
+        self._assert_no_trace_of(api, fx, beta["id"], label)
+        self.assertIsNone(
+            api.store.roster_entry_for_player(fx["gid"], beta["id"]), label)
+        # ...and neither was the occupant: auto-filling the REMAINING
+        # slots must not answer availability on a player already seated,
+        # so their row is still SELECTED, not CONFIRMED.
+        self._assert_no_trace_of(api, fx, zulu["id"], label)
+        self.assertEqual(api.store.roster_entry_for_player(
+            fx["gid"], zulu["id"]).status.value, "selected", label)
+        # The newcomer that DID seat was confirmed in the same transaction.
+        self.assertEqual(api.store.roster_entry_for_player(
+            fx["gid"], alpha["id"]).status.value, "confirmed", label)
+        self.assertIsNotNone(api.store.availability_for_player(
+            fx["gid"], alpha["id"]), label)
+        # And the report finally agrees with storage.
+        self.assertEqual(result["open_skater_slots"], 0, (label, result))
+
+    def test_the_owners_recipe_seats_exactly_one_newcomer(self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._side(store, target_skaters=2)
+                with self.subTest(backend=label):
+                    self._run_owner_recipe(label, api, fx)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
+    # -- 2. the goalie bucket, mirrored against the skater one ------------
+    def test_the_goalie_bucket_is_capped_independently(self):
+        """The same shape in the GOALIE bucket, with a skater newcomer
+        alongside — so a cap that leaked across buckets (one shared
+        counter, or a goalie occupant charged to the skater room) fails
+        here rather than passing on the single-bucket case above."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._side(store, target_skaters=1,
+                                     target_goalies=2)
+                with self.subTest(backend=label):
+                    zulu = self._player(api, fx["home"], "Zulu Goalie",
+                                        position="goalie")
+                    alpha = self._player(api, fx["home"], "Alpha Goalie",
+                                         position="goalie")
+                    beta = self._player(api, fx["home"], "Beta Goalie",
+                                        position="goalie")
+                    mid = self._player(api, fx["home"], "Mid Skater")
+                    entry = self._preseat(api, fx, zulu)
+                    self.assertEqual(entry.seated_position.slot_type.value,
+                                     "goalie", (label, entry))
+                    before = self._writes(api, fx["gid"])
+
+                    result = api.auto_build_roster(
+                        fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                    self.assertNotIn("error", result, (label, result))
+                    # goalie room = 2 - 1 = 1; skater room = 1 - 0 = 1.
+                    self.assertEqual(result["seated"],
+                                     [alpha["id"], mid["id"]],
+                                     (label, result))
+                    self.assertEqual(
+                        self._rows(result, "deferred"),
+                        [(beta["id"], RosterService.TARGET_MET)],
+                        (label, result))
+                    self.assertEqual(
+                        self._rows(result, "already_seated"),
+                        [(zulu["id"], RosterService.ALREADY_SEATED)],
+                        (label, result))
+
+                    after = self._writes(api, fx["gid"])
+                    new_rows = self._new_roster_rows(
+                        before[f"roster:{fx['gid']}"],
+                        after[f"roster:{fx['gid']}"])
+                    self.assertEqual([r[1] for r in new_rows],
+                                     sorted([alpha["id"], mid["id"]]),
+                                     (label, new_rows))
+                    # Both buckets land exactly on target, counted off the
+                    # durable rows.
+                    self.assertEqual(self._occupancy(api, fx, "goalie"), 2,
+                                     label)
+                    self.assertEqual(self._occupancy(api, fx, "skater"), 1,
+                                     label)
+                    self._assert_no_trace_of(api, fx, beta["id"], label)
+                    self._assert_no_trace_of(api, fx, zulu["id"], label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
+    # -- 3. the occupant that sorts FIRST --------------------------------
+    def test_an_occupant_sorting_first_is_still_a_reported_no_op(self):
+        """The mirror image of the owner's recipe: the occupant sorts
+        BEFORE both newcomers, so the OLD truncation happened to keep the
+        occupancy at two and produced no overfill at all.
+
+        It still reported the occupant in ``seated`` — telling the coach
+        auto-fill had added a player who was already on the roster — and,
+        because auto-fill confirms what it seats, it also wrote an
+        availability row and flipped that row from SELECTED to CONFIRMED,
+        answering availability on the player's behalf. Both are asserted
+        here, so the ordering cannot silently save the defect."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._side(store, target_skaters=2)
+                with self.subTest(backend=label):
+                    aaron = self._player(api, fx["home"], "Aaron Existing")
+                    yara = self._player(api, fx["home"], "Yara New")
+                    zoe = self._player(api, fx["home"], "Zoe New")
+                    self._preseat(api, fx, aaron)
+                    self.assertEqual(
+                        sorted(p["name"] for p in (aaron, yara, zoe))[0],
+                        "Aaron Existing", label)
+                    before = self._writes(api, fx["gid"])
+
+                    result = api.auto_build_roster(
+                        fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                    self.assertNotIn("error", result, (label, result))
+                    self.assertEqual(result["seated"], [yara["id"]],
+                                     (label, result))
+                    self.assertEqual(
+                        self._rows(result, "deferred"),
+                        [(zoe["id"], RosterService.TARGET_MET)],
+                        (label, result))
+                    self.assertEqual(
+                        self._rows(result, "already_seated"),
+                        [(aaron["id"], RosterService.ALREADY_SEATED)],
+                        (label, result))
+
+                    after = self._writes(api, fx["gid"])
+                    new_rows = self._new_roster_rows(
+                        before[f"roster:{fx['gid']}"],
+                        after[f"roster:{fx['gid']}"])
+                    self.assertEqual(len(new_rows), 1, (label, new_rows))
+                    self.assertEqual(new_rows[0][1], yara["id"],
+                                     (label, new_rows))
+                    self.assertEqual(self._occupancy(api, fx), 2, label)
+                    # THE HALF THE ORDERING WOULD HAVE HIDDEN: the
+                    # occupant's row is untouched and unconfirmed, and no
+                    # availability was recorded for them.
+                    self.assertEqual(api.store.roster_entry_for_player(
+                        fx["gid"], aaron["id"]).status.value, "selected",
+                        label)
+                    self._assert_no_trace_of(api, fx, aaron["id"], label)
+                    self._assert_no_trace_of(api, fx, zoe["id"], label)
+                    self.assertEqual(
+                        before[f"availability:{fx['gid']}"], [], label)
+                    self.assertEqual(
+                        [a[1] for a in after[f"availability:{fx['gid']}"]],
+                        [yara["id"]], label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
+    # -- 4. an already-FULL roster ---------------------------------------
+    def test_an_already_full_roster_seats_nobody_and_writes_nothing(self):
+        """Zero remaining room: every eligible newcomer is deferred, every
+        occupant is reported as already on the roster, and the ONLY write
+        the call makes is the batch audit row that records it ran.
+
+        At head 04a4b11 this was the loudest shape of all: the full target
+        (2) was handed down as the limit over a pool whose first entry was
+        the newcomer, so the newcomer SEATED and storage went to three
+        occupying rows against a target of two."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._side(store, target_skaters=2)
+                with self.subTest(backend=label):
+                    yara = self._player(api, fx["home"], "Yara Existing")
+                    zoe = self._player(api, fx["home"], "Zoe Existing")
+                    alpha = self._player(api, fx["home"], "Alpha New")
+                    self._preseat(api, fx, yara)
+                    self._preseat(api, fx, zoe)
+                    self.assertEqual(self._occupancy(api, fx), 2, label)
+                    before = self._writes(api, fx["gid"])
+
+                    result = api.auto_build_roster(
+                        fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                    self.assertNotIn("error", result, (label, result))
+                    self.assertEqual(result["seated"], [], (label, result))
+                    self.assertEqual(
+                        self._rows(result, "deferred"),
+                        [(alpha["id"], RosterService.TARGET_MET)],
+                        (label, result))
+                    self.assertEqual(
+                        self._rows(result, "already_seated"),
+                        [(yara["id"], RosterService.ALREADY_SEATED),
+                         (zoe["id"], RosterService.ALREADY_SEATED)],
+                        (label, result))
+
+                    after = self._writes(api, fx["gid"])
+                    gid = fx["gid"]
+                    # NOTHING was written but the one audit row.
+                    self.assertEqual(after[f"roster:{gid}"],
+                                     before[f"roster:{gid}"], label)
+                    self.assertEqual(after[f"availability:{gid}"],
+                                     before[f"availability:{gid}"], label)
+                    self.assertEqual(after[f"substitutes:{gid}"],
+                                     before[f"substitutes:{gid}"], label)
+                    new_audit = sorted(set(after[f"audit:{gid}"])
+                                       - set(before[f"audit:{gid}"]))
+                    self.assertEqual([a[1] for a in new_audit],
+                                     [AuditAction.ROSTER_BATCH_SEATED.value],
+                                     (label, new_audit))
+                    self.assertEqual(self._occupancy(api, fx), 2, label)
+                    self._assert_no_trace_of(api, fx, alpha["id"], label)
+                    self.assertIsNone(api.store.roster_entry_for_player(
+                        gid, alpha["id"]), label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
+    # -- 5. the derivation reads DURABLE occupancy, not the live spine ----
+    def test_capacity_counts_an_occupant_whose_participation_has_ended(self):
+        """"Do not infer capacity from confirmed counts or live
+        membership; existing durable occupants still consume their
+        recorded slot."
+
+        The occupant here is seated, and their membership is then ENDED —
+        so they resolve onto NO side of this game and are classified as a
+        SKIP, not as an already-seated candidate. Their row nevertheless
+        still occupies the slot it records, so the room stays one, and a
+        capacity derived from live membership (or from the confirmed
+        count, which is zero for both of them) would seat two newcomers
+        and overfill."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._side(store, target_skaters=2)
+                with self.subTest(backend=label):
+                    zulu = self._player(api, fx["home"], "Zulu Ended")
+                    alpha = self._player(api, fx["home"], "Alpha New")
+                    beta = self._player(api, fx["home"], "Beta New")
+                    self._preseat(api, fx, zulu)
+                    end_membership_directly(
+                        api.store,
+                        self._stint_id(api, zulu["id"], fx["ls_id"]),
+                        "released")
+                    # The premise: no live context at all any more, and the
+                    # row is still occupying and still attributed to HOME.
+                    self.assertIsNone(
+                        api.roster.resolve_membership_context(
+                            api.store.get_game(fx["gid"]),
+                            api.store.get_player(zulu["id"])), label)
+                    entry = api.store.roster_entry_for_player(
+                        fx["gid"], zulu["id"])
+                    self.assertEqual(entry.team_side, fx["home"], label)
+                    self.assertTrue(entry.status.occupies_slot, label)
+                    # ...and NOBODY is confirmed, so a confirmed-count
+                    # derivation would read two open slots.
+                    self.assertEqual(
+                        api.roster.compute_roster_status(
+                            fx["gid"], fx["home"]).confirmed_skaters, 0,
+                        label)
+
+                    result = api.auto_build_roster(
+                        fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                    self.assertNotIn("error", result, (label, result))
+                    self.assertEqual(result["seated"], [alpha["id"]],
+                                     (label, result))
+                    self.assertEqual(
+                        self._rows(result, "deferred"),
+                        [(beta["id"], RosterService.TARGET_MET)],
+                        (label, result))
+                    self.assertEqual(
+                        [s["player_id"] for s in result["skipped"]],
+                        [zulu["id"]], (label, result))
+                    self.assertEqual(self._occupancy(api, fx), 2, label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
 if __name__ == "__main__":
     unittest.main()

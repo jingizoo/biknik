@@ -2071,6 +2071,25 @@ class RosterService:
     # candidate the batch examined.
     TARGET_MET = "roster_target_met"
 
+    # A candidate who is ALREADY sitting in an occupying roster row on this
+    # game before the batch ran (owner ruling, PR #427, comment 5385783876).
+    #
+    # NEITHER A SEAT NOR A SKIP, so it gets its own reported bucket:
+    #
+    #   * not ``seated`` — no row was written for them, and telling the
+    #     operator "Auto-fill added Zulu" when Zulu was already on the
+    #     roster is exactly the false report the ruling calls out;
+    #   * not ``deferred`` — ``roster_target_met`` means "eligible, but the
+    #     roster had no room"; this player HAS room, they are in it;
+    #   * not ``skipped`` — nothing is wrong with them, so they must not
+    #     appear in the operator warning about players who CANNOT be
+    #     seated. Like :data:`TARGET_MET` this is deliberately NOT in
+    #     ``SKIP_REASON_PRECEDENCE``.
+    #
+    # The audit row still accounts for them, so every candidate the batch
+    # examined is present in exactly one bucket.
+    ALREADY_SEATED = "already_on_roster"
+
     def _ordered_candidates(self, player_ids) -> List[str]:
         """De-duplicate and order candidate ids by ``(name, player_id)``.
 
@@ -2080,8 +2099,8 @@ class RosterService:
         ``memberships_for_team`` hand back ``player_1, player_10, player_11,
         …, player_2`` on SQL and insertion order in memory. Measured
         tri-store at head 4de9452, that was not a cosmetic difference:
-        ``auto_build_roster`` TRUNCATES its pool at the game's targets, so
-        the ORDER DECIDED SET MEMBERSHIP — from one identical 12-player
+        ``auto_build_roster`` TRUNCATES its pool at the room the side has
+        left, so the ORDER DECIDED SET MEMBERSHIP — from one identical 12-player
         fixture with ``target_skaters=3``, Memory seated "Player 00/01/02"
         while SQLite and PostgreSQL both seated "Player 00/09/10".
 
@@ -2202,7 +2221,7 @@ class RosterService:
 
     def _seat_batch(self, game, team_id, candidates, source,
                     from_game_id=None, actor_id=None, confirm=False,
-                    limits=None, preclassified=None) -> dict:
+                    cap_to_open_slots=False, preclassified=None) -> dict:
         """THE unit of work both batch entry points share: lock, revalidate,
         partition, seat, audit.
 
@@ -2214,9 +2233,9 @@ class RosterService:
         the mutability guard are the caller's, and taking them after
         discovery would be too late).
 
-        ``limits`` (auto-fill only) is ``{SlotType: count}``; when given, at
-        most that many SEATABLE candidates are seated per bucket, taken in
-        the ordered pool's order, and the eligible remainder is reported as
+        ``cap_to_open_slots`` (auto-fill only) bounds the number of NEW
+        seats per bucket by THE ROOM THAT IS ACTUALLY LEFT — see
+        "REMAINING CAPACITY" below — and reports the eligible remainder as
         ``deferred`` with reason :data:`TARGET_MET`. ``confirm``
         additionally marks each seated player AVAILABLE inside this SAME
         transaction — previously that was N separate ``set_availability``
@@ -2224,22 +2243,100 @@ class RosterService:
         mid-loop left players seated but unconfirmed with nothing to roll
         back to.
 
+        ------------------------------------------------------------------
+        REMAINING CAPACITY (owner ruling, PR #427, comment 5385783876)
+        ------------------------------------------------------------------
+        "auto-fill currently overfills a partially occupied roster. […] The
+        defect is at RosterService.auto_build_roster: it passes the full
+        targets as limits (target_skaters=2) rather than the remaining
+        durable capacity. […] derive each bucket's remaining capacity from
+        the current durable side/bucket occupancy, exclude or explicitly
+        treat already-occupying rows idempotently, and cap only genuinely
+        new seats against that remaining room. Do not infer capacity from
+        confirmed counts or live membership; existing durable occupants
+        still consume their recorded slot."
+
+        Measured tri-store at head 04a4b11, with ``target_skaters=2``, an
+        occupying "Zulu Existing" and eligible "Alpha New"/"Beta New": the
+        response said ``seated=[Alpha, Beta]``, ``deferred=[(Zulu,
+        roster_target_met)]`` and ``open_skater_slots=0`` while storage
+        held THREE occupying rows — the truncation dropped the occupant
+        (who sorts last) instead of the newcomer, and ``open_count``'s
+        ``max(0, …)`` clipped the extra row out of the report.
+
+        SO THE ROOM IS READ, NOT ASSUMED, and it is read from the ONE place
+        the slot gate reads it: :meth:`_slot_summaries` -> :meth:`_side_data`,
+        whose occupancy comes off each row's DURABLE
+        ``GameRosterEntry.attribution`` (migration 061) and from nothing
+        else. That satisfies the ruling's two prohibitions by construction:
+
+          * NOT confirmed counts — ``open_count`` is
+            ``max(0, target - OCCUPIED)``; ``confirmed_count`` is a separate
+            field this never touches, so a seated-but-unanswered row still
+            consumes its slot;
+          * NOT live membership — ``_side_data`` re-resolves nothing for a
+            seated row. An occupant whose participation has since ended,
+            or who has moved to the other side, STILL consumes the slot
+            their row records (and a pre-061 NULL-attribution row is
+            charged on every side and in both buckets, fail-closed).
+
+        Read AFTER ``_lock_candidates``/``_partition_candidates`` and inside
+        the caller's transaction, so the Season and Player row locks that
+        make the partition unraceable also cover this arithmetic.
+
+        ALREADY-OCCUPYING CANDIDATES ARE A NO-OP, AND SAID SO. A candidate
+        whose row on this game already occupies a slot is excluded from the
+        new-seat cap and reported in ``already_seated``
+        (:data:`ALREADY_SEATED`) rather than seated:
+
+          * they need no new seat — the row is already there, and it is
+            already counted in the occupancy the room was derived from, so
+            charging them against the room would refuse a genuine newcomer
+            for a seat nobody takes;
+          * they must not be re-seated. ``select_roster`` is idempotent for
+            an occupying row (it returns it untouched, keeping the
+            attribution that authorized the original seating), so passing
+            them through would write nothing to the roster — but under
+            ``confirm`` it WOULD drive a ``set_availability`` that flips a
+            SELECTED row to CONFIRMED and writes an availability row and an
+            audit row. "Auto-fill the remaining slots" must not answer
+            availability on behalf of players who were already on the
+            roster;
+          * so the batch is idempotent: run twice, the second run seats
+            nobody, writes no roster/availability row, and reports every
+            candidate it found already in place.
+
+        A candidate whose live context resolves to the OTHER side of this
+        game is charged against THIS side's room exactly as before —
+        unchanged, deliberately: it is conservative (it can only refuse a
+        seat, never admit one) and which side such a candidate belongs on
+        is the cohort question the 2026-08-22 correction governs, not this
+        one.
+
         ZERO SEATS IS A SUCCESSFUL RESULT: ``select_roster`` is not called
         at all, so NO roster write of any kind happens, and the audit row is
         still written because it is the only durable record that the
         operation ran.
 
         Returns identity, never counts: ``{"team_id", "source",
-        "from_game_id", "candidate_count", "seated", "skipped",
-        "deferred"}``."""
+        "from_game_id", "candidate_count", "seated", "skipped", "deferred",
+        "already_seated"}``."""
         locked = self._lock_candidates(candidates)
         seatable, skipped, contexts = self._partition_candidates(
             game, candidates, locked, preclassified)
         deferred: List[Tuple[str, str]] = []
-        if limits is not None:
-            room = dict(limits)
+        already: List[Tuple[str, str]] = []
+        if cap_to_open_slots:
+            summaries = self._slot_summaries(game.id, team_id)
+            room = {st: summaries[st].open_count for st in summaries}
+            occupying = {e.player_id
+                         for e in self.store.roster_for_game(game.id)
+                         if e.status.occupies_slot}
             capped = []
             for pid in seatable:
+                if pid in occupying:
+                    already.append((pid, self.ALREADY_SEATED))
+                    continue
                 slot = contexts[pid].slot_type
                 if room.get(slot, 0) <= 0:
                     deferred.append((pid, self.TARGET_MET))
@@ -2255,6 +2352,7 @@ class RosterService:
                         game.id, pid, AvailabilityStatus.AVAILABLE)
         skipped_rows = self._batch_rows(skipped)
         deferred_rows = self._batch_rows(deferred)
+        already_rows = self._batch_rows(already)
         # ONE audit row per batch, inside this transaction, present even on a
         # zero-seat run. It records IDS AND REASONS — never counts — so the
         # durable trail answers "which players, and why" without a join
@@ -2273,6 +2371,9 @@ class RosterService:
                              "reason": r["reason"]} for r in skipped_rows],
                 "deferred": [{"player_id": r["player_id"],
                               "reason": r["reason"]} for r in deferred_rows],
+                "already_seated": [{"player_id": r["player_id"],
+                                    "reason": r["reason"]}
+                                   for r in already_rows],
             },
         )
         return {
@@ -2283,6 +2384,7 @@ class RosterService:
             "seated": list(seatable),
             "skipped": skipped_rows,
             "deferred": deferred_rows,
+            "already_seated": already_rows,
         }
 
     def _batch_team(self, game, team_id) -> str:
@@ -2482,12 +2584,23 @@ class RosterService:
         the wrong bucket. For an unbound game the context IS the permanent
         pointer, so that path is unchanged.
 
+        IT FILLS THE REMAINING SLOTS, NOT THE WHOLE TARGET (owner ruling,
+        PR #427, comment 5385783876). The cap this passes down is the room
+        DERIVED FROM CURRENT DURABLE OCCUPANCY on this side, never the raw
+        ``game.target_*``; a partially occupied roster is topped up rather
+        than overfilled, and a candidate who already occupies a slot is a
+        reported no-op instead of a seat. See ``_seat_batch``'s "REMAINING
+        CAPACITY" section for the derivation, the two prohibited sources
+        (confirmed counts, live membership) and the measured overfill this
+        replaces.
+
         EVERY INELIGIBLE CANDIDATE IS REPORTED, including ones the targets
         would never have reached: the cohort is the coach's own bench, the
         reasons are facts about it, and reporting only the first N would
         make the warning depend on how many slots happened to be open. The
-        eligible remainder the targets had no room for is reported
-        separately as ``deferred`` — nothing is wrong with those players.
+        eligible remainder there was no room for is reported separately as
+        ``deferred``, and the candidates already on the roster as
+        ``already_seated`` — nothing is wrong with either group.
 
         ``ValidationError`` still means "this team has nobody at all"; an
         empty COHORT (no pointers and no membership rows) is an empty state
@@ -2502,9 +2615,7 @@ class RosterService:
             )
         return self._seat_batch(
             game, team_id, candidates, source="auto_build_roster",
-            actor_id=actor_id, confirm=True,
-            limits={SlotType.GOALIE: game.target_goalies,
-                    SlotType.SKATER: game.target_skaters})
+            actor_id=actor_id, confirm=True, cap_to_open_slots=True)
 
     @staticmethod
     def _is_visible_game(g) -> bool:
