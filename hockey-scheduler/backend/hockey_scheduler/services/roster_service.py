@@ -1608,6 +1608,17 @@ class RosterService:
         membership id makes the order total, so nothing here can fall back
         to store iteration order.
 
+        SAID PRECISELY, BECAUSE THE PARAGRAPH ABOVE READS STRONGER THAN IT
+        IS: ``rung`` and ``side_rank`` are UNFALSIFIABLE, exactly as the
+        ``parked`` collapse is and for the same reason. This pick's return
+        value is consumed only as ``why[m.id]`` — a string — so rows sharing
+        a reason yield the same answer whichever of them wins, and dropping
+        both secondary keys leaves every test green. They are kept because
+        a stable, explainable survivor is worth having when someone later
+        makes the winning ROW observable; they are not load-bearing today,
+        and no test can fail on them. Only ``reason_rank`` and ``m.id`` do
+        observable work here.
+
         ``why`` must name every row in ``matched``; the direct subscript is
         deliberate, so a row that reached the ``raw`` bucket without a
         recorded reason fails loudly here rather than being ranked as if it
