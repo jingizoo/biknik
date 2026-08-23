@@ -131,6 +131,25 @@ A roster entry **occupies a slot** when its status is one of `SELECTED`,
 `REMOVED`. It is **confirmed** (counts as a confirmed body) when `CONFIRMED`
 or `ACCEPTED`.
 
+**Player self-service into `CONFIRMED` asks two questions with two different
+answerers.** The durable row *identifies* the side and bucket in play; the
+player's *current live* membership context *authorizes* the transition. So
+`POST /api/games/{id}/availability` with `available` — the only route the UI
+offers a player — refuses when the live context resolves to a different team
+than `team_side` (`not_eligible`, `details.reason =
+"seated_side_not_live_eligible"`), and refuses when no live context resolves
+at all. One gate,
+`RosterService._authorize_seated_side`, serves both routes into `CONFIRMED`:
+re-confirming a backed-out (`UNAVAILABLE`) row, and confirming a row that
+never backed out. It runs before any store write.
+
+The two routes differ in exactly one respect, deliberately. Re-confirming
+*re-takes* a freed slot, so it additionally requires that slot to still be
+open, and refuses a pre-061 `NULL`-attribution row whose side cannot be
+identified. Confirming a still-occupying row takes nothing — `SELECTED` and
+`CONFIRMED` hold the same slot — so it applies **no** open-slot check (that
+would refuse the last seat's own confirmation) and lets a `NULL` row through.
+
 ## GameAvailability
 
 Tracks a player's response.

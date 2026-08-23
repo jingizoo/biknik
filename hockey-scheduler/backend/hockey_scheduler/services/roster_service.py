@@ -418,38 +418,25 @@ class RosterService:
                 # So: resolve LIVE (fails closed exactly as before — the #270
                 # deactivation gate / the accept_substitute re-resolution),
                 # read the slot off the ROW, and refuse unless the live
-                # context's team IS the side that row occupies.
-                ctx = self._require_membership_context(game, player)
-                attribution = entry.attribution
+                # context's team IS the side that row occupies. That last
+                # step is _authorize_seated_side, which the SELECTED branch
+                # below calls too — ONE gate, so the two player-driven
+                # routes to CONFIRMED cannot drift apart.
+                attribution = self._authorize_seated_side(
+                    game, player, entry, "re-confirm")
                 if attribution is None:
                     # Pre-061 row: its side is unknown and must never be
                     # guessed (owner ruling). Re-confirming is "take a slot
                     # back", and a slot whose side is unknown must not be
-                    # taken. Refuse rather than re-derive.
+                    # taken. Refuse rather than re-derive. (The SELECTED
+                    # branch below deliberately does NOT refuse here: it
+                    # takes nothing back — see its own comment.)
                     raise NotEligibleError(
                         f"{player.name} cannot re-confirm: this roster row "
                         f"predates durable game-side attribution, so the "
                         f"slot it holds cannot be identified.",
                         details={"reason": "attribution_missing"})
                 side, st = attribution
-                if ctx.team_id != side:
-                    # AUTHORIZATION, not occupancy — deliberately raised
-                    # BEFORE the slot gate and with its own code/reason so
-                    # the two refusals can never be mistaken for each other.
-                    # "That side's slot happens to be free" is not a licence
-                    # to take it; a player who now plays for the other side
-                    # has no claim on this row's slot whether it is open or
-                    # full. (Their route back onto a roster is a coach
-                    # re-selection or a substitute accept — both of which
-                    # RE-SEAT the row from the live context that authorized
-                    # them, so identify and authorize agree by construction.)
-                    raise NotEligibleError(
-                        f"{player.name} cannot re-confirm: this roster row "
-                        f"holds a slot on a side they are no longer eligible "
-                        f"for.",
-                        details={"reason": "seated_side_not_live_eligible",
-                                 "seated_team_id": side,
-                                 "eligible_team_id": ctx.team_id})
                 # ...and only once the player is authorized for that side do
                 # we ask whether the slot itself is still free (a substitute
                 # may have filled it while they were out). The BUCKET is the
@@ -457,6 +444,38 @@ class RosterService:
                 # ROW back in the slot it held, so a season-scoped position
                 # change must not silently move it to a different bucket.
                 self._require_open_slot(game_id, st, side)
+            elif entry.status.occupies_slot:
+                # THE SAME SPLIT, for the transition that never backs out
+                # (#205, owner ruling on PR #427, 2026-08-22): "For player
+                # self-service, the durable roster row identifies the side
+                # and bucket; the player's current live context authorizes
+                # the transition. Therefore, SELECTED -> CONFIRMED must
+                # reject when the player's live team no longer matches the
+                # durable row's side."
+                #
+                # The re-confirm gate above only fires for a row already in
+                # UNAVAILABLE, so it never saw a row that was coach-selected
+                # and never backed out. A player selected on HOME who then
+                # moved HOME->AWAY could therefore self-confirm on the
+                # durable HOME row and become a confirmed HOME body while
+                # being live-eligible only for AWAY.
+                #
+                # NO OPEN-SLOT CHECK HERE, deliberately. This row ALREADY
+                # occupies its slot (``occupies_slot`` is what put us in
+                # this branch) and CONFIRMED occupies the same one, so
+                # nothing is being taken: requiring an open slot would
+                # refuse every legitimate confirmation of the last seat.
+                # Occupancy is not the question — authorization is.
+                #
+                # A pre-061 row with no attribution is ALLOWED through
+                # (the helper returns None and we ignore it), which is the
+                # one place this branch and the re-confirm branch above
+                # differ, and why: re-confirming re-TAKES a slot, so an
+                # unidentifiable side must not be taken; confirming takes
+                # nothing, so refusing would strand every legacy selected
+                # row's self-confirmation for a hazard that does not exist
+                # on this transition.
+                self._authorize_seated_side(game, player, entry, "confirm")
 
         existing = self.store.availability_for_player(game_id, player_id)
         av = GameAvailability(
@@ -488,6 +507,58 @@ class RosterService:
                   and entry.status.occupies_slot):
                 self._back_out_entry(game, entry, actor_id)
         return av
+
+    def _authorize_seated_side(
+        self, game, player, entry, action: str
+    ) -> Optional[Tuple[str, SlotType]]:
+        """AUTHORIZE — "MAY THIS PLAYER still hold the SIDE this row is
+        seated on?" — for every PLAYER-DRIVEN transition into CONFIRMED.
+
+        ONE gate, called from both of ``set_availability``'s routes to
+        CONFIRMED (the re-confirm of a backed-out row, and the confirm of a
+        row that never backed out), because they ask the identical question
+        and a second copy would be free to answer it differently. Written
+        as a helper for exactly that reason: a change here is a change to
+        both, and a mutation here breaks both.
+
+        The answer comes from the LIVE context and from nothing else.
+        Durable attribution records what the row HOLDS; it says nothing
+        about who is still entitled to hold it. If the stored value could
+        authorize its own re-use, the row would be a standing permission
+        that outlives the participation that granted it. Resolution fails
+        CLOSED (``_require_membership_context`` — the #270 deactivation
+        gate), so a player with no live context at all is refused before
+        any comparison is reached.
+
+        Returns the row's ``(team_side, slot_type)`` attribution, or
+        ``None`` for a pre-061 row that carries none. An unidentifiable
+        side cannot be compared to anything, so this helper does NOT
+        decide what it means — that is a property of the TRANSITION, not
+        of authorization, and each caller states its own answer.
+
+        ``action`` is the caller's verb, so the message names the refused
+        transition; the machine-readable ``details`` are identical on both
+        paths by construction.
+        """
+        ctx = self._require_membership_context(game, player)
+        attribution = entry.attribution
+        if attribution is not None and ctx.team_id != attribution[0]:
+            # AUTHORIZATION, not occupancy — deliberately raised BEFORE any
+            # slot gate and with its own reason so the two refusals can
+            # never be mistaken for each other. "That side's slot happens
+            # to be free" is not a licence to take it; a player who now
+            # plays for the other side has no claim on this row's slot
+            # whether it is open or full. (Their route back onto a roster
+            # is a coach re-selection or a substitute accept — both of
+            # which RE-SEAT the row from the live context that authorized
+            # them, so identify and authorize agree by construction.)
+            raise NotEligibleError(
+                f"{player.name} cannot {action}: this roster row holds a "
+                f"slot on a side they are no longer eligible for.",
+                details={"reason": "seated_side_not_live_eligible",
+                         "seated_team_id": attribution[0],
+                         "eligible_team_id": ctx.team_id})
+        return attribution
 
     @_transactional
     def set_roster_entry_status(
