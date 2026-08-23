@@ -53,10 +53,14 @@ from ..store import InMemoryStore
 from .membership_spine import (
     DENORMALIZED_SEASON_MISMATCH,
     LEAGUE_SEASON_MISSING,
+    MEMBERSHIP_OTHER_LEAGUE_SEASON,
+    MEMBERSHIP_OTHER_TEAM,
     NO_ELIGIBLE_MEMBERSHIP,
+    PLAYER_INACTIVE,
     PLAYER_MISSING,
     missing_or_unequal,
     side_spine_break,
+    status_ineligible_reason,
 )
 from .notifier import push as _push_notification
 from .season_guard import require_active_season
@@ -1237,6 +1241,21 @@ class RosterService:
     _ELIGIBLE_MEMBERSHIP_STATUSES = (MembershipStatus.ACTIVE,
                                      MembershipStatus.AFFILIATE)
 
+    # The order in which a NON-participating membership at the right key is
+    # REPORTED (PR #427) — never an eligibility order, only a tie-break for
+    # "which of this player's parked rows explains the skip". Terminal first
+    # (the stint genuinely ended, and that is the more final fact about the
+    # player), then the open-but-not-authoritative states. Together with
+    # ``_ELIGIBLE_MEMBERSHIP_STATUSES`` this must partition ``MembershipStatus``
+    # exactly — ``MembershipReasonsCoverEveryStatus`` fails if a new value
+    # lands in neither tuple, so a status nobody has classified can never be
+    # silently reported (or silently seated).
+    _INELIGIBLE_MEMBERSHIP_STATUSES = (MembershipStatus.TRANSFERRED,
+                                       MembershipStatus.RELEASED,
+                                       MembershipStatus.INACTIVE,
+                                       MembershipStatus.INJURED,
+                                       MembershipStatus.APPLICANT)
+
     def resolve_membership_context(
         self, game, player
     ) -> Optional["GameMembershipContext"]:
@@ -1323,15 +1342,62 @@ class RosterService:
         _ctx, reason = self._resolve_context_with_reason(game, player)
         return reason
 
+    def seating_block_reason(self, game, player) -> Optional[str]:
+        """The STABLE reason ``player`` may not be SEATED on ``game`` right
+        now, or ``None`` — the whole eligibility answer for one candidate, in
+        one non-raising call (PR #427).
+
+        :meth:`membership_spine_break_reason` answers only the MEMBERSHIP
+        question. Seating asks one more: ``select_roster`` refuses a
+        deactivated ``Player`` (#270) after the context resolves, and that
+        refusal needs a reason of its own or the #427 ruling's "a stable
+        reason for each skip" has a hole in it for the single most ordinary
+        shape (a player who left the club entirely).
+
+        THE ORDER IS THE GATE'S ORDER, deliberately. ``select_roster`` tests
+        the context FIRST and ``player.is_active`` second, so a candidate
+        failing both is reported under the context reason — the reason names
+        the gate that would actually refuse, not whichever check this method
+        happens to run first. Deactivation is NOT folded into
+        ``_resolve_context_with_reason``: that resolver also feeds
+        ``compute_roster_status``/``_slot_summaries``/the private reads, and
+        closing it on ``is_active`` would newly hide rows that are visible
+        today — a behaviour change this ruling does not authorize.
+
+        PURE and NON-RAISING, so :meth:`partition_seatable` can call it
+        before opening a transaction."""
+        _ctx, reason = self._resolve_context_with_reason(game, player)
+        if reason is not None:
+            return reason
+        if player is not None and not player.is_active:
+            return PLAYER_INACTIVE
+        return None
+
     def _resolve_context_with_reason(self, game, player):
         """``(context, None)`` or ``(None, reason)`` — the ONE resolution
-        both public forms are views of."""
+        both public forms are views of.
+
+        The candidate loop is a CLASSIFIER, not a filter (PR #427). It used
+        to ``continue`` past every membership row that was "simply not about
+        this game" without recording anything, so a player who had
+        TRANSFERRED, whose membership had gone INACTIVE, who was registered
+        in a DIFFERENT LeagueSeason, or who had no membership at all were all
+        reported identically as ``no_eligible_membership``. The owner's #427
+        ruling requires each skipped player to carry a stable reason an
+        operator can act on, so each of those discards is now NAMED — see the
+        reason block in ``membership_spine``. The GATE is unchanged: the same
+        rows are candidates, the same precedence picks among them, and the
+        same contexts are returned. Only the ``None`` answer got more
+        specific."""
         if game is None or player is None:
             return None, NO_ELIGIBLE_MEMBERSHIP
         sides = tuple(t for t in (game.home_team_id, game.away_team_id) if t)
         if not sides:
             return None, NO_ELIGIBLE_MEMBERSHIP
         if not game.league_season_id:
+            # An UNBOUND game has no membership rows in play at all, so the
+            # narrowed NO_ELIGIBLE_MEMBERSHIP ("nothing to resolve") is
+            # exactly right for a permanent pointer naming another team.
             if player.team_id not in sides:
                 return None, NO_ELIGIBLE_MEMBERSHIP
             return GameMembershipContext(
@@ -1352,15 +1418,25 @@ class RosterService:
         spines: Dict[str, Tuple[Optional[str], object]] = {}
         valid: Dict[MembershipStatus, Dict[str, SeasonRosterMembership]] = {}
         raw: Dict[MembershipStatus, Dict[str, SeasonRosterMembership]] = {}
+        parked: Dict[MembershipStatus, Dict[str, SeasonRosterMembership]] = {}
         why: Dict[str, str] = {}
+        any_row = False          # the player holds ANY membership at all
+        any_here = False         # …and at least one at THIS LeagueSeason
         for m in self.store.memberships_for_player(player.id):
             # The membership's OWN keys first: the exact LeagueSeason, one of
             # this game's two sides, and a status that grants current
-            # participation. A row failing these is not a broken spine, it is
-            # simply not about this game.
-            if not (m.league_season_id == game.league_season_id
-                    and m.team_id in sides
-                    and m.status in self._ELIGIBLE_MEMBERSHIP_STATUSES):
+            # participation. A row failing these is not a broken spine — but
+            # it is not nothing either, so each discard is CLASSIFIED rather
+            # than dropped (#427: a skipped player owes the operator a
+            # reason).
+            any_row = True
+            if m.league_season_id != game.league_season_id:
+                continue
+            any_here = True
+            if m.team_id not in sides:
+                continue
+            if m.status not in self._ELIGIBLE_MEMBERSHIP_STATUSES:
+                parked.setdefault(m.status, {}).setdefault(m.team_id, m)
                 continue
             raw.setdefault(m.status, {}).setdefault(m.team_id, m)
             if missing_or_unequal(m.season_id, ls.season_id):
@@ -1378,10 +1454,25 @@ class RosterService:
         if m is not None:
             return self._context_for(game, player, ls, spines[m.team_id][1],
                                      m), None
+        # MOST SPECIFIC FIRST. The row that came CLOSEST to seating the
+        # player names the reason: a broken spine on a right-keyed,
+        # participation-granting row outranks a parked row at the same key,
+        # which outranks a row on the wrong bench, which outranks a row in
+        # another competition, which outranks having no rows at all. Each
+        # step is decided by a deterministic pick (status order, then home
+        # before away), never by store iteration order.
         m = self._pick_eligible_membership(raw, sides)
-        if m is None:
-            return None, NO_ELIGIBLE_MEMBERSHIP
-        return None, why.get(m.id, NO_ELIGIBLE_MEMBERSHIP)
+        if m is not None:
+            return None, why.get(m.id, NO_ELIGIBLE_MEMBERSHIP)
+        m = self._pick_membership(parked, sides,
+                                  self._INELIGIBLE_MEMBERSHIP_STATUSES)
+        if m is not None:
+            return None, status_ineligible_reason(m.status)
+        if any_here:
+            return None, MEMBERSHIP_OTHER_TEAM
+        if any_row:
+            return None, MEMBERSHIP_OTHER_LEAGUE_SEASON
+        return None, NO_ELIGIBLE_MEMBERSHIP
 
     def _side_spine(self, cache, ls, team_id):
         """``(reason, SideSpine)`` for one of the game's sides — the spine is
@@ -1434,7 +1525,23 @@ class RosterService:
         ``resolve_membership_contexts_for_game`` (batched, #205 blocker 5)
         need, factored once here so the batch form is a thin wrapper over the
         same rule rather than a parallel reimplementation."""
-        for status in cls._ELIGIBLE_MEMBERSHIP_STATUSES:
+        return cls._pick_membership(matched, sides,
+                                    cls._ELIGIBLE_MEMBERSHIP_STATUSES)
+
+    @staticmethod
+    def _pick_membership(
+        matched: Dict[MembershipStatus, Dict[str, SeasonRosterMembership]],
+        sides: Tuple[str, ...],
+        status_order: Tuple[MembershipStatus, ...],
+    ) -> Optional[SeasonRosterMembership]:
+        """status-order-then-home-before-away pick over a
+        ``{status: {team_id: membership}}`` dict — the shared mechanism
+        behind both :meth:`_pick_eligible_membership` (which picks the row
+        that SEATS a player) and the #427 classifier's parked-row pick (which
+        picks the row that EXPLAINS a skip). The two differ only in which
+        status order they hand in, so factoring the walk keeps "home before
+        away, deterministically" a single rule."""
+        for status in status_order:
             by_team = matched.get(status, {})
             for side in sides:
                 m = by_team.get(side)

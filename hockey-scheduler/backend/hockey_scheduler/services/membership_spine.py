@@ -22,10 +22,17 @@ answer it identically:
 
 The reason strings are the ones ``setup_service``'s raising guards already
 use, so a read-time refusal and a write-time refusal name the same edge.
+
+It ALSO holds the *pre-spine* skip vocabulary the #427 batch-seating ruling
+needs (``MEMBERSHIP_STATUS_REASONS``, ``MEMBERSHIP_OTHER_TEAM``,
+``MEMBERSHIP_OTHER_LEAGUE_SEASON``, ``PLAYER_INACTIVE``, and the narrowed
+``NO_ELIGIBLE_MEMBERSHIP``) — see the block above those constants for why
+every reason an operator can be shown lives in this one module.
 """
 
 from typing import NamedTuple, Optional, Tuple
 
+from ..domain.enums import MembershipStatus
 from .league_scope import exact_registration_or_conflict
 
 
@@ -78,7 +85,83 @@ REGISTRATION_CONFLICT = "team_registration_conflict"
 # every spine reason lives in one place.
 PLAYER_MISSING = "membership_player_missing"
 DENORMALIZED_SEASON_MISMATCH = "membership_denormalized_season_mismatch"
+
+# ======================================================================
+# WHY A PLAYER DID NOT RESOLVE — the *pre-spine* reasons (PR #427)
+# ======================================================================
+# The owner's #427 product ruling requires the two BATCH seating entry
+# points to "deterministically identify … the players skipped, with a
+# stable reason for each skip". Before this commit ``NO_ELIGIBLE_
+# MEMBERSHIP`` was the single answer for FOUR of the five candidate shapes
+# the ruling names by hand — transferred, membership inactive,
+# membership-less, and wrong-LeagueSeason all collapsed into one
+# undifferentiated string, because ``_resolve_context_with_reason``'s
+# candidate filter ``continue``d before recording anything about a row it
+# discarded. An operator told "4 players skipped: no_eligible_membership"
+# learns nothing they can act on, and the ruling's "never a silent partial
+# success" is only nominally satisfied.
+#
+# So the filter became a CLASSIFIER (roster_service.
+# ``_resolve_context_with_reason``) and these are the names it records.
+# They live HERE, beside the spine's own reasons, because the ruling's
+# skip vocabulary must have exactly one home — a second table somewhere
+# else is how a code ends up meaning two things.
+#
+# ONE REASON PER MEMBERSHIP STATUS, not one bucket with the status in a
+# detail field. ``transferred`` and ``inactive`` are different facts about
+# a player, they need different operator-facing words ("transferred to
+# another team" vs "membership is inactive"), and a UI that has to reach
+# into a detail payload to tell two skips apart is a UI that will
+# eventually stop bothering. Deriving the reason from the enum ALSO means
+# a new ``MembershipStatus`` value cannot silently inherit some other
+# status's wording: :func:`status_ineligible_reason` raises for anything
+# unmapped, and ``MembershipReasonsCoverEveryStatus`` in
+# tests/test_membership_skip_reasons.py fails the moment the enum grows.
+MEMBERSHIP_STATUS_REASONS = {
+    MembershipStatus.APPLICANT: "membership_applicant",
+    MembershipStatus.INACTIVE: "membership_inactive",
+    MembershipStatus.INJURED: "membership_injured",
+    MembershipStatus.RELEASED: "membership_released",
+    MembershipStatus.TRANSFERRED: "membership_transferred",
+}
+
+# A membership exists at this EXACT LeagueSeason, and grants current
+# participation — but on a team that is not playing in this game. The
+# "borrowed from another club" shape; cross-team borrowing is off (#287
+# open question 4 is unruled), so it is a skip, not a seat.
+MEMBERSHIP_OTHER_TEAM = "membership_other_team"
+
+# The player holds membership rows, but NONE of them names this game's
+# LeagueSeason — the owner's "wrong-LeagueSeason" shape. Distinct from
+# ``MEMBERSHIP_OTHER_TEAM`` because the remedy is different: this player is
+# registered in a different competition, not merely on a different bench.
+MEMBERSHIP_OTHER_LEAGUE_SEASON = "membership_other_league_season"
+
+# The ``Player`` row itself is deactivated (#270's ``Player.is_active``).
+# NOT a spine leg and deliberately NOT decided by
+# ``_resolve_context_with_reason``: deactivation is a property of the
+# person, checked by the write-time gates (``select_roster``,
+# ``_require_active_player``) AFTER the context resolves, and folding it
+# into the resolver would newly close reads that are open today. It is
+# produced by ``RosterService.seating_block_reason``, which layers the two
+# gates in the SAME order ``select_roster`` applies them.
+PLAYER_INACTIVE = "player_inactive"
+
+# NARROWED (PR #427) to its true meaning: this player has NO membership
+# rows AT ALL — nothing to resolve, nothing to explain. Every shape that
+# used to land here now has its own name above.
 NO_ELIGIBLE_MEMBERSHIP = "no_eligible_membership"
+
+
+def status_ineligible_reason(status) -> str:
+    """The stable reason naming WHY a membership at the right key does not
+    grant participation, from its :class:`MembershipStatus`.
+
+    Raises :class:`KeyError` for a status that is not mapped — an ELIGIBLE
+    status (``active``/``affiliate``) never needs a reason, and a NEW status
+    nobody has classified must fail loudly here rather than be reported to an
+    operator under some other status's wording."""
+    return MEMBERSHIP_STATUS_REASONS[status]
 
 
 def side_spine_break(store, ls, team_id) -> Tuple[Optional[str],
