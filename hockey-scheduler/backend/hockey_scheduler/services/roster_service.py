@@ -60,6 +60,7 @@ from .membership_spine import (
     PLAYER_MISSING,
     PRIOR_SEAT_UNATTRIBUTED,
     missing_or_unequal,
+    reason_rank,
     side_spine_break,
     status_ineligible_reason,
 )
@@ -1442,17 +1443,22 @@ class RosterService:
             if m.team_id not in sides:
                 continue
             if m.status not in self._ELIGIBLE_MEMBERSHIP_STATUSES:
-                parked.setdefault(m.status, {}).setdefault(m.team_id, m)
+                self._keep_lowest_id(parked, m)
                 continue
-            raw.setdefault(m.status, {}).setdefault(m.team_id, m)
+            # ``raw`` collects only rows that FAILED, which is not a
+            # narrowing: it is read exactly once, after the ``valid`` pick
+            # below has already returned for any player holding a row that
+            # succeeded, so at that point every right-keyed,
+            # participation-granting row carries a reason.
             if missing_or_unequal(m.season_id, ls.season_id):
-                why[m.id] = DENORMALIZED_SEASON_MISMATCH
+                row_reason = DENORMALIZED_SEASON_MISMATCH
+            else:
+                row_reason, _spine = self._side_spine(spines, ls, m.team_id)
+            if row_reason is None:
+                self._keep_lowest_id(valid, m)
                 continue
-            reason, spine = self._side_spine(spines, ls, m.team_id)
-            if spine is None:
-                why[m.id] = reason
-                continue
-            valid.setdefault(m.status, {}).setdefault(m.team_id, m)
+            why[m.id] = row_reason
+            self._keep_best_reason(raw, m, row_reason, why)
         # Precedence runs over the SPINE-VALIDATED candidates: a membership
         # on a side whose participation has ended was never a candidate, so
         # it must not shadow a still-valid membership on the other side.
@@ -1534,6 +1540,91 @@ class RosterService:
         return cls._pick_membership(matched, sides,
                                     cls._ELIGIBLE_MEMBERSHIP_STATUSES)
 
+    # -- the {status: {team_id: membership}} COLLAPSE ---------------------
+    #
+    # Both resolvers narrow a player's membership rows into a
+    # ``{status: {team_id: membership}}`` dict before ``_pick_membership``
+    # walks it. That dict holds ONE row per (status, team) key, so when a
+    # player holds SEVERAL rows sharing a key — repeated historical stints
+    # on one bench are ordinary history — the others are DISCARDED. The two
+    # helpers below decide WHICH survives, by an explicit key, because the
+    # obvious ``setdefault`` spelling decides it by STORE ITERATION ORDER:
+    # ``InMemoryStore`` hands rows back in insertion order and ``SqlStore``
+    # orders by a TEXT id column, so ``srm_10`` precedes ``srm_2`` on SQL
+    # and follows it in memory.
+    #
+    # THAT WAS NOT COSMETIC. Measured at head e2bde17 on ``InMemoryStore``,
+    # a player holding two participation-granting rows at one (status, team)
+    # key that fail for DIFFERENT reasons — one carrying a denormalized
+    # ``season_id`` mismatch, one on a side whose registration has lapsed —
+    # was reported as ``team_not_registered`` in one row order and
+    # ``membership_denormalized_season_mismatch`` in the other. The #427
+    # acceptance bar asks for "a stable reason for each skip"; a reason that
+    # flips with insertion order is stable only by luck, and the ladder in
+    # ``membership_spine`` claims to be "the SAME order the code actually
+    # applies", which at that head it was not.
+    #
+    # WHY A DATABASE INDEX IS NOT THE ANSWER. Migration 059's
+    # ``ux_srm_open_player_league_season`` and ``ux_srm_active_player_season``
+    # do bound the multiplicity that produced that exact flip — between them,
+    # at most one NON-TERMINAL row per (player, LeagueSeason) — so on SQLite
+    # and PostgreSQL the two-open-row shape is engine-refused
+    # (``TwoOpenStintsAtOneLeagueSeasonAreEngineRefused`` pins it, and pins
+    # that BOTH indexes are load-bearing). But ``InMemoryStore`` enforces no
+    # uniqueness and is a first-class backend of this suite, TERMINAL rows
+    # are deliberately outside those indexes and may repeat without limit,
+    # and determinism that holds only because some other layer forbids the
+    # input is not determinism. The tie-break is imposed HERE, where the
+    # reason is chosen.
+    #
+    # WHICH row wins is deliberately uninteresting; that it is the SAME row
+    # on every backend is the whole point. Membership id is the final key
+    # because it is the one totally-ordered, store-independent value every
+    # row carries.
+
+    @staticmethod
+    def _keep_lowest_id(bucket, m) -> None:
+        """Collapse ``m`` into ``bucket`` keeping the LOWEST membership id at
+        its (status, team) key — the tie-break for buckets whose reported
+        answer is derived from the STATUS alone (``parked``, whose reason is
+        ``status_ineligible_reason``) or from the row itself (``valid``,
+        whose winner becomes the resolved context).
+
+        ``valid`` matters even though a second participation-granting row at
+        one key cannot survive migration 059's uniqueness indexes on SQL:
+        the resolved row supplies the context's ``position``, hence the SLOT
+        TYPE a batch buckets and seats by, so two rows disagreeing there
+        would seat the same player into different buckets on different
+        backends. It also keeps this resolver and
+        ``resolve_membership_contexts_for_game`` picking the SAME row, so the
+        form that DECIDES and the form that NAMES can never diverge on which
+        stint they are talking about."""
+        by_team = bucket.setdefault(m.status, {})
+        current = by_team.get(m.team_id)
+        if current is None or m.id < current.id:
+            by_team[m.team_id] = m
+
+    @staticmethod
+    def _keep_best_reason(bucket, m, reason, why) -> None:
+        """Collapse ``m`` into ``bucket`` keeping the row whose REASON ranks
+        earliest in ``SKIP_REASON_PRECEDENCE``, id-tie-broken.
+
+        This is the bucket whose survivor decides a SERIALIZED REASON
+        STRING, so its tie-break is the written ladder rather than an
+        arbitrary-but-stable key: among rows that came equally close to
+        seating the player, the reported reason is the one the ladder
+        already says outranks the other. That makes
+        ``SKIP_REASON_PRECEDENCE`` authoritative WITHIN a rung as well as
+        between rungs, which is what its own docstring promises.
+        ``reason_rank`` raises for an unlisted reason, so a new skip reason
+        nobody has placed in the ladder fails loudly here instead of sorting
+        wherever it happens to land."""
+        by_team = bucket.setdefault(m.status, {})
+        current = by_team.get(m.team_id)
+        if current is None or ((reason_rank(reason), m.id)
+                               < (reason_rank(why[current.id]), current.id)):
+            by_team[m.team_id] = m
+
     @staticmethod
     def _pick_membership(
         matched: Dict[MembershipStatus, Dict[str, SeasonRosterMembership]],
@@ -1603,8 +1694,8 @@ class RosterService:
                     continue
                 if missing_or_unequal(m.season_id, ls.season_id):
                     continue
-                per_player.setdefault(m.player_id, {}).setdefault(
-                    m.status, {}).setdefault(m.team_id, m)
+                self._keep_lowest_id(
+                    per_player.setdefault(m.player_id, {}), m)
         for player_id, matched in per_player.items():
             m = self._pick_eligible_membership(matched, sides)
             if m is None:

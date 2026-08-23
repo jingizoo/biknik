@@ -194,6 +194,17 @@ PRIOR_SEAT_UNATTRIBUTED = "prior_seat_unattributed"
 # ``test_the_ladder_covers_every_producible_reason`` asserts the ladder is
 # closed over every string the classifier can emit.
 #
+# IT GOVERNS WITHIN A RUNG TOO, not only between rungs. A player may hold
+# SEVERAL right-keyed, participation-granting rows that fail for DIFFERENT
+# reasons; they collapse onto one ``(status, team)`` key, and
+# ``RosterService._keep_best_reason`` resolves that collapse by THIS ladder
+# (``reason_rank``, id-tie-broken) rather than by whichever row the store
+# listed first. Before that, the reported string could flip between two
+# equally true reasons on nothing but insertion order — see
+# ``TheReportedReasonIsInvariantUnderEveryRowOrder``, which runs the
+# classifier once per permutation of a player's rows and requires one
+# answer.
+#
 # THE RULE BEHIND THE ORDER, stated once so a new reason can be placed
 # without guessing: **report the gate that is furthest from being satisfied,
 # and among equals the one that says most about THIS candidate.**

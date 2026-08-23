@@ -882,6 +882,260 @@ class TheNewestPriorRosterIsAuthoritativeEvenWhenItSeatsNobody(
                 self._close(label, store)
         self._assert_ran(ran)
 
+    def test_a_newer_game_with_no_roster_at_all_loses_to_an_older_one(self):
+        """"A newer game with no roster at all may still be skipped in
+        favour of an older game with one" — the owner's own wording, and a
+        DISTINCT case from the away-only one above.
+
+        The two rules read as opposites and are not: the walk skips a game
+        that yields NO CANDIDATES ON THIS SIDE, and stops dead at the first
+        that yields any. An empty game yields none, so it is passed over; a
+        game whose candidates are all INELIGIBLE yields candidates, so it is
+        chosen and reports them (the case above). Asserted here with the
+        older game's player actually SEATED, so "skipped in favour of" is
+        proven by the outcome and not just by ``from_game_id``."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._pair(store)
+                with self.subTest(backend=label):
+                    older = self._prior_game(api, fx["season"], fx["league"],
+                                             fx["teams"], hour=1)
+                    old_timer = self._player(api, fx["home"], "Ada Available")
+                    res = api.select_roster(older["id"], [old_timer["id"]],
+                                            actor_id=ADMIN)
+                    self.assertNotIn(
+                        "error", res if isinstance(res, dict) else {}, res)
+                    # The NEWER prior game exists, involves this team, and is
+                    # published — it simply has no roster rows at all.
+                    self.assertEqual(
+                        list(api.store.roster_for_game(fx["pid"])), [], label)
+                    self.assertGreater(
+                        api.store.get_game(fx["pid"]).start_time,
+                        api.store.get_game(older["id"]).start_time, label)
+
+                    r = api.copy_previous_roster(
+                        fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                    self.assertNotIn("error", r, (label, r))
+                    self.assertEqual(r["from_game_id"], older["id"],
+                                     (label, r))
+                    self.assertEqual(r["seated"], [old_timer["id"]],
+                                     (label, r))
+                    self.assertEqual(r["skipped"], [], (label, r))
+                    self.assertEqual(self._occupying(api, fx["gid"]),
+                                     [old_timer["id"]], label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
+    def test_a_newer_game_seated_only_on_the_other_side_loses_too(self):
+        """The away-only rule in its LOAD-BEARING form. The single-game case
+        above proves only that an away-only game raises; this proves the
+        walk CONTINUES PAST it to an older game that does have this side,
+        which is what "keyed on the durable attribution FOR THAT SIDE"
+        actually means.
+
+        RED against a selection keyed on "the newest earlier game with ANY
+        roster row": that reading picks the newer game, finds nothing for
+        HOME, and either raises or seats nobody."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._pair(store)
+                with self.subTest(backend=label):
+                    older = self._prior_game(api, fx["season"], fx["league"],
+                                             fx["teams"], hour=1)
+                    old_timer = self._player(api, fx["home"], "Ada Available")
+                    res = api.select_roster(older["id"], [old_timer["id"]],
+                                            actor_id=ADMIN)
+                    self.assertNotIn(
+                        "error", res if isinstance(res, dict) else {}, res)
+                    away_only = self._player(api, fx["away"], "Zoe Away")
+                    res = api.select_roster(fx["pid"], [away_only["id"]],
+                                            actor_id=ADMIN)
+                    self.assertNotIn(
+                        "error", res if isinstance(res, dict) else {}, res)
+                    # The newer game HAS a roster — just not on this side.
+                    self.assertEqual(
+                        [e.team_side
+                         for e in api.store.roster_for_game(fx["pid"])],
+                        [fx["away"]], label)
+
+                    r = api.copy_previous_roster(
+                        fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                    self.assertNotIn("error", r, (label, r))
+                    self.assertEqual(r["from_game_id"], older["id"],
+                                     (label, r))
+                    self.assertEqual(r["seated"], [old_timer["id"]],
+                                     (label, r))
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
+    def test_a_newest_prior_game_of_only_null_rows_is_still_the_source(self):
+        """THE SELECTION half of the pre-061 NULL-attribution decision,
+        which section 6 below does not reach: an unattributed row makes the
+        game that holds it a SOURCE, and the walk stops there.
+
+        The two halves could easily have been decided differently — a NULL
+        row could have been excluded from candidate DISCOVERY (so the game
+        holding only NULL rows would yield nothing and the walk would fall
+        through to an older one) rather than admitted and refused. It is
+        admitted, which is the same fail-closed posture the standing owner
+        ruling takes everywhere else on this branch: NULL attribution is
+        UNPROVABLE, never an invitation to substitute an older lineup the
+        coach did not ask for. The operator is told the newest roster cannot
+        be proven and can re-select by hand — they are not silently handed
+        three-week-old names."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._pair(store)
+                with self.subTest(backend=label):
+                    older = self._prior_game(api, fx["season"], fx["league"],
+                                             fx["teams"], hour=1)
+                    old_timer = self._player(api, fx["home"], "Ada Available")
+                    res = api.select_roster(older["id"], [old_timer["id"]],
+                                            actor_id=ADMIN)
+                    self.assertNotIn(
+                        "error", res if isinstance(res, dict) else {}, res)
+                    legacy = self._player(api, fx["home"], "Finn Unattributed")
+                    self._seat_prior(api, fx, [legacy])
+                    entry = api.store.roster_entry_for_player(
+                        fx["pid"], legacy["id"])
+                    entry.team_side = None
+                    entry.seated_position = None
+                    api.store.save_roster_entry(entry)
+                    self.assertIsNone(
+                        api.store.roster_entry_for_player(
+                            fx["pid"], legacy["id"]).team_side, label)
+                    # The control: this player would seat perfectly well.
+                    self.assertIsNone(api.roster.seating_block_reason(
+                        api.store.get_game(fx["gid"]),
+                        api.store.get_player(legacy["id"])), label)
+
+                    r = api.copy_previous_roster(
+                        fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                    self.assertNotIn("error", r, (label, r))
+                    # The NULL-only game is the source, and does NOT fall
+                    # through to the older, perfectly attributed one…
+                    self.assertEqual(r["from_game_id"], fx["pid"], (label, r))
+                    self.assertEqual(r["seated"], [], (label, r))
+                    self.assertEqual(
+                        [(s["player_id"], s["reason"]) for s in r["skipped"]],
+                        [(legacy["id"], spine.PRIOR_SEAT_UNATTRIBUTED)],
+                        (label, r))
+                    # …so the older game's eligible player is NOT seated.
+                    self.assertEqual(self._occupying(api, fx["gid"]), [],
+                                     label)
+                    self.assertNotIn(old_timer["id"], r["seated"], (label, r))
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
+
+class TheChosenSourceIsNamedInEveryOutcomeIncludingZeroSeat(
+        _BatchHarness, unittest.TestCase):
+    """The owner's three SOURCE STATES, distinguished side by side, and the
+    AUDIT's own record of the chosen source.
+
+    The three states are answered by three DIFFERENT outcomes, and this
+    walks all three in one table so "distinguishable" is asserted rather
+    than inferred from three tests that never meet:
+
+      no source roster        -> ValidationError, and NO audit row at all
+      source, zero eligible   -> success, seated [], source NAMED
+      source, some eligible   -> success, seated [...], source NAMED
+
+    THE AUDIT IS THE POINT of the last two. The response is ephemeral; the
+    audit row is the durable record that the operation ran, and on a
+    ZERO-SEAT run it is the ONLY record — there are no roster rows to infer
+    the source from afterwards. An audit that recorded the skips but not
+    WHICH ROSTER they were skipped FROM would leave "why did this copy seat
+    nobody?" unanswerable the moment the source game's roster moves on."""
+
+    def _no_source(self, api, fx):
+        """Nothing seated on this side anywhere earlier."""
+        return None, []
+
+    def _source_zero_eligible(self, api, fx):
+        """The newest prior roster exists and has entirely aged out."""
+        gone = self._player(api, fx["home"], "Gia Transferred")
+        self._seat_prior(api, fx, [gone])
+        self._transfer(api, gone["id"], fx["ls_id"], fx["ls_id"],
+                       fx["third"])
+        return fx["pid"], []
+
+    def _source_some_eligible(self, api, fx):
+        """The ordinary shape: one aged-out, one still good."""
+        gone = self._player(api, fx["home"], "Gia Transferred")
+        keeper = self._player(api, fx["home"], "Ada Available")
+        self._seat_prior(api, fx, [keeper, gone])
+        self._transfer(api, gone["id"], fx["ls_id"], fx["ls_id"],
+                       fx["third"])
+        return fx["pid"], [keeper["id"]]
+
+    STATES = ("no_source", "source_zero_eligible", "source_some_eligible")
+
+    def test_the_three_source_states_are_told_apart_and_name_the_source(self):
+        seen, ran = {}, []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                for state in self.STATES:
+                    store.clear_all_data()
+                    api, fx = self._pair(store)
+                    with self.subTest(backend=label, state=state):
+                        expected_src, expected_seated = getattr(
+                            self, "_" + state)(api, fx)
+                        r = api.copy_previous_roster(
+                            fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                        rows = [a for a in api.store.audit_for_game(fx["gid"])
+                                if a.action == AuditAction.ROSTER_BATCH_SEATED]
+                        if expected_src is None:
+                            self.assertEqual(r["error"]["code"],
+                                             "validation_error", (label, r))
+                            # Nothing ran, so nothing is recorded as having
+                            # run — the ValidationError is not a zero-seat
+                            # success wearing a different hat.
+                            self.assertEqual(rows, [], (label, rows))
+                            seen.setdefault(state, set()).add("error")
+                        else:
+                            self.assertNotIn("error", r, (label, r))
+                            self.assertEqual(r["seated"], expected_seated,
+                                             (label, r))
+                            # THE RESPONSE names the chosen source…
+                            self.assertEqual(r["from_game_id"], expected_src,
+                                             (label, r))
+                            # …and so does the DURABLE audit row, on the
+                            # zero-seat outcome as much as the partial one.
+                            self.assertEqual(len(rows), 1, (label, rows))
+                            self.assertEqual(rows[0].detail["from_game_id"],
+                                             expected_src,
+                                             (label, rows[0].detail))
+                            self.assertEqual(rows[0].detail["source"],
+                                             "copy_previous_roster",
+                                             (label, rows[0].detail))
+                            seen.setdefault(state, set()).add(
+                                "seated" if expected_seated else "zero")
+                    ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+        # The three states really are THREE, not two wearing one answer.
+        self.assertEqual(
+            [sorted(seen[s]) for s in self.STATES],
+            [["error"], ["zero"], ["seated"]], seen)
+
 
 # ======================================================================
 # 6. THE PRE-061 ROW — NULL attribution fails closed, and is REPORTED
@@ -1290,6 +1544,190 @@ class ClassificationReadsLiveStateNotTheDiscoverySnapshot(
                         [(late["id"], "membership_transferred")], (label, r))
                     self.assertEqual(self._occupying(api, fx["gid"]),
                                      [mate["id"]], label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
+
+class TheLockedStateDecidesAndNoWriteBeginsBeforeIt(_BatchHarness,
+                                                    unittest.TestCase):
+    """The owner's third added requirement (2026-08-23): "The race test can
+    be deterministic with an instrumented store that changes membership at
+    lock acquisition, proving classification uses the locked/revalidated
+    state and that no write begins beforehand."
+
+    WHAT THIS ADDS OVER THE TWO NEIGHBOURS. The class above hooks the
+    SERVICE method ``_lock_candidates`` and mutates BEFORE it runs, which
+    pins "the partition re-reads live state" but says nothing about the
+    lock. The PostgreSQL two-connection races below pin the real concurrent
+    case but only on PostgreSQL, so Memory and SQLite hold neither property
+    deterministically. This instruments the STORE —
+    ``get_player_for_update``, the call that IS the lock acquisition — so
+    the mutation lands at the
+    exact instant the correction names, on ALL THREE backends, with no
+    threads and no timing.
+
+    TWO PROPERTIES, ASSERTED SEPARATELY:
+
+    (i)  CLASSIFICATION USES THE LOCKED STATE. The membership changes during
+         the lock sweep, and the candidate is skipped with the NEW reason —
+         so the partition decided from state read after the locks, not from
+         a snapshot taken at discovery. RED against any implementation that
+         classified before locking: the candidate would be seated.
+
+    (ii) NO WRITE HAS BEGUN. The hook snapshots every write class on the
+         target game AT LOCK ACQUISITION and requires it to be empty. Order
+         alone would not prove this — a batch could hold the locks and still
+         have inserted a roster row first — and "then seat" is the half of
+         "acquire the relevant locks, revalidate every candidate, partition
+         … then seat" that an ordering assertion silently skips.
+
+    The mutation deliberately targets a candidate whose Player row is locked
+    LATER in the sweep (``_lock_candidates`` locks in sorted-id order), so
+    the change genuinely lands mid-acquisition rather than before it."""
+
+    def _instrument(self, store, gid, target, when_locked, snapshots):
+        """Wrap ``get_player_for_update`` — the LOCK — on this store
+        INSTANCE, so one backend's instrumentation cannot leak into the next
+        loop iteration.
+
+        KEYED ON ``target``'s OWN LOCK, not on "the first lock taken".
+        ``select_roster`` locks its own list too, so a hook on the first
+        lock anywhere would fire inside a WRITE path that had not written
+        yet — and would then report an empty snapshot for an implementation
+        that seats before it classifies. Waiting for this candidate's row
+        makes the snapshot mean what it says: nothing had been written by
+        the time the batch locked the player it is about to classify."""
+        real = store.get_player_for_update
+        state = {"n": 0}
+
+        def wrapped(player_id):
+            if player_id == target and not state["n"]:
+                state["n"] += 1
+                snapshots.append(self._writes_only(store, gid))
+                when_locked()
+            return real(player_id)
+
+        store.get_player_for_update = wrapped
+        return state
+
+    @staticmethod
+    def _writes_only(store, gid):
+        """Every write class a batch makes on the TARGET game, as identity
+        values. Audit rows are excluded on purpose: the batch's own audit is
+        written at the END, and the question here is whether any ROSTER
+        state was touched before the locks."""
+        return {
+            "roster": sorted((e.id, e.player_id) for e in
+                             store.roster_for_game(gid)),
+            "availability": sorted((a.id, a.player_id) for a in
+                                   store.availability_for_game(gid)),
+            "substitutes": sorted((s.id, s.player_id) for s in
+                                  store.substitutes_for_game(gid)),
+        }
+
+    def test_a_membership_change_at_lock_acquisition_decides_the_outcome(
+            self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._pair(store)
+                with self.subTest(backend=label):
+                    mate = self._player(api, fx["home"], "Ada Available")
+                    late = self._player(api, fx["home"], "Late Leaver")
+                    self._seat_prior(api, fx, [mate, late])
+                    # Locked in sorted-id order, so ``mate`` is locked first
+                    # and ``late`` is mutated while the sweep is still
+                    # running.
+                    self.assertLess(mate["id"], late["id"])
+                    stint = self._stint_id(api, late["id"], fx["ls_id"])
+                    # The control: before the batch, this candidate seats.
+                    self.assertIsNone(api.roster.seating_block_reason(
+                        api.store.get_game(fx["gid"]),
+                        api.store.get_player(late["id"])), label)
+
+                    snapshots = []
+
+                    def park():
+                        end_membership_directly(api.store, stint,
+                                                "transferred")
+
+                    fired = self._instrument(api.store, fx["gid"],
+                                             late["id"], park, snapshots)
+                    try:
+                        r = api.copy_previous_roster(
+                            fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                    finally:
+                        del api.store.get_player_for_update
+                    self.assertEqual(fired["n"], 1, label)
+
+                    # (ii) NOT ONE write of any class had begun when the
+                    # first lock was taken.
+                    self.assertEqual(
+                        snapshots,
+                        [{"roster": [], "availability": [],
+                          "substitutes": []}],
+                        (label, snapshots))
+
+                    # (i) …and the classification answered from the state as
+                    # of the locks, not from discovery.
+                    self.assertNotIn("error", r, (label, r))
+                    self.assertEqual(r["candidate_count"], 2, (label, r))
+                    self.assertEqual(r["seated"], [mate["id"]], (label, r))
+                    self.assertEqual(
+                        [(s["player_id"], s["reason"])
+                         for s in r["skipped"]],
+                        [(late["id"], spine.MEMBERSHIP_STATUS_REASONS[
+                            MembershipStatus.TRANSFERRED])], (label, r))
+                    self.assertEqual(self._occupying(api, fx["gid"]),
+                                     [mate["id"]], label)
+                    # …and the durable audit agrees with the response.
+                    self._assert_audit(api, fx["gid"], [mate["id"]],
+                                       r["skipped"], label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran)
+
+    def test_the_write_snapshot_would_catch_a_write_that_had_begun(self):
+        """The falsifier for (ii). The emptiness assertion above is only
+        worth something if a write made before the locks WOULD show up in
+        that snapshot — so here one is made deliberately, through the same
+        seating primitive the batch itself uses, and the snapshot is
+        required to see it. Without this, ``assertEqual(snapshots, [empty])``
+        could be passing because the snapshot helper reads nothing at all."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, fx = self._pair(store)
+                with self.subTest(backend=label):
+                    mate = self._player(api, fx["home"], "Ada Available")
+                    early = self._player(api, fx["home"], "Bex Backup")
+                    self._seat_prior(api, fx, [mate, early])
+                    # A roster row on the TARGET game, before any batch runs.
+                    res = api.select_roster(fx["gid"], [early["id"]],
+                                            actor_id=ADMIN)
+                    self.assertNotIn(
+                        "error", res if isinstance(res, dict) else {}, res)
+                    snapshots = []
+                    fired = self._instrument(api.store, fx["gid"],
+                                             mate["id"], lambda: None,
+                                             snapshots)
+                    try:
+                        r = api.copy_previous_roster(
+                            fx["gid"], team_id=fx["home"], actor_id=ADMIN)
+                    finally:
+                        del api.store.get_player_for_update
+                    self.assertNotIn("error", r, (label, r))
+                    self.assertEqual(fired["n"], 1, label)
+                    self.assertEqual(
+                        [p for _id, p in snapshots[0]["roster"]],
+                        [early["id"]], (label, snapshots))
                 ran.append(label)
             finally:
                 self._close(label, store)
