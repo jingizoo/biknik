@@ -1894,6 +1894,14 @@ class SqlStore:
         return self._query(
             SeasonRosterMembership, "league_season_id = ? AND team_id = ?",
             (league_season_id, team_id), order="id")
+    def memberships_for_team(self, team_id):
+        """EVERY membership row naming this Team, at ANY LeagueSeason and in
+        ANY status — see ``InMemoryStore.memberships_for_team`` for why the
+        #427 auto-fill cohort needs it unfiltered. ``order="id"`` matches the
+        rest of this class; the SERVICE imposes the real, cross-backend
+        ordering, and must not inherit this TEXT-column one."""
+        return self._query(SeasonRosterMembership, "team_id = ?",
+                           (team_id,), order="id")
     def active_memberships_for_player_in_season(self, player_id, season_id):
         """Every AUTHORITATIVE (status = 'active') membership at this
         (player, Season) key. Always 0 or 1 here — migration 059's

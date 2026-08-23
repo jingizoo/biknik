@@ -152,6 +152,20 @@ class GameType(str, Enum):
 
 class AuditAction(str, Enum):
     ROSTER_SELECTED = "roster_selected"
+    # ONE row per BATCH seating run (copy-previous / auto-fill), written
+    # inside the batch's own transaction and present even when the batch
+    # seated NOBODY (#427). Deliberately NOT ``ROSTER_SELECTED``: that action
+    # means "these players were seated" and is written by ``select_roster``
+    # on every seating, batch or not. The batch's record is a different
+    # event — it names the candidate pool, the players SELECTED out of it,
+    # and every player SKIPPED with the reason — and a zero-seat run
+    # produces this row and no ``ROSTER_SELECTED`` row at all, so collapsing
+    # the two would make "the batch ran and seated nobody" indistinguishable
+    # from "the batch seated somebody". ``audit_logs.action`` is plain TEXT
+    # with no CHECK constraint (migration 001), so a new value needs no
+    # migration; ``AUDIT_LABEL`` in web/static/app.js carries its display
+    # text.
+    ROSTER_BATCH_SEATED = "roster_batch_seated"
     AVAILABILITY_SET = "availability_set"
     PLAYER_BACKED_OUT = "player_backed_out"
     SUBSTITUTE_ENROLLED = "substitute_enrolled"

@@ -39,7 +39,6 @@ from ..domain import (
     RosterEntryStatus,
     SeasonStatus,
     SensitiveFieldCategory,
-    SlotType,
     SubstituteStatus,
     can,
     intervals_overlap,
@@ -4195,36 +4194,34 @@ class ApiService:
     @catch
     def auto_build_roster(self, game_id: str, team_id: Optional[str] = None,
                           actor_id: Optional[str] = None) -> dict:
-        """Demo helper: select + confirm a full roster for one side.
+        """Select + confirm a roster for one side, up to the game's targets.
 
         Picks the team's goalies and skaters up to the game's targets so a
         newly-scheduled game becomes immediately playable by the roster flow.
         ``team_id`` defaults to the home side (#25); a team not playing in the
-        game is rejected. Raises if the team has no players (empty state).
-        """
-        game = self.roster._require_game(game_id)
-        team_id = team_id or game.home_team_id
-        if team_id not in (game.home_team_id, game.away_team_id):
-            raise ValidationError("That team is not playing in this game.")
-        players = self.store.players_for_team(team_id)
-        if not players:
-            raise ValidationError(
-                "Team has no players yet. Add or import players first."
-            )
-        goalies = [p for p in players if p.slot_type == SlotType.GOALIE]
-        skaters = [p for p in players if p.slot_type == SlotType.SKATER]
-        selected = ([g.id for g in goalies[:game.target_goalies]]
-                    + [s.id for s in skaters[:game.target_skaters]])
-        self.roster.select_roster(game_id, selected, actor_id)
-        for pid in selected:
-            self.roster.set_availability(game_id, pid, AvailabilityStatus.AVAILABLE)
-        status = self.roster.compute_roster_status(game_id, team_id).to_dict()
+        game is rejected. Raises if the team has no candidates at all (empty
+        state).
+
+        THE SEATING ITSELF NOW LIVES IN ``RosterService.auto_build_roster``
+        (PR #427) — see it for the candidate cohort, the one-transaction
+        lock/revalidate/partition/seat order, and why the response has to
+        carry player identity. What is left here is the presentation this
+        endpoint has always added on top: the resulting roster status plus
+        the coach-friendly short-roster classification.
+
+        The response is the batch result MERGED WITH that status, so
+        ``seated``/``skipped``/``deferred``/``candidate_count`` are ADDITIVE
+        — every existing caller reading ``status``/``open_*_slots``/
+        ``short_roster`` is unaffected."""
+        result = self.roster.auto_build_roster(game_id, team_id, actor_id)
+        status = self.roster.compute_roster_status(
+            game_id, result["team_id"]).to_dict()
         # Coach-friendly classification of a short roster.
         status["missing_goalies"] = status["open_goalie_slots"]
         status["missing_skaters"] = status["open_skater_slots"]
         status["short_roster"] = (status["open_goalie_slots"] > 0
                                   or status["open_skater_slots"] > 0)
-        return status
+        return {**status, **result}
 
     @catch
     def publish_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:

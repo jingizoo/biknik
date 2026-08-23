@@ -25,9 +25,12 @@ use, so a read-time refusal and a write-time refusal name the same edge.
 
 It ALSO holds the *pre-spine* skip vocabulary the #427 batch-seating ruling
 needs (``MEMBERSHIP_STATUS_REASONS``, ``MEMBERSHIP_OTHER_TEAM``,
-``MEMBERSHIP_OTHER_LEAGUE_SEASON``, ``PLAYER_INACTIVE``, and the narrowed
-``NO_ELIGIBLE_MEMBERSHIP``) — see the block above those constants for why
-every reason an operator can be shown lives in this one module.
+``MEMBERSHIP_OTHER_LEAGUE_SEASON``, ``PLAYER_INACTIVE``,
+``PRIOR_SEAT_UNATTRIBUTED``, and the narrowed ``NO_ELIGIBLE_MEMBERSHIP``) —
+see the block above those constants for why every reason an operator can be
+shown lives in this one module — and ``SKIP_REASON_PRECEDENCE``, the written
+order in which those reasons are considered when more than one applies to the
+same candidate.
 """
 
 from typing import NamedTuple, Optional, Tuple
@@ -151,6 +154,122 @@ PLAYER_INACTIVE = "player_inactive"
 # rows AT ALL — nothing to resolve, nothing to explain. Every shape that
 # used to land here now has its own name above.
 NO_ELIGIBLE_MEMBERSHIP = "no_eligible_membership"
+
+# The candidate came from a PRIOR game's roster row that carries NO durable
+# attribution (a pre-migration-061 row, whose ``team_side`` is NULL). It is a
+# DISCOVERY-stage reason, produced by ``RosterService._prior_side_candidates``
+# before any question about today's eligibility is even asked, and it is the
+# copy-previous analogue of the rule the owner already ruled on this branch
+# for the slot arithmetic: NULL attribution FAILS CLOSED as unprovable.
+#
+# WHY IT IS A REPORTED SKIP AND NOT A SILENT OMISSION. The two honest options
+# for "this historical row names no side" are (a) drop it from the candidate
+# pool, which is the silent drop this whole ruling exists to abolish, and
+# (b) admit it as a candidate on EVERY side and refuse it with a reason. (b)
+# is chosen, and it is exactly symmetric with
+# ``LegacyRowsWithNoAttributionFailClosed``'s already-shipped decision that
+# such a row is charged as occupying on every side and in both buckets: the
+# accepted cost is OVER-reporting (a NULL row that was really on the AWAY
+# bench is reported as unprovable when copying HOME), never a guess and never
+# a seat. The operator is told the truth — "this row predates attribution;
+# re-select this player by hand" — instead of watching them vanish.
+PRIOR_SEAT_UNATTRIBUTED = "prior_seat_unattributed"
+
+
+# ======================================================================
+# REASON PRECEDENCE — which reason wins when several could apply
+# ======================================================================
+# The #427 acceptance bar requires the classifier's precedence to be
+# DOCUMENTED and pinned, not merely emergent from the order of a few ``if``
+# statements. A candidate very often matches more than one reason at once
+# (a transferred player who has ALSO been deactivated; a parked membership on
+# a side whose registration has ALSO lapsed), and without a written order two
+# equally "true" reasons could be reported for the same shape depending on
+# which store returned which row first.
+#
+# ``SKIP_REASON_PRECEDENCE`` is that order, most-specific first, and it is
+# the SAME order the code actually applies — ``ReasonPrecedenceIsPinned`` in
+# tests/test_membership_skip_reasons.py builds candidates matching several
+# reasons at once and asserts the earlier entry wins, and
+# ``test_the_ladder_covers_every_producible_reason`` asserts the ladder is
+# closed over every string the classifier can emit.
+#
+# THE RULE BEHIND THE ORDER, stated once so a new reason can be placed
+# without guessing: **report the gate that is furthest from being satisfied,
+# and among equals the one that says most about THIS candidate.**
+#
+#  1. ``prior_seat_unattributed`` — a fact about the HISTORY the candidate
+#     was discovered from. It outranks everything because a candidate whose
+#     provenance cannot be proven was never established as a candidate for
+#     this side at all; today's eligibility is not even consulted.
+#  2. ``membership_league_season_missing`` — a fact about the GAME (its
+#     LeagueSeason pointer dangles). It applies to every candidate equally,
+#     so no per-candidate reason can be more informative.
+#  3. ``membership_player_missing`` — the identity leg: the Player ROW is
+#     gone. Nothing further can be said about a row that does not exist.
+#  4-10. the SPINE legs, in ``side_spine_break``'s own leg order, reached
+#     only by a membership that is at the right LeagueSeason, on a side of
+#     this game, and carrying a participation-granting status — i.e. the row
+#     that came CLOSEST to seating the player. ``membership_denormalized_
+#     season_mismatch`` precedes them because the resolver checks it first.
+#  11-15. the PARKED/terminal statuses, in
+#     ``RosterService._INELIGIBLE_MEMBERSHIP_STATUSES`` order (terminal
+#     before open-but-not-authoritative — a stint that ENDED is the more
+#     final fact). Reached only when no participation-granting row exists at
+#     this key.
+#  16. ``membership_other_team`` — rows exist at this LeagueSeason, on
+#     another bench.
+#  17. ``membership_other_league_season`` — rows exist, in another
+#     competition.
+#  18. ``no_eligible_membership`` — no membership rows at all. The least
+#     specific membership answer, so it sorts last among them.
+#  19. ``player_inactive`` — DELIBERATELY LAST, and it is the one entry whose
+#     position is not "most specific first" but "the order the GATE applies".
+#     ``select_roster`` tests the membership context FIRST and
+#     ``Player.is_active`` SECOND, so a candidate failing both is refused by
+#     the context check and must be REPORTED under the context reason — the
+#     reason has to name the gate that would actually refuse. See
+#     ``RosterService.seating_block_reason``, which layers the two in exactly
+#     this order.
+#
+# ``MEMBERSHIP_STATUS_REASONS`` is expanded here in a FIXED literal order
+# rather than by iterating the dict, so the ladder cannot silently reorder if
+# the mapping is ever rewritten, and so a newly added status fails the
+# coverage test instead of being appended wherever it happens to land.
+SKIP_REASON_PRECEDENCE = (
+    PRIOR_SEAT_UNATTRIBUTED,
+    LEAGUE_SEASON_MISSING,
+    PLAYER_MISSING,
+    DENORMALIZED_SEASON_MISMATCH,
+    TEAM_MISSING,
+    SEASON_MISSING,
+    LEAGUE_MISMATCH,
+    PROGRAM_MISMATCH,
+    REGISTRATION_CONFLICT,
+    NOT_REGISTERED,
+    MEMBERSHIP_STATUS_REASONS[MembershipStatus.TRANSFERRED],
+    MEMBERSHIP_STATUS_REASONS[MembershipStatus.RELEASED],
+    MEMBERSHIP_STATUS_REASONS[MembershipStatus.INACTIVE],
+    MEMBERSHIP_STATUS_REASONS[MembershipStatus.INJURED],
+    MEMBERSHIP_STATUS_REASONS[MembershipStatus.APPLICANT],
+    MEMBERSHIP_OTHER_TEAM,
+    MEMBERSHIP_OTHER_LEAGUE_SEASON,
+    NO_ELIGIBLE_MEMBERSHIP,
+    PLAYER_INACTIVE,
+)
+
+_PRECEDENCE_RANK = {reason: i for i, reason in
+                    enumerate(SKIP_REASON_PRECEDENCE)}
+
+
+def reason_rank(reason: str) -> int:
+    """This reason's position in :data:`SKIP_REASON_PRECEDENCE`.
+
+    Raises :class:`KeyError` for an unlisted reason — the same fail-loud
+    discipline :func:`status_ineligible_reason` applies, so a new skip reason
+    that nobody has placed in the ladder cannot be silently reported (or
+    silently sorted last)."""
+    return _PRECEDENCE_RANK[reason]
 
 
 def status_ineligible_reason(status) -> str:

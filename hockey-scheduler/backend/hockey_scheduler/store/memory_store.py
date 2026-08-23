@@ -886,6 +886,24 @@ class InMemoryStore:
                 if m.league_season_id == league_season_id
                 and m.team_id == team_id]
 
+    def memberships_for_team(
+            self, team_id: str) -> List[SeasonRosterMembership]:
+        """EVERY membership row naming this Team, at ANY LeagueSeason and in
+        ANY status — terminal and parked rows included (#427).
+
+        Deliberately unfiltered, unlike
+        :meth:`memberships_for_league_season_team`. It backs the auto-fill
+        candidate COHORT, which the owner ruled must be the UNION of the
+        legacy team pointers and the team's season-membership rows
+        "including terminal, inactive, wrong-LeagueSeason, and
+        divergent-pointer cases, then deduplicated and classified". Filtering
+        here would drop exactly the players the batch owes the operator a
+        reason for, before the classifier ever sees them — the silent drop in
+        a new form. Every one of these rows is CLASSIFIED by the caller; none
+        of them is seated on the strength of appearing in this list."""
+        return [m for m in self.season_roster_memberships.values()
+                if m.team_id == team_id]
+
     def active_memberships_for_player_in_season(
             self, player_id: str,
             season_id: str) -> List[SeasonRosterMembership]:

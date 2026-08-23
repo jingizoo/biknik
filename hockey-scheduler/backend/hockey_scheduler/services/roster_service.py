@@ -58,6 +58,7 @@ from .membership_spine import (
     NO_ELIGIBLE_MEMBERSHIP,
     PLAYER_INACTIVE,
     PLAYER_MISSING,
+    PRIOR_SEAT_UNATTRIBUTED,
     missing_or_unequal,
     side_spine_break,
     status_ineligible_reason,
@@ -1364,8 +1365,13 @@ class RosterService:
         closing it on ``is_active`` would newly hide rows that are visible
         today — a behaviour change this ruling does not authorize.
 
-        PURE and NON-RAISING, so :meth:`partition_seatable` can call it
-        before opening a transaction."""
+        PURE and NON-RAISING, which is what lets
+        :meth:`_partition_candidates` call it to NAME a skip *inside* the
+        batch's transaction. Non-raising is the point: catching
+        ``NotEligibleError`` there instead would have nothing to unwind to
+        (``transaction()`` is reentrant with no savepoints) and would leave
+        a PostgreSQL connection in InFailedSqlTransaction — see the batch
+        seating section header."""
         _ctx, reason = self._resolve_context_with_reason(game, player)
         if reason is not None:
             return reason
@@ -1719,42 +1725,545 @@ class RosterService:
         self._back_out_entry(game, entry, actor_id, removed=True)
         return entry
 
+    # ====================================================================
+    # BATCH SEATING — copy-previous and auto-fill (owner ruling, PR #427,
+    # comment 5379885403, plus the 2026-08-22 candidate-discovery
+    # correction)
+    # ====================================================================
+    # "On a LeagueSeason-bound game, copy_previous_roster and
+    # auto_build_roster must skip each currently ineligible player and
+    # continue seating the eligible remainder. […] This is not permission
+    # for a silent partial success."
+    #
+    # ------------------------------------------------------------------
+    # 1. WHERE CANDIDATES COME FROM — the correction's whole point
+    # ------------------------------------------------------------------
+    # Candidate discovery must NOT run through the CURRENT membership
+    # spine, for either entry point. A transferred/parked/deregistered
+    # player resolves onto NO side of this game, so a spine-derived pool
+    # would not contain them, so they could never be REPORTED as skipped —
+    # the silent drop reappearing in a new form, one layer up. The two
+    # pools are therefore built from sources that are true regardless of
+    # today's eligibility, and the spine is applied AFTERWARDS, only to
+    # CLASSIFY what discovery already found:
+    #
+    #   copy-previous  ->  the newest prior game's DURABLE
+    #                      ``GameRosterEntry.team_side`` (migration 061) —
+    #                      the historical record of who that team seated,
+    #                      written from the context that authorized each
+    #                      seating. See :meth:`_prior_side_candidates`.
+    #   auto-fill      ->  the UNION of the legacy ``Player.team_id``
+    #                      pointers and EVERY ``SeasonRosterMembership``
+    #                      naming this Team (terminal, inactive,
+    #                      wrong-LeagueSeason and divergent-pointer rows
+    #                      included), de-duplicated. See
+    #                      :meth:`_auto_build_candidates`.
+    #
+    # ------------------------------------------------------------------
+    # 2. ONE OUTER TRANSACTION, WITH LOCKS, CLASSIFICATION INSIDE IT
+    # ------------------------------------------------------------------
+    # The owner's correction: "Keep classification and seating inside one
+    # outer transaction: acquire the relevant locks, revalidate every
+    # candidate, partition eligible/skipped before the first write, then
+    # seat. Partition-before-write must not become classify-before-
+    # transaction, or membership changes can race the batch."
+    #
+    # So the order, in both entry points, is exactly:
+    #
+    #   open transaction (@_transactional)
+    #     -> _guard_mutable            = the SEASON ROW LOCK
+    #     -> discover candidates
+    #     -> _lock_candidates          = every candidate's PLAYER ROW LOCK
+    #     -> _partition_candidates     = revalidate + partition, no writes
+    #     -> select_roster / set_availability
+    #     -> ONE audit row
+    #
+    # WHY THOSE TWO LOCKS ARE "THE RELEVANT LOCKS". Between them they cover
+    # every governed mutation that can change a candidate's answer:
+    #
+    #   * ``SetupService.set_season_roster_membership_status`` (park,
+    #     revive, end a stint) locks the membership row AND, via
+    #     ``_require_active_season``, the SEASON row — the same row
+    #     ``_guard_mutable`` -> ``_guard_active_season`` ->
+    #     ``require_active_season`` takes here, first, and holds to commit;
+    #   * ``SetupService.create_season_roster_membership`` (open a new
+    #     stint) locks the PLAYER row;
+    #   * ``SetupService.set_player_active`` (#270 deactivation) locks the
+    #     PLAYER row;
+    #   * ``SetupService.assign_player_team`` (the permanent pointer, which
+    #     the auto-fill pool reads) locks the PLAYER row.
+    #
+    # A game with no ``season_id`` at all (an unbound legacy row) takes no
+    # Season lock — there is no Season to lock and no membership to change;
+    # its eligibility is the permanent pointer, which the Player lock
+    # covers.
+    #
+    # WHY THE PARTITION CANNOT BE A try/except AROUND ``select_roster``.
+    # ``transaction()`` is REENTRANT WITH NO SAVEPOINTS in both backends:
+    # only the outermost context commits or rolls back, and a nested block
+    # has nothing to unwind to. Catching ``NotEligibleError`` mid-batch
+    # would therefore KEEP every write made before it, and on PostgreSQL an
+    # exception raised after any statement leaves the connection in
+    # InFailedSqlTransaction so the NEXT statement fails too. The partition
+    # is a decision taken from NON-RAISING classification
+    # (:meth:`seating_block_reason`), which is what makes the ruling's last
+    # requirement true: the transaction contains only writes expected to
+    # succeed, so "unexpected persistence/transaction failures remain
+    # all-or-nothing" and an ELIGIBILITY SKIP rolls nothing back.
+    #
+    # AND WHY THERE IS NO ``skip=True`` FLAG ON ``select_roster``. The
+    # ruling closes with "This ruling does not relax the live-eligibility
+    # requirement for individual mutations." A mode flag on the shared
+    # seating primitive is one careless call site away from relaxing
+    # enroll/offer/accept/coach-add/re-confirm too. ``select_roster`` is
+    # called here with an already-validated list and still fails closed on
+    # every one of them — under the locks above it cannot disagree, and if
+    # it ever did, it RAISES and the whole batch rolls back rather than
+    # silently seating something the partition did not authorize.
+
+    # An eligible candidate the auto-fill targets simply had no room for.
+    # NOT an eligibility reason and deliberately NOT in
+    # ``SKIP_REASON_PRECEDENCE``: nothing is wrong with this player, the
+    # roster is just full. Kept as its own reported bucket rather than
+    # folded into ``skipped`` so the operator warning stays about players
+    # who CANNOT be seated, while the audit row still accounts for every
+    # candidate the batch examined.
+    TARGET_MET = "roster_target_met"
+
+    def _ordered_candidates(self, player_ids) -> List[str]:
+        """De-duplicate and order candidate ids by ``(name, player_id)``.
+
+        ORDERING IS IMPOSED BY THE SERVICE, NEVER INHERITED FROM THE STORE.
+        Ids are ``f"{prefix}_{seq}"`` and ``SqlStore`` orders by a TEXT
+        column, so ``players_for_team``/``roster_for_game``/
+        ``memberships_for_team`` hand back ``player_1, player_10, player_11,
+        …, player_2`` on SQL and insertion order in memory. Measured
+        tri-store at head 4de9452, that was not a cosmetic difference:
+        ``auto_build_roster`` TRUNCATES its pool at the game's targets, so
+        the ORDER DECIDED SET MEMBERSHIP — from one identical 12-player
+        fixture with ``target_skaters=3``, Memory seated "Player 00/01/02"
+        while SQLite and PostgreSQL both seated "Player 00/09/10".
+
+        ``(name, player_id)`` is the convention ``list_addable_players``
+        already uses, so the pool a coach reads and the pool auto-fill draws
+        from agree; the id tail makes it a TOTAL order, so two players
+        sharing a name still sort deterministically. A candidate whose
+        Player row is missing sorts under ``""`` — it is going to be skipped
+        as ``membership_player_missing`` anyway, and it still needs a
+        defined position so the SKIPPED list is ordered too."""
+        seen = set()
+        rows = []
+        for pid in player_ids:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            player = self.store.get_player(pid)
+            rows.append(((player.name if player is not None else ""), pid))
+        rows.sort()
+        return [pid for _name, pid in rows]
+
+    def _lock_candidates(self, player_ids) -> Dict[str, Optional[Player]]:
+        """Row-lock every candidate Player, UP FRONT and in canonical
+        (sorted-unique-id) order, and return ``{player_id: Player|None}``.
+
+        Sorted so two concurrent batches over overlapping pools cannot AB-BA
+        deadlock on PostgreSQL — the identical discipline (and the identical
+        comment) ``select_roster`` applies to its own list. MUST run inside
+        the caller's ``transaction()``: the locks are held to commit, and
+        they are the whole reason the classification below cannot be raced
+        by a concurrent ``set_player_active`` /
+        ``create_season_roster_membership`` / ``assign_player_team``."""
+        return {pid: self.store.get_player_for_update(pid)
+                for pid in sorted(set(player_ids))}
+
+    def _partition_candidates(self, game, candidates, locked,
+                              preclassified=None):
+        """``(seatable, skipped, contexts)`` — the REVALIDATION, run under
+        the locks and BEFORE the first write.
+
+        ``seatable`` and ``skipped`` both preserve ``candidates`` order (the
+        caller has already imposed a deterministic one). ``skipped`` is
+        ``[(player_id, reason)]`` with each reason one of the stable strings
+        in :mod:`~.membership_spine`. ``contexts`` carries THE resolved
+        :class:`GameMembershipContext` for each seatable id, so the caller
+        buckets by the SEASON-scoped slot type the seat will actually be
+        written with rather than re-deriving a second, possibly disagreeing
+        one.
+
+        ``preclassified`` is ``{player_id: reason}`` for candidates already
+        refused at DISCOVERY time — today only copy-previous's
+        ``prior_seat_unattributed``. Those reasons win outright, which is
+        rank 0 of ``SKIP_REASON_PRECEDENCE``: a candidate whose provenance
+        cannot be proven was never established as a candidate for this side,
+        so today's eligibility is not consulted at all.
+
+        IT DECIDES WITH THE SAME RESOLUTION ``select_roster`` DECIDES WITH —
+        the batched ``resolve_membership_contexts_for_game`` for a bound
+        game, the per-player form for an unbound one — so a player this
+        method calls seatable cannot then be refused inside the transaction.
+        The batched form produces no reasons, so a MISS is re-asked of
+        :meth:`seating_block_reason` purely to NAME it; the DECISION is
+        never taken from that second call.
+
+        NON-RAISING, by construction. Everything it consults is a read."""
+        bound = bool(game.league_season_id)
+        contexts = (self.resolve_membership_contexts_for_game(game)
+                    if bound else {})
+        preclassified = preclassified or {}
+        seatable: List[str] = []
+        skipped: List[Tuple[str, str]] = []
+        chosen: Dict[str, GameMembershipContext] = {}
+        for pid in candidates:
+            forced = preclassified.get(pid)
+            if forced is not None:
+                skipped.append((pid, forced))
+                continue
+            player = locked.get(pid)
+            if player is None:
+                skipped.append((pid, PLAYER_MISSING))
+                continue
+            ctx = (contexts.get(pid) if bound
+                   else self.resolve_membership_context(game, player))
+            if ctx is None:
+                # ``or NO_ELIGIBLE_MEMBERSHIP``: the two resolutions agree by
+                # construction, so this fallback is unreachable — it exists
+                # so a future divergence degrades to the narrowest honest
+                # answer instead of putting ``None`` in an operator's face.
+                skipped.append((pid, self.seating_block_reason(game, player)
+                                or NO_ELIGIBLE_MEMBERSHIP))
+                continue
+            if not player.is_active:
+                # The GATE's order, and therefore the ladder's: the context
+                # is tested first and deactivation second, so a candidate
+                # failing both is reported under the context reason.
+                skipped.append((pid, PLAYER_INACTIVE))
+                continue
+            seatable.append(pid)
+            chosen[pid] = ctx
+        return seatable, skipped, chosen
+
+    def _batch_rows(self, entries) -> List[dict]:
+        """``[(player_id, reason)]`` -> the operator-facing row shape.
+
+        ``name`` travels with the reason because the UI must NAME the
+        skipped players and the reason codes alone cannot; it is the
+        display name the coach already sees on this very screen, not a
+        privacy-gated field (``SensitiveFieldCategory`` covers birthdate,
+        registration number and contact/medical/discipline data — not the
+        roster name), and both batch routes are MANAGE_ROSTER-gated."""
+        rows = []
+        for pid, reason in entries:
+            player = self.store.get_player(pid)
+            rows.append({"player_id": pid,
+                         "name": player.name if player is not None else "",
+                         "reason": reason})
+        return rows
+
+    def _seat_batch(self, game, team_id, candidates, source,
+                    from_game_id=None, actor_id=None, confirm=False,
+                    limits=None, preclassified=None) -> dict:
+        """THE unit of work both batch entry points share: lock, revalidate,
+        partition, seat, audit.
+
+        MUST run inside the caller's ``transaction()``, AFTER the caller's
+        ``_guard_mutable`` has taken the Season row lock — see the section
+        header above for why those two locks are the relevant ones.
+        Deliberately NOT ``@_transactional`` itself: decorating it would
+        advertise a self-sufficiency it does not have (the Season lock and
+        the mutability guard are the caller's, and taking them after
+        discovery would be too late).
+
+        ``limits`` (auto-fill only) is ``{SlotType: count}``; when given, at
+        most that many SEATABLE candidates are seated per bucket, taken in
+        the ordered pool's order, and the eligible remainder is reported as
+        ``deferred`` with reason :data:`TARGET_MET`. ``confirm``
+        additionally marks each seated player AVAILABLE inside this SAME
+        transaction — previously that was N separate ``set_availability``
+        transactions after a separate ``select_roster`` one, so a failure
+        mid-loop left players seated but unconfirmed with nothing to roll
+        back to.
+
+        ZERO SEATS IS A SUCCESSFUL RESULT: ``select_roster`` is not called
+        at all, so NO roster write of any kind happens, and the audit row is
+        still written because it is the only durable record that the
+        operation ran.
+
+        Returns identity, never counts: ``{"team_id", "source",
+        "from_game_id", "candidate_count", "seated", "skipped",
+        "deferred"}``."""
+        locked = self._lock_candidates(candidates)
+        seatable, skipped, contexts = self._partition_candidates(
+            game, candidates, locked, preclassified)
+        deferred: List[Tuple[str, str]] = []
+        if limits is not None:
+            room = dict(limits)
+            capped = []
+            for pid in seatable:
+                slot = contexts[pid].slot_type
+                if room.get(slot, 0) <= 0:
+                    deferred.append((pid, self.TARGET_MET))
+                    continue
+                room[slot] -= 1
+                capped.append(pid)
+            seatable = capped
+        if seatable:
+            self.select_roster(game.id, seatable, actor_id)
+            if confirm:
+                for pid in seatable:
+                    self.set_availability(
+                        game.id, pid, AvailabilityStatus.AVAILABLE)
+        skipped_rows = self._batch_rows(skipped)
+        deferred_rows = self._batch_rows(deferred)
+        # ONE audit row per batch, inside this transaction, present even on a
+        # zero-seat run. It records IDS AND REASONS — never counts — so the
+        # durable trail answers "which players, and why" without a join
+        # against state that has since moved on.
+        self._audit(
+            game.id,
+            AuditAction.ROSTER_BATCH_SEATED,
+            actor_id=actor_id,
+            detail={
+                "source": source,
+                "team_id": team_id,
+                "from_game_id": from_game_id,
+                "candidate_count": len(candidates),
+                "selected_player_ids": list(seatable),
+                "skipped": [{"player_id": r["player_id"],
+                             "reason": r["reason"]} for r in skipped_rows],
+                "deferred": [{"player_id": r["player_id"],
+                              "reason": r["reason"]} for r in deferred_rows],
+            },
+        )
+        return {
+            "team_id": team_id,
+            "source": source,
+            "from_game_id": from_game_id,
+            "candidate_count": len(candidates),
+            "seated": list(seatable),
+            "skipped": skipped_rows,
+            "deferred": deferred_rows,
+        }
+
+    def _batch_team(self, game, team_id) -> str:
+        """The side a batch entry point acts on: the caller's, or the home
+        side by default (#25). A team not playing in this game is refused —
+        that is a bad REQUEST, not an ineligible candidate, so it keeps
+        raising rather than becoming a skip."""
+        team_id = team_id or game.home_team_id
+        if team_id not in (game.home_team_id, game.away_team_id):
+            raise ValidationError("That team is not playing in this game.")
+        return team_id
+
+    # -- copy previous roster --------------------------------------------
+    def _prior_side_candidates(self, src, team_id):
+        """``(candidates, preclassified)`` for one source game and one side —
+        DISCOVERED EXCLUSIVELY FROM THE SOURCE GAME'S DURABLE ATTRIBUTION.
+
+        WHICH SIDE a historical row was seated on is answered by the row's
+        own ``GameRosterEntry.team_side`` (migration 061, written at every
+        seat and re-seat) and by NOTHING ELSE. That is the owner's
+        correction, and the reason is exact: re-deriving the side from the
+        player's CURRENT membership would answer "no side at all" for
+        precisely the transferred/parked/deregistered players this ruling
+        exists to REPORT, so they would disappear from the candidate pool
+        before they could be reported again; and re-deriving it from the
+        permanent ``Player.team_id`` pointer is the silent-drop defect
+        itself (measured tri-store at head 4de9452: a genuinely transferred
+        player was absent from ``copied`` and from the response entirely,
+        with no reason anywhere).
+
+        PRE-061 ROWS — the NULL-attribution decision, stated. A row written
+        before migration 061 carries ``team_side IS NULL``; 061 performs no
+        backfill because no honest backfill value exists. Such a row is
+        admitted as a candidate on EVERY side and immediately refused with
+        :data:`~.membership_spine.PRIOR_SEAT_UNATTRIBUTED`. It is never
+        seated, its current eligibility is never consulted, and it is never
+        silently omitted. This is exactly symmetric with the rule already
+        shipped on this branch for the slot arithmetic
+        (``LegacyRowsWithNoAttributionFailClosed``): a NULL row is charged
+        on every side and in both buckets, consulting nothing, accepting
+        OVER-refusal as the price of never guessing. Here the same trade
+        costs OVER-reporting — a NULL row that was really on the away bench
+        is reported as unprovable when copying home — which is strictly
+        better than the alternative, since the operator can see the name and
+        re-select by hand."""
+        candidates = []
+        preclassified = {}
+        for e in self.store.roster_for_game(src.id):
+            if not e.status.occupies_slot:
+                continue
+            if e.team_side is None:
+                candidates.append(e.player_id)
+                preclassified[e.player_id] = PRIOR_SEAT_UNATTRIBUTED
+            elif e.team_side == team_id:
+                candidates.append(e.player_id)
+        return self._ordered_candidates(candidates), preclassified
+
+    def _newest_prior_source(self, game, team_id):
+        """The single AUTHORITATIVE source game for a copy, or ``None``.
+
+        The newest non-cancelled earlier game this team played in which
+        ANYBODY occupied a slot on this side. ORDERING IS TOTAL AND
+        SERVICE-IMPOSED: ``(start_time, id)`` descending. The previous
+        version sorted on ``start_time`` alone and broke a TIE on
+        ``all_games()`` order — insertion order on Memory, TEXT id order on
+        SQL — so two backends could pick DIFFERENT source games for the same
+        fixture, and (because the copy then seats a different roster) reach
+        different final state.
+
+        AUTHORITATIVE MEANS IT DOES NOT FALL THROUGH. Once this game is
+        chosen, a copy whose candidates are ALL ineligible is a successful
+        zero-seat result naming every one of them — never a walk further
+        back to an older game. Walking on would seat a lineup the coach
+        never asked for and would HIDE the fact that this team's last roster
+        has entirely aged out, which is the opposite of what "never a silent
+        partial success" asks for."""
+        earlier = [
+            g for g in self.store.all_games()
+            if g.id != game.id and team_id in (g.home_team_id, g.away_team_id)
+            and not g.cancelled and g.start_time is not None
+            and (game.start_time is None or g.start_time < game.start_time)
+        ]
+        earlier.sort(key=lambda g: (g.start_time, g.id), reverse=True)
+        for src in earlier:
+            candidates, preclassified = self._prior_side_candidates(
+                src, team_id)
+            if candidates:
+                return src, candidates, preclassified
+        return None, [], {}
+
+    @_transactional
     def copy_previous_roster(
         self, game_id: str, team_id: Optional[str] = None,
         actor_id: Optional[str] = None,
     ) -> dict:
-        """Seed one side's roster from that team's most recent earlier game.
+        """Seed one side's roster from that team's most recent earlier game —
+        SKIPPING each currently ineligible player, seating the eligible
+        remainder, and REPORTING every skip (owner ruling, PR #427).
 
-        A time-saver for coaches: find the newest non-cancelled game the team
-        played (as home *or* away) that had players occupying slots, then
-        re-select those players (skipping any no longer active on the team). The
-        selection goes through :meth:`select_roster`, so all eligibility, lock,
-        and audit rules still apply. ``team_id`` defaults to the home side.
-        """
+        Candidates come from the newest prior game's durable
+        ``team_side`` attribution (:meth:`_prior_side_candidates`); the
+        target game's spine then classifies each of them
+        (:meth:`_partition_candidates`), inside this method's transaction
+        and under its locks. Seating goes through :meth:`select_roster`, so
+        every eligibility, lock and audit rule still applies to the players
+        that ARE seated. ``team_id`` defaults to the home side.
+
+        WHAT THIS METHOD USED TO DO, and why both halves were wrong —
+        measured tri-store at head 4de9452:
+
+        * its candidate filter was ``p.team_id == team_id``, the PERMANENT
+          pointer that #205 is retiring. A genuinely TRANSFERRED player was
+          **silently dropped** by it: absent from ``copied``, absent from
+          the response, with no reason anywhere. "Not permission for a
+          silent partial success" was already violated, today, for the very
+          first shape the owner names;
+        * and a "Mover" (pointer still on the team, seasonal record
+          elsewhere) SURVIVED that filter, reached ``select_roster`` and
+          raised ``NotEligibleError``, **aborting the whole batch** — the
+          still-eligible team-mates were not seated either.
+
+        ZERO-SEAT IS A SUCCESS. ``ValidationError`` is reserved for its true
+        meaning: there is no earlier game with ANY occupying roster on this
+        side at all. "A source game existed but every one of its players is
+        now ineligible" returns a successful zero-seat result naming all of
+        them and makes no roster writes.
+
+        The response keeps ``copied``/``from_game_id``/``team_id`` with
+        their exact previous meanings and ADDS the identity keys, so every
+        existing consumer of this plain dict keeps working."""
         game = self._require_game(game_id)
-        self._guard_mutable(game)
-        team_id = team_id or game.home_team_id
-        if team_id not in (game.home_team_id, game.away_team_id):
-            raise ValidationError("That team is not playing in this game.")
-        earlier = [
-            g for g in self.store.all_games()
-            if g.id != game_id and team_id in (g.home_team_id, g.away_team_id)
-            and not g.cancelled and g.start_time is not None
-            and (game.start_time is None or g.start_time < game.start_time)
-        ]
-        earlier.sort(key=lambda g: g.start_time, reverse=True)
-        for src in earlier:
-            eligible = [
-                e.player_id for e in self.store.roster_for_game(src.id)
-                if e.status.occupies_slot
-                and (p := self.store.get_player(e.player_id)) is not None
-                and p.is_active and p.team_id == team_id
-            ]
-            if eligible:
-                self.select_roster(game_id, eligible, actor_id)
-                return {"copied": len(eligible), "from_game_id": src.id,
-                        "team_id": team_id}
-        raise ValidationError("No previous roster to copy for this team.")
+        self._guard_mutable(game)          # <- the SEASON ROW LOCK
+        team_id = self._batch_team(game, team_id)
+        src, candidates, preclassified = self._newest_prior_source(
+            game, team_id)
+        if src is None:
+            raise ValidationError("No previous roster to copy for this team.")
+        result = self._seat_batch(
+            game, team_id, candidates, source="copy_previous_roster",
+            from_game_id=src.id, actor_id=actor_id,
+            preclassified=preclassified)
+        return {**result, "copied": len(result["seated"])}
+
+    # -- auto-fill --------------------------------------------------------
+    def _auto_build_candidates(self, game, team_id) -> List[str]:
+        """The auto-fill candidate COHORT: the UNION the owner's correction
+        specifies — "legacy team pointers plus the team's season-membership
+        rows — including terminal, inactive, wrong-LeagueSeason, and
+        divergent-pointer cases — then deduplicated and classified".
+
+        Both halves are load-bearing, and each covers what the other misses:
+
+        * the POINTER half (``players_for_team``) keeps the ruling's named
+          shapes reportable. A membership-less, parked or deregistered
+          player resolves onto no side at all, so a purely spine-derived
+          pool would make them invisible rather than skipped-with-a-reason,
+          and the operator would be told nothing about the bench they can
+          see in front of them;
+        * the MEMBERSHIP half (``memberships_for_team``, unfiltered by
+          status and by LeagueSeason) keeps a "Mover" — pointer elsewhere,
+          seasonal record here — SEATABLE, and keeps a player whose only
+          stint on this team has ENDED or belongs to a DIFFERENT
+          competition reportable rather than absent.
+
+        Nothing here decides eligibility; every id this returns is
+        classified afterwards, inside the transaction."""
+        ids = [p.id for p in self.store.players_for_team(team_id)]
+        ids += [m.player_id
+                for m in self.store.memberships_for_team(team_id)]
+        return self._ordered_candidates(ids)
+
+    @_transactional
+    def auto_build_roster(self, game_id: str, team_id: Optional[str] = None,
+                          actor_id: Optional[str] = None) -> dict:
+        """Select + confirm a roster for one side up to the game's targets,
+        skipping each currently ineligible candidate and reporting every one
+        of them (owner ruling, PR #427).
+
+        THE SEATING LIVES HERE, not in the facade. It used to live in
+        ``ApiService.auto_build_roster``, and that placement caused two of
+        the defects the ruling names: the method could not be
+        ``@_transactional`` (the decorator is a ``RosterService`` concern),
+        so one ``select_roster`` transaction was followed by N SEPARATE
+        ``set_availability`` transactions and a failure mid-loop left
+        players seated but unconfirmed with nothing to roll back; and its
+        response carried NO PLAYER IDENTITY AT ALL — only slot counts — so
+        "identify the players seated" was unmet even on the happy path. The
+        facade keeps only the presentation it has always added on top (the
+        resulting roster status and the coach-friendly short-roster
+        classification).
+
+        BUCKETING IS BY THE RESOLVED CONTEXT'S SLOT TYPE, never the
+        permanent ``Player.position``. The seat this method writes carries
+        ``ctx.position`` (``select_roster``, migration 061) and the slot
+        arithmetic counts THAT, so choosing a goalie by the permanent
+        pointer and then seating them as a season-scoped skater would fill
+        the wrong bucket. For an unbound game the context IS the permanent
+        pointer, so that path is unchanged.
+
+        EVERY INELIGIBLE CANDIDATE IS REPORTED, including ones the targets
+        would never have reached: the cohort is the coach's own bench, the
+        reasons are facts about it, and reporting only the first N would
+        make the warning depend on how many slots happened to be open. The
+        eligible remainder the targets had no room for is reported
+        separately as ``deferred`` — nothing is wrong with those players.
+
+        ``ValidationError`` still means "this team has nobody at all"; an
+        empty COHORT (no pointers and no membership rows) is an empty state
+        to fix in Setup, not a partial outcome."""
+        game = self._require_game(game_id)
+        self._guard_mutable(game)          # <- the SEASON ROW LOCK
+        team_id = self._batch_team(game, team_id)
+        candidates = self._auto_build_candidates(game, team_id)
+        if not candidates:
+            raise ValidationError(
+                "Team has no players yet. Add or import players first."
+            )
+        return self._seat_batch(
+            game, team_id, candidates, source="auto_build_roster",
+            actor_id=actor_id, confirm=True,
+            limits={SlotType.GOALIE: game.target_goalies,
+                    SlotType.SKATER: game.target_skaters})
 
     @staticmethod
     def _is_visible_game(g) -> bool:

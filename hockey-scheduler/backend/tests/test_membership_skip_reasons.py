@@ -419,5 +419,262 @@ class TheReasonsAreAdditiveDetailNotNewRefusals(_ReasonHarness,
         self.assertEqual(set(ran), expected, sorted(ran))
 
 
+# ======================================================================
+# 4. REASON PRECEDENCE — which reason wins when several apply
+# ======================================================================
+class ReasonPrecedenceIsPinned(_ReasonHarness, unittest.TestCase):
+    """The #427 acceptance bar's first item: the classifier's reason
+    precedence must be DOCUMENTED and pinned by a test.
+
+    Sections 1-3 build candidates that match exactly ONE reason each, so
+    they say nothing at all about the far more common real case — a player
+    who is transferred AND deactivated, or parked on a side whose
+    registration has ALSO lapsed. Without a written, tested order, two
+    equally true reasons could be reported for the same shape depending on
+    which store handed back which row first, and the "stable reason for each
+    skip" the ruling asks for would be stable only by luck.
+
+    ``services/membership_spine.SKIP_REASON_PRECEDENCE`` is the written
+    order and the block above it is the rationale. THIS class asserts the
+    CODE agrees with it: each case below is a candidate matching two or more
+    reasons, and the one that must be reported is the earlier entry.
+
+    THE LADDER IS NOT ALL THIS PINS. Within one rung, a player holding
+    several right-keyed rows is resolved by ``_pick_membership``'s
+    status-then-home-before-away walk, which is a different (and already
+    pinned) deterministic rule. The ladder governs which RUNG answers."""
+
+    def _cases_for(self, make):
+        """Run ``make(api, fx) -> (player, expected_reason)`` on every
+        configured backend, asserting the reason the classifier reports."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, season, league, teams, game, ls_id = self._build(
+                    store, target_skaters=4, target_goalies=1)
+                fx = {"api": api, "season": season, "league": league,
+                      "teams": teams, "game": game, "ls_id": ls_id,
+                      "home": teams["home"]["id"],
+                      "away": teams["away"]["id"],
+                      "third": teams["third"]["id"]}
+                pid, expected = make(api, fx)
+                with self.subTest(backend=label):
+                    g = api.store.get_game(fx["game"]["id"])
+                    player = api.store.get_player(pid)
+                    reason = api.roster.seating_block_reason(g, player)
+                    self.assertEqual(reason, expected, (label, reason))
+                    # …and it really is the EARLIER of the applicable rungs.
+                    spine.reason_rank(reason)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        expected_backends = {"memory", "sqlite"}
+        if os.environ.get("TEST_DATABASE_URL"):
+            expected_backends.add("postgres")
+        self.assertEqual(set(ran), expected_backends, sorted(ran))
+
+    def test_a_membership_reason_outranks_deactivation(self):
+        """``player_inactive`` is LAST on purpose, and this is why: the
+        order is the GATE's order. ``select_roster`` tests the membership
+        context FIRST and ``Player.is_active`` SECOND, so a candidate
+        failing both must be reported under the context reason — the reason
+        has to name the gate that would actually refuse."""
+        def make(api, fx):
+            p = self._pointer_only_player(api, fx["third"], "Both Ways")
+            self._membership(api, p["id"], fx["ls_id"], fx["home"])
+            self._transfer(api, p["id"], fx["ls_id"], fx["ls_id"],
+                           fx["third"])
+            res = api.set_player_active(p["id"], False, actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            self.assertFalse(api.store.get_player(p["id"]).is_active)
+            return p["id"], "membership_transferred"
+        self._cases_for(make)
+
+    def test_a_parked_membership_outranks_deactivation_too(self):
+        """The same rung comparison with a different membership reason, so
+        the case above cannot be passing because of something peculiar to
+        the terminal statuses."""
+        def make(api, fx):
+            p = self._pointer_only_player(api, fx["third"], "Parked Gone")
+            self._membership(api, p["id"], fx["ls_id"], fx["home"])
+            res = api.set_season_roster_membership_status(
+                self._stint_id(api, p["id"], fx["ls_id"]), "inactive",
+                actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            res = api.set_player_active(p["id"], False, actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            return p["id"], "membership_inactive"
+        self._cases_for(make)
+
+    def test_a_broken_spine_outranks_a_parked_row_elsewhere(self):
+        """The row that came CLOSEST to seating the player names the reason.
+        Here an ACTIVE, right-keyed HOME membership has a broken spine (the
+        Team's registration lapsed) while a RELEASED stint sits in history
+        on the AWAY bench. The spine break is reported, because that is the
+        row that would have seated them.
+
+        The old stint has to be TERMINAL rather than merely parked: only one
+        OPEN membership per (player, LeagueSeason) may exist at a time, so
+        an applicant row and an active row cannot coexist at this key. That
+        constraint is the reason the shape is built as
+        "played for AWAY, released, signed for HOME"."""
+        def make(api, fx):
+            p = self._pointer_only_player(api, fx["third"], "Spine Vs Park")
+            self._membership(api, p["id"], fx["ls_id"], fx["away"])
+            end_membership_directly(
+                api.store, self._stint_id(api, p["id"], fx["ls_id"]),
+                "released")
+            self._membership(api, p["id"], fx["ls_id"], fx["home"])
+            (reg,) = api.store.registrations_for_team_in_league_season(
+                fx["ls_id"], fx["home"])
+            reg.active = False
+            api.store.save_season_team_registration(reg)
+            statuses = sorted(m.status.value for m in
+                              api.store.memberships_for_player(p["id"]))
+            self.assertEqual(statuses, ["active", "released"], statuses)
+            return p["id"], spine.NOT_REGISTERED
+        self._cases_for(make)
+
+    def test_a_parked_row_here_outranks_a_live_row_on_another_bench(self):
+        """A TRANSFERRED stint on a side of THIS game outranks a perfectly
+        live ACTIVE stint on a team that is not playing — the parked row is
+        about this game, the other one is not."""
+        def make(api, fx):
+            p = self._pointer_only_player(api, fx["third"], "Left For Third")
+            self._membership(api, p["id"], fx["ls_id"], fx["home"])
+            self._transfer(api, p["id"], fx["ls_id"], fx["ls_id"],
+                           fx["third"])
+            live = [m for m in api.store.memberships_for_player(p["id"])
+                    if m.team_id == fx["third"]]
+            self.assertEqual(len(live), 1, live)
+            self.assertEqual(live[0].status, MembershipStatus.ACTIVE)
+            return p["id"], "membership_transferred"
+        self._cases_for(make)
+
+    def test_another_bench_outranks_another_competition(self):
+        """Rows at THIS LeagueSeason, even on a bench that is not playing,
+        say more about this game than rows in a different competition."""
+        def make(api, fx):
+            team2 = self._other_competition(api, fx["season"], fx["teams"])
+            p = self._pointer_only_player(api, fx["third"], "Two Places")
+            # …a live row on a bench that is not in this game…
+            self._membership(api, p["id"], fx["ls_id"], fx["third"])
+            # …and a row in an entirely different competition.
+            other_ls = [ls.id for ls in api.store.all_league_seasons()
+                        if ls.id != fx["ls_id"]]
+            self.assertTrue(other_ls, other_ls)
+            self._membership(api, p["id"], other_ls[0], team2["id"])
+            return p["id"], spine.MEMBERSHIP_OTHER_TEAM
+        self._cases_for(make)
+
+    def test_a_dangling_league_season_outranks_every_membership_reason(self):
+        """A fact about the GAME beats every fact about the candidate: when
+        the game's own LeagueSeason pointer dangles, nothing per-candidate
+        can be more informative, so the same transferred-and-deactivated
+        player is now reported under the game's reason instead."""
+        def make(api, fx):
+            p = self._pointer_only_player(api, fx["third"], "Both Ways")
+            self._membership(api, p["id"], fx["ls_id"], fx["home"])
+            self._transfer(api, p["id"], fx["ls_id"], fx["ls_id"],
+                           fx["third"])
+            res = api.set_player_active(p["id"], False, actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            g = api.store.get_game(fx["game"]["id"])
+            g.league_season_id = "ls_does_not_exist"
+            api.store.save_game(g)
+            return p["id"], spine.LEAGUE_SEASON_MISSING
+        self._cases_for(make)
+
+    def test_a_missing_player_row_outranks_the_rest(self):
+        """The identity leg. The caller hands in a Player OBJECT it read a
+        moment ago; the ROW is the authority. A candidate whose row has been
+        deleted is reported as missing even though the object in hand is
+        also deactivated and also transferred."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                api, season, league, teams, game, ls_id = self._build(
+                    store, target_skaters=4, target_goalies=1)
+                with self.subTest(backend=label):
+                    # Pointer on HOME and no membership at all, so the
+                    # OTHER applicable rungs are ``no_eligible_membership``
+                    # and (via the stale object) ``player_inactive``. The
+                    # Player row itself is then deleted — which is only
+                    # possible for a player carrying no membership rows,
+                    # since those are FK-constrained to it.
+                    p = self._pointer_only_player(api, teams["home"]["id"],
+                                                  "Deleted Anyway")
+                    stale = api.store.get_player(p["id"])
+                    stale.is_active = False
+                    api.store.delete_player(p["id"])
+                    self.assertIsNone(api.store.get_player(p["id"]))
+                    g = api.store.get_game(game["id"])
+                    self.assertEqual(
+                        api.roster.seating_block_reason(g, stale),
+                        spine.PLAYER_MISSING, label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        expected = {"memory", "sqlite"}
+        if os.environ.get("TEST_DATABASE_URL"):
+            expected.add("postgres")
+        self.assertEqual(set(ran), expected, sorted(ran))
+
+
+class ThePrecedenceLadderIsClosedOverEveryProducibleReason(unittest.TestCase):
+    """A pure, store-free closure check on the ladder itself.
+
+    A ladder that omits a reason is worse than no ladder: ``reason_rank``
+    raises for it, so the omission surfaces only when some unlucky operator
+    hits that shape. This pins the ladder against the reason vocabulary the
+    same way ``MembershipReasonsCoverEveryStatus`` pins the status table
+    against the enum."""
+
+    def _all_reasons(self):
+        return {spine.TEAM_MISSING, spine.LEAGUE_SEASON_MISSING,
+                spine.SEASON_MISSING, spine.LEAGUE_MISMATCH,
+                spine.PROGRAM_MISMATCH, spine.NOT_REGISTERED,
+                spine.REGISTRATION_CONFLICT, spine.PLAYER_MISSING,
+                spine.DENORMALIZED_SEASON_MISMATCH,
+                spine.MEMBERSHIP_OTHER_TEAM,
+                spine.MEMBERSHIP_OTHER_LEAGUE_SEASON,
+                spine.PLAYER_INACTIVE, spine.NO_ELIGIBLE_MEMBERSHIP,
+                spine.PRIOR_SEAT_UNATTRIBUTED,
+                *spine.MEMBERSHIP_STATUS_REASONS.values()}
+
+    def test_the_ladder_holds_every_reason_exactly_once(self):
+        ladder = list(spine.SKIP_REASON_PRECEDENCE)
+        self.assertEqual(len(set(ladder)), len(ladder), sorted(ladder))
+        self.assertEqual(set(ladder), self._all_reasons(),
+                         sorted(set(ladder) ^ self._all_reasons()))
+
+    def test_rank_is_a_total_order_starting_at_zero(self):
+        ranks = [spine.reason_rank(r) for r in spine.SKIP_REASON_PRECEDENCE]
+        self.assertEqual(ranks, list(range(len(ranks))), ranks)
+
+    def test_an_unlisted_reason_fails_loudly(self):
+        """The same fail-loud discipline ``status_ineligible_reason`` uses:
+        a reason nobody has placed must raise rather than sort last by
+        default."""
+        with self.assertRaises(KeyError):
+            spine.reason_rank("some_reason_nobody_classified")
+        # ``roster_target_met`` is deliberately NOT an eligibility reason,
+        # so it is deliberately NOT in the ladder.
+        with self.assertRaises(KeyError):
+            spine.reason_rank(RosterService.TARGET_MET)
+
+    def test_the_discovery_stage_reason_outranks_everything(self):
+        """``prior_seat_unattributed`` is rank 0 by construction: a
+        candidate whose provenance cannot be proven was never established as
+        a candidate for this side, so today's eligibility is not consulted
+        at all. Asserted here as a property of the ladder, and exercised
+        end-to-end in test_batch_seating_partial.py."""
+        self.assertEqual(spine.reason_rank(spine.PRIOR_SEAT_UNATTRIBUTED), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
