@@ -2102,6 +2102,17 @@ class SelectedConfirmOverTheRealHttpAvailabilityRoute(
 ACCEPTED_CONFIRM = (_Case("accepted_row_confirmed_by_the_player"),)
 CONFIRMED_REAFFIRM = (_Case("already_confirmed_row_reaffirmed"),)
 NULL_CONFIRM = (_Case("null_attribution_row_confirmed"),)
+# The THIRD shape of the NULL row, added by owner comment
+# 5384676215: the row names no side AND the player has no live
+# membership left at all. Its own label, because it is the shape the
+# previous head did not cover -- "the previous exact-head correction
+# explicitly required the NULL selected row under matching, moved,
+# AND absent-live-context shapes; this head covers only the first
+# two."
+NULL_CONFIRM_NO_LIVE = (
+    _Case("null_attribution_row_confirmed_with_no_live_context"),)
+NULL_RECONFIRM_NO_LIVE = (
+    _Case("null_attribution_backed_out_row_with_no_live_context"),)
 
 # The occupying states this round classifies as NOT REACHABLE, and so
 # deliberately outside ``_PLAYER_CONFIRM_SOURCE_STATES``. Kept in the
@@ -2514,14 +2525,22 @@ class NullAttributionRefusesEveryConfirmBecauseItCannotBeProven(
     saying so -- confirming "takes nothing back" -- and this input
     CONFIRMED and wrote (RED output in this section's header)."""
 
-    def _selected_then_nulled(self, fx, label, move_to=None):
+    def _selected_then_nulled(self, fx, label, move_to=None,
+                              end_live=False):
         """A genuinely-seated SELECTED row whose attribution columns are
         then NULLed at the store -- exactly the on-disk shape migration
         061 leaves behind for a pre-061 row (it performs no backfill).
 
         The move, when a case asks for one, happens BEFORE the NULLing:
         ``_move_to_the_other_side`` reads the durable side to prove the
-        two answers disagree, which a NULL row cannot do."""
+        two answers disagree, which a NULL row cannot do.
+
+        ``end_live`` is the THIRD shape (owner comment 5384676215): the
+        stint is ENDED after the NULLing, so the row names no side AND
+        the player resolves onto no side either. It is ended at the STORE
+        for the reason ``_move_to_the_other_side`` documents -- the facade
+        refuses every terminal transition until the governed transfer
+        slice ships."""
         api, gid = fx["api"], fx["gid"]
         p = self._mover(fx, "Legacy")
         self.assertNotIn("error", api.select_roster(
@@ -2531,6 +2550,14 @@ class NullAttributionRefusesEveryConfirmBecauseItCannotBeProven(
         self.assertEqual(seated_side, fx["home"], label)
         if move_to is not None:
             self._move_to_the_other_side(fx, p["id"], move_to, label)
+        if end_live:
+            end_membership_directly(
+                api.store, self._stint_id(api, p["id"], fx["ls_id"]),
+                "released")
+            # THE PREMISE, asserted: there is no live context left for the
+            # gate to resolve, so a live-context-first ordering CANNOT
+            # reach the attribution test.
+            self.assertIsNone(self._live_side(fx, p["id"]), label)
         row = api.store.roster_entry_for_player(gid, p["id"])
         row.team_side = None
         row.seated_position = None
@@ -2616,6 +2643,126 @@ class NullAttributionRefusesEveryConfirmBecauseItCannotBeProven(
                 self._assert_refused_with_zero_writes(fx, p, label)
             ran.append((label, NULL_CONFIRM[0].name))
         self._assert_matrix_ran(ran, shapes=NULL_CONFIRM)
+
+    def test_confirm_is_refused_as_attribution_missing_with_no_live_context(
+            self):
+        """THE OWNER'S BLOCKER, comment 5384676215 (exact head 04a4b11):
+
+            "a selected row with NULL durable attribution and no live
+             membership does not return attribution_missing.
+             _authorize_seated_side calls _require_membership_context
+             before reading entry.attribution. […] The request is safely
+             refused, but it returns only not_eligible: … no membership
+             with a team in it with no details.reason, instead of the
+             ruled attribution_missing outcome."
+
+        RED at head 04a4b11 on all three backends:
+
+            [memory]   selected_confirm: code='not_eligible' details=None
+            [memory]   message='… is not eligible for this game (no
+                       membership with a team in it; cross-team borrowing
+                       is off).'
+            [sqlite]/[postgres] ...identical...
+
+        TWO INDEPENDENTLY SUFFICIENT REFUSALS ARE TRUE OF THIS INPUT, and
+        the ruling decides WHICH ONE THE OPERATOR IS TOLD: "NULL
+        attribution is independently sufficient to prove that the row
+        cannot identify the side being confirmed. Letting the live-context
+        lookup win changes the structured operator/API diagnosis according
+        to an unrelated second defect and means the shared NULL contract is
+        not actually authoritative."
+
+        So this case cannot be satisfied by "it was refused" -- the two
+        sibling cases above already prove that. What it pins is the
+        ORDERING, and it is falsified precisely by restoring the
+        live-context-first ordering, which turns the structured
+        ``attribution_missing`` back into the unstructured refusal above.
+        ``_assert_refused_with_zero_writes`` additionally holds the
+        ruling's "before every attempted write" with the spy, because the
+        refusal moved EARLIER in the method, not later."""
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                p = self._selected_then_nulled(fx, label, end_live=True)
+                self._assert_refused_with_zero_writes(fx, p, label)
+            ran.append((label, NULL_CONFIRM_NO_LIVE[0].name))
+        self._assert_matrix_ran(ran, shapes=NULL_CONFIRM_NO_LIVE)
+
+
+class NullAttributionRefusesTheBackedOutReconfirmWithNoLiveContext(
+        _ReseatHarness, unittest.TestCase):
+    """THE SIBLING PATH, same blocker, same head.
+
+    ``set_availability``'s backed-out RE-CONFIRM branch reaches CONFIRMED
+    through the identical ``_authorize_seated_side`` call, so it carried
+    the identical ordering defect -- measured at head 04a4b11 alongside
+    the SELECTED one and answering byte-for-byte the same thing:
+
+        [memory]   backed_out_reconfirm: code='not_eligible' details=None
+        [sqlite]/[postgres] ...identical...
+
+    ``test_reconfirm_after_back_out_refuses_on_a_null_row`` (section 4)
+    already pins the NULL row on this path while the player is STILL
+    eligible; what it cannot see is which of the two facts decides the
+    answer once the membership has also ended. This class is the
+    difference, and it is here rather than folded into that test because
+    the fix is one shared call site: a change that fixed only the SELECTED
+    branch would leave this red."""
+
+    def _backed_out_then_nulled_and_ended(self, fx, label):
+        api, gid = fx["api"], fx["gid"]
+        p = self._mover(fx, "Legacy")
+        self.assertNotIn("error", api.select_roster(
+            gid, [p["id"]], actor_id=ADMIN), label)
+        self.assertNotIn("error", api.set_availability(
+            gid, p["id"], "available", actor_id=p["id"]), label)
+        self.assertNotIn("error", api.set_availability(
+            gid, p["id"], "unavailable", actor_id=p["id"]), label)
+        row = api.store.roster_entry_for_player(gid, p["id"])
+        self.assertEqual(row.status.value, "unavailable", label)
+        self.assertEqual(row.team_side, fx["home"], label)
+        row.team_side = None
+        row.seated_position = None
+        api.store.save_roster_entry(row)
+        end_membership_directly(
+            api.store, self._stint_id(api, p["id"], fx["ls_id"]),
+            "released")
+        reread = api.store.roster_entry_for_player(gid, p["id"])
+        # The NULL must survive the round trip on a real database, and the
+        # live context must really be gone.
+        self.assertIsNone(reread.attribution, label)
+        self.assertEqual(reread.status.value, "unavailable", label)
+        self.assertIsNone(self._live_side(fx, p["id"]), label)
+        return p
+
+    def test_reconfirm_is_refused_as_attribution_missing_with_no_live_context(
+            self):
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                api, gid = fx["api"], fx["gid"]
+                p = self._backed_out_then_nulled_and_ended(fx, label)
+                before = self._writes(api, gid)
+                with self._write_attempts(api.store) as attempts:
+                    res = api.set_availability(gid, p["id"], "available",
+                                               actor_id=p["id"])
+                # "BEFORE every attempted write" -- the spy, not the diff:
+                # set_availability is @_transactional, so a gate placed
+                # after the availability upsert leaves the diff empty too.
+                self.assertEqual(attempts, [], (label, attempts))
+                err = res.get("error", {})
+                self.assertEqual(err.get("code"), "not_eligible",
+                                 (label, res))
+                self.assertEqual(err.get("details", {}).get("reason"),
+                                 "attribution_missing", (label, res))
+                self.assertIn("durable game-side attribution",
+                              err.get("message", ""), (label, res))
+                self.assertEqual(self._writes(api, gid), before, label)
+                row = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(row.status.value, "unavailable", label)
+                self.assertIsNone(row.team_side, label)
+            ran.append((label, NULL_RECONFIRM_NO_LIVE[0].name))
+        self._assert_matrix_ran(ran, shapes=NULL_RECONFIRM_NO_LIVE)
 
 
 class AcceptedConfirmOverTheRealHttpAvailabilityRoute(
@@ -2747,7 +2894,8 @@ class NullAttributionConfirmOverTheRealHttpAvailabilityRoute(
     arrive as a structured 403 carrying ``attribution_missing`` -- not a
     500, and not a silent success."""
 
-    def _selected_then_nulled(self, fx, label, move_to=None):
+    def _selected_then_nulled(self, fx, label, move_to=None,
+                              end_live=False):
         api, gid = fx["api"], fx["gid"]
         p = self._mover(fx, "Legacy")
         self.assertNotIn("error", api.select_roster(
@@ -2760,6 +2908,11 @@ class NullAttributionConfirmOverTheRealHttpAvailabilityRoute(
         row.team_side = None
         row.seated_position = None
         api.store.save_roster_entry(row)
+        if end_live:
+            end_membership_directly(
+                api.store, self._stint_id(api, p["id"], fx["ls_id"]),
+                "released")
+            self.assertIsNone(self._live_side(fx, p["id"]), label)
         reread = api.store.roster_entry_for_player(gid, p["id"])
         self.assertIsNone(reread.attribution, label)
         return p
@@ -2768,13 +2921,24 @@ class NullAttributionConfirmOverTheRealHttpAvailabilityRoute(
         api, gid = fx["api"], fx["gid"]
         opener = self._serve(fx, label)
         before = self._writes(api, gid)
-        status, body = self._req(
-            opener, "POST", f"/api/games/{gid}/availability",
-            {"player_id": p["id"], "availability_status": "available"})
+        with self._write_attempts(api.store) as attempts:
+            status, body = self._req(
+                opener, "POST", f"/api/games/{gid}/availability",
+                {"player_id": p["id"], "availability_status": "available"})
+        # The ruling's "before every attempted write", over the transport:
+        # the spy watches the SAME store instance the request thread
+        # writes through, so a gate that ran after the availability upsert
+        # would show it here even though the rollback hid it from the diff
+        # below. Nothing the ROUTE itself does before dispatch may write
+        # either -- the session was established by ``_serve`` above.
+        self.assertEqual(attempts, [], (label, attempts))
         self.assertEqual(status, 403, (label, body))
         self.assertEqual(body["error"]["code"], "not_eligible",
                          (label, body))
-        self.assertEqual(body["error"]["details"]["reason"],
+        # ``.get`` rather than ``[…]``: the defect this pins produced a
+        # body with NO ``details`` key at all, and that must read as a
+        # FAILED assertion naming the reason, not as a KeyError.
+        self.assertEqual(body["error"].get("details", {}).get("reason"),
                          "attribution_missing", (label, body))
         self.assertEqual(self._writes(api, gid), before, label)
         self.assertIsNone(api.store.availability_for_player(gid, p["id"]),
@@ -2806,6 +2970,23 @@ class NullAttributionConfirmOverTheRealHttpAvailabilityRoute(
                 self._assert_http_refused(fx, p, label)
             ran.append((label, NULL_CONFIRM[0].name))
         self._assert_matrix_ran(ran, shapes=NULL_CONFIRM)
+
+    def test_http_refuses_as_attribution_missing_with_no_live_context(self):
+        """The blocker's own input over the route the UI posts to
+        (owner comment 5384676215): a SELECTED row with team_side=NULL and
+        seated_position=NULL whose membership has ENDED.
+
+        At head 04a4b11 this arrived as a 403 whose body carried NO
+        ``details`` at all -- ``not_eligible`` with the "no membership with
+        a team in it" message -- so a client could not tell the ruled
+        ``attribution_missing`` outcome from an ordinary ineligibility."""
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                p = self._selected_then_nulled(fx, label, end_live=True)
+                self._assert_http_refused(fx, p, label)
+            ran.append((label, NULL_CONFIRM_NO_LIVE[0].name))
+        self._assert_matrix_ran(ran, shapes=NULL_CONFIRM_NO_LIVE)
 
 
 if __name__ == "__main__":

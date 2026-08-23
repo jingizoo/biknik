@@ -509,11 +509,18 @@ class RosterService:
                 # step is _authorize_seated_side, which the SELECTED branch
                 # below calls too — ONE gate, so the two player-driven
                 # routes to CONFIRMED cannot drift apart.
-                attribution = self._authorize_seated_side(
+                #
+                # A ROW THAT NAMES NO SIDE NEVER GETS THAT FAR: the gate
+                # refuses NULL durable attribution with
+                # ``attribution_missing`` BEFORE it resolves anything live
+                # (owner ruling, PR #427, comment 5384676215 — see the
+                # gate's STEP 1). This branch used to make that decision
+                # itself, on the gate's ``None`` return, which meant the
+                # live-context lookup inside the gate ran first and a
+                # player whose membership had ALSO ended was diagnosed by
+                # that unrelated second fact instead.
+                side, st = self._authorize_seated_side(
                     game, player, entry, "re-confirm")
-                if attribution is None:
-                    self._refuse_unattributed(player, "re-confirm")
-                side, st = attribution
                 # ...and only once the player is authorized for that side do
                 # we ask whether the slot itself is still free (a substitute
                 # may have filled it while they were out). The BUCKET is the
@@ -555,30 +562,32 @@ class RosterService:
                 # nothing is being taken: requiring an open slot would
                 # refuse every legitimate confirmation of the last seat.
                 # Occupancy is not the question — authorization is.
-                attribution = self._authorize_seated_side(
+                #
+                # NULL DURABLE ATTRIBUTION FAILS CLOSED HERE TOO — owner
+                # ruling, PR #427, 2026-08-22 (Decision 3): "A selected
+                # legacy row with no team_side/seated_position cannot prove
+                # that its live team matches the side it holds. Reject with
+                # attribution_missing before any attempted write, without
+                # adding an open-slot check."
+                #
+                # That REVERSED the round before it, which let a pre-061
+                # row through on this path on the reasoning that confirming
+                # "takes nothing back". Overruled: the question this branch
+                # asks is not "is a slot being taken?" but "can this player
+                # be shown to be eligible for the side this row sits on?",
+                # and a row that names no side can never answer it. Silence
+                # is not a match.
+                #
+                # THE REFUSAL LIVES IN THE GATE, and is now taken BEFORE
+                # the live resolution rather than after it (comment
+                # 5384676215 — see ``_authorize_seated_side``'s STEP 1), so
+                # a NULL row whose membership has ALSO ended is still
+                # diagnosed ``attribution_missing`` instead of by the
+                # unrelated second fact. Still no open-slot check, and
+                # still raised BEFORE the GameAvailability upsert below,
+                # which is ``set_availability``'s first write.
+                self._authorize_seated_side(
                     game, player, entry, "confirm")
-                if attribution is None:
-                    # NULL DURABLE ATTRIBUTION FAILS CLOSED HERE TOO —
-                    # owner ruling, PR #427, 2026-08-22 (Decision 3): "A
-                    # selected legacy row with no team_side/seated_position
-                    # cannot prove that its live team matches the side it
-                    # holds. Reject with attribution_missing before any
-                    # attempted write, without adding an open-slot check."
-                    #
-                    # This REVERSES the previous round, which let a pre-061
-                    # row through on this path on the reasoning that
-                    # confirming "takes nothing back". That reasoning is
-                    # overruled: the question this branch asks is not "is a
-                    # slot being taken?" but "can this player be shown to
-                    # be eligible for the side this row sits on?", and a row
-                    # that names no side can never answer it. Silence is
-                    # not a match.
-                    #
-                    # Still NO open-slot check — the refusal is about
-                    # unprovable authorization, not about occupancy — and
-                    # still raised BEFORE the GameAvailability upsert below,
-                    # which is ``set_availability``'s first write.
-                    self._refuse_unattributed(player, "confirm")
 
         existing = self.store.availability_for_player(game_id, player_id)
         av = GameAvailability(
@@ -621,7 +630,7 @@ class RosterService:
 
     def _authorize_seated_side(
         self, game, player, entry, action: str
-    ) -> Optional[Tuple[str, SlotType]]:
+    ) -> Tuple[str, SlotType]:
         """AUTHORIZE — "MAY THIS PLAYER still hold the SIDE this row is
         seated on?" — for every PLAYER-DRIVEN transition into CONFIRMED.
 
@@ -632,29 +641,69 @@ class RosterService:
         as a helper for exactly that reason: a change here is a change to
         both, and a mutation here breaks both.
 
-        The answer comes from the LIVE context and from nothing else.
-        Durable attribution records what the row HOLDS; it says nothing
-        about who is still entitled to hold it. If the stored value could
-        authorize its own re-use, the row would be a standing permission
-        that outlives the participation that granted it. Resolution fails
-        CLOSED (``_require_membership_context`` — the #270 deactivation
-        gate), so a player with no live context at all is refused before
-        any comparison is reached.
+        ------------------------------------------------------------------
+        STEP 1 — CAN THE ROW NAME A SIDE AT ALL? Asked FIRST, and answered
+        without consulting anything live (owner ruling, PR #427, comment
+        5384676215):
 
-        Returns the row's ``(team_side, slot_type)`` attribution, or
-        ``None`` for a pre-061 row that carries none — because the
-        re-confirm caller needs the pair to run its slot gate, and the
-        confirm caller does not. What the ``None`` MEANS is no longer
-        caller-specific: both callers now refuse it, through the shared
-        ``_refuse_unattributed`` (owner ruling, PR #427, Decision 3).
+          "a selected row with NULL durable attribution and no live
+           membership does not return attribution_missing.
+           _authorize_seated_side calls _require_membership_context before
+           reading entry.attribution. […] The request is safely refused,
+           but it returns only not_eligible: … no membership with a team in
+           it with no details.reason, instead of the ruled
+           attribution_missing outcome. […] NULL attribution is
+           independently sufficient to prove that the row cannot identify
+           the side being confirmed. Letting the live-context lookup win
+           changes the structured operator/API diagnosis according to an
+           unrelated second defect and means the shared NULL contract is
+           not actually authoritative."
+
+        Measured tri-store at head 04a4b11 — a SELECTED row on HOME with
+        ``team_side``/``seated_position`` NULLed and its membership ENDED,
+        on both routes into CONFIRMED:
+
+          [memory] selected_confirm:      code='not_eligible' details=None
+          [memory] backed_out_reconfirm:  code='not_eligible' details=None
+          message='… is not eligible for this game (no membership with a
+                   team in it; cross-team borrowing is off).'
+
+        …identically on SQLite and PostgreSQL. The refusal was safe but
+        UNSTRUCTURED, and it named the wrong condition: whether the player
+        still has a live membership is a SECOND, independent fact, and it
+        cannot decide a question the row has already answered by naming no
+        side. So :meth:`_refuse_unattributed` is raised here, before the
+        resolution — which also keeps it before every attempted write,
+        since the resolution itself is the first thing this gate did.
+
+        STEP 2 — MAY THIS PLAYER HOLD THAT SIDE? Only now, and from the
+        LIVE context and nothing else. Durable attribution records what the
+        row HOLDS; it says nothing about who is still entitled to hold it.
+        If the stored value could authorize its own re-use, the row would
+        be a standing permission that outlives the participation that
+        granted it. Resolution fails CLOSED
+        (``_require_membership_context`` — the #270 deactivation gate), so
+        a player with no live context at all is still refused before any
+        comparison is reached; what changed is only that an unattributed
+        row no longer reaches this step to be diagnosed by it.
+
+        NO OPEN-SLOT CHECK IS ADDED by either step — the ruling forbids
+        one here, and the re-confirm caller keeps running its own.
+
+        Returns the row's ``(team_side, slot_type)`` attribution, never
+        ``None``: the re-confirm caller needs the pair for its slot gate,
+        and an unattributed row raises above rather than handing back a
+        value each caller would have to re-interpret.
 
         ``action`` is the caller's verb, so the message names the refused
         transition; the machine-readable ``details`` are identical on both
         paths by construction.
         """
-        ctx = self._require_membership_context(game, player)
         attribution = entry.attribution
-        if attribution is not None and ctx.team_id != attribution[0]:
+        if attribution is None:
+            self._refuse_unattributed(player, action)
+        ctx = self._require_membership_context(game, player)
+        if ctx.team_id != attribution[0]:
             # AUTHORIZATION, not occupancy — deliberately raised BEFORE any
             # slot gate and with its own reason so the two refusals can
             # never be mistaken for each other. "That side's slot happens
@@ -687,9 +736,20 @@ class RosterService:
         path, and the two answers lived in two places precisely because
         they were allowed to differ. Now the ``reason`` string
         (``attribution_missing``) is written once and both paths raise it
-        by calling here — a mutation to this message or reason breaks both
-        paths' tests together, which is the property the shared
+        — a mutation to this message or reason breaks both paths' tests
+        together, which is the property the shared
         ``_authorize_seated_side`` already gives the mismatch refusal.
+
+        AND IT IS ``_authorize_seated_side`` THAT CALLS IT, as its first
+        step, rather than each caller acting on a ``None`` return (owner
+        ruling, PR #427, comment 5384676215). While the decision lived in
+        the callers, the gate had already resolved the live membership by
+        the time they could take it, so a NULL row belonging to a player
+        whose participation had ALSO ended was refused by that unrelated
+        second fact and answered ``not_eligible`` with no ``details``.
+        One call site inside the gate makes the NULL contract
+        authoritative for both routes at once; this function always
+        raises.
 
         ``action`` is the caller's verb so the human message names the
         refused transition; the machine-readable ``details`` are identical
