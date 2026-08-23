@@ -1459,9 +1459,13 @@ class RosterService:
                 continue
             why[m.id] = row_reason
             self._keep_best_reason(raw, m, row_reason, why)
-        # Precedence runs over the SPINE-VALIDATED candidates: a membership
-        # on a side whose participation has ended was never a candidate, so
-        # it must not shadow a still-valid membership on the other side.
+        # THE SEATING PICK. Precedence runs over the SPINE-VALIDATED
+        # candidates: a membership on a side whose participation has ended
+        # was never a candidate, so it must not shadow a still-valid
+        # membership on the other side. ACTIVE-over-AFFILIATE then
+        # home-before-away, and this is the ONLY pick on this path whose
+        # answer becomes a CONTEXT — see ``_pick_eligible_membership`` for
+        # why that order is load-bearing and must not be retuned.
         m = self._pick_eligible_membership(valid, sides)
         if m is not None:
             return self._context_for(game, player, ls, spines[m.team_id][1],
@@ -1471,11 +1475,27 @@ class RosterService:
         # participation-granting row outranks a parked row at the same key,
         # which outranks a row on the wrong bench, which outranks a row in
         # another competition, which outranks having no rows at all. Each
-        # step is decided by a deterministic pick (status order, then home
-        # before away), never by store iteration order.
-        m = self._pick_eligible_membership(raw, sides)
+        # step is decided by a deterministic pick, never by store iteration
+        # order.
+        #
+        # THE REASON-NAMING PICK, and it is deliberately NOT the seating
+        # pick's order. Every row in ``raw`` is equally close to seating the
+        # player — all of them are right-keyed, participation-granting rows
+        # on a side of this game — so they differ ONLY in WHY they failed,
+        # and "which reason wins when several apply" is precisely what
+        # ``SKIP_REASON_PRECEDENCE`` answers. Ranking these by
+        # ACTIVE-before-AFFILIATE/home-before-away would answer a question
+        # nobody asked: the player is not being seated on this path, so
+        # which STINT names the failure is uninteresting next to which
+        # FAILURE is named.
+        #
+        # ``why[m.id]`` is a direct subscript, not a defaulted ``get``: the
+        # pick above has already read the reason of every row it considered,
+        # so a survivor without one is unreachable and would be a bug in the
+        # bucket rather than a player owed a fallback string.
+        m = self._pick_reason_membership(raw, sides, why)
         if m is not None:
-            return None, why.get(m.id, NO_ELIGIBLE_MEMBERSHIP)
+            return None, why[m.id]
         m = self._pick_membership(parked, sides,
                                   self._INELIGIBLE_MEMBERSHIP_STATUSES)
         if m is not None:
@@ -1530,15 +1550,80 @@ class RosterService:
         matched: Dict[MembershipStatus, Dict[str, SeasonRosterMembership]],
         sides: Tuple[str, ...],
     ) -> Optional[SeasonRosterMembership]:
-        """ACTIVE-over-AFFILIATE, home-before-away precedence over a
-        ``{status: {team_id: membership}}`` dict already narrowed to ONE
-        player's SPINE-VALIDATED memberships against ``sides`` — the exact
-        tie-break both ``resolve_membership_context`` (per player) and
-        ``resolve_membership_contexts_for_game`` (batched, #205 blocker 5)
-        need, factored once here so the batch form is a thin wrapper over the
-        same rule rather than a parallel reimplementation."""
+        """THE SEATING PICK: ACTIVE-over-AFFILIATE, home-before-away
+        precedence over a ``{status: {team_id: membership}}`` dict already
+        narrowed to ONE player's SPINE-VALIDATED memberships against
+        ``sides`` — the exact tie-break both ``resolve_membership_context``
+        (per player) and ``resolve_membership_contexts_for_game`` (batched,
+        #205 blocker 5) need, factored once here so the batch form is a thin
+        wrapper over the same rule rather than a parallel reimplementation.
+
+        THIS ORDER IS LOAD-BEARING AND IS NOT A DIAGNOSTIC PREFERENCE. Its
+        answer becomes a ``GameMembershipContext``: the side the player is
+        attributed to, and the season-scoped ``position`` the slot arithmetic
+        buckets them by. It exists because a player pathologically eligible
+        on BOTH sides at once must resolve to exactly ONE — the defect
+        ``test_slot_overfill_regression`` was written for, where one occupied
+        roster row was counted into both sides' summaries and a target of one
+        skater seated two. ACTIVE beats AFFILIATE because the authoritative
+        stint outranks the governed call-up; home beats away only to make the
+        remaining tie total.
+
+        DO NOT rank this by ``reason_rank``. A seating pick has no reason to
+        rank — every row reaching it SUCCEEDED — and re-ordering it would
+        silently move which membership seats a player. The reason ladder
+        governs :meth:`_pick_reason_membership`, which is a separate call
+        site on a branch that returns no context at all."""
         return cls._pick_membership(matched, sides,
                                     cls._ELIGIBLE_MEMBERSHIP_STATUSES)
+
+    @classmethod
+    def _pick_reason_membership(
+        cls,
+        matched: Dict[MembershipStatus, Dict[str, SeasonRosterMembership]],
+        sides: Tuple[str, ...],
+        why: Dict[str, str],
+    ) -> Optional[SeasonRosterMembership]:
+        """THE REASON-NAMING PICK: of one player's right-keyed,
+        participation-granting rows that all FAILED, the one whose reason
+        ranks earliest in ``SKIP_REASON_PRECEDENCE``.
+
+        WHY THIS IS NOT :meth:`_pick_eligible_membership`. ``_keep_best_
+        reason`` already resolves the rows sharing ONE ``(status, team)`` key
+        by the ladder, but the survivor ACROSS keys used to be chosen by the
+        SEATING order — so a player with a denormalized ``season_id``
+        mismatch (rank 3) on one key and a lapsed registration (rank 9) on
+        another was reported under rank 9, purely because that row's stint
+        happened to be ACTIVE, or on the home bench. The answer was stable,
+        deterministic and true; it was just not the ladder's answer, which
+        made ``SKIP_REASON_PRECEDENCE``'s claim to be "the SAME order the
+        code actually applies" hold only inside a key. It now holds across
+        the whole bucket.
+
+        THE ROWS CONSIDERED ARE EXACTLY ``_pick_membership``'s — the same
+        status walk over ``_ELIGIBLE_MEMBERSHIP_STATUSES``, the same sides —
+        so only the ORDER differs, and status-then-side survive as the
+        secondary keys. Two rows carrying the SAME reason therefore still
+        answer with the row the seating order would have named, and the
+        membership id makes the order total, so nothing here can fall back
+        to store iteration order.
+
+        ``why`` must name every row in ``matched``; the direct subscript is
+        deliberate, so a row that reached the ``raw`` bucket without a
+        recorded reason fails loudly here rather than being ranked as if it
+        had one. ``reason_rank`` is likewise fail-loud for a reason nobody
+        has placed in the ladder."""
+        best = best_key = None
+        for rung, status in enumerate(cls._ELIGIBLE_MEMBERSHIP_STATUSES):
+            by_team = matched.get(status, {})
+            for side_rank, side in enumerate(sides):
+                m = by_team.get(side)
+                if m is None:
+                    continue
+                key = (reason_rank(why[m.id]), rung, side_rank, m.id)
+                if best_key is None or key < best_key:
+                    best, best_key = m, key
+        return best
 
     # -- the {status: {team_id: membership}} COLLAPSE ---------------------
     #
@@ -1577,28 +1662,63 @@ class RosterService:
     # input is not determinism. The tie-break is imposed HERE, where the
     # reason is chosen.
     #
-    # WHICH row wins is deliberately uninteresting; that it is the SAME row
-    # on every backend is the whole point. Membership id is the final key
-    # because it is the one totally-ordered, store-independent value every
-    # row carries.
+    # WHICH row wins is deliberately uninteresting WHERE THE CHOICE IS FREE;
+    # that it is the SAME row on every backend and in every row order is the
+    # whole point. Membership id is the final key because it is the one
+    # totally-ordered, store-independent value every row carries.
+    #
+    # The choice is NOT free everywhere, and the two helpers say so
+    # individually: ``_keep_best_reason``'s survivor names a reason and is
+    # ranked by the ladder, and ``_keep_lowest_id``'s survivor at the
+    # ``valid``/``per_player`` call sites becomes a resolved context and
+    # carries its ``position`` into the slot arithmetic. Only the ``parked``
+    # call site is genuinely indifferent.
+    #
+    # NARROWING THE BUCKET IS NOT THE SAME AS PICKING FROM IT. Both helpers
+    # collapse rows at ONE ``(status, team)`` key. Which key then answers is
+    # a separate decision, and the two picks that make it — the SEATING pick
+    # and the REASON-NAMING pick — order the keys by different rules on
+    # purpose. See ``_pick_eligible_membership`` and
+    # ``_pick_reason_membership``.
 
     @staticmethod
     def _keep_lowest_id(bucket, m) -> None:
         """Collapse ``m`` into ``bucket`` keeping the LOWEST membership id at
-        its (status, team) key — the tie-break for buckets whose reported
-        answer is derived from the STATUS alone (``parked``, whose reason is
-        ``status_ineligible_reason``) or from the row itself (``valid``,
-        whose winner becomes the resolved context).
+        its (status, team) key — the tie-break for the buckets the reason
+        ladder does NOT govern. Three call sites: ``parked`` here,
+        ``valid`` here, and ``per_player`` in
+        ``resolve_membership_contexts_for_game``.
 
-        ``valid`` matters even though a second participation-granting row at
-        one key cannot survive migration 059's uniqueness indexes on SQL:
-        the resolved row supplies the context's ``position``, hence the SLOT
-        TYPE a batch buckets and seats by, so two rows disagreeing there
-        would seat the same player into different buckets on different
-        backends. It also keeps this resolver and
-        ``resolve_membership_contexts_for_game`` picking the SAME row, so the
-        form that DECIDES and the form that NAMES can never diverge on which
-        stint they are talking about."""
+        WHAT EACH ONE IS WORTH, stated precisely because a previous round of
+        this PR described the helper as simply "not mutation-observable" and
+        that is true of only ONE of the three.
+
+        ``valid`` and ``per_player`` ARE observable, and the observation is
+        not cosmetic: the surviving row becomes the resolved
+        ``GameMembershipContext``, supplying its ``position`` — hence the
+        GOALIE/SKATER bucket the slot arithmetic counts the player in. Two
+        rows disagreeing there under the old ``setdefault`` spelling seat the
+        same player into a DIFFERENT SLOT TYPE depending on the order the
+        store listed them, which
+        ``TheLowestIdTieBreakIsObservableWhereItSeats`` pins by
+        permuting the store read each resolver actually calls (one answer
+        here, two under ``setdefault``). No PRE-EXISTING test could see it,
+        which is what the earlier round measured: on ``InMemoryStore`` the
+        natural insertion order already puts the low id first, and on SQL
+        migration 059's ``ux_srm_open_player_league_season`` refuses the
+        second open row outright. Agreement on the natural order is not
+        order-independence. This call site also keeps the single resolver and
+        the batch form picking the SAME row, so the form that DECIDES and the
+        form that NAMES can never diverge on which stint they mean.
+
+        ``parked`` is the genuinely unfalsifiable one, and by CONSTRUCTION
+        rather than for want of a test: its survivor is consumed as
+        ``status_ineligible_reason(m.status)``, and ``status`` is half the
+        key the rows collapsed onto, so every row at one parked key yields
+        the identical string whichever survives. It is hardening against a
+        future reader of that bucket, nothing more, and no test can redden on
+        it — ``test_the_parked_call_site_cannot_be_observed_at_all`` asserts
+        exactly that, passing under both spellings on purpose."""
         by_team = bucket.setdefault(m.status, {})
         current = by_team.get(m.team_id)
         if current is None or m.id < current.id:
@@ -1613,9 +1733,20 @@ class RosterService:
         STRING, so its tie-break is the written ladder rather than an
         arbitrary-but-stable key: among rows that came equally close to
         seating the player, the reported reason is the one the ladder
-        already says outranks the other. That makes
-        ``SKIP_REASON_PRECEDENCE`` authoritative WITHIN a rung as well as
-        between rungs, which is what its own docstring promises.
+        already says outranks the other.
+
+        HALF THE STORY, and the half that is easy to overstate. This
+        resolves the rows sharing ONE ``(status, team)`` key; the survivor
+        ACROSS keys is chosen by :meth:`_pick_reason_membership`, which ranks
+        by the same ladder for the same reason. BOTH are required for
+        ``SKIP_REASON_PRECEDENCE`` to be authoritative within a rung as well
+        as between rungs. With only this one, a player whose two applicable
+        reasons sat at DIFFERENT keys — a different status, or the other
+        bench — was still answered by the seating order, and the ladder's
+        promise held only inside a key. See
+        ``TheLadderGovernsAcrossKeysNotOnlyWithinOne``, whose control case is
+        exactly the shape this helper alone already handled.
+
         ``reason_rank`` raises for an unlisted reason, so a new skip reason
         nobody has placed in the ladder fails loudly here instead of sorting
         wherever it happens to land."""
@@ -1633,11 +1764,19 @@ class RosterService:
     ) -> Optional[SeasonRosterMembership]:
         """status-order-then-home-before-away pick over a
         ``{status: {team_id: membership}}`` dict — the shared mechanism
-        behind both :meth:`_pick_eligible_membership` (which picks the row
-        that SEATS a player) and the #427 classifier's parked-row pick (which
-        picks the row that EXPLAINS a skip). The two differ only in which
-        status order they hand in, so factoring the walk keeps "home before
-        away, deterministically" a single rule."""
+        behind :meth:`_pick_eligible_membership` (which picks the row that
+        SEATS a player) and the #427 classifier's PARKED-row pick (whose
+        answer is read for its ``status`` alone). The two differ only in
+        which status order they hand in, so factoring the walk keeps "home
+        before away, deterministically" a single rule.
+
+        THE ``raw`` BUCKET IS NOT ONE OF THEM, deliberately. Its survivor
+        names a REASON, which is ranked by ``SKIP_REASON_PRECEDENCE`` in
+        :meth:`_pick_reason_membership` instead. Keeping that a separate
+        method rather than another ``status_order`` argument here is the
+        whole guard: this walk's order is load-bearing for SEATING — it is
+        what makes a player eligible on both sides resolve to exactly one —
+        and a reason preference must never be able to reach it."""
         for status in status_order:
             by_team = matched.get(status, {})
             for side in sides:

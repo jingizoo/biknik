@@ -196,14 +196,36 @@ PRIOR_SEAT_UNATTRIBUTED = "prior_seat_unattributed"
 #
 # IT GOVERNS WITHIN A RUNG TOO, not only between rungs. A player may hold
 # SEVERAL right-keyed, participation-granting rows that fail for DIFFERENT
-# reasons; they collapse onto one ``(status, team)`` key, and
-# ``RosterService._keep_best_reason`` resolves that collapse by THIS ladder
-# (``reason_rank``, id-tie-broken) rather than by whichever row the store
-# listed first. Before that, the reported string could flip between two
-# equally true reasons on nothing but insertion order — see
+# reasons. Every one of them lands in the classifier's ``raw`` bucket, and
+# THIS ladder decides which of them is reported — at BOTH of the two places
+# that bucket is narrowed, which is the part that is easy to get half-right:
+#
+#   * ``RosterService._keep_best_reason`` resolves the rows that collapse
+#     onto ONE ``(status, team)`` key, by ``reason_rank``, id-tie-broken;
+#   * ``RosterService._pick_reason_membership`` then picks ACROSS those keys,
+#     by ``reason_rank`` again, with the status-then-side walk demoted to a
+#     tie-break among rows carrying the SAME reason.
+#
+# The second was added later than the first, and until it was, this very
+# paragraph was false for the shapes that straddle two keys: a player with a
+# rank-3 reason on an AFFILIATE row and a rank-9 reason on an ACTIVE one was
+# answered by the SEATING order — ACTIVE-before-AFFILIATE, home-before-away —
+# and reported under rank 9. Deterministically, and truthfully, but not by
+# this ladder. ``TheLadderGovernsAcrossKeysNotOnlyWithinOne`` pins both
+# straddles and keeps the single-key control beside them.
+#
+# Before either, the reported string could flip between two equally true
+# reasons on nothing but insertion order — see
 # ``TheReportedReasonIsInvariantUnderEveryRowOrder``, which runs the
 # classifier once per permutation of a player's rows and requires one
 # answer.
+#
+# IT DOES NOT GOVERN THE SEATING PICK, and must not. Which membership SEATS
+# a player is decided by ``RosterService._pick_eligible_membership``'s
+# ACTIVE-over-AFFILIATE, home-before-away order, whose job is to make a
+# player eligible on BOTH sides resolve to exactly one. Rows reaching it have
+# no reason to rank — they SUCCEEDED. The two picks are separate methods so
+# that a change to this ladder can never move a seat.
 #
 # THE RULE BEHIND THE ORDER, stated once so a new reason can be placed
 # without guessing: **report the gate that is furthest from being satisfied,

@@ -56,7 +56,7 @@ from test_batch_seating_partial import _BatchHarness
 from test_slot_overfill_regression import _OverfillFixture
 from test_substitute_membership_cutover import ADMIN
 
-from hockey_scheduler.domain import MembershipStatus
+from hockey_scheduler.domain import MembershipStatus, Position
 from hockey_scheduler.domain.errors import IntegrityConflictError
 from hockey_scheduler.services import membership_spine as spine
 from hockey_scheduler.services.roster_service import RosterService
@@ -444,12 +444,16 @@ class ReasonPrecedenceIsPinned(_ReasonHarness, unittest.TestCase):
     CODE agrees with it: each case below is a candidate matching two or more
     reasons, and the one that must be reported is the earlier entry.
 
-    THE LADDER IS NOT ALL THIS PINS. Within one rung, a player holding
-    several right-keyed rows is resolved by ``_pick_membership``'s
-    status-then-home-before-away walk, which is a different (and already
-    pinned) deterministic rule. The cases here govern which RUNG answers;
-    section 5 governs what happens when several rows share ONE key, which is
-    the ladder again (``_keep_best_reason``) plus an id tie-break."""
+    WHAT THIS SECTION DOES AND DOES NOT COVER. The cases here govern which
+    RUNG answers. Section 5 governs several rows sharing ONE ``(status,
+    team)`` key — the ladder again, via ``_keep_best_reason``, plus an id
+    tie-break. Section 6 governs rows spread ACROSS keys, which is the ladder
+    a third time, via ``_pick_reason_membership``; until that existed the
+    across-keys survivor was chosen by ``_pick_membership``'s
+    status-then-home-before-away walk, which is the SEATING rule and answers
+    a question the reason path never asked. Section 6 also pins that the
+    seating rule itself is unmoved, and section 7 covers the one remaining
+    collapse (``_keep_lowest_id``) that the ladder does NOT govern."""
 
     def _cases_for(self, make):
         """Run ``make(api, fx) -> (player, expected_reason)`` on every
@@ -1142,6 +1146,469 @@ class MultipleHistoricalRowsReportOneOutcomeOnEveryBackend(_MultiRowFixture,
         self.assertNotEqual(orders["memory"], orders["sqlite"], orders)
         if "postgres" in orders:
             self.assertNotEqual(orders["memory"], orders["postgres"], orders)
+
+
+# ======================================================================
+# 6. the ladder governs ACROSS (status, team) keys, not only within one
+# ======================================================================
+class _TwoFailingRowsFixture(_ReasonHarness):
+    """One player, TWO right-keyed participation-granting rows that both
+    FAIL — one with a denormalized ``season_id`` (ladder rank 3), one
+    spine-correct but on a bench whose registration has lapsed (rank 9).
+
+    The three shapes differ ONLY in whether the two rows land on the same
+    ``(status, team)`` key, and that is the whole point: the collapse
+    ``_keep_best_reason`` resolves happens INSIDE a key, so the shapes that
+    straddle two keys were never reached by it.
+
+    MEMORY-ONLY, BY THE ENGINE AND NOT BY CHOICE. All three plant a SECOND
+    non-terminal row for one player at one LeagueSeason, which migration
+    059's ``ux_srm_open_player_league_season`` — ``(player_id,
+    league_season_id) WHERE status NOT IN ('released','transferred')`` —
+    refuses. Measured on both SQL backends, for each of the three shapes:
+
+        IntegrityConflictError: Player already has an open membership on
+        this league season; update or end it instead of creating another.
+
+    The index does not care which BENCH or which non-terminal STATUS the
+    second row carries, so widening the shape cannot buy a SQL leg.
+    ``TwoOpenStintsAtOneLeagueSeasonAreEngineRefused`` above pins the
+    refusal itself, on every backend. Writing this matrix as tri-store would
+    therefore be a fake: ``InMemoryStore`` enforces no uniqueness and is a
+    first-class backend of this suite, so the shape is REAL there and the
+    tie-break has to be imposed in the service. That is the same reasoning
+    ``_keep_best_reason``'s own regression test states, and it is why these
+    are honestly labelled rather than dressed up."""
+
+    #: ``(name, second row's status, second row's bench, note)``
+    STRADDLES = (
+        ("one_key",
+         MembershipStatus.ACTIVE, "home",
+         "THE CONTROL — both rows ACTIVE on HOME, so they share ONE "
+         "(status, team) key and _keep_best_reason alone already answered "
+         "this correctly at f570d78. It stays pinned as the BOUNDARY of "
+         "what that commit closed"),
+        ("two_statuses_one_bench",
+         MembershipStatus.AFFILIATE, "home",
+         "GAP A — same bench, DIFFERENT status, so the rows sit at two "
+         "keys and the survivor used to be chosen by ACTIVE-before-"
+         "AFFILIATE. That order has nothing to do with the ladder, so the "
+         "rank-9 reason was reported while the rank-3 one also applied"),
+        ("one_status_two_benches",
+         MembershipStatus.ACTIVE, "away",
+         "GAP B — same status, DIFFERENT bench: two keys again, and the "
+         "survivor used to be chosen by home-before-away. Same defect, "
+         "reached through the other half of the seating order"),
+    )
+
+    def _plant_two_failing_rows(self, api, teams, ls_id, status, bench):
+        """The ACTIVE/HOME row whose registration has lapsed, plus a second
+        row at ``(status, bench)`` carrying a denormalized ``season_id``."""
+        home = teams["home"]["id"]
+        pid = self._pointer_only_player(api, teams["third"]["id"],
+                                        "Twin Failure")["id"]
+        m = self._membership(api, pid, ls_id, home)
+        row = api.store.get_season_roster_membership(m["id"])
+        api.store.add_season_roster_membership(dataclasses.replace(
+            row, id=api.store.next_id("srm"), status=status,
+            team_id=teams[bench]["id"],
+            season_id="season_that_does_not_exist"))
+        # …and the spine-correct row fails too, so neither can seat and the
+        # RAW bucket is what names the skip.
+        (reg,) = api.store.registrations_for_team_in_league_season(
+            ls_id, home)
+        reg.active = False
+        api.store.save_season_team_registration(reg)
+        rows = list(api.store.memberships_for_player(pid))
+        self.assertEqual(len(rows), 2, rows)
+        return pid
+
+
+class TheLadderGovernsAcrossKeysNotOnlyWithinOne(_TwoFailingRowsFixture,
+                                                 unittest.TestCase):
+    """``SKIP_REASON_PRECEDENCE`` decides the reported reason over the WHOLE
+    ``raw`` bucket, not merely among the rows sharing one key.
+
+    WHAT WAS WRONG, and it was the CLAIM before it was the code. f570d78
+    made ``_keep_best_reason`` collapse rows at ONE ``(status, team)`` key
+    by ``reason_rank``, and ``membership_spine`` then stated that the ladder
+    "GOVERNS WITHIN A RUNG TOO, not only between rungs". For the ``raw``
+    bucket that held only inside a key: the survivor ACROSS keys was still
+    picked by ``_pick_eligible_membership``'s ACTIVE-before-AFFILIATE then
+    home-before-away walk — the SEATING order, which has no relationship to
+    the ladder. So a player carrying a rank-3 denormalized ``season_id``
+    mismatch on one key and a rank-9 lapsed registration on another was
+    reported under rank 9, and the ladder's own promise was false.
+
+    Measured at f570d78, all three shapes deterministic under every row
+    order:
+
+        one_key                 -> membership_denormalized_season_mismatch
+        two_statuses_one_bench  -> team_not_registered      (rank 3 applied)
+        one_status_two_benches  -> team_not_registered      (rank 3 applied)
+
+    Nothing about those answers was unstable or untrue — which is exactly
+    why this is worth closing rather than documenting. A ladder that is
+    authoritative except in two shapes nobody can predict from reading it
+    reintroduces the confusion the ladder was written to remove.
+
+    ``RosterService._pick_reason_membership`` now ranks the ``raw`` pick by
+    ``reason_rank`` first, keeping status-then-side as the secondary keys so
+    two rows carrying the SAME reason still answer exactly as before. The
+    SEATING pick is a different method on a different branch and is
+    unmoved — ``TheSeatingPickIsNotTheReasonPick`` below is its proof."""
+
+    def test_the_higher_ranked_reason_wins_however_the_rows_are_keyed(self):
+        for name, status, bench, note in self.STRADDLES:
+            store = InMemoryStore()
+            try:
+                self._assert_backend("memory", store)
+                api, season, league, teams, game, ls_id = self._build(
+                    store, target_skaters=4, target_goalies=1)
+                with self.subTest(shape=name, note=note):
+                    pid = self._plant_two_failing_rows(
+                        api, teams, ls_id, status, bench)
+                    # Every row order, not just the two the store happens
+                    # to produce: the answer must not depend on order AT
+                    # ALL, which is the property f570d78 established and
+                    # this must not regress.
+                    seen = TheReportedReasonIsInvariantUnderEveryRowOrder.\
+                        _permuted_reasons(
+                            self, api, api.store.get_game(game["id"]),
+                            api.store.get_player(pid))
+                    self.assertEqual(list(seen),
+                                     [spine.DENORMALIZED_SEASON_MISMATCH],
+                                     (name, seen))
+            finally:
+                self._close("memory", store)
+
+    def test_the_other_applicable_reason_really_does_rank_lower(self):
+        """The assertion above means nothing unless ``team_not_registered``
+        was genuinely applicable and genuinely later in the ladder — a
+        shape where only ONE reason applied would pass it vacuously.
+
+        Both halves are asserted here: the lapsed-registration row is
+        planted ALONE and reports ``team_not_registered`` on its own, and
+        the ladder ranks that strictly after the denormalized reason."""
+        self.assertLess(
+            spine.reason_rank(spine.DENORMALIZED_SEASON_MISMATCH),
+            spine.reason_rank(spine.NOT_REGISTERED))
+        store = InMemoryStore()
+        try:
+            api, season, league, teams, game, ls_id = self._build(
+                store, target_skaters=4, target_goalies=1)
+            home = teams["home"]["id"]
+            pid = self._pointer_only_player(api, teams["third"]["id"],
+                                            "Lone Lapse")["id"]
+            self._membership(api, pid, ls_id, home)
+            (reg,) = api.store.registrations_for_team_in_league_season(
+                ls_id, home)
+            reg.active = False
+            api.store.save_season_team_registration(reg)
+            self.assertEqual(
+                api.roster.seating_block_reason(
+                    api.store.get_game(game["id"]),
+                    api.store.get_player(pid)),
+                spine.NOT_REGISTERED)
+        finally:
+            self._close("memory", store)
+
+    def test_the_two_gap_shapes_are_engine_refused_on_both_sql_backends(self):
+        """The Memory-only label above, PROVEN rather than asserted in
+        prose — and proven for the gap shapes specifically, not merely for
+        the two-ACTIVE-rows shape the class above already covers.
+
+        A shape claimed to be Memory-only that a SQL backend actually
+        accepts would mean this matrix is silently under-covering."""
+        ran = []
+        for label, store in self._stores():
+            if label == "memory":
+                self._close(label, store)
+                continue
+            try:
+                self._assert_backend(label, store)
+                for name, status, bench, _note in self.STRADDLES:
+                    store.clear_all_data()
+                    api, season, league, teams, game, ls_id = self._build(
+                        store, target_skaters=4, target_goalies=1)
+                    with self.subTest(backend=label, shape=name):
+                        with self.assertRaises(IntegrityConflictError):
+                            self._plant_two_failing_rows(
+                                api, teams, ls_id, status, bench)
+                    ran.append((label, name))
+            finally:
+                self._close(label, store)
+        backends = {b for b, _s in ran}
+        expected = {"sqlite"}
+        if os.environ.get("TEST_DATABASE_URL"):
+            expected.add("postgres")
+        else:
+            print("\n[SKIP-REASON MATRIX] " + _PG_SKIP)
+        self.assertEqual(backends, expected, sorted(backends))
+        for backend in expected:
+            self.assertEqual({s for b, s in ran if b == backend},
+                             {s[0] for s in self.STRADDLES}, backend)
+
+
+class TheSeatingPickIsNotTheReasonPick(_ReasonHarness, unittest.TestCase):
+    """THE GUARD ON THE FIX ABOVE, and the higher-risk half of it.
+
+    ``_pick_membership`` is shared. It backs the pick that NAMES a skip
+    reason and, through ``_pick_eligible_membership``, the pick that SEATS a
+    player — and only the first of those wants the reason ladder. The
+    seating order is load-bearing for a different reason entirely: it is why
+    a player pathologically eligible on BOTH sides resolves to exactly ONE,
+    which is the double-count defect ``test_slot_overfill_regression`` was
+    written for. Retuning the shared helper would have moved it silently.
+
+    So the fix added a SEPARATE method rather than a parameter, and this
+    class pins the seating answer independently: ACTIVE outranks AFFILIATE
+    even when the AFFILIATE row is on HOME, and home breaks the tie only
+    among equals. ``affiliate_home_active_away`` is the discriminating case
+    — it is the one shape where the STATUS rung and the SIDE rung disagree,
+    so a seating pick that had been re-ordered by anything else would show
+    up here. Measured identical at f570d78 and after the fix, in both the
+    single and the batched resolver, under every row order:
+
+        active_home_affiliate_away  -> srm_1 on HOME
+        affiliate_home_active_away  -> srm_2 on AWAY   <- discriminating
+        active_both                 -> srm_1 on HOME
+
+    MEMORY-ONLY, for the SAME engine reason as the class above and measured
+    the same way: two open rows for one player at one LeagueSeason are
+    refused by ``ux_srm_open_player_league_season`` on both SQL backends
+    regardless of bench or status, so "eligible on both sides at once" is
+    not constructible there at all. That is not a coverage hole in the fix —
+    the seating path is exercised tri-store by the whole resolver /
+    attribution / overfill suite, which this change leaves untouched — it is
+    the honest bound on THIS shape."""
+
+    SHAPES = (
+        ("active_home_affiliate_away", MembershipStatus.ACTIVE,
+         MembershipStatus.AFFILIATE, "home"),
+        ("affiliate_home_active_away", MembershipStatus.AFFILIATE,
+         MembershipStatus.ACTIVE, "away"),
+        ("active_both", MembershipStatus.ACTIVE, MembershipStatus.ACTIVE,
+         "home"),
+    )
+
+    def test_a_player_eligible_on_both_sides_seats_where_it_always_did(self):
+        for name, home_status, away_status, expect in self.SHAPES:
+            store = InMemoryStore()
+            try:
+                self._assert_backend("memory", store)
+                api, season, league, teams, game, ls_id = self._build(
+                    store, target_skaters=4, target_goalies=1)
+                home, away = teams["home"]["id"], teams["away"]["id"]
+                with self.subTest(shape=name):
+                    pid = self._pointer_only_player(
+                        api, teams["third"]["id"], "Both Benches")["id"]
+                    m = self._membership(api, pid, ls_id, home)
+                    row = api.store.get_season_roster_membership(m["id"])
+                    api.store.save_season_roster_membership(
+                        dataclasses.replace(row, status=home_status))
+                    api.store.add_season_roster_membership(
+                        dataclasses.replace(
+                            row, id=api.store.next_id("srm"), team_id=away,
+                            status=away_status))
+                    want = home if expect == "home" else away
+                    g = api.store.get_game(game["id"])
+                    player = api.store.get_player(pid)
+                    # (a) the SINGLE form, under every row order.
+                    real = store.memberships_for_player
+                    rows = list(real(pid))
+                    seen = {}
+                    try:
+                        for perm in itertools.permutations(rows):
+                            store.memberships_for_player = (
+                                lambda p, _p=perm:
+                                [x for x in _p if x.player_id == p])
+                            ctx = api.roster.resolve_membership_context(
+                                g, player)
+                            seen.setdefault(
+                                (ctx.membership.id, ctx.team_id), []).append(
+                                    [x.id for x in perm])
+                    finally:
+                        store.memberships_for_player = real
+                    self.assertEqual(list(seen), [("srm_1" if expect == "home"
+                                                   else "srm_2", want)],
+                                     (name, seen))
+                    # (b) …and the BATCHED form agrees, which is what the
+                    # slot arithmetic actually calls.
+                    batch = api.roster.resolve_membership_contexts_for_game(g)
+                    self.assertEqual(batch[pid].team_id, want, (name, batch))
+                    self.assertEqual(batch[pid].membership.id,
+                                     next(iter(seen))[0], (name, batch))
+            finally:
+                self._close("memory", store)
+
+    def test_the_reason_pick_and_the_seating_pick_are_separate_methods(self):
+        """The structural half. The two picks are separate ATTRIBUTES, so a
+        future edit retuning one cannot silently retune the other — which is
+        precisely what would have happened had the ladder been pushed into
+        ``_pick_membership``.
+
+        The seating pick is also asserted NOT to consult the reason map:
+        rows reaching it SUCCEEDED and carry no reason at all, so ranking
+        them by one is not merely wrong, it is unanswerable."""
+        self.assertIsNot(RosterService._pick_reason_membership,
+                         RosterService._pick_eligible_membership)
+        import inspect
+        seating = inspect.signature(RosterService._pick_eligible_membership)
+        naming = inspect.signature(RosterService._pick_reason_membership)
+        self.assertNotIn("why", seating.parameters, seating)
+        self.assertIn("why", naming.parameters, naming)
+
+
+# ======================================================================
+# 7. the OTHER collapse tie-break — what _keep_lowest_id is really worth
+# ======================================================================
+class TheLowestIdTieBreakIsObservableWhereItSeats(
+        _ReasonHarness, unittest.TestCase):
+    """``_keep_lowest_id`` has THREE call sites, and they are not equally
+    defensible. A previous round described the helper as "deliberately not
+    mutation-observable"; reverting all three to the old ``setdefault``
+    spelling does indeed leave the whole suite green. That is a statement
+    about the SUITE, not about the helper, and this class corrects it by
+    building the test that was missing.
+
+    ``valid`` and ``per_player`` ARE observable, and here is the shape:
+    two participation-granting rows at one ``(status, team)`` key carrying
+    DIFFERENT season-scoped ``position`` values. The surviving row supplies
+    ``GameMembershipContext.position``, hence the GOALIE/SKATER bucket the
+    slot arithmetic counts the player in — so the two spellings do not merely
+    pick a different row, they seat the player into a different SLOT TYPE.
+    Measured by permuting the store read the resolver actually calls:
+
+        _keep_lowest_id  ->  {('srm_1','forward')}                 one answer
+        setdefault       ->  {('srm_1','forward'), ('srm_2','goalie')}
+
+    Both spellings agree on the store's NATURAL order (insertion order on
+    Memory puts the low id first, and SQL refuses the input outright), which
+    is why no pre-existing test could see the difference. The permutation
+    injection is what makes it visible, and it is the same technique
+    ``TheReportedReasonIsInvariantUnderEveryRowOrder`` already uses.
+
+    ``parked`` is the genuinely unfalsifiable one, and NOT merely for want
+    of a test: its survivor is consumed as
+    ``status_ineligible_reason(m.status)``, and ``status`` is half the key
+    the rows collapsed onto. Every row at one parked key therefore yields
+    the identical string no matter which survives. That call site is
+    hardening against a future reader of the bucket, nothing more, and it is
+    described that way in the helper rather than claimed as a fix.
+
+    MEMORY-ONLY for the same engine reason as the classes above: two open
+    rows at one LeagueSeason are refused by
+    ``ux_srm_open_player_league_season`` on both SQL backends."""
+
+    def _two_positions_at_one_key(self, api, teams, ls_id):
+        """One player, two ACTIVE HOME rows, FORWARD and GOALIE. Both are
+        fully spine-valid, so this exercises the ``valid``/``per_player``
+        buckets and never the reason path."""
+        pid = self._pointer_only_player(api, teams["third"]["id"],
+                                        "Twin Position",
+                                        position="forward")["id"]
+        m = self._membership(api, pid, ls_id, teams["home"]["id"])
+        row = api.store.get_season_roster_membership(m["id"])
+        api.store.save_season_roster_membership(
+            dataclasses.replace(row, position=Position.FORWARD))
+        api.store.add_season_roster_membership(dataclasses.replace(
+            row, id=api.store.next_id("srm"), position=Position.GOALIE))
+        rows = list(api.store.memberships_for_player(pid))
+        self.assertEqual(len(rows), 2, rows)
+        self.assertEqual({r.position for r in rows},
+                         {Position.FORWARD, Position.GOALIE}, rows)
+        return pid
+
+    def test_the_single_resolver_answers_one_context_in_every_row_order(self):
+        store = InMemoryStore()
+        try:
+            self._assert_backend("memory", store)
+            api, season, league, teams, game, ls_id = self._build(
+                store, target_skaters=4, target_goalies=1)
+            pid = self._two_positions_at_one_key(api, teams, ls_id)
+            g = api.store.get_game(game["id"])
+            player = api.store.get_player(pid)
+            real = store.memberships_for_player
+            rows = list(real(pid))
+            seen = {}
+            try:
+                for perm in itertools.permutations(rows):
+                    store.memberships_for_player = (
+                        lambda p, _p=perm: [x for x in _p if x.player_id == p])
+                    ctx = api.roster.resolve_membership_context(g, player)
+                    seen.setdefault((ctx.membership.id, ctx.position), []
+                                    ).append([x.id for x in perm])
+            finally:
+                store.memberships_for_player = real
+            self.assertEqual(list(seen), [("srm_1", Position.FORWARD)], seen)
+        finally:
+            self._close("memory", store)
+
+    def test_the_batched_resolver_answers_one_context_too(self):
+        """The third call site, reached through the store method the BATCH
+        reads — a different method from the one above, so the single form's
+        invariance says nothing about it."""
+        store = InMemoryStore()
+        try:
+            self._assert_backend("memory", store)
+            api, season, league, teams, game, ls_id = self._build(
+                store, target_skaters=4, target_goalies=1)
+            pid = self._two_positions_at_one_key(api, teams, ls_id)
+            g = api.store.get_game(game["id"])
+            real = store.memberships_for_league_season_team
+            mine = [r for r in real(g.league_season_id, g.home_team_id)
+                    if r.player_id == pid]
+            self.assertEqual(len(mine), 2, mine)
+            seen = {}
+            try:
+                for perm in itertools.permutations(mine):
+                    store.memberships_for_league_season_team = (
+                        lambda ls, t, _p=perm, _r=real:
+                        list(_p) + [x for x in _r(ls, t)
+                                    if x.player_id != pid])
+                    ctx = api.roster.resolve_membership_contexts_for_game(
+                        g)[pid]
+                    seen.setdefault((ctx.membership.id, ctx.position), []
+                                    ).append([x.id for x in perm])
+            finally:
+                store.memberships_for_league_season_team = real
+            self.assertEqual(list(seen), [("srm_1", Position.FORWARD)], seen)
+        finally:
+            self._close("memory", store)
+
+    def test_the_parked_call_site_cannot_be_observed_at_all(self):
+        """The honest negative, asserted rather than assumed.
+
+        Two RELEASED rows at one key differing in every field that is NOT
+        part of the key still report ONE reason under EITHER spelling,
+        because the reason is derived from the key itself. This test passes
+        with ``_keep_lowest_id`` and passes with ``setdefault`` — that is
+        the finding, and stating it here is the point of the test."""
+        store = InMemoryStore()
+        try:
+            self._assert_backend("memory", store)
+            api, season, league, teams, game, ls_id = self._build(
+                store, target_skaters=4, target_goalies=1)
+            pid = self._pointer_only_player(api, teams["third"]["id"],
+                                            "Twin Parked")["id"]
+            m = self._membership(api, pid, ls_id, teams["home"]["id"])
+            end_membership_directly(api.store, m["id"], "released")
+            row = api.store.get_season_roster_membership(m["id"])
+            api.store.add_season_roster_membership(dataclasses.replace(
+                row, id=api.store.next_id("srm"),
+                position=Position.GOALIE, jersey_number=99))
+            seen = TheReportedReasonIsInvariantUnderEveryRowOrder.\
+                _permuted_reasons(self, api, api.store.get_game(game["id"]),
+                                  api.store.get_player(pid))
+            self.assertEqual(list(seen), ["membership_released"], seen)
+            # …and it is the KEY that decided, not the tie-break: the reason
+            # is a pure function of the status the rows share.
+            self.assertEqual(
+                spine.status_ineligible_reason(MembershipStatus.RELEASED),
+                "membership_released")
+        finally:
+            self._close("memory", store)
 
 
 if __name__ == "__main__":
