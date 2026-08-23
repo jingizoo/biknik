@@ -812,14 +812,50 @@ class UnboundGamesKeepThePermanentGate(_DeclineAudienceContract,
                 self.assertEqual(res["error"]["code"], "not_eligible", label)
 
     def test_dangling_league_season_fails_closed(self):
+        """A dangling binding must reject everyone rather than quietly
+        reverting to permanent ownership.
+
+        THE REFUSAL MOVED EARLIER IN PR #427, and this assertion moved with
+        it rather than being relaxed. It used to read ``not_eligible``: the
+        only thing closing this case was the ELIGIBILITY gate, downstream of
+        the resolver. ``season_guard.guard_game_season`` now refuses the
+        Game's identity BEFORE eligibility is consulted at all, with the
+        pre-existing ``regular_game_missing_league_season`` — the same code
+        ``SetupService._revalidate_game_participation`` has raised for this
+        exact shape since #331 review round 22.
+
+        This is a STRENGTHENING, not a rename, and the second half of the
+        test is why. The old ``not_eligible`` answer was only ever available
+        to the surfaces that RESOLVE A MEMBERSHIP. ``lock_roster`` and
+        ``cancel_game`` consult none, so on a dangling-bound Game they used
+        to succeed outright, having taken no Season lock whatsoever. They are
+        asserted here so a fallback that "helpfully" treats an unresolvable
+        LeagueSeason as a legacy unbound row cannot pass — ``game.season_id``
+        still names a real, ACTIVE Season, so such a fallback would find one
+        and let the write through."""
         api, season, league, teams, game, ls_id = self._build(InMemoryStore())
         p = self._player(api, teams["home"]["id"], "P")  # parity stint opens
         # Corrupt the binding at the store level: the LeagueSeason row is
-        # gone but the game still claims one. Resolution must reject
-        # everyone rather than quietly reverting to permanent ownership.
+        # gone but the game still claims one.
         del api.store.league_seasons[ls_id]
+        # The Game's own Season pointer is untouched and perfectly valid —
+        # which is exactly what a bound-to-unbound fallback would seize on.
+        self.assertEqual(api.store.get_game(game["id"]).season_id,
+                         season["id"])
         res = api.enroll_substitute(game["id"], p["id"])
-        self.assertEqual(res["error"]["code"], "not_eligible")
+        self.assertEqual(res["error"]["code"], "validation_error", res)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "regular_game_missing_league_season", res)
+        # …and the membership-free surfaces, which the old assertion could
+        # not reach.
+        for call in (lambda: api.lock_roster(game["id"], actor_id=ADMIN),
+                     lambda: api.cancel_game(game["id"], actor_id=ADMIN)):
+            res = call()
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "regular_game_missing_league_season", res)
+        g = api.store.get_game(game["id"])
+        self.assertFalse(g.locked, g)
+        self.assertFalse(g.cancelled, g)
 
     def test_decline_notifies_the_offer_owner_not_the_new_team(self):
         """Case (a) of the offer-owner matrix: HOME enroll/offer -> ordinary

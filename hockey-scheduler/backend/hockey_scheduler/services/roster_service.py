@@ -65,7 +65,8 @@ from .membership_spine import (
     status_ineligible_reason,
 )
 from .notifier import push as _push_notification
-from .season_guard import require_active_season
+from . import season_guard
+from .season_guard import GAME_LEAGUE_SEASON_MISMATCH
 
 
 def _utcnow() -> datetime:
@@ -227,7 +228,13 @@ class RosterService:
         A concurrent ``cancel_game`` / ``move_game`` / ``publish_game`` commits
         under the same Season lock, so a Game-state mutation must act on the
         FRESH row — otherwise saving the stale object silently resurrects a
-        cancelled Game or clobbers a relocation."""
+        cancelled Game or clobbers a relocation.
+
+        CALLED BY THE GUARD ITSELF since #427, not by individual callers.
+        Three of the fifteen roster mutations remembered to call it; the other
+        twelve did not, and "remember to re-fetch" is not an invariant. Now
+        ``_guard_active_season`` returns this row and every caller rebinds, so
+        the lock and the read that follows it cannot be separated."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
@@ -261,22 +268,61 @@ class RosterService:
             raise NotEligibleError(f"{player.name} is not an active player.")
         return player
 
-    def _guard_active_season(self, game: Game) -> None:
+    def _guard_active_season(self, game: Game) -> Game:
         """An archived Season is read-only (#159): its Games accept no roster,
         availability, substitute, lock, or cancel changes. Row-locks the Season
         (must run inside the caller's transaction) so the check is linearizable
         with ``archive_season``. Shared by ``_guard_mutable`` and the few
-        mutations that legitimately bypass the cancelled/locked guard."""
-        if game.season_id:
-            require_active_season(self.store, game.season_id)
+        mutations that legitimately bypass the cancelled/locked guard.
 
-    def _guard_mutable(self, game: Game) -> None:
-        """Guard for operations that change the committed roster."""
-        self._guard_active_season(game)  # #159 — archived Season is read-only
+        WHICH Season is the authority is decided in ONE place for both guard
+        families — :func:`season_guard.guard_game_season` (PR #427 blocker).
+        This method used to answer it itself with ``if game.season_id:``, which
+        skipped the guard on a NULL and locked a SIBLING Season on drift; see
+        that function for the full precedence (dangling binding, then the
+        canonical Season's archive state, then the denormalized column).
+
+        RETURNS THE GAME RE-FETCHED UNDER THAT LOCK, and every caller rebinds.
+        The pre-lock ``_require_game`` read is only a LOCATOR: until the Season
+        row is held, a concurrent ``cancel_game``/``move_game``/``publish_game``
+        can commit underneath it, so both this guard's own cancelled/locked
+        checks and the caller's subsequent write must act on the FRESH row. Only
+        three call sites re-fetched before #427; making the guard return the
+        row rolls that out everywhere by construction rather than by
+        remembering.
+
+        The identity is then RE-VERIFIED on the fresh row, but only when the
+        fresh row's identity columns actually differ from the ones just
+        judged. Re-running unconditionally would re-lock the same Season on
+        every single mutation for nothing; skipping it entirely would let a
+        Game whose binding changed between the locator read and the lock be
+        written under a Season that is no longer its authority. When they DO
+        differ the guard runs again and locks the new canonical Season, which
+        is the only correct row to hold — and that second lock is reachable
+        only on a row production cannot produce, since every writer that could
+        move these columns must itself hold the Season lock this transaction
+        is already holding."""
+        season_guard.guard_game_season(self.store, game)
+        fresh = self._refetch_under_season_lock(game.id)
+        if (fresh.league_season_id != game.league_season_id
+                or fresh.season_id != game.season_id):
+            season_guard.guard_game_season(self.store, fresh)
+        return fresh
+
+    def _guard_mutable(self, game: Game) -> Game:
+        """Guard for operations that change the committed roster.
+
+        Returns the Game RE-FETCHED under the Season lock (see
+        :meth:`_guard_active_season`) — and note the cancelled/locked checks
+        below are made on that fresh row, not on the caller's locator read, so
+        a cancel or a lock that commits between the two is observed rather than
+        clobbered."""
+        game = self._guard_active_season(game)  # #159 + #427 — see above
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
         if game.locked:
             raise RosterLockedError("Roster is locked. Unlock to make changes.")
+        return game
 
     def _audit(
         self,
@@ -324,7 +370,7 @@ class RosterService:
         self, game_id: str, player_ids: List[str], actor_id: Optional[str] = None
     ) -> List[GameRosterEntry]:
         game = self._require_game(game_id)
-        self._guard_mutable(game)
+        game = self._guard_mutable(game)
 
         # Row-lock every referenced Player so each is_active eligibility check is
         # serialized with a concurrent set_player_active deactivation (which
@@ -370,7 +416,7 @@ class RosterService:
         # rather than per player, so a 20-player roster does not pay 20
         # membership lookups — the same batching _side_data uses, and the
         # same precedence, via the shared _pick_eligible_membership.
-        bound = bool(game.league_season_id)
+        bound = season_guard.game_is_league_season_bound(game)
         contexts = (self.resolve_membership_contexts_for_game(game)
                     if bound else {})
 
@@ -453,7 +499,7 @@ class RosterService:
         notes: Optional[str] = None,
     ) -> GameAvailability:
         game = self._require_game(game_id)
-        self._guard_active_season(game)  # #159 read-only guard
+        game = self._guard_active_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
         if game.locked:
@@ -770,7 +816,7 @@ class RosterService:
     ) -> GameRosterEntry:
         """PATCH /roster/{playerId}/status — confirm or back out."""
         game = self._require_game(game_id)
-        self._guard_mutable(game)
+        game = self._guard_mutable(game)
         entry = self.store.roster_entry_for_player(game_id, player_id)
         if entry is None:
             raise NotFoundError(f"Player {player_id} is not on this game's roster.")
@@ -889,7 +935,7 @@ class RosterService:
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
-        self._guard_mutable(game)
+        game = self._guard_mutable(game)
         player = self._require_player(player_id)
 
         # #205 cutover: membership-resolved for a LeagueSeason-bound game,
@@ -954,7 +1000,7 @@ class RosterService:
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
-        self._guard_mutable(game)
+        game = self._guard_mutable(game)
         sub = self._require_active_enrollment(game_id, player_id)
         was_offered = sub.status == SubstituteStatus.OFFERED
         sub.status = SubstituteStatus.WITHDRAWN
@@ -985,7 +1031,7 @@ class RosterService:
         offer_expires_at: Optional[datetime] = None,
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
-        self._guard_mutable(game)
+        game = self._guard_mutable(game)
         player = self._require_active_player(player_id)   # fail closed on deactivation
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status != SubstituteStatus.ENROLLED:
@@ -1044,7 +1090,7 @@ class RosterService:
         entry = None
         with self.store.transaction():
             game = self._require_game(game_id)
-            self._guard_mutable(game)
+            game = self._guard_mutable(game)
             self._require_active_player(player_id)   # fail closed on deactivation
             sub = self.store.substitute_for_player(game_id, player_id)
             if sub is None or sub.status != SubstituteStatus.OFFERED:
@@ -1114,7 +1160,7 @@ class RosterService:
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
-        self._guard_mutable(game)
+        game = self._guard_mutable(game)
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status != SubstituteStatus.OFFERED:
             raise InvalidTransitionError("No active offer to decline.")
@@ -1196,7 +1242,7 @@ class RosterService:
     ) -> GameRosterEntry:
         """Coach override: offer + accept in one step (audited)."""
         game = self._require_game(game_id)
-        self._guard_mutable(game)
+        game = self._guard_mutable(game)
         player = self._require_active_player(player_id)   # fail closed on deactivation
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status not in (
@@ -1461,7 +1507,7 @@ class RosterService:
         sides = tuple(t for t in (game.home_team_id, game.away_team_id) if t)
         if not sides:
             return None, NO_ELIGIBLE_MEMBERSHIP
-        if not game.league_season_id:
+        if not season_guard.game_is_league_season_bound(game):
             # An UNBOUND game has no membership rows in play at all, so the
             # narrowed NO_ELIGIBLE_MEMBERSHIP ("nothing to resolve") is
             # exactly right for a permanent pointer naming another team.
@@ -1476,6 +1522,29 @@ class RosterService:
         ls = self.store.get_league_season(game.league_season_id)
         if ls is None:
             return None, LEAGUE_SEASON_MISSING
+        # THE GAME'S OWN IDENTITY, before any membership is considered (PR #427
+        # blocker 5379031499). ``ls.season_id`` is the competition this game
+        # belongs to; ``game.season_id`` is a nullable, FK-less denormalization
+        # of it. When the two disagree the game's identity is not trustworthy,
+        # so NOTHING resolves on it — the same conclusion ``context_scope``'s
+        # read-only Official gate already reaches for the identical drift.
+        #
+        # This is the READ half of the fix and it is deliberately not a copy of
+        # the WRITE half: ``season_guard.guard_game_season`` additionally LOCKS
+        # the canonical Season and refuses an ARCHIVED one, because a write must
+        # serialize against ``archive_season``. A read must not — an archived
+        # Season is read-only, not invisible, and closing this resolver on
+        # archive state would blank out every historical roster view. So the
+        # resolver checks IDENTITY only, and the write guard adds the lock and
+        # the lifecycle check on top of it.
+        #
+        # Unconditional equality, matching the write guard: ``None`` is a
+        # disagreement, not an exemption. Without this the whole read surface
+        # (substitute_block_reason -> the opportunity list, the addable-player
+        # list, compute_roster_status) answered from a context whose Season was
+        # LS1's while the game claimed a sibling's, or none at all.
+        if game.season_id != ls.season_id:
+            return None, GAME_LEAGUE_SEASON_MISMATCH
         # Identity: the membership's Player must still exist. Callers hand in
         # a Player OBJECT, which a long-lived caller (or a batch that read it
         # a moment ago) may still hold across a delete; the ROW is the
@@ -1881,13 +1950,24 @@ class RosterService:
 
         Returns ``{}`` for a game with no LeagueSeason binding (see
         :meth:`team_for_game` for the permanent-pointer fallback such a game
-        keeps) or a bound game whose LeagueSeason row itself dangles — fail
-        closed, the same posture as the single form."""
+        keeps), a bound game whose LeagueSeason row itself dangles, or a bound
+        game whose own ``season_id`` disagrees with that LeagueSeason (PR #427)
+        — fail closed, the same posture and the same three checks, in the same
+        order, as the single form."""
         result: Dict[str, GameMembershipContext] = {}
-        if game is None or not game.league_season_id:
+        if game is None or not season_guard.game_is_league_season_bound(game):
             return result
         ls = self.store.get_league_season(game.league_season_id)
         if ls is None:
+            return result
+        # The same unconditional game-identity check the single form applies
+        # (see ``_resolve_context_with_reason``). It has to be repeated here
+        # rather than inherited because this batch form is a genuinely
+        # independent resolution — ``compute_roster_status``/``_slot_summaries``
+        # /``_partition_candidates`` reach the membership rows through it and
+        # never through the single form — and a gate present in only one of two
+        # resolvers is the split authority this blocker is about.
+        if game.season_id != ls.season_id:
             return result
         sides = tuple(t for t in (game.home_team_id, game.away_team_id) if t)
         if not sides:
@@ -2004,7 +2084,7 @@ class RosterService:
         permanent roster is the pool and the context is resolved the same
         (pointer-based) way the rest of that path always has. Ordering is
         the caller's job."""
-        if not game.league_season_id:
+        if not season_guard.game_is_league_season_bound(game):
             return [(p, self.resolve_membership_context(game, p))
                     for p in self.store.players_for_team(team_id)]
         contexts = self.resolve_membership_contexts_for_game(game)
@@ -2019,7 +2099,7 @@ class RosterService:
         self, game_id: str, player_id: str, actor_id: Optional[str] = None
     ) -> GameRosterEntry:
         game = self._require_game(game_id)
-        self._guard_mutable(game)
+        game = self._guard_mutable(game)
         entry = self.store.roster_entry_for_player(game_id, player_id)
         if entry is None:
             raise NotFoundError("Player is not on this game's roster.")
@@ -2094,10 +2174,23 @@ class RosterService:
     #   * ``SetupService.assign_player_team`` (the permanent pointer, which
     #     the auto-fill pool reads) locks the PLAYER row.
     #
-    # A game with no ``season_id`` at all (an unbound legacy row) takes no
-    # Season lock — there is no Season to lock and no membership to change;
-    # its eligibility is the permanent pointer, which the Player lock
-    # covers.
+    # WHICH Season lock, precisely — and this is where an earlier version of
+    # this comment taught the wrong rule (PR #427 blocker). It said "a game
+    # with no season_id at all (an unbound legacy row) takes no Season lock",
+    # which conflates two different rows: a game is UNBOUND when
+    # ``league_season_id is None``, never because its denormalized
+    # ``season_id`` happens to be empty. A LeagueSeason-BOUND game with a
+    # missing or drifted ``season_id`` is a corrupted bound row, not a legacy
+    # one, and ``season_guard.guard_game_season`` refuses it outright rather
+    # than letting it through unlocked.
+    #
+    # So: a BOUND game locks the Season its LEAGUESEASON names — the shared
+    # row every writer on that competition, and ``archive_season`` itself,
+    # serializes on. Only a genuinely unbound row (an exhibition, or a
+    # pre-#283 legacy game) uses its own ``season_id``, and only such a row
+    # naming no Season at all takes no Season lock: there is then no
+    # competition and no membership to change, and its eligibility is the
+    # permanent pointer, which the Player lock covers.
     #
     # WHY THE PARTITION CANNOT BE A try/except AROUND ``select_roster``.
     # ``transaction()`` is REENTRANT WITH NO SAVEPOINTS in both backends:
@@ -2226,7 +2319,7 @@ class RosterService:
         never taken from that second call.
 
         NON-RAISING, by construction. Everything it consults is a read."""
-        bound = bool(game.league_season_id)
+        bound = season_guard.game_is_league_season_bound(game)
         contexts = (self.resolve_membership_contexts_for_game(game)
                     if bound else {})
         preclassified = preclassified or {}
@@ -2576,7 +2669,7 @@ class RosterService:
         their exact previous meanings and ADDS the identity keys, so every
         existing consumer of this plain dict keeps working."""
         game = self._require_game(game_id)
-        self._guard_mutable(game)          # <- the SEASON ROW LOCK
+        game = self._guard_mutable(game)          # <- the SEASON ROW LOCK
         team_id = self._batch_team(game, team_id)
         src, candidates, preclassified = self._newest_prior_source(
             game, team_id)
@@ -2666,7 +2759,7 @@ class RosterService:
         empty COHORT (no pointers and no membership rows) is an empty state
         to fix in Setup, not a partial outcome."""
         game = self._require_game(game_id)
-        self._guard_mutable(game)          # <- the SEASON ROW LOCK
+        game = self._guard_mutable(game)          # <- the SEASON ROW LOCK
         team_id = self._batch_team(game, team_id)
         candidates = self._auto_build_candidates(game, team_id)
         if not candidates:
@@ -3005,8 +3098,7 @@ class RosterService:
     @_transactional
     def lock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
-        self._guard_active_season(game)  # #159 read-only guard
-        game = self._refetch_under_season_lock(game_id)  # #201
+        game = self._guard_active_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise GameCancelledError("Game is cancelled.")
         was_locked = game.locked
@@ -3028,8 +3120,7 @@ class RosterService:
     @_transactional
     def unlock_roster(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
-        self._guard_active_season(game)  # #159 read-only guard
-        game = self._refetch_under_season_lock(game_id)  # #201
+        game = self._guard_active_season(game)  # #159/#427 guard + re-fetch
         was_locked = game.locked
         game.locked = False
         self.store.save_game(game)
@@ -3043,8 +3134,7 @@ class RosterService:
     @_transactional
     def cancel_game(self, game_id: str, actor_id: Optional[str] = None) -> Game:
         game = self._require_game(game_id)
-        self._guard_active_season(game)  # #159 read-only guard
-        game = self._refetch_under_season_lock(game_id)  # #201
+        game = self._guard_active_season(game)  # #159/#427 guard + re-fetch
         was_cancelled = game.cancelled
         game.cancelled = True
         self.store.save_game(game)
@@ -3120,7 +3210,7 @@ class RosterService:
         game = self._require_game(game_id)
         entries = self.store.roster_for_game(game_id)
         subs = self.store.substitutes_for_game(game_id)
-        bound = bool(game.league_season_id)
+        bound = season_guard.game_is_league_season_bound(game)
         contexts = (self.resolve_membership_contexts_for_game(game)
                     if bound else {})
 

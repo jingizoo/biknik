@@ -587,13 +587,54 @@ class SetupService:
         through here."""
         return require_active_season(self.store, season_id)
 
-    def _guard_game_season(self, game) -> None:
+    def _guard_game_season(self, game):
         """Guard a Game-owned mutation against its archived Season (#159).
-        Row-locks + checks the Game's Season so no write lands on a Game whose
-        Season is archived. Takes the already-fetched Game (preserving each
-        caller's own not-found semantics); a Season-less legacy Game is a no-op."""
-        if game is not None and game.season_id:
-            require_active_season(self.store, game.season_id)
+        Row-locks + checks the Season that AUTHORIZES this Game so no write
+        lands on a Game whose competition is archived. Takes the
+        already-fetched Game (preserving each caller's own not-found
+        semantics) and returns it RE-FETCHED under that lock; ``None`` in,
+        ``None`` out.
+
+        WHICH Season that is used to be answered here, with ``if
+        game.season_id:`` — the same falsy-skip/wrong-row defect
+        ``RosterService._guard_active_season`` carried, in a second copy that
+        could drift from it. Both now call the ONE shared
+        :func:`season_guard.guard_game_season`, which resolves the Game's
+        LeagueSeason, locks and archive-checks the Season IT names, and only
+        then compares ``game.season_id`` to it (PR #427 blocker 5379031499).
+        See that function for the precedence and for why an unbound EXHIBITION
+        keeps using its own ``season_id``.
+
+        The RE-FETCH is the second half of the owner's correction: the caller's
+        pre-lock read is a locator, and a concurrent ``cancel_game`` /
+        ``move_game`` / ``archive_season`` commits under this very Season lock,
+        so the row a caller goes on to mutate must be the one read AFTER the
+        lock was taken. A caller's ``None`` still passes straight through (its
+        own not-found handling runs next), but a Game that VANISHED between the
+        locator read and the lock is a real ``NotFoundError`` here rather than
+        a stale object the caller would resurrect by saving. It carries
+        ``reason="game_missing"`` — the detail ``_move_game_locked``'s own
+        post-lock re-fetch already used for exactly this outcome, so
+        centralizing the re-fetch neither invents a new code nor drops the one
+        that existed."""
+        if game is None:
+            return None
+        season_guard.guard_game_season(self.store, game)
+        fresh = self.store.get_game(game.id)
+        if fresh is None:
+            raise NotFoundError(f"Game {game.id} not found.",
+                                details={"reason": "game_missing"})
+        # Re-verify the identity on the fresh row, but only when its identity
+        # columns actually moved — same reasoning as
+        # ``RosterService._guard_active_season``: unconditional re-running
+        # would re-lock the same Season on every mutation for nothing, while
+        # skipping it would let a Game whose binding changed between the
+        # locator read and the lock be written under a Season that is no
+        # longer its authority.
+        if (fresh.league_season_id != game.league_season_id
+                or fresh.season_id != game.season_id):
+            season_guard.guard_game_season(self.store, fresh)
+        return fresh
 
     def _policy_scope_lock_plan(self, rink_ids, season_ids) -> dict:
         """#318 review — pre-lock LOCATOR for every policy scope the placement
@@ -1923,7 +1964,21 @@ class SetupService:
                 "published or moved until it is repaired.",
                 {"reason": "regular_game_missing_league_season",
                  "game_id": game.id, "league_season_id": ls_id})
-        if game.season_id and ls.season_id != game.season_id:
+        # PR #427 blocker: this comparison is UNCONDITIONAL, exactly like the
+        # `league_id` one below. It is the SAME argument #331 review round 24
+        # already made for that line, applied to the column round 23 left
+        # guarded: `game.season_id` is explicitly Optional with a nullable
+        # `games.season_id` column carrying no FK and no CHECK, so `None` is
+        # not "a legacy row to be lenient with", it is precisely the corrupted
+        # shape the guard let through. By this point the game is REGULAR
+        # (exhibitions returned far above) and `ls` is a real LeagueSeason, so
+        # the correct invariant is plain equality — a bound game whose Season
+        # is missing is drift, not a legacy case. Guarding it behind
+        # truthiness meant a store-written NULL evaded the check entirely
+        # while `league_season_id` still named the competition, which is the
+        # authority split the owner's blocker describes. The stored value is
+        # reported as-is (including `None`) so remediation sees the row.
+        if ls.season_id != game.season_id:
             raise ValidationError(
                 "This game's league-season belongs to a different season; "
                 "it cannot be published or moved until it is repaired.",
@@ -6788,14 +6843,12 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
-        # locator). A concurrent move_game relocates the game (new slot/time,
-        # unpublished) under the same Season lock; publishing the stale object
-        # would clobber those fields back. Act on the fresh row.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches under the Season lock it takes (the
+        # pre-lock read was a locator). A concurrent move_game relocates the
+        # game (new slot/time, unpublished) under the same Season lock;
+        # publishing the stale object would clobber those fields back. Act on
+        # the fresh row the guard returns (#427 centralized this).
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         # A game may only be made public while both teams are still valid
         # participants of its competition scope (#180 / #283 Slice E: exact
         # LeagueSeason for a regular game, active Season participation for an
@@ -7024,12 +7077,10 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch under the Season lock; a concurrent move_game may
-        # have unpublished/relocated the game after the locator read.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches under the Season lock it takes; a
+        # concurrent move_game may have unpublished/relocated the game after
+        # the locator read.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot request a reschedule for a cancelled game.")
         if not game.published:
@@ -10628,13 +10679,11 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch the game under the Season lock so the cancelled /
-        # time-overlap checks below run on its current state, not a locator
-        # snapshot a concurrent move_game may have changed.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches the game under the Season lock it
+        # takes, so the cancelled / time-overlap checks below run on its
+        # current state, not a locator snapshot a concurrent move_game may
+        # have changed.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot assign officials to a cancelled game.")
         # #159 r15 — row-lock the Official: delete_official locks the Official row
@@ -10779,12 +10828,10 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #201 — re-fetch under the Season lock; a concurrent cancel_game commits
-        # under the same lock, so the cancelled gate must see the fresh Game.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #201 — the guard re-fetches under the Season lock it takes; a
+        # concurrent cancel_game commits under the same lock, so the cancelled
+        # gate must see the fresh Game.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot record a result for a cancelled game.")
         hs, as_ = self._require_score(home_score), self._require_score(away_score)
@@ -10814,12 +10861,10 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #201 — re-fetch under the Season lock; a concurrent cancel_game commits
-        # under the same lock, so the cancelled gate must see the fresh Game.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #201 — the guard re-fetches under the Season lock it takes; a
+        # concurrent cancel_game commits under the same lock, so the cancelled
+        # gate must see the fresh Game.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot approve a result for a cancelled game.")
         result = self.store.result_for_game(game_id)
@@ -11621,14 +11666,11 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch under the Season lock; a concurrent publish_game/
-        # move_game commits under the same lock, so decide draft-eligibility and
-        # release the slot from the FRESH row (never delete a just-published game
-        # or free the wrong old slot).
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches under the Season lock it takes; a
+        # concurrent publish_game/move_game commits under the same lock, so
+        # decide draft-eligibility and release the slot from the FRESH row
+        # (never delete a just-published game or free the wrong old slot).
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if not getattr(game, "is_draft", False) or game.published \
                 or game.cancelled \
                 or self.store.result_for_game(game_id) is not None:

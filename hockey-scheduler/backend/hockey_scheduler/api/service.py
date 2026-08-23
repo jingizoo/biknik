@@ -53,6 +53,7 @@ from ..domain.errors import (
     ScheduleConflictError,
     ValidationError,
 )
+from ..services import season_guard
 from ..services import visibility_policy
 from ..services import (
     ACTOR_TYPES,
@@ -4087,7 +4088,19 @@ class ApiService:
         """Per-player availability for a team in a game (#89), bucketed into
         available / unavailable / maybe / no_response, with counts. Private
         (player names) — callers are gated by the same #73 access check."""
-        game = self.roster._require_game(game_id)
+        return self._availability_summary_of(
+            self.roster._require_game(game_id), team_id)
+
+    def _availability_summary_of(self, game, team_id: str) -> dict:
+        """The summary computed off an ALREADY-RESOLVED Game row.
+
+        Split out of :meth:`get_availability_summary` for PR #427 so
+        :meth:`remind_unresponded` can compute its recipient list from the row
+        it holds under the canonical Season lock, rather than from a second,
+        earlier, unlocked read of the same Game. The read surface keeps its
+        exact previous behaviour: it passes the row its own locator produced.
+        """
+        game_id = game.id
         if team_id not in (game.home_team_id, game.away_team_id):
             raise ValidationError("That team is not playing in this game.")
         avail = {a.player_id: a
@@ -4111,25 +4124,62 @@ class ApiService:
         player-targeted AVAILABILITY_REMINDER per no-response player, so the
         reminder actually reaches them (delivery honors each player's channel
         preferences, #81). Returns the number of players reminded — a no-op
-        (emitting nothing) when everyone has already responded."""
-        summary = self.get_availability_summary(game_id, team_id)
-        if isinstance(summary, dict) and summary.get("error"):
-            return summary
-        unresponded = [p for p in summary["players"]
-                       if p["status"] == "no_response"]
-        _rg = self.store.get_game(game_id)
+        (emitting nothing) when everyone has already responded.
+
+        ONE TRANSACTION, AND THE GAME IS RE-FETCHED INSIDE IT (PR #427 ruling
+        4). Every read this method decides on — which Season authorizes it,
+        whether ``team_id`` is even playing in this Game, and WHO is
+        unresponded — now happens under the canonical Season row lock, and the
+        notifications are written in that same transaction.
+
+        THE HOLE THIS CLOSES. The previous shape called
+        ``get_availability_summary`` and ``store.get_game`` OUTSIDE the
+        transaction and then guarded the *stale* row: ``guard_game_season``
+        was handed an object read before any lock existed, so it resolved and
+        locked whatever Season that object's ``league_season_id`` named at
+        that moment. A concurrent writer that rebound the Game to another
+        competition in the window between — the same check/use gap the fifteen
+        RosterService mutation sites close by rebinding to the row the guard
+        returns — left this site locking a Season that no longer authorizes
+        the Game, and it then wrote reminders under it. The recipient list was
+        stale by the same window: players whose team assignment or availability
+        changed after the summary read were reminded (or missed) against a
+        world that had moved on.
+
+        The fix is the roster family's, reused rather than re-derived:
+        ``RosterService._guard_active_season`` locks the canonical Season,
+        re-fetches the Game under that lock, and re-runs the guard when the
+        fresh row's identity columns actually moved — so the row this method
+        goes on to use is the one the held lock actually authorizes. It is
+        deliberately the SAME helper the fifteen bound mutation sites call:
+        emitting a notification is a Season-owned write like any other, and a
+        second hand-written copy of this sequence is exactly what #427
+        collapsed."""
         with self.store.transaction():
-            # #159 — no reminders may be generated for an archived Season's
-            # Game; lock the Season and emit inside one transaction.
-            if _rg is not None and _rg.season_id:
-                self.setup._require_active_season(_rg.season_id)
+            # A LOCATOR read only — `_guard_active_season` returns the row
+            # re-fetched under the Season lock, and everything below uses that
+            # row. #159: no reminders may be generated for an archived
+            # Season's Game. PR #427: WHICH Season is the shared guard's
+            # answer, never `game.season_id` — this site carried the identical
+            # falsy-skip/wrong-row defect as the two service guard families,
+            # so a bound Game with a NULL or drifted `season_id` emitted
+            # reminders against an archived competition, having locked nothing.
+            game = self.roster._guard_active_season(
+                self.roster._require_game(game_id))
+            # Recipients determined from the LOCKED row, inside the same
+            # transaction that writes the notifications. Participation is
+            # re-checked here too: `team_id` must be playing in the Game as it
+            # stands under the lock, not as the caller's earlier read saw it.
+            summary = self._availability_summary_of(game, team_id)
+            unresponded = [p for p in summary["players"]
+                           if p["status"] == "no_response"]
             for p in unresponded:
                 _push_notification(
                     self.store, self.roster.clock,
                     NotificationKind.AVAILABILITY_REMINDER,
                     NotificationAudience.PLAYER, "Availability reminder",
                     "Please confirm your availability for this game.",
-                    audience_ref=p["player_id"], game_id=game_id)
+                    audience_ref=p["player_id"], game_id=game.id)
         return {"reminded": len(unresponded)}
 
     @catch
@@ -8000,9 +8050,42 @@ class ApiService:
     def _guard_active_seasons(self, season_ids) -> None:
         """Row-lock every distinct Season in canonical (sorted) order and
         guard it read-only (#159). Sorted order avoids lock-order deadlocks
-        across a multi-Season batch; MUST run inside a store.transaction()."""
+        across a multi-Season batch; MUST run inside a store.transaction().
+
+        Takes SEASON IDS, and callers holding GAMES must not derive them by
+        reading ``g.season_id`` — that is the denormalized column PR #427's
+        blocker is about, and this helper's ``if s`` filter would silently drop
+        a bound Game whose copy of it is NULL, leaving that Game's archived
+        competition unguarded for the whole batch. Use
+        :meth:`_guard_active_game_seasons` instead."""
         for sid in sorted({s for s in season_ids if s}):
             self.setup._require_active_season(sid)
+
+    def _guard_active_game_seasons(self, games) -> None:
+        """The GAME-shaped form of :meth:`_guard_active_seasons` (PR #427).
+
+        Same contract — every distinct Season row-locked in canonical sorted
+        order, read-only guarded, inside the caller's transaction — but the
+        Season each Game is judged against is the one its LEAGUESEASON names,
+        resolved through the single shared
+        :func:`season_guard.guard_game_season`, so a batch cannot reach a
+        conclusion the equivalent single-Game path would refuse.
+
+        Two passes, and the split is load-bearing. Pass one only RESOLVES each
+        Game's authorizing Season (a plain read) so the distinct ids can be
+        locked in sorted order — the deadlock-avoidance property this helper
+        exists for, which per-Game guarding in arrival order would lose. Pass
+        two then runs the full guard per Game: its ``FOR UPDATE`` is an
+        idempotent re-lock of a row this transaction already holds, and it is
+        where the archive state and the ``game.season_id`` comparison are
+        actually decided — under the lock, never off pass one's read."""
+        games = [g for g in games if g is not None]
+        planned = {season_guard.game_season_authority_id(self.store, g)
+                   for g in games}
+        for sid in sorted(s for s in planned if s):
+            self.setup._require_active_season(sid)
+        for game in sorted(games, key=lambda g: g.id):
+            season_guard.guard_game_season(self.store, game)
 
     @catch
     def commit_draft_schedule(self, division_id: str = None,
@@ -8993,12 +9076,14 @@ class ApiService:
            Seasons of unauthorized candidates would run
            `_require_active_season` against a foreign Season and turn its
            `season_read_only` refusal into an existence oracle;
-        3. the **Season** rows named by that plan (`_guard_active_seasons`,
-           sorted);
+        3. the **Season** rows named by that plan
+           (`_guard_active_game_seasons`, sorted) -- each Game judged against
+           the Season its LeagueSeason names, never against its own
+           denormalized `season_id` column (PR #427);
         4. the **Game** rows (`get_game_for_update`, sorted).
 
         Season BEFORE Game is load-bearing. An earlier revision locked Games
-        first and left `_guard_active_seasons` to the callers afterwards, which
+        first and left the Season guard to the callers afterwards, which
         reversed the order every single-Game path already uses:
         `SetupService.publish_game` and `delete_game` lock the Season through
         `_guard_game_season` and only then touch the Game. A batch discard and
@@ -9048,7 +9133,7 @@ class ApiService:
             # the identity-less path (caught by
             # `test_season_lifecycle...test_reminders_and_draft_batches_blocked`).
             legacy = self._select_draft_targets(drafts, game_ids, all_drafts)
-            self._guard_active_seasons([g.season_id for g in legacy])
+            self._guard_active_game_seasons(legacy)
             return legacy
         # -- step 2: the pre-lock locator, authorized before anything is
         # locked. Selection applies first so an explicit id list plans only
@@ -9056,14 +9141,34 @@ class ApiService:
         planned = [g for g in self._select_draft_targets(
             drafts, game_ids, all_drafts)
             if self._game_in_active_tuple(g, program, season, league)]
-        planned_seasons = {g.season_id for g in planned if g.season_id}
-        # Each planned Game's EXACT Season, kept per row rather than as a set:
-        # a set only answers "is this Season one we locked", which a row that
-        # moved between two Seasons the batch happens to hold would pass.
-        planned_season_of = {g.id: g.season_id for g in planned}
+        # Each planned Game's EXACT identity pair, kept per row rather than as
+        # a set: a set only answers "is this Season one we locked", which a row
+        # that moved between two Seasons the batch happens to hold would pass.
+        # This snapshot answers the DRIFT question below ("did this row move
+        # between the locator read and the lock"); it is NOT the authority for
+        # which Season to guard — see step 3.
+        #
+        # PR #427: BOTH columns are snapshotted, not `season_id` alone.
+        # `league_season_id` is now the column the authority is keyed on —
+        # `season_guard.guard_game_season` resolves the LeagueSeason and locks
+        # the Season IT names — so a rebinding that moves `league_season_id`
+        # to a different competition moves the authorizing Season with it,
+        # and a `season_id`-only comparison cannot see that at all. The two
+        # columns are also independently writable (`games.league_season_id`
+        # and `games.season_id` are both nullable TEXT with no FK and no
+        # CHECK), so the pair is the identity that has to hold still, not
+        # either half of it.
+        planned_identity_of = {
+            g.id: (g.league_season_id, g.season_id) for g in planned}
 
-        # -- step 3: SEASONS first, sorted, matching every other path.
-        self._guard_active_seasons(planned_seasons)
+        # -- step 3: SEASONS first, sorted, matching every other path. PR #427:
+        # the Season each Game is guarded against is the one its LeagueSeason
+        # names, so this passes the GAMES and lets the shared guard resolve
+        # them. Passing `{g.season_id …}` was the batch's copy of the blocker's
+        # defect: a planned draft whose denormalized column was NULL dropped
+        # out of the set entirely and its archived competition went unguarded
+        # for the whole batch, and a drifted one locked a sibling Season.
+        self._guard_active_game_seasons(planned)
 
         # -- step 4: then the Games, sorted, so two concurrent batches take
         # them in one global order and cannot deadlock against each other.
@@ -9074,15 +9179,28 @@ class ApiService:
             # stand under the lock, never as the pre-lock scan saw them.
             if locked is None or not locked.is_draft:
                 continue
-            # The Season comparison runs HERE -- immediately after the lock and
-            # BEFORE authorization. Authorization would otherwise drop the
+            # The IDENTITY comparison runs HERE -- immediately after the lock
+            # and BEFORE authorization. Authorization would otherwise drop the
             # changed row silently: a Game whose Season moved while its other
             # parents still name the old one has a DISAGREEING parent graph, so
             # `_game_in_active_tuple` answers False and `continue`s, and this
             # raise is never reached. The batch would then carry on writing to
             # ice this transaction never locked, and the drift would look
-            # exactly like an ordinary out-of-tuple row.
-            if locked.season_id != planned_season_of[game_id]:
+            # exactly like an ordinary out-of-tuple row. That ordering is the
+            # whole point of this line's position and must not be moved below
+            # the authorization filter.
+            #
+            # PR #427: EITHER column drifting is the race. A rebinding that
+            # changes `league_season_id` while leaving `season_id` alone is
+            # invisible to a `season_id`-only comparison, yet it moves the
+            # authorizing Season — step 3 locked the Season the OLD binding
+            # named, so the batch would go on to write this row under a lock
+            # it does not hold for the row's current competition. Raising
+            # `placement_raced` rolls the whole attempt back; the retry
+            # re-plans from the committed rows, and step 3 then locks the
+            # Season the NEW binding names.
+            if ((locked.league_season_id, locked.season_id)
+                    != planned_identity_of[game_id]):
                 raise ConcurrencyConflictError(
                     "A draft game's season changed while processing the "
                     "request; please retry.",

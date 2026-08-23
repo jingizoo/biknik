@@ -21,6 +21,7 @@ the new Program/Season *projection* on top of that canonical identity.
 
 from ..domain import GameType, Role
 from . import scope_bridge
+from . import season_guard
 from .league_scope import (
     exact_league_season_or_conflict, exact_registration_or_conflict)
 from .subject_scope import own_team_id as _own_team_id
@@ -174,7 +175,7 @@ def _official_league_ids(store, official_id):
         # assignment to one grants no League view.
         if (game.game_type or GameType.REGULAR.value) != GameType.REGULAR.value:
             continue
-        if not game.league_season_id:
+        if not season_guard.game_is_league_season_bound(game):
             continue
         ls = store.get_league_season(game.league_season_id)
         if ls is None:
@@ -182,7 +183,18 @@ def _official_league_ids(store, official_id):
         # The binding must agree with the Game's own columns. They cannot drift
         # through any supported write path, so disagreement means corrupted or
         # legacy data -- fail closed rather than trust either side.
-        if game.season_id and ls.season_id != game.season_id:
+        #
+        # PR #427: the Season comparison is UNCONDITIONAL, and the League one
+        # stays as it was. The `game.season_id and` prefix it used to carry was
+        # the same falsy-skip the two write guards carried: a bound Game with a
+        # NULL `season_id` skipped the check entirely and the Official was
+        # granted the League anyway -- widening a scoped role's visibility off a
+        # Game whose identity does not hold together, which is precisely what
+        # this module exists to prevent. `games.season_id` is nullable with no
+        # FK and no CHECK, so NULL is the reachable corrupted shape, not an
+        # exemption. Same reasoning as #331 review round 24 applied to
+        # `league_id` one line down.
+        if ls.season_id != game.season_id:
             continue
         if game.league_id and ls.league_id != game.league_id:
             continue

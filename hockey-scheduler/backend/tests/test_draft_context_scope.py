@@ -3071,5 +3071,157 @@ class DraftActiveTupleHttpTest(unittest.TestCase):
         self.assertEqual((status, payload), (200, {"discarded": 6}))
 
 
+class DraftBatchLeagueSeasonDriftTest(unittest.TestCase):
+    """PR #427 ruling 5 — the batch's post-lock re-verify compares the WHOLE
+    identity ``(league_season_id, season_id)``, not ``season_id`` alone.
+
+    WHY THE OTHER HALF WAS NOT ENOUGH. Since #427 the Season a Game is guarded
+    against is the one its LeagueSeason names —
+    ``season_guard.guard_game_season`` resolves ``game.league_season_id`` and
+    locks the Season IT points at. Step 3 of ``_locked_draft_targets`` takes
+    those Season locks from the PRE-LOCK plan. So a rebinding that moves
+    ``league_season_id`` moves the authorizing Season with it, and a
+    ``season_id``-only comparison cannot see that at all: the two columns are
+    independently writable (both nullable TEXT, no FK, no CHECK), and the
+    sharpest case leaves ``season_id`` byte-identical.
+
+    THE ORDERING IS THE POINT, and it is why this cannot be left to
+    authorization. ``_game_in_active_tuple`` resolves ``league_season_id`` as
+    its own Season and League ends and returns NO edge when two parents
+    disagree — so a row whose binding drifted answers False and is silently
+    ``continue``d. The batch would then report a perfectly ordinary partial
+    result while the row it dropped had, for the duration, an authorizing
+    Season this transaction never locked. Both cases below are demonstrated
+    to be exactly that shape: without the raise the batch publishes FIVE and
+    nobody is told why.
+
+    THE INJECTION is the copy-drift `test_a_locked_game_whose_season_left_the_
+    plan_restarts_the_unit` established here, for the reason stated there: the
+    batch runs SERIALIZABLE on PostgreSQL, so its plan and its locked re-read
+    come from one snapshot and cannot disagree on their own. FIRST ATTEMPT
+    ONLY, so the retry meets the real rows and the unit completes — which is
+    what makes "the first attempt rolled back completely" assertable as an
+    exact audit count rather than a vague absence.
+    """
+
+    maxDiff = None
+
+    # (case, corner the drifted binding is taken from). The first keeps
+    # `season_id` IDENTICAL -- invisible to the old comparison by
+    # construction. The second moves the authorizing Season to one step 3
+    # never locked, which is the concrete harm.
+    DRIFT_CASES = (("sibling_league_same_season", ("A", "1", "b")),
+                   ("sibling_season", ("A", "2", "a")))
+
+    def test_a_league_season_rebinding_under_the_lock_restarts_the_unit(self):
+        for label, store in _backends():
+            for case, target in self.DRIFT_CASES:
+                with self.subTest(store=label, case=case):
+                    try:
+                        self._one_drift(store, case, target)
+                    finally:
+                        store.clear_all_data()
+            _close(store)
+
+    def _one_drift(self, store, case, target):
+        api = ApiService(store)
+        fixture = build_two_programs(api)
+        pa, sa, la, da = corner(fixture, "A", "1", "a")
+        _tp, ts, tl, _td = corner(fixture, *target)
+        _ok(api.set_active_context(ADMIN, Role.LEAGUE_ADMIN, {}, pa, sa, la),
+            "set_active_context")
+        preview = _ok(api.draft_season_schedule(
+            division_id=da, user_id=ADMIN, role=Role.LEAGUE_ADMIN, scope={}))
+        committed = [row["game_id"] for row in _ok(api.commit_draft_schedule(
+            division_id=da, draft_fingerprint=preview["draft_fingerprint"],
+            actor_id=ADMIN, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
+            scope={}), "seed commit")["created"]]
+        self.assertEqual(len(committed), 6)
+
+        other_ls = store.league_season_for(tl, ts)
+        self.assertIsNotNone(other_ls)
+        moved = committed[-1]
+        original = store.get_game(moved)
+        # THE PRECONDITIONS that make each case what it claims to be.
+        self.assertNotEqual(other_ls.id, original.league_season_id)
+        if case == "sibling_league_same_season":
+            # `season_id` is UNTOUCHED, so the old comparison is blind here.
+            self.assertEqual(other_ls.season_id, original.season_id)
+        else:
+            # The authority moves to a Season step 3 never planned a lock for.
+            self.assertNotEqual(other_ls.season_id, original.season_id)
+
+        attempts = {"count": 0}
+        plain_resolve = api.context.resolve_with_league
+
+        def counting_resolve(*args, **kwargs):
+            attempts["count"] += 1
+            return plain_resolve(*args, **kwargs)
+
+        api.context.resolve_with_league = counting_resolve
+        self.addCleanup(setattr, api.context, "resolve_with_league",
+                        plain_resolve)
+
+        locked_seasons = []
+        plain_season_lock = store.get_season_for_update
+
+        def recording_season_lock(season_id):
+            locked_seasons.append((attempts["count"], season_id))
+            return plain_season_lock(season_id)
+
+        store.get_season_for_update = recording_season_lock
+        original_lock = store.get_game_for_update
+
+        def rebound_on_the_first_attempt(game_id):
+            locked = original_lock(game_id)
+            if attempts["count"] == 1 and locked is not None \
+                    and locked.id == moved:
+                drifted = copy.copy(locked)
+                drifted.league_season_id = other_ls.id
+                return drifted
+            return locked
+
+        store.get_game_for_update = rebound_on_the_first_attempt
+        audit_before = len(store.all_setup_audit())
+        try:
+            result = api.publish_draft_games(
+                game_ids=list(committed), actor_id=ADMIN, user_id=ADMIN,
+                role=Role.LEAGUE_ADMIN, scope={})
+        finally:
+            store.get_game_for_update = original_lock
+            store.get_season_for_update = plain_season_lock
+
+        # THE assertion. Without the `league_season_id` half of the
+        # comparison the drifted row is dropped by `_game_in_active_tuple`
+        # instead -- one attempt, five published, no raise, no retry.
+        self.assertEqual(
+            attempts["count"], 2,
+            "the locked Game named a LeagueSeason the plan never resolved "
+            "and the batch carried on regardless -- the identity comparison "
+            "must run BEFORE authorization, which otherwise drops the "
+            "rebound row silently, and either drift must restart the unit")
+        # The authorizing Season the drifted binding named was NOT among the
+        # locks the aborted attempt held -- which is exactly why continuing
+        # would have written under a lock this transaction did not hold.
+        if case == "sibling_season":
+            self.assertNotIn(
+                (1, other_ls.season_id), locked_seasons,
+                "step 3 locked the drifted row's NEW authorizing Season, "
+                "which the pre-lock plan could not have known about")
+        # The retry re-planned from the committed rows and completed.
+        _ok(result, "publish_draft_games")
+        self.assertEqual(result["published"], 6, result)
+        self.assertEqual(
+            {g.id for g in store.all_games() if g.published}, set(committed))
+        # COMPLETE ROLLBACK: only the successful attempt's six publishes are
+        # audited. A partially-applied first attempt would show more.
+        self.assertEqual(
+            len(store.all_setup_audit()) - audit_before, 6,
+            "the abandoned attempt left audit rows behind")
+        # And the row's real binding was never rewritten by the injection.
+        self.assertEqual(store.get_game(moved).league_season_id,
+                         original.league_season_id)
+
+
 if __name__ == "__main__":
     unittest.main()
