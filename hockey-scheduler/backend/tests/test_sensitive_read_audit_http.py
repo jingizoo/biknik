@@ -21,6 +21,8 @@ request" checkpoint rather than wiping the store between cases — a wipe
 every login in this file depends on.
 """
 
+import email.message
+import io
 import json
 import os
 import tempfile
@@ -162,9 +164,18 @@ class SensitiveReadHttpContract:
         <HTTPError ...>`` warnings from a single test method, invisible to
         plain ``python3 -m unittest`` because the warning fires from a
         ``__del__`` at garbage-collection time, well after the test already
-        recorded "ok" — see test_resource_warning_leak.py for the permanent
-        regression that actually catches this class of leak, which trusting
-        the process exit code cannot.
+        recorded "ok".
+
+        WHAT KEEPS THE ``with e:`` HERE, on every interpreter:
+        :class:`HttpErrorBranchClosesOnEveryReturnPath` at the bottom of this
+        file. It injects an ``HTTPError`` that RECORDS its own ``close()``
+        and drives THIS method's error branch through all four of that
+        branch's exits, so removing the ``with e:`` — or narrowing it to one
+        status code — fails. That regression does not depend on
+        ``ResourceWarning``, which is what makes it work on CI's 3.11, where
+        an abandoned ``HTTPError`` warns about nothing at all;
+        test_resource_warning_leak.py covers the ResourceWarning-visible half
+        and documents exactly which interpreters can see it.
         """
         url = f"http://127.0.0.1:{self.port}{path}"
         data = json.dumps(body).encode() if body is not None else None
@@ -623,6 +634,224 @@ class PostgresSensitiveReadHttpTest(SensitiveReadHttpContract, unittest.TestCase
         store.clear_all_data()
         super().setUp()
 
+
+# ======================================================================
+# THE TARGETED CLOSE REGRESSION FOR _req()'s ERROR BRANCH
+# ======================================================================
+# OWNER RULING, PR #427, 2026-08-22: "#427 must retain the smallest
+# targeted close-tracking regression around the real
+# SensitiveReadHttpContract._req(). Replace the negative 'scanner is
+# absent' importability test: it does not protect _req() and makes #427
+# fail if #433 lands first. Under Python 3.11, injecting an HTTPError
+# that records close() must prove that the actual error branch closes on
+# every return path; removing or conditionalizing `with e:` must fail."
+#
+# WHY NOT ResourceWarning. test_resource_warning_leak.py's HTTPError half
+# is a NO-OP on the interpreter that gates this repository: an abandoned
+# HTTPError emits no ResourceWarning of any kind on 3.11 or 3.12 (it does
+# on 3.14). Watching the garbage collector therefore cannot protect this
+# branch where it most needs protecting. CLOSING IS AN OBSERVABLE ACT,
+# not a garbage-collection side effect, so this observes the act: an
+# HTTPError that RECORDS ITS OWN close() calls, driven through the real
+# _req(), asserted directly. That works identically on every interpreter,
+# which is the whole point.
+#
+# WHY THIS IS NOT THE REPOSITORY-WIDE GUARD. It protects _req() and
+# nothing else. A NEW `except urllib.error.HTTPError as e:` somewhere
+# else in the tree that never closes what it binds is still caught by
+# nothing on an interpreter that cannot warn. That guard is
+# jingizoo/biknik#433, and it has not landed.
+#
+# THE ERROR BRANCH'S EXITS, enumerated from the code rather than assumed
+# (see _req above -- `with e:` / `raw = e.read()` /
+# `return e.code, (json.loads(raw) if raw else {}), dict(e.headers)`):
+#
+#   R1  empty body            -> RETURNS (code, {}, headers)
+#   R2  non-empty JSON body   -> RETURNS (code, parsed, headers)
+#   R3  non-empty NON-JSON    -> json.loads raises; branch exits by
+#                                EXCEPTION, mid-`with`
+#   R4  e.read() itself fails -> branch exits by EXCEPTION before the
+#                                return expression is even built
+#
+# Two of the four are exception exits, which is exactly where a hand-
+# rolled `e.close()` before the `return` would silently miss -- so
+# "every return path" is enforced by covering all four, each across
+# SEVERAL DISTINCT STATUS CODES so a `with e:` made conditional on one
+# code cannot pass either.
+
+
+class _ExplodingBody(io.BytesIO):
+    """A response body whose ``read()`` fails, for exit R4."""
+
+    def read(self, *args, **kwargs):
+        raise OSError("body stream failed mid-read")
+
+
+class _CloseRecordingHTTPError(urllib.error.HTTPError):
+    """A REAL ``urllib.error.HTTPError`` that records its own ``close()``.
+
+    A subclass rather than a mock, because what is under test is whether
+    the real branch invokes the real protocol: ``HTTPError`` IS an
+    ``addinfourl``/``addbase``, ``with e:`` calls ``addbase.__exit__``,
+    and ``__exit__`` calls ``self.close()`` -- so an override here sees
+    exactly the call the fix is supposed to make, and ``super().close()``
+    still performs the real close (asserted through ``fp.closed``, so a
+    recorded call that closed nothing would not pass).
+
+    THE TEST HOLDS A REFERENCE to every instance it builds, so nothing
+    here can be closed by the garbage collector part-way through: a
+    recorded close is a close the branch made.
+    """
+
+    def __init__(self, code, body=b"", fp=None):
+        self.closes = []
+        headers = email.message.Message()
+        headers["Content-Type"] = "application/json"
+        headers["X-Close-Probe"] = f"code-{code}"
+        super().__init__(f"http://127.0.0.1/close-probe/{code}", code,
+                         "Close Probe", headers,
+                         io.BytesIO(body) if fp is None else fp)
+
+    def close(self):
+        self.closes.append(self.code)
+        super().close()
+
+
+class _RaisingOpener:
+    """The injection point: stands where ``urllib.request.build_opener()``
+    normally stands and raises the prepared error out of ``open()``.
+
+    ``_req`` takes its opener as a parameter, so this drives the REAL
+    method -- its Request construction, its ``try``, its ``except
+    urllib.error.HTTPError as e:`` branch -- with no server, no socket
+    and no interpreter-dependent timing. Records the Request it was
+    handed so the test can prove ``_req`` really got that far.
+    """
+
+    def __init__(self, error):
+        self.error = error
+        self.requests = []
+
+    def open(self, req, *args, **kwargs):
+        self.requests.append(req)
+        raise self.error
+
+
+class _ReqOnly:
+    """The smallest object ``_req`` needs: it reads ``self.port`` and
+    nothing else. Bound to the REAL function below (asserted), so no
+    fixture server has to be started to exercise the error branch."""
+
+    port = 65535
+
+
+# The status codes this file's own matrix provokes, plus a 500. Several
+# codes, deliberately: a `with e:` narrowed to one status ("close only
+# for 403") would still pass a single-code test.
+CLOSE_PROBE_CODES = (401, 403, 405, 500)
+
+
+class HttpErrorBranchClosesOnEveryReturnPath(unittest.TestCase):
+    """The #427 targeted regression for ``_req()``'s ``except`` branch.
+
+    Interpreter-independent by construction: it never consults
+    ``ResourceWarning``, never starts a server and never waits for a GC
+    pass. Verified on CPython 3.12 (the closest available proxy for CI's
+    3.11 -- neither warns for an abandoned HTTPError) and on 3.14.
+    """
+
+    def _drive(self, err):
+        """Run the REAL ``_req`` against a prepared error and return
+        whatever it produced."""
+        opener = _RaisingOpener(err)
+        result = SensitiveReadHttpContract._req(
+            _ReqOnly(), "GET", "/api/notifications/contacts", opener=opener)
+        # _req really reached the opener, i.e. the branch under test is
+        # the one that ran.
+        self.assertEqual(len(opener.requests), 1)
+        self.assertEqual(
+            opener.requests[0].full_url,
+            f"http://127.0.0.1:{_ReqOnly.port}/api/notifications/contacts")
+        return result
+
+    def test_the_function_under_test_is_the_one_the_file_uses(self):
+        """Anti-vacuity: this class calls ``_req`` unbound, so it must be
+        the very function every test class in this file inherits. If a
+        subclass ever overrode it, this regression would be protecting
+        something nothing uses."""
+        for cls in (MemorySensitiveReadHttpTest, SqliteSensitiveReadHttpTest,
+                    PostgresSensitiveReadHttpTest):
+            self.assertIs(cls._req, SensitiveReadHttpContract._req, cls)
+
+    def test_r1_empty_body_return_path_closes(self):
+        for code in CLOSE_PROBE_CODES:
+            with self.subTest(code=code, path="R1 empty body"):
+                err = _CloseRecordingHTTPError(code, b"")
+                status, body, headers = self._drive(err)
+                self.assertEqual(status, code)
+                self.assertEqual(body, {})
+                self.assertEqual(headers["X-Close-Probe"], f"code-{code}")
+                self._assert_closed(err, code)
+
+    def test_r2_json_body_return_path_closes(self):
+        for code in CLOSE_PROBE_CODES:
+            with self.subTest(code=code, path="R2 json body"):
+                err = _CloseRecordingHTTPError(
+                    code, b'{"error": "denied", "code": %d}' % code)
+                status, body, _headers = self._drive(err)
+                self.assertEqual(status, code)
+                self.assertEqual(body, {"error": "denied", "code": code})
+                self._assert_closed(err, code)
+
+    def test_r3_undecodable_body_exception_exit_closes(self):
+        """The branch can leave through ``json.loads`` raising, which is
+        NOT a return -- and is precisely where a hand-rolled
+        ``e.close()`` placed before the ``return`` would be skipped."""
+        for code in CLOSE_PROBE_CODES:
+            with self.subTest(code=code, path="R3 undecodable body"):
+                err = _CloseRecordingHTTPError(code, b"<html>nope</html>")
+                with self.assertRaises(json.JSONDecodeError):
+                    self._drive(err)
+                self._assert_closed(err, code)
+
+    def test_r4_failing_read_exception_exit_closes(self):
+        """The earliest exit of all: ``e.read()`` itself raises, before
+        the return expression is even built."""
+        for code in CLOSE_PROBE_CODES:
+            with self.subTest(code=code, path="R4 failing read"):
+                err = _CloseRecordingHTTPError(
+                    code, fp=_ExplodingBody(b"never read"))
+                with self.assertRaises(OSError):
+                    self._drive(err)
+                self._assert_closed(err, code)
+
+    def test_every_enumerated_exit_is_covered_by_a_test(self):
+        """The enumeration in this section's header is a claim about
+        ``_req``'s source; this keeps the claim and the coverage tied
+        together, so an exit added to the branch is noticed."""
+        covered = set()
+        for name in dir(self):
+            if not name.startswith("test_r"):
+                continue
+            tag = name.split("_")[1]
+            if len(tag) == 2 and tag[0] == "r" and tag[1].isdigit():
+                covered.add(tag)
+        self.assertEqual(covered, {"r1", "r2", "r3", "r4"}, sorted(covered))
+
+    def _assert_closed(self, err, code):
+        # RECORDED: the branch called close() -- exactly once, on the way
+        # out, whatever way it went out.
+        self.assertEqual(
+            err.closes, [code],
+            f"_req()'s HTTPError branch did not close the {code} response "
+            f"exactly once (recorded closes: {err.closes}). The `with e:` "
+            f"in _req's `except urllib.error.HTTPError as e:` branch is "
+            f"what closes it; removing it, or making it conditional on a "
+            f"status code, leaves the response body open on this path. "
+            f"This is NOT caught by ResourceWarning on CI's interpreter "
+            f"-- see test_resource_warning_leak.py's docstring.")
+        # ...and the close was REAL, not merely recorded.
+        self.assertTrue(err.fp.closed, code)
 
 if __name__ == "__main__":
     unittest.main()

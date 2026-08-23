@@ -86,21 +86,28 @@ a skip -- A SKIP IS NOT A PASS -- so:
   the deliberate-leak fixture really executed, asserts what is TRUE there, and
   prints a loud banner naming the interpreter and saying this half is
   unenforceable by ResourceWarning (:func:`_announce_unenforceable`);
-* AND THERE IS NO REPLACEMENT PROTECTION IN THE TREE. On an interpreter that
-  cannot warn for an abandoned ``HTTPError`` -- which includes the 3.11 that
-  gates this repository -- THIS HALF OF THE CONTRACT IS CURRENTLY
-  UNPROTECTED. Nothing here or anywhere else in the suite would fail the
-  build on a new ``except urllib.error.HTTPError as e:`` that never closes
-  what it binds.
+* ONE HANDLER IS PROTECTED VERSION-INDEPENDENTLY; THE TREE IS NOT.
+  ``test_sensitive_read_audit_http.HttpErrorBranchClosesOnEveryReturnPath``
+  (added in #427 on the owner's ruling) injects an ``HTTPError`` that RECORDS
+  ITS OWN ``close()`` into the real ``SensitiveReadHttpContract._req()`` and
+  asserts the ``except urllib.error.HTTPError as e:`` branch closes on all
+  FOUR of that branch's exits -- empty body, JSON body, undecodable body
+  (``json.loads`` raising), and a failing ``read()`` -- across several status
+  codes, so a ``with e:`` that is removed OR narrowed to one code fails.
+  Closing is an OBSERVABLE ACT rather than a garbage-collection side effect,
+  so that regression holds on every interpreter, 3.11 included.
 
-  A version-independent guard is possible -- an unclosed ``HTTPError`` is a
-  property of the SOURCE, so it can be checked by parsing the source rather
-  than by watching the garbage collector -- and one was written and measured
-  during this review. It is NOT here: the owner ruled (PR #427, 2026-08-22)
-  that a repository-wide scanner plus its ledger is its own change, and moved
-  it to **jingizoo/biknik#433**. Until #433 lands, the sentence above is the
-  whole truth about CI, and this file deliberately says so rather than
-  pointing at a guard that no longer exists.
+  IT PROTECTS ``_req()`` AND NOTHING ELSE. A NEW ``except
+  urllib.error.HTTPError as e:`` anywhere else in this repository that never
+  closes what it binds is still caught by nothing on an interpreter that
+  cannot warn. A version-independent REPOSITORY-WIDE guard is possible -- an
+  unclosed ``HTTPError`` is a property of the SOURCE, so it can be checked by
+  parsing the source rather than by watching the garbage collector -- and one
+  was written and measured during this review. It is NOT here: the owner
+  ruled (PR #427, 2026-08-22) that a repository-wide scanner plus its ledger
+  is its own change, and moved it to **jingizoo/biknik#433**. Until #433
+  lands, that gap is the whole truth about CI, and this file deliberately
+  says so rather than pointing at a guard that does not exist.
 
 The psycopg half is unaffected -- psycopg emits its own "connection was
 deleted while still open" ``ResourceWarning`` on every interpreter measured
@@ -213,12 +220,17 @@ def _announce_unenforceable(label):
     Do not "fix" that by making this fail, and do not read the notice as the
     protection. It is a marker for someone running this file directly.
 
-    AND NOTHING ELSE IN THE TREE PROTECTS CI EITHER. A version-independent
-    source guard was written and measured during the #427 review, and the
-    owner moved it out to jingizoo/biknik#433 as its own change (PR #427,
-    2026-08-22). Until #433 lands, an interpreter that cannot warn has NO
-    check on unclosed HTTPError handlers at all. This notice says exactly
-    that; it must not be edited back into naming a guard that is not here.
+    ONE HANDLER IS PROTECTED ANYWAY, AND ONLY ONE.
+    ``test_sensitive_read_audit_http.HttpErrorBranchClosesOnEveryReturnPath``
+    proves ``_req()``'s own error branch closes on every one of its exits, by
+    RECORDING close() on an injected HTTPError rather than by watching the
+    garbage collector -- so that one handler is covered on this interpreter
+    too. Nothing generalises it: any OTHER unclosed ``except
+    urllib.error.HTTPError as e:`` in the tree is still caught by nothing
+    here. The repository-wide source guard was written and measured during
+    the #427 review, and the owner moved it out to jingizoo/biknik#433 as its
+    own change (PR #427, 2026-08-22); it has not landed. This notice says
+    exactly that, and must not be edited into claiming either more or less.
 
     The alternative -- ``skipTest`` -- would report the case as "skipped" and
     let a reader conclude the contract was checked. It was not, and this says
@@ -232,10 +244,14 @@ def _announce_unenforceable(label):
         "\n!! this interpreter, so the ResourceWarning probe CANNOT catch the"
         "\n!! #426 leak here. The case below still runs and asserts what IS"
         "\n!! true here, but it is NOT proving the leak would be detected."
-        "\n!! THERE IS NO REPLACEMENT GUARD IN THE TREE: on this interpreter"
-        "\n!! -- and on CI's 3.11 -- THIS HALF OF THE CONTRACT IS CURRENTLY"
-        "\n!! UNPROTECTED. A version-independent source guard is tracked in"
-        "\n!! jingizoo/biknik#433 and has not landed."
+        "\n!! ONE handler is protected anyway, and only one: test_sensitive_"
+        "\n!! read_audit_http.HttpErrorBranchClosesOnEveryReturnPath records"
+        "\n!! close() on an injected HTTPError driven through the real _req(),"
+        "\n!! so _req()'s own error branch IS covered on this interpreter."
+        "\n!! NOTHING GENERALISES IT: any OTHER unclosed HTTPError handler in"
+        "\n!! the tree is caught by nothing here or on CI's 3.11. The"
+        "\n!! repository-wide source guard is tracked in jingizoo/biknik#433"
+        "\n!! and has not landed."
         "\n" + "!" * 74,
         file=sys.stderr, flush=True)
 
@@ -855,53 +871,28 @@ class LeakProbeRegressionTest(unittest.TestCase):
         self.assertIn("resourcewarning", message)
         self.assertIn("exception ignored", message)
 
-    def test_the_unenforceable_half_has_no_replacement_guard_in_the_tree(self):
-        """THE GAP, asserted as a fact rather than described in prose.
-
-        This test used to be ``test_the_unenforceable_half_is_covered_by_the_
-        source_guard``: it fed this file's own deliberate-leak fixture to a
-        repository-wide source scanner and proved the scanner reported it, so
-        the handover from "the runtime probe cannot see this on 3.11" to
-        "something else does" could not silently lapse.
-
-        The owner removed the scanner from PR #427 (2026-08-22): "Extract the
-        repository-wide HTTPError scanner and 115-entry ledger into a separate
-        issue and PR. Keep only the smallest targeted leak regression needed
-        for #427." That work is jingizoo/biknik#433.
-
-        So the handover has no destination right now, and pretending otherwise
-        is the one outcome this file exists to prevent. What is asserted here
-        is the truth: the guard modules are NOT importable, i.e. there is no
-        version-independent protection in the tree, and on an interpreter that
-        cannot warn (CI's 3.11) an unclosed ``HTTPError`` handler would be
-        caught by nothing at all.
-
-        THIS TEST IS THE TRIPWIRE FOR #433. When the guard lands, this fails
-        -- and the correct fix is to restore the handover assertions above
-        (they are preserved verbatim in this branch's history at 8a411b7 and
-        in #433), not to delete this test. Until then it is what stops the
-        docstrings and the banner from drifting back into claiming a
-        protection that is not here.
-        """
-        import importlib.util
-        for name in ("httperror_close_check", "test_httperror_close_guard"):
-            self.assertIsNone(
-                importlib.util.find_spec(name),
-                f"{name} is importable again -- the version-independent "
-                f"HTTPError source guard appears to have landed. Restore the "
-                f"handover assertions this test replaced (see #433) instead "
-                f"of leaving this tripwire red, and correct this module's "
-                f"docstring and _announce_unenforceable's banner, which both "
-                f"currently state -- correctly, as of PR #427 -- that CI's "
-                f"3.11 has NO protection for this half of the contract.")
-
-        # ...and the fixture the handover used is still here and still
-        # leaking, so restoring the handover is a matter of re-adding the
-        # assertions, not of reconstructing what they ran against.
-        source = textwrap.dedent(_HTTP_ERROR_LEAK_SOURCE)
-        self.assertIn("except urllib.error.HTTPError as e:", source)
-        self.assertIn("e.read()  # read it, then drop it WITHOUT the "
-                      "`with e:` fix", source)
+    # REMOVED in #427: test_the_unenforceable_half_has_no_replacement_guard_
+    # in_the_tree. It asserted that "httperror_close_check"/"test_httperror_
+    # close_guard" were NOT importable, as a tripwire for jingizoo/biknik#433.
+    # The owner removed it (PR #427, 2026-08-22): "Replace the negative
+    # 'scanner is absent' importability test: it does not protect _req(), and
+    # it makes #427 fail if #433 lands first." Both are true -- a test that
+    # goes RED when the guard it is waiting for finally arrives is a trap for
+    # whoever lands #433, and proving a module is absent proves nothing about
+    # whether _req() closes anything.
+    #
+    # WHAT REPLACED IT, and where: test_sensitive_read_audit_http.
+    # HttpErrorBranchClosesOnEveryReturnPath. It injects an HTTPError that
+    # RECORDS its own close() into the real SensitiveReadHttpContract._req()
+    # and asserts the error branch closes on all four of that branch's exits
+    # (empty body, JSON body, undecodable body, failing read) across several
+    # status codes. Closing is an observable act rather than a garbage-
+    # collection side effect, so that regression holds on every interpreter --
+    # including the 3.11 that gates this repository and cannot warn.
+    #
+    # It protects _req() and nothing else. The repository-wide guard is still
+    # jingizoo/biknik#433 and still has not landed, which is what this file's
+    # docstring and _announce_unenforceable's banner say.
 
     @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                          "PostgreSQL suite only (TEST_DATABASE_URL not set)")
