@@ -474,6 +474,17 @@ select.player-picker {
 .ps-bar.open span { background: var(--orange); }
 .ros-warn { background: #fff5e8; border: 1px solid #ffd9a8; border-radius: 10px;
   padding: 9px 12px; margin: 10px 0; font-size: 13px; color: #8a5a00; }
+/* The batch-seating partial-result / zero-seat warning (#427). Same block,
+   same palette; only the internal layout differs, because this one names
+   players and reasons as a list rather than a run-on sentence.
+   NO NEW BREAKPOINT: it is fluid, so 390px is covered by the existing 480px
+   rule below and by `overflow-wrap` — e2e/breakpoint-contract.js fails the
+   build for any width outside {480,720,880,1040}. */
+.ros-partial .rp-head { font-weight: 700; margin-bottom: 4px; }
+.ros-partial .rp-list { margin: 0; padding-left: 18px; }
+/* A long "Name — reason" pair must wrap inside the card, never widen the page
+   into a horizontal scroll on a 390px viewport. */
+.ros-partial .rp-list li { margin: 2px 0; overflow-wrap: anywhere; }
 .ros-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
 .ros-toolbar .act { flex: 1; }
 .avail-group { border-bottom: 1px solid var(--sep); }

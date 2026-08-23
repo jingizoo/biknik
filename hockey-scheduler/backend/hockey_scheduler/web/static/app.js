@@ -6,6 +6,15 @@ let gameView = "coach";     // coach | player (roster)
 let rosterSide = "home";    // home | away — which lineup the roster tab shows (#25)
 let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
 let currentGame = null;     // game id whose roster we're viewing
+// The last batch-seating outcome (copy-previous / auto-fill) for THIS game and
+// side (#427). Carries identity — {game_id, team_id, source, seated[],
+// skipped[{player_id,name,reason}], deferred[]} — so the partial-result
+// warning can NAME the players who were not seated instead of reducing the
+// whole outcome to a copied count. Held in module state rather than in a
+// toast because the warning must SURVIVE the re-render the action itself
+// triggers: a toast is cleared by switchTab() and auto-clears after 4s, and a
+// coach who looks away misses the only statement that anything was skipped.
+let rosterBatch = null;
 let pickedPlayer = null;
 let wizard = null;          // {slot_id, league_id, division_id, home_id, away_id} when scheduling
 let iceBuilder = null;      // {form, preview} when the Ice Availability Builder is open (#158)
@@ -990,6 +999,100 @@ function placementSaveToast(result, successMessage) {
 
 /* ---------- shared ---------- */
 const bannerClass = (s) => s === "open_slot" ? "alert" : s === "needs_substitute" ? "warn" : s === "roster_confirmed" ? "ok" : "neutral";
+
+/* ---------- batch seating: the partial outcome, made visible (#427) -------
+   The owner's ruling: "the operator-facing response must make the partial
+   outcome visible … show the partial-result warning on desktop and 390px
+   rather than reducing it to a copied count."
+
+   ONE code->text map, here and nowhere else. The server's skip reasons are
+   STABLE MACHINE CODES (services/membership_spine.py) precisely so the UI can
+   translate them; a second table somewhere else is how a code ends up meaning
+   two different things on two screens. An UNKNOWN code falls back to the code
+   itself rather than to silence — a reason the server added and the UI has
+   not learned yet must still reach the operator, visibly wrong rather than
+   invisibly absent. */
+// Every SPINE leg collapses to one sentence on purpose: an operator cannot
+// act on "the denormalized season disagrees", and the remedy for all of them
+// is the same Setup remedy. The distinct machine codes are still what the
+// audit row records, so the diagnosis is not lost — only the wording is
+// shared.
+const SETUP_SPINE_TEXT =
+  "this game's league/season setup is inconsistent — check the team in Setup";
+const SKIP_REASON_TEXT = {
+  // discovery-stage: the history itself cannot prove the seat
+  prior_seat_unattributed:
+    "the previous game's roster row predates side tracking, so it can't be "
+    + "proved they played for this team — add them by hand",
+  // the player's own season registration
+  membership_transferred: "transferred to another team",
+  membership_released: "released from the team",
+  membership_inactive: "season registration is inactive",
+  membership_injured: "listed as injured",
+  membership_applicant: "season registration is still pending approval",
+  membership_other_team: "registered to a different team this season",
+  membership_other_league_season: "registered in a different competition",
+  no_eligible_membership: "no season registration on file",
+  player_inactive: "no longer an active player",
+  membership_player_missing: "the player record no longer exists",
+  // the TEAM's participation, not the player's — one message, because the
+  // remedy is the same for all of them and it is a Setup remedy
+  team_not_registered:
+    "the team's registration for this season is not active",
+  team_registration_conflict:
+    "the team has conflicting season registrations — fix them in Setup",
+  membership_team_missing: SETUP_SPINE_TEXT,
+  membership_season_missing: SETUP_SPINE_TEXT,
+  membership_league_season_missing: SETUP_SPINE_TEXT,
+  membership_league_mismatch: SETUP_SPINE_TEXT,
+  membership_program_mismatch: SETUP_SPINE_TEXT,
+  membership_denormalized_season_mismatch: SETUP_SPINE_TEXT,
+  // not an eligibility problem at all — the roster simply filled up
+  roster_target_met: "the roster was already full",
+};
+const skipReasonText = (code) => SKIP_REASON_TEXT[code] || code;
+const namedSkips = (rows) => rows
+  .map((r) => `${r.name || r.player_id} (${skipReasonText(r.reason)})`)
+  .join("; ");
+// The ONE sentence spoken in the live region — deliberately a summary, so the
+// polite announcement stays short while the persistent block below carries
+// every name. Returns "" when there is nothing partial to say.
+function rosterBatchAnnouncement(b) {
+  if (!b || !b.skipped.length) return "";
+  const n = b.skipped.length;
+  const verb = b.source === "auto_build_roster" ? "Auto-fill" : "Copy";
+  return b.seated.length
+    ? `${verb} added ${b.seated.length} player${b.seated.length === 1 ? "" : "s"}; `
+      + `${n} could not be added.`
+    : `${verb} added no players — ${n} candidate${n === 1 ? "" : "s"} `
+      + `${n === 1 ? "is" : "are"} not eligible.`;
+}
+// The PERSISTENT statement, rendered into the same .ros-warn block above the
+// roster toolbar that already carries the open-slot / backed-out warnings —
+// it survives every re-render, which the toast does not.
+//
+// Identity-gated (#365's discipline): a result belongs to the game and side
+// it was produced for, so switching game or lineup tab drops it rather than
+// letting a stale warning describe the wrong bench.
+function rosterBatchWarningHtml() {
+  const b = rosterBatch;
+  if (!b || b.game_id !== currentGame || b.team_id !== rosterTeamId) return "";
+  if (!b.skipped.length) return "";
+  const head = b.seated.length
+    ? `${b.seated.length} of ${b.seated.length + b.skipped.length} `
+      + `player${b.seated.length + b.skipped.length === 1 ? "" : "s"} added.`
+    // ZERO-SEAT: a successful call that seated nobody. It must not read as a
+    // failure, and it must not read as "nothing happened" either.
+    : `No players were added — none of the `
+      + `${b.skipped.length} candidate${b.skipped.length === 1 ? "" : "s"} `
+      + `is currently eligible.`;
+  const items = b.skipped.map((r) =>
+    `<li>${esc(r.name || r.player_id)} — ${esc(skipReasonText(r.reason))}</li>`
+  ).join("");
+  return `<div class="ros-warn ros-partial">
+    <div class="rp-head">⚠ ${esc(head)} Not added:</div>
+    <ul class="rp-list">${items}</ul></div>`;
+}
 // Same ok/warn/alert/neutral → green/orange/red/gray mapping the .banner
 // classes use (styles.css), so a roster status badge never disagrees with the
 // banner shown for the same status elsewhere (#118 Phase 3.2).
@@ -9979,7 +10082,12 @@ function coachBody(board, ov) {
   if (s.open_goalie_slots > 0) warn.push(`Need ${s.open_goalie_slots} more goalie${plural(s.open_goalie_slots)}.`);
   if (s.open_skater_slots > 0) warn.push(`Need ${s.open_skater_slots} more skater${plural(s.open_skater_slots)}.`);
   if (backedOut.length) warn.push(`${backedOut.length} player${plural(backedOut.length)} backed out or removed — re-confirm or refill.`);
-  const warnHtml = warn.length ? `<div class="ros-warn">⚠ ${warn.map(esc).join(" ")}</div>` : "";
+  // The last batch outcome sits in its OWN .ros-warn block, immediately above
+  // the toolbar that produced it (#427). Separate from the slot warnings
+  // because it names players and reasons as a list rather than a run-on
+  // sentence, and because it must be identity-gated to this game and side.
+  const warnHtml = (warn.length ? `<div class="ros-warn">⚠ ${warn.map(esc).join(" ")}</div>` : "")
+    + rosterBatchWarningHtml();
 
   const toolbar = canEdit ? `<div class="ros-toolbar">
     <button class="act ghost" data-act="copy">⧉ Copy previous roster</button>
@@ -10093,7 +10201,9 @@ function playerBody(board) {
 
 /* ---------- Activity ---------- */
 const AUDIT_LABEL = {
-  roster_selected: "Roster selected", availability_set: "Availability updated",
+  roster_selected: "Roster selected",
+  roster_batch_seated: "Roster batch seated",
+  availability_set: "Availability updated",
   player_backed_out: "Player backed out", substitute_enrolled: "Substitute enrolled",
   substitute_withdrawn: "Substitute withdrawn", substitute_offered: "Substitute offered",
   substitute_accepted: "Substitute accepted", substitute_declined: "Substitute declined",
@@ -10382,13 +10492,38 @@ async function submitSetup(kind) {
   await render();
 }
 
+// Take ONE batch-seating response and turn it into (a) the persistent
+// warning's state and (b) at most ONE live-region announcement (#427).
+//
+// SPOKEN EXACTLY ONCE. `toast` is set here and the `await render()` that
+// follows every rosterAction() drives updateToast() a single time — the same
+// route announceCardStatus() uses, and the same reason: #toast-root is the
+// ONE sitewide `role="status" aria-live="polite"` region (index.html), so
+// minting a second one per surface would speak the same sentence twice.
+// A response that skipped NOBODY says nothing at all: a fully successful
+// auto-fill or copy is already visible in the roster that just re-rendered.
+function recordRosterBatch(r) {
+  if (!r || r.error || !Array.isArray(r.skipped)) return;
+  rosterBatch = {
+    game_id: currentGame, team_id: r.team_id || rosterTeamId,
+    source: r.source, seated: r.seated || [], skipped: r.skipped,
+    deferred: r.deferred || [],
+  };
+  const said = rosterBatchAnnouncement(rosterBatch);
+  if (said) { toast = said; toastIsError = false; }
+}
+
 async function rosterAction(act, id) {
   toast = "";
   const B = `/api/games/${currentGame}`;
-  if (act === "build") await post(`${B}/build-roster`, { team_id: rosterTeamId });
+  // BOTH batch entry points route through the SAME renderer (#427). "build"
+  // used to DISCARD its response entirely and "copy" reduced its response to
+  // a copied count, so a partial outcome — the whole point of the ruling —
+  // was invisible on one and unstated on the other.
+  if (act === "build") recordRosterBatch(await post(`${B}/build-roster`, { team_id: rosterTeamId }));
   else if (act === "select") await post(`${B}/roster/select`, { player_ids: [id] });
   else if (act === "remove") await post(`${B}/roster/remove`, { player_id: id });
-  else if (act === "copy") { const r = await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }); if (r && !r.error) toast = `Copied ${r.copied} player${r.copied === 1 ? "" : "s"} from the previous game.`; }
+  else if (act === "copy") recordRosterBatch(await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }));
   else if (act === "confirm") await post(`${B}/availability`, { player_id: id, availability_status: "available" });
   else if (act === "backout") await post(`${B}/availability`, { player_id: id, availability_status: "unavailable" });
   else if (act === "enroll") await post(`${B}/substitutes/enroll`, { player_id: id });
@@ -13284,6 +13419,12 @@ function resetTransientViewState(next) {
   // Same discipline for the guardian surface (#26): leaving "My Players"
   // clears any open junior checkout confirm / opportunity detail.
   if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
+  // A batch-seating outcome describes ONE visit to ONE game's roster (#427).
+  // It is already identity-gated to (currentGame, rosterTeamId) so a game or
+  // lineup switch drops it on its own; this clears it on the way OUT so
+  // coming back to the roster never reopens a warning about work the coach
+  // has since finished elsewhere.
+  if (next !== "roster") rosterBatch = null;
 }
 
 function switchTab(next) {

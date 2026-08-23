@@ -612,6 +612,66 @@ async function checkViewport(browser, viewport) {
     if (publish.status !== 200 || publish.body.error) {
       fail(`game publish failed: ${JSON.stringify(publish)}`);
     }
+    // ------------------------------------------------------------------
+    // A PRIOR game for the Coach's own team, with a real seated roster --
+    // the source a "Copy previous roster" reads from (#427). Placed in the
+    // PAST so it cannot become anybody's "next game" and the Next Game card
+    // below still points at the fixture's real target game.
+    //
+    // Two players are seated on it while both are eligible; one is then
+    // deactivated, which makes the copy below a genuinely MIXED batch: one
+    // player seats, one is skipped with a reason the warning must NAME.
+    // ------------------------------------------------------------------
+    const priorStart = new Date(Date.now() - 10 * 24 * 3600 * 1000);
+    priorStart.setUTCHours(18, 30, 0, 0);
+    const priorEnd = new Date(priorStart.getTime() + 90 * 60000);
+    const priorRink = await apiPost(page, "/api/v2/setup/rink",
+      { venue_id: venue.body.id, name: `Prior Rink ${suffix}` });
+    const priorSlot = await apiPost(page, "/api/v2/setup/ice-slot", {
+      rink_id: priorRink.body.id, start_time: iso(priorStart),
+      end_time: iso(priorEnd), slot_type: "game",
+    });
+    if (priorSlot.status !== 200 || priorSlot.body.error) {
+      fail(`prior ice slot create failed: ${JSON.stringify(priorSlot)}`);
+    }
+    const priorGame = await apiPost(page, "/api/setup/game", {
+      season_id: season.id, division_id: division.body.id,
+      home_team_id: coachTeam.body.id, away_team_id: rivalTeam.body.id,
+      ice_slot_id: priorSlot.body.id,
+    });
+    if (priorGame.status !== 200 || priorGame.body.error) {
+      fail(`prior game create failed: ${JSON.stringify(priorGame)}`);
+    }
+    // Names fix the order the warning lists them in: the batch orders
+    // candidates by (name, player_id), so "Copy Keeper" precedes
+    // "Copy Skipped" in every response, on every backend.
+    const keeper = await apiPost(page, "/api/v2/setup/player",
+      { team_id: coachTeam.body.id, name: `Copy Keeper ${suffix}`, position: "forward" });
+    const skipped = await apiPost(page, "/api/v2/setup/player",
+      { team_id: coachTeam.body.id, name: `Copy Skipped ${suffix}`, position: "defense" });
+    const seatPrior = await apiPost(page,
+      `/api/games/${priorGame.body.id}/roster/select`,
+      { player_ids: [keeper.body.id, skipped.body.id] });
+    if (seatPrior.status !== 200 || seatPrior.body.error) {
+      fail(`prior roster select failed: ${JSON.stringify(seatPrior)}`);
+    }
+    // The durable attribution the copy discovers candidates from must really
+    // be on those rows -- if it were not, the copy would find nobody and the
+    // whole leg below would pass vacuously.
+    const priorBoard = await apiGet(page, `/api/games/${priorGame.body.id}/lineups`);
+    const priorSeated = (priorBoard.body.home.players || [])
+      .filter((pl) => pl.group === "selected").map((pl) => pl.id).sort();
+    if (JSON.stringify(priorSeated)
+        !== JSON.stringify([keeper.body.id, skipped.body.id].sort())) {
+      fail(`prior game did not seat both players on the Coach's side: `
+        + `${JSON.stringify(priorSeated)}`);
+    }
+    const deactivate = await apiPost(page,
+      `/api/v2/setup/player/${skipped.body.id}/active`, { active: false });
+    if (deactivate.status !== 200 || deactivate.body.error) {
+      fail(`deactivate failed: ${JSON.stringify(deactivate)}`);
+    }
+
     // Jamie Junior plays for the Rival Team -- deliberately NOT the Coach's
     // own team, and deliberately a different team than Priya Player's, so
     // Guardian's "next game" and Player's "no upcoming game" are each
@@ -875,6 +935,159 @@ async function checkViewport(browser, viewport) {
       fail(`Coach: expected the Roster view to show Coach's own team `
         + `("Coach Team ${suffix}"), got: ${coachRosterText.slice(0, 200)}`);
     }
+
+    // ============================================================
+    // Coach -- the AUTHORIZED batch mutation, and the partial outcome
+    // it must make visible (#427).
+    //
+    // Until this leg existed the Coach's only proven interactions were
+    // navigational: every role in this matrix probed a FORBIDDEN mutation,
+    // and Coach -- the one role that actually manages rosters -- performed
+    // no authorized one at all. The owner's ruling ("show the partial-result
+    // warning on desktop and 390px rather than reducing it to a copied
+    // count") is a claim about THIS surface at BOTH of the viewports this
+    // file already runs, so it is proven here rather than in a new spec.
+    // ============================================================
+    const onTarget = await page.evaluate(() => ({
+      game: typeof currentGame === "string" ? currentGame : null,
+      team: typeof rosterTeamId === "string" ? rosterTeamId : null,
+    }));
+    if (onTarget.game !== game.body.id) {
+      fail(`Coach: expected the Roster view to be on the fixture's target `
+        + `game ${game.body.id}, got ${onTarget.game}`);
+    }
+    if (onTarget.team !== coachTeam.body.id) {
+      fail(`Coach: expected the Roster view to be on the Coach's own side `
+        + `${coachTeam.body.id}, got ${onTarget.team}`);
+    }
+    // No warning before the action -- so the assertions below cannot be
+    // satisfied by something that was already on screen.
+    if (await page.$(".ros-partial")) {
+      fail("Coach: a batch partial-result warning was present before any "
+        + "batch action ran");
+    }
+    // A REAL keyboard activation of the real control, the same discipline
+    // every other authorized mutation in this file uses.
+    await page.waitForSelector('[data-act="copy"]', { timeout: 10000 });
+    await tabToAndActivate(page, '[data-act="copy"]', "Coach copy previous roster");
+    await page.waitForSelector(".ros-partial", { timeout: 10000 });
+    const partial = await page.evaluate(() => {
+      const el = document.querySelector(".ros-partial");
+      return {
+        text: (el.textContent || "").replace(/\s+/g, " ").trim(),
+        items: Array.from(el.querySelectorAll(".rp-list li"))
+          .map((li) => (li.textContent || "").replace(/\s+/g, " ").trim()),
+      };
+    });
+    // It NAMES the skipped player and says WHY, in operator language -- not
+    // a machine code, and not a bare count.
+    if (!new RegExp(`Copy Skipped ${suffix}`).test(partial.text)) {
+      fail(`Coach: the partial-result warning must NAME the skipped player `
+        + `("Copy Skipped ${suffix}"), got: ${partial.text}`);
+    }
+    if (!/no longer an active player/i.test(partial.text)) {
+      fail(`Coach: the partial-result warning must give the skipped player's `
+        + `reason in operator language, got: ${partial.text}`);
+    }
+    if (/player_inactive/.test(partial.text)) {
+      fail(`Coach: the warning leaked the raw machine reason code instead of `
+        + `its operator wording: ${partial.text}`);
+    }
+    if (partial.items.length !== 1) {
+      fail(`Coach: expected exactly one skipped player listed, got `
+        + `${JSON.stringify(partial.items)}`);
+    }
+    // ...and the ELIGIBLE player really was seated: a partial success, not a
+    // refusal dressed up as a warning.
+    const afterCopy = await apiGet(page, `/api/games/${game.body.id}/lineups`);
+    const seatedNow = (afterCopy.body.home.players || [])
+      .filter((pl) => pl.group === "selected").map((pl) => pl.id);
+    if (JSON.stringify(seatedNow) !== JSON.stringify([keeper.body.id])) {
+      fail(`Coach: expected the copy to seat exactly the eligible player, `
+        + `got ${JSON.stringify(seatedNow)}`);
+    }
+    // The live region spoke the outcome ONCE (#toast-root is the single
+    // sitewide role="status" region).
+    const spoken = await page.evaluate(() => {
+      const root = document.getElementById("toast-root");
+      return { hidden: !!root.hidden, regions: document.querySelectorAll('[role="status"]').length,
+        text: (root.textContent || "").replace(/\s+/g, " ").trim() };
+    });
+    if (spoken.hidden || !/could not be added/i.test(spoken.text)) {
+      fail(`Coach: the partial outcome was not announced in the live region, `
+        + `got ${JSON.stringify(spoken)}`);
+    }
+    if (spoken.regions !== 1) {
+      fail(`Coach: expected exactly one role="status" live region so the `
+        + `outcome is spoken once, found ${spoken.regions}`);
+    }
+    // ------------------------------------------------------------
+    // ZERO-SEAT: the other half of the ruling. An authorized admin
+    // (the independent reader session) deactivates the one player who
+    // seated, so every candidate on the prior roster is now ineligible.
+    // The copy must SUCCEED, seat nobody, write nothing, and say so.
+    // ------------------------------------------------------------
+    const deactivateKeeper = await apiPost(reader,
+      `/api/v2/setup/player/${keeper.body.id}/active`, { active: false });
+    if (deactivateKeeper.status !== 200 || deactivateKeeper.body.error) {
+      fail(`Coach: could not deactivate the remaining player: `
+        + `${JSON.stringify(deactivateKeeper)}`);
+    }
+    await tabToAndActivate(page, '[data-act="copy"]', "Coach copy again (zero seat)");
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector(".ros-partial");
+        return !!el && el.querySelectorAll(".rp-list li").length === 2;
+      }, { timeout: 10000 });
+    const zero = await page.evaluate(() => {
+      const el = document.querySelector(".ros-partial");
+      return (el.textContent || "").replace(/\s+/g, " ").trim();
+    });
+    if (!/No players were added/i.test(zero)) {
+      fail(`Coach: expected the ZERO-SEAT warning, got: ${zero}`);
+    }
+    for (const who of [`Copy Keeper ${suffix}`, `Copy Skipped ${suffix}`]) {
+      if (!new RegExp(who).test(zero)) {
+        fail(`Coach: the zero-seat warning must name every candidate `
+          + `("${who}"), got: ${zero}`);
+      }
+    }
+    // No roster writes: the already-seated row is untouched and nothing new
+    // appeared.
+    const afterZero = await apiGet(page, `/api/games/${game.body.id}/lineups`);
+    const seatedAfterZero = (afterZero.body.home.players || [])
+      .filter((pl) => pl.group === "selected").map((pl) => pl.id);
+    if (JSON.stringify(seatedAfterZero) !== JSON.stringify(seatedNow)) {
+      fail(`Coach: a zero-seat copy must write no roster rows; lineup went `
+        + `from ${JSON.stringify(seatedNow)} to `
+        + `${JSON.stringify(seatedAfterZero)}`);
+    }
+    // The whole warning fits the viewport -- at 390px as well as at
+    // desktop -- with no horizontal overflow. No new breakpoint exists or
+    // may exist (e2e/breakpoint-contract.js), so 390 is covered by the
+    // existing 480px rule and by the block's own wrapping.
+    const overflow = await page.evaluate(() => {
+      const el = document.querySelector(".ros-partial");
+      return {
+        docScroll: document.documentElement.scrollWidth,
+        docClient: document.documentElement.clientWidth,
+        elRight: Math.ceil(el.getBoundingClientRect().right),
+        elScroll: el.scrollWidth, elClient: el.clientWidth,
+      };
+    });
+    if (overflow.docScroll > overflow.docClient) {
+      fail(`Coach [${L}]: the partial-result warning pushed the page into a `
+        + `horizontal scroll: ${JSON.stringify(overflow)}`);
+    }
+    if (overflow.elScroll > overflow.elClient + 1) {
+      fail(`Coach [${L}]: the partial-result warning overflows its own box `
+        + `(text not wrapping): ${JSON.stringify(overflow)}`);
+    }
+    if (overflow.elRight > overflow.docClient) {
+      fail(`Coach [${L}]: the partial-result warning extends past the `
+        + `viewport: ${JSON.stringify(overflow)}`);
+    }
+
     // Direct-navigation bypass: Setup is hidden from nav (neither
     // manage_setup nor manage_arena) -- switchTab() must self-guard.
     await page.evaluate(() => switchTab("setup"));
