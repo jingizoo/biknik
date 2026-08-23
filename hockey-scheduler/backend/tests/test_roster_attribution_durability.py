@@ -65,9 +65,11 @@ PASS.
 """
 
 import contextlib
+import io
 import json
 import os
 import threading
+import tokenize
 import unittest
 import urllib.error
 import urllib.request
@@ -81,7 +83,12 @@ from helpers import end_membership_directly, fresh_sql_store
 from test_slot_overfill_regression import _OverfillFixture
 from test_substitute_membership_cutover import ADMIN
 
+import hockey_scheduler
 from hockey_scheduler.domain import Position, SlotType
+from hockey_scheduler.domain.enums import RosterEntryStatus
+from hockey_scheduler.services.roster_service import (
+    _PLAYER_CONFIRM_SOURCE_STATES,
+)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web import server as srv
 from hockey_scheduler.web.auth import DEMO_PASSWORD, DEMO_USERS
@@ -2040,6 +2047,766 @@ class SelectedConfirmOverTheRealHttpAvailabilityRoute(
                         gid, home).to_dict()["confirmed_skaters"], 1, label)
             ran.append((label, SELECTED_CONFIRM[0].name))
         self._assert_matrix_ran(ran, shapes=SELECTED_CONFIRM)
+
+
+# ======================================================================
+# 8. THE EXPLICIT TRANSITION SET (owner ruling, PR #427, 2026-08-22)
+# ======================================================================
+# THREE RULINGS LAND HERE, and each reverses or widens something the
+# previous round shipped. They are pinned separately so a revert of one
+# cannot quietly take another with it.
+#
+#   DECISION 1 — the gate covers EVERY player-driven transition INTO
+#     CONFIRMED, not just SELECTED, and the covered states are an
+#     EXPLICIT module-level frozenset rather than
+#     ``entry.status.occupies_slot``: "occupancy is not authorization,
+#     and future enum changes must not silently widen this gate."
+#     ``_PLAYER_CONFIRM_SOURCE_STATES`` is that set;
+#     ``SELECTED`` keeps its section-7 coverage and ``ACCEPTED`` gets its
+#     own below, driven through a real enroll -> offer -> accept arc so
+#     the test proves the REAL transition rather than a hand-planted row.
+#
+#   DECISION 2 — an ALREADY-CONFIRMED row stays idempotent. Head
+#     5b26758 refused it (CONFIRMED is in ``occupies_slot``, so the old
+#     derived gate swept it in); that widening is REVERSED, and
+#     ``AlreadyConfirmedReaffirmationStaysIdempotent`` is what stops it
+#     coming back.
+#
+#   DECISION 3 — NULL durable attribution FAILS CLOSED on this path too.
+#     Head 5b26758 deliberately did the opposite here, on the reasoning
+#     that confirming "takes nothing back". Overruled: the question is
+#     not whether a slot is being taken but whether the row can PROVE its
+#     live team matches the side it holds, and a row that names no side
+#     can never answer it.
+#
+# REPRODUCED RED at head 5b26758, identically on Memory, SQLite AND
+# PostgreSQL (both regressions, one probe run):
+#
+#   (i)  [memory]   seeded row.status=confirmed team_side=team_1
+#        [memory]   live side now=team_2; durable row side still=team_1
+#        [memory]   RE-AFFIRM available -> {'error': {'code':
+#                   'not_eligible', ... 'reason':
+#                   'seated_side_not_live_eligible' ...}}
+#        [sqlite]/[postgres] ...identical...
+#
+#   (ii) [memory]   row.status=selected team_side=None
+#                   seated_position=None attribution=None
+#        [memory]   live side=team_2, durable side=NULL -> unprovable
+#        [memory]   CONFIRM -> {'id': 'avail_1', ...}      (NO error)
+#        [memory]   WRITES ATTEMPTED: ['next_id',
+#                   'upsert_availability', 'next_id', 'add_audit',
+#                   'save_roster_entry']
+#        [memory]   row.status BEFORE=selected AFTER=confirmed
+#        [sqlite]/[postgres] ...identical...
+
+ACCEPTED_CONFIRM = (_Case("accepted_row_confirmed_by_the_player"),)
+CONFIRMED_REAFFIRM = (_Case("already_confirmed_row_reaffirmed"),)
+NULL_CONFIRM = (_Case("null_attribution_row_confirmed"),)
+
+# The occupying states this round classifies as NOT REACHABLE, and so
+# deliberately outside ``_PLAYER_CONFIRM_SOURCE_STATES``. Kept in the
+# TEST rather than in product code: it is a claim about what the codebase
+# can currently produce, and
+# ``test_offered_is_still_unreachable_in_product_code`` is what keeps the
+# claim true rather than merely asserted.
+ACKNOWLEDGED_UNREACHABLE_OCCUPYING = frozenset({RosterEntryStatus.OFFERED})
+
+# A module that MENTIONS the member without REFERENCING it, used to prove
+# the reachability scanner below distinguishes the two. Kept as source
+# text rather than a real file so the fixture cannot itself be mistaken
+# for a product reference.
+_COMMENT_ONLY_MENTION_FIXTURE = "<comment-and-string-only mention>"
+_COMMENT_ONLY_MENTION_SOURCE = (
+    "# a comment naming RosterEntryStatus.OFFERED\n"
+    "DOC = 'a string naming RosterEntryStatus.OFFERED'\n"
+    "def f():\n"
+    "    '''a docstring naming RosterEntryStatus.OFFERED'''\n"
+    "    return None\n"
+)
+
+
+class PlayerConfirmSourceStatesArePartitionedDeliberately(unittest.TestCase):
+    """The anti-drift guard for Decision 1's "no silent widening".
+
+    An explicit frozenset stops a new enum value from silently ENTERING
+    the authorization gate. It does not, on its own, stop a new value
+    from silently BYPASSING it: ``set_availability``'s trailing sync is
+    still keyed on ``occupies_slot``, so a state that occupies but is
+    unclassified would reach CONFIRMED with no authorization at all.
+
+    So this pins the PARTITION rather than the set: every occupying
+    state must be classified as exactly one of
+
+      * a source of a player-driven transition INTO CONFIRMED
+        (``_PLAYER_CONFIRM_SOURCE_STATES`` — gated), or
+      * CONFIRMED itself (Decision 2 — not a transition into CONFIRMED,
+        idempotent by ruling), or
+      * acknowledged UNREACHABLE (``ACKNOWLEDGED_UNREACHABLE_OCCUPYING``
+        — no code path can produce it).
+
+    Add an occupying state and this fails until somebody says which one
+    it is. That is the whole point: the failure is the review."""
+
+    def test_every_occupying_state_is_classified_exactly_once(self):
+        occupying = {s for s in RosterEntryStatus if s.occupies_slot}
+        parts = (_PLAYER_CONFIRM_SOURCE_STATES,
+                 frozenset({RosterEntryStatus.CONFIRMED}),
+                 ACKNOWLEDGED_UNREACHABLE_OCCUPYING)
+        union = frozenset().union(*parts)
+        self.assertEqual(
+            occupying, union,
+            "an occupying RosterEntryStatus is unclassified: decide "
+            "whether a player may drive it into CONFIRMED (add it to "
+            "_PLAYER_CONFIRM_SOURCE_STATES and give it named tri-store + "
+            "HTTP coverage) or record it as unreachable — do not leave "
+            "it to fall through set_availability's occupies_slot sync "
+            "ungated")
+        self.assertEqual(sum(len(p) for p in parts), len(union),
+                         "the three classifications must be disjoint")
+
+    def test_confirmed_is_not_a_source_state(self):
+        """Decision 2, asserted against the set directly rather than only
+        through behaviour: a row already in CONFIRMED is not
+        TRANSITIONING into it."""
+        self.assertNotIn(RosterEntryStatus.CONFIRMED,
+                         _PLAYER_CONFIRM_SOURCE_STATES)
+
+    def test_the_backed_out_and_removed_states_are_not_source_states(self):
+        """UNAVAILABLE belongs to the ``reconfirming`` branch (which must
+        ALSO run ``_require_open_slot``), and REMOVED is refused outright
+        and earlier. Either one appearing here would route a transition
+        past the gate that actually governs it."""
+        for s in (RosterEntryStatus.UNAVAILABLE, RosterEntryStatus.REMOVED):
+            self.assertNotIn(s, _PLAYER_CONFIRM_SOURCE_STATES, s)
+
+    def test_the_set_is_exactly_selected_and_accepted(self):
+        self.assertEqual(
+            _PLAYER_CONFIRM_SOURCE_STATES,
+            frozenset({RosterEntryStatus.SELECTED,
+                       RosterEntryStatus.ACCEPTED}))
+
+    def test_offered_is_still_unreachable_in_product_code(self):
+        """THE EVIDENCE FOR EXCLUDING OFFERED, kept executable.
+
+        The ruling admits OFFERED "only if that state is genuinely
+        reachable or supported here". At head 5b26758 it is not: the
+        member ``RosterEntryStatus.OFFERED`` occurs exactly once in the
+        whole product package — inside ``occupies_slot``'s own set in
+        ``domain/enums.py`` — so nothing writes it, nothing compares
+        against it, and no importer, seed, migration or route can produce
+        it (the full method and evidence are recorded beside
+        ``_PLAYER_CONFIRM_SOURCE_STATES``).
+
+        A prose claim about reachability rots the first time somebody
+        writes the state. This scan is what makes it fail loudly instead:
+        the moment any product module other than the enum definition
+        REFERENCES the member in code, this test demands the exclusion be
+        revisited and named coverage added.
+
+        TOKENISED, not grepped. A text search counts the member name
+        wherever it appears -- including in the very comment beside
+        ``_PLAYER_CONFIRM_SOURCE_STATES`` that records this evidence,
+        which would make the guard fail on its own documentation. Real
+        ``NAME '.' NAME`` token triples are what a reference IS, and
+        prose about one is not."""
+        root = os.path.dirname(os.path.abspath(hockey_scheduler.__file__))
+        hits = {}
+        scanned = 0
+        for dirpath, _dirs, files in os.walk(root):
+            if "__pycache__" in dirpath:
+                continue
+            for name in sorted(files):
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, name)
+                scanned += 1
+                n = self._enum_member_references(
+                    path, "RosterEntryStatus", "OFFERED")
+                if n:
+                    hits[os.path.relpath(path, root)] = n
+        # The scan really looked at the package, rather than at nothing.
+        self.assertGreater(scanned, 20, scanned)
+        self.assertEqual(
+            hits, {os.path.join("domain", "enums.py"): 1},
+            "RosterEntryStatus.OFFERED is now referenced in code outside "
+            "its own enum definition. #427 excluded it from "
+            "_PLAYER_CONFIRM_SOURCE_STATES because NO code path could "
+            "produce it; if that has changed, decide whether a player may "
+            "drive OFFERED -> CONFIRMED and give it named "
+            "Memory/SQLite/PostgreSQL and HTTP coverage")
+
+    def test_the_reference_scanner_can_actually_see_a_reference(self):
+        """The anti-vacuity check for the scan above: a guard that finds
+        nothing because it looks for the wrong thing is worse than no
+        guard. ``RosterEntryStatus.SELECTED`` -- a member the product
+        demonstrably DOES use -- must be found in this module's own
+        source and in the service that gates on it."""
+        here = os.path.abspath(__file__)
+        self.assertGreater(
+            self._enum_member_references(here, "RosterEntryStatus",
+                                         "SELECTED"), 0, here)
+        service = os.path.join(
+            os.path.dirname(os.path.abspath(hockey_scheduler.__file__)),
+            "services", "roster_service.py")
+        self.assertGreater(
+            self._enum_member_references(service, "RosterEntryStatus",
+                                         "SELECTED"), 0, service)
+        # ...and it must NOT be fooled by a mention in a comment or a
+        # docstring, which is exactly what the OFFERED scan turns on.
+        self.assertEqual(
+            self._enum_member_references(
+                _COMMENT_ONLY_MENTION_FIXTURE, "RosterEntryStatus",
+                "OFFERED", _source=_COMMENT_ONLY_MENTION_SOURCE), 0)
+
+    @staticmethod
+    def _enum_member_references(path, enum_name, member, _source=None):
+        """Count ``<enum_name>.<member>`` attribute references in real
+        Python TOKENS, so comments and strings do not count."""
+        if _source is None:
+            with open(path, encoding="utf-8") as fh:
+                _source = fh.read()
+        toks = [t for t in tokenize.generate_tokens(io.StringIO(_source).readline)
+                if t.type not in (tokenize.COMMENT, tokenize.NL,
+                                  tokenize.NEWLINE, tokenize.INDENT,
+                                  tokenize.DEDENT, tokenize.STRING)]
+        return sum(
+            1 for a, b, c in zip(toks, toks[1:], toks[2:])
+            if a.type == tokenize.NAME and a.string == enum_name
+            and b.type == tokenize.OP and b.string == "."
+            and c.type == tokenize.NAME and c.string == member)
+
+
+class AcceptedConfirmAuthorizesFromTheLiveSide(_ReseatHarness,
+                                               unittest.TestCase):
+    """DECISION 1's added covered state: ACCEPTED -> CONFIRMED.
+
+    SECTION 7 COVERED ONLY SELECTED. An ACCEPTED row reached the same
+    ``occupies_slot`` branch at head 5b26758 and so happened to be
+    authorized, but nothing said so: every assertion in section 7 seats
+    its subject with ``select_roster``. Narrowing the gate to SELECTED
+    would have left the substitute who took an offer ungated, and the
+    whole suite green.
+
+    THE ROW IS PRODUCED BY THE REAL ARC — ``enroll_substitute`` ->
+    ``offer_substitute`` -> ``accept_substitute`` — and not planted, so
+    what is under test is the transition the product actually performs:
+    the offer is made while HOME's slot is genuinely open, and the accept
+    re-resolves and writes the attribution it was gated against."""
+
+    def _accepted_on_home(self, fx, label, name="Sub"):
+        api, gid = fx["api"], fx["gid"]
+        p = self._mover(fx, name)
+        self.assertNotIn("error", api.enroll_substitute(gid, p["id"]), label)
+        self.assertNotIn("error", api.offer_substitute(gid, p["id"]), label)
+        self.assertNotIn("error", api.accept_substitute(
+            gid, p["id"], actor_id=p["id"]), label)
+        entry = api.store.roster_entry_for_player(gid, p["id"])
+        # The state this class is about, PROVEN rather than assumed --
+        # ACCEPTED, seated on HOME, and never backed out.
+        self.assertEqual(entry.status.value, "accepted", label)
+        self.assertEqual(entry.team_side, fx["home"], label)
+        self.assertEqual(entry.seated_position, Position.FORWARD, label)
+        self.assertIsNone(api.store.availability_for_player(gid, p["id"]),
+                          label)
+        return p
+
+    def test_confirmation_is_refused_when_the_live_side_left_the_row(self):
+        """ACCEPTED on HOME, live context moved to AWAY, BOTH sides still
+        carrying an open skater slot -- so no occupancy gate could produce
+        this refusal even if one existed, and the assertion can only be
+        pinning the live-side AUTHORIZATION.
+
+        ``target_skaters=2`` is what makes "both sides open" literally
+        true: the ACCEPTED row itself holds one of HOME's two seats."""
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                api, gid = fx["api"], fx["gid"]
+                home, away = fx["home"], fx["away"]
+                p = self._accepted_on_home(fx, label)
+                self._move_to_the_other_side(fx, p["id"], away, label)
+
+                self.assertEqual(self._open(fx, home), 1, label)
+                self.assertEqual(self._open(fx, away), 2, label)
+                self.assertEqual(self._live_side(fx, p["id"]), away, label)
+
+                before = self._writes(api, gid)
+                home_before = api.roster.compute_roster_status(
+                    gid, home).to_dict()
+                away_before = api.roster.compute_roster_status(
+                    gid, away).to_dict()
+
+                with self._write_attempts(api.store) as attempts:
+                    res = api.set_availability(gid, p["id"], "available",
+                                               actor_id=p["id"])
+                # BEFORE ANY MUTATION, in the strong sense.
+                self.assertEqual(attempts, [], (label, attempts))
+                err = res.get("error", {})
+                self.assertEqual(err.get("code"), "not_eligible",
+                                 (label, res))
+                self.assertEqual(err.get("details", {}).get("reason"),
+                                 "seated_side_not_live_eligible",
+                                 (label, res))
+                self.assertEqual(err.get("details", {}).get("seated_team_id"),
+                                 home, (label, res))
+                self.assertEqual(
+                    err.get("details", {}).get("eligible_team_id"), away,
+                    (label, res))
+
+                row = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(row.status.value, "accepted", label)
+                self.assertEqual(row.team_side, home, label)
+                self.assertEqual(row.seated_position, Position.FORWARD,
+                                 label)
+                self.assertEqual(
+                    api.roster.compute_roster_status(gid, home).to_dict(),
+                    home_before, label)
+                self.assertEqual(
+                    api.roster.compute_roster_status(gid, away).to_dict(),
+                    away_before, label)
+                self.assertEqual(self._writes(api, gid), before, label)
+                self.assertIsNone(
+                    api.store.availability_for_player(gid, p["id"]), label)
+            ran.append((label, ACCEPTED_CONFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=ACCEPTED_CONFIRM)
+
+    def test_confirmation_succeeds_when_the_live_side_still_matches(self):
+        """The other half of the covered state: the substitute who took an
+        offer and is still eligible for the side they took it on must be
+        able to confirm.
+
+        HOME's ONLY skater slot is the one THIS ROW holds
+        (``target_skaters=1``), so ``open_skater_slots`` reads 0 before
+        the call -- the arrangement in which an added open-slot check
+        would refuse a legitimate confirmation. The ruling forbids that
+        check on this path, and this is what enforces the prohibition for
+        ACCEPTED."""
+        ran = []
+        for label, fx in self._each(target_skaters=1):
+            with self.subTest(backend=label):
+                api, gid, home = fx["api"], fx["gid"], fx["home"]
+                p = self._accepted_on_home(fx, label)
+                self.assertEqual(self._live_side(fx, p["id"]), home, label)
+                self.assertEqual(self._open(fx, home), 0, label)
+
+                res = api.set_availability(gid, p["id"], "available",
+                                           actor_id=p["id"])
+                self.assertNotIn("error", res, (label, res))
+                self.assertEqual(res["availability_status"], "available",
+                                 (label, res))
+                row = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(row.status.value, "confirmed", label)
+                # Confirming is not a re-seat: the attribution is untouched.
+                self.assertEqual(row.team_side, home, label)
+                self.assertEqual(row.seated_position, Position.FORWARD,
+                                 label)
+                st = api.roster.compute_roster_status(gid, home).to_dict()
+                self.assertEqual(st["confirmed_skaters"], 1, (label, st))
+                self.assertEqual(st["open_skater_slots"], 0, (label, st))
+            ran.append((label, ACCEPTED_CONFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=ACCEPTED_CONFIRM)
+
+
+class AlreadyConfirmedReaffirmationStaysIdempotent(_ReseatHarness,
+                                                   unittest.TestCase):
+    """DECISION 2, and it is a REGRESSION TEST for a widening this PR
+    itself shipped.
+
+    Head 5b26758 gated on ``entry.status.occupies_slot``. CONFIRMED
+    occupies, so a player who was already confirmed on HOME and whose
+    membership then moved HOME->AWAY was REFUSED when they re-affirmed
+    availability -- captured RED on all three backends in this section's
+    header. The owner ruled that behaviour out: "Preserve the existing
+    behavior for an already-CONFIRMED row. Reaffirming availability must
+    remain idempotent for this slice ... This ruling concerns transitions
+    into CONFIRMED, not a row already in that state."
+
+    NOT VACUOUS: the live side is moved to AWAY first and the
+    disagreement is asserted (``_move_to_the_other_side``), so this is
+    exactly the input head 5b26758 refused. Put CONFIRMED back into
+    ``_PLAYER_CONFIRM_SOURCE_STATES`` and this test fails."""
+
+    def _confirmed_on_home(self, fx, label, name="Mover"):
+        api, gid = fx["api"], fx["gid"]
+        p = self._mover(fx, name)
+        self.assertNotIn("error", api.select_roster(
+            gid, [p["id"]], actor_id=ADMIN), label)
+        self.assertNotIn("error", api.set_availability(
+            gid, p["id"], "available", actor_id=p["id"]), label)
+        entry = api.store.roster_entry_for_player(gid, p["id"])
+        self.assertEqual(entry.status.value, "confirmed", label)
+        self.assertEqual(entry.team_side, fx["home"], label)
+        return p
+
+    def _identity(self, api, gid, player_id):
+        """Everything the seating decided, as one comparable value."""
+        row = api.store.roster_entry_for_player(gid, player_id)
+        return (row.id, row.status.value, row.team_side,
+                getattr(row.seated_position, "value", None))
+
+    def test_reaffirming_availability_succeeds_though_the_live_side_moved(
+            self):
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                api, gid = fx["api"], fx["gid"]
+                home, away = fx["home"], fx["away"]
+                p = self._confirmed_on_home(fx, label)
+                self._move_to_the_other_side(fx, p["id"], away, label)
+                # The premise head 5b26758 refused on, asserted.
+                self.assertEqual(self._live_side(fx, p["id"]), away, label)
+
+                identity_before = self._identity(api, gid, p["id"])
+                home_before = api.roster.compute_roster_status(
+                    gid, home).to_dict()
+                away_before = api.roster.compute_roster_status(
+                    gid, away).to_dict()
+
+                res = api.set_availability(gid, p["id"], "available",
+                                           actor_id=p["id"])
+                # SUCCEEDS -- no error at all, and specifically not the
+                # live-side refusal this PR added for the transitions.
+                self.assertNotIn("error", res, (label, res))
+                self.assertEqual(res["availability_status"], "available",
+                                 (label, res))
+
+                # IDEMPOTENT: a no-op on everything the seating decided.
+                self.assertEqual(self._identity(api, gid, p["id"]),
+                                 identity_before, label)
+                self.assertEqual(
+                    api.roster.compute_roster_status(gid, home).to_dict(),
+                    home_before, label)
+                self.assertEqual(
+                    api.roster.compute_roster_status(gid, away).to_dict(),
+                    away_before, label)
+                # ...and it stays a no-op when repeated, which is what
+                # "idempotent" claims.
+                self.assertNotIn("error", api.set_availability(
+                    gid, p["id"], "available", actor_id=p["id"]), label)
+                self.assertEqual(self._identity(api, gid, p["id"]),
+                                 identity_before, label)
+            ran.append((label, CONFIRMED_REAFFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=CONFIRMED_REAFFIRM)
+
+
+class NullAttributionRefusesEveryConfirmBecauseItCannotBeProven(
+        _ReseatHarness, unittest.TestCase):
+    """DECISION 3, the round's blocker: "NULL durable attribution must
+    fail closed. A selected legacy row with no team_side/seated_position
+    cannot prove that its live team matches the side it holds. Reject
+    with attribution_missing before any attempted write, without adding
+    an open-slot check."
+
+    THE REFUSAL IS ABOUT UNPROVABILITY, NOT ABOUT MISMATCH, and the two
+    tests below exist to make that distinction impossible to blur: the
+    same row is refused whether the live side would have MATCHED the one
+    it was seated on or not. A row that names no side does not disagree
+    with the live context -- it says nothing, and silence is not a match.
+
+    THE REASON STRING IS SHARED with the backed-out re-confirm path
+    (``RosterService._refuse_unattributed``), so the two cannot drift
+    into two dialects of one refusal;
+    ``test_reconfirm_after_back_out_refuses_on_a_null_row`` in section 4
+    asserts the identical ``attribution_missing`` and fails with this one
+    under a mutation to that helper.
+
+    Head 5b26758 did the OPPOSITE here, deliberately and with a comment
+    saying so -- confirming "takes nothing back" -- and this input
+    CONFIRMED and wrote (RED output in this section's header)."""
+
+    def _selected_then_nulled(self, fx, label, move_to=None):
+        """A genuinely-seated SELECTED row whose attribution columns are
+        then NULLed at the store -- exactly the on-disk shape migration
+        061 leaves behind for a pre-061 row (it performs no backfill).
+
+        The move, when a case asks for one, happens BEFORE the NULLing:
+        ``_move_to_the_other_side`` reads the durable side to prove the
+        two answers disagree, which a NULL row cannot do."""
+        api, gid = fx["api"], fx["gid"]
+        p = self._mover(fx, "Legacy")
+        self.assertNotIn("error", api.select_roster(
+            gid, [p["id"]], actor_id=ADMIN), label)
+        seated_side = api.store.roster_entry_for_player(
+            gid, p["id"]).team_side
+        self.assertEqual(seated_side, fx["home"], label)
+        if move_to is not None:
+            self._move_to_the_other_side(fx, p["id"], move_to, label)
+        row = api.store.roster_entry_for_player(gid, p["id"])
+        row.team_side = None
+        row.seated_position = None
+        api.store.save_roster_entry(row)
+        # The NULL must survive the round trip on a real database, or this
+        # class would be testing an in-process object.
+        reread = api.store.roster_entry_for_player(gid, p["id"])
+        self.assertEqual(reread.status.value, "selected", label)
+        self.assertIsNone(reread.team_side, label)
+        self.assertIsNone(reread.seated_position, label)
+        self.assertIsNone(reread.attribution, label)
+        return p
+
+    def _assert_refused_with_zero_writes(self, fx, p, label):
+        api, gid = fx["api"], fx["gid"]
+        before = self._writes(api, gid)
+        with self._write_attempts(api.store) as attempts:
+            res = api.set_availability(gid, p["id"], "available",
+                                       actor_id=p["id"])
+        # "BEFORE ANY ATTEMPTED WRITE" is the ruling's words, so it is
+        # the spy -- not the identity diff -- that has to carry it:
+        # set_availability is @_transactional, so a gate placed after the
+        # availability upsert leaves the diff empty too.
+        self.assertEqual(attempts, [], (label, attempts))
+        err = res.get("error", {})
+        self.assertEqual(err.get("code"), "not_eligible", (label, res))
+        self.assertEqual(err.get("details", {}).get("reason"),
+                         "attribution_missing", (label, res))
+        # The SAME reason the backed-out path raises, and NOT the
+        # live-side mismatch refusal: three conditions, three answers.
+        self.assertNotEqual(err.get("details", {}).get("reason"),
+                            "seated_side_not_live_eligible", (label, res))
+        self.assertIn("durable game-side attribution",
+                      err.get("message", ""), (label, res))
+        # Nothing survived either.
+        self.assertEqual(self._writes(api, gid), before, label)
+        self.assertIsNone(api.store.availability_for_player(gid, p["id"]),
+                          label)
+        row = api.store.roster_entry_for_player(gid, p["id"])
+        self.assertEqual(row.status.value, "selected", label)
+        self.assertIsNone(row.team_side, label)
+        self.assertIsNone(row.seated_position, label)
+
+    def test_confirm_is_refused_when_the_live_side_moved_away(self):
+        """The mismatched case. BOTH sides carry an open skater slot, so
+        no occupancy gate could be producing this -- and the ruling
+        forbids adding one here."""
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                p = self._selected_then_nulled(fx, label,
+                                               move_to=fx["away"])
+                self.assertEqual(self._live_side(fx, p["id"]), fx["away"],
+                                 label)
+                # A NULL row is charged on EVERY side (section 4), so both
+                # sides read one open seat out of two.
+                self.assertEqual(self._open(fx, fx["home"]), 1, label)
+                self.assertEqual(self._open(fx, fx["away"]), 1, label)
+                self._assert_refused_with_zero_writes(fx, p, label)
+            ran.append((label, NULL_CONFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=NULL_CONFIRM)
+
+    def test_confirm_is_refused_even_though_the_live_side_would_have_matched(
+            self):
+        """THE POINT OF DECISION 3, stated as a test: the player never
+        moved, so their live side IS the side this row was seated on --
+        and the row is STILL refused, because it no longer records that
+        side and therefore cannot PROVE the match.
+
+        Without this case the refusal above would be indistinguishable
+        from an ordinary mismatch refusal, and a "fix" that compared the
+        live side against a re-derived guess would pass. The refusal is
+        about UNPROVABILITY, not about disagreement."""
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                p = self._selected_then_nulled(fx, label)
+                # The live context still answers the very side the row was
+                # seated on -- asserted, so "would have matched" is a
+                # measured premise and not a claim.
+                self.assertEqual(self._live_side(fx, p["id"]), fx["home"],
+                                 label)
+                self._assert_refused_with_zero_writes(fx, p, label)
+            ran.append((label, NULL_CONFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=NULL_CONFIRM)
+
+
+class AcceptedConfirmOverTheRealHttpAvailabilityRoute(
+        _HttpAvailabilityHarness, unittest.TestCase):
+    """Decision 1's added covered state, over the real route the UI posts
+    to. The facade tests prove the rule; these prove the PLAYER-FACING
+    SURFACE carries it for an ACCEPTED row too."""
+
+    def _accepted_on_home(self, fx, label):
+        api, gid = fx["api"], fx["gid"]
+        p = self._mover(fx, "Sub")
+        self.assertNotIn("error", api.enroll_substitute(gid, p["id"]), label)
+        self.assertNotIn("error", api.offer_substitute(gid, p["id"]), label)
+        self.assertNotIn("error", api.accept_substitute(
+            gid, p["id"], actor_id=p["id"]), label)
+        entry = api.store.roster_entry_for_player(gid, p["id"])
+        self.assertEqual(entry.status.value, "accepted", label)
+        self.assertEqual(entry.team_side, fx["home"], label)
+        self.assertIsNone(api.store.availability_for_player(gid, p["id"]),
+                          label)
+        return p
+
+    def test_http_refuses_the_confirm_when_the_live_side_moved_away(self):
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                api, gid, home = fx["api"], fx["gid"], fx["home"]
+                p = self._accepted_on_home(fx, label)
+                self._move_to_the_other_side(fx, p["id"], fx["away"], label)
+                self.assertEqual(self._open(fx, home), 1, label)
+                self.assertEqual(self._open(fx, fx["away"]), 2, label)
+
+                opener = self._serve(fx, label)
+                before = self._writes(api, gid)
+                status, body = self._req(
+                    opener, "POST", f"/api/games/{gid}/availability",
+                    {"player_id": p["id"],
+                     "availability_status": "available"})
+                self.assertEqual(status, 403, (label, body))
+                self.assertEqual(body["error"]["code"], "not_eligible",
+                                 (label, body))
+                self.assertEqual(body["error"]["details"]["reason"],
+                                 "seated_side_not_live_eligible",
+                                 (label, body))
+                self.assertEqual(self._writes(api, gid), before, label)
+                self.assertIsNone(
+                    api.store.availability_for_player(gid, p["id"]), label)
+                row = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(row.status.value, "accepted", label)
+                self.assertEqual(row.team_side, home, label)
+            ran.append((label, ACCEPTED_CONFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=ACCEPTED_CONFIRM)
+
+    def test_http_allows_the_confirm_when_the_live_side_still_matches(self):
+        ran = []
+        for label, fx in self._each(target_skaters=1):
+            with self.subTest(backend=label):
+                api, gid, home = fx["api"], fx["gid"], fx["home"]
+                p = self._accepted_on_home(fx, label)
+                self.assertEqual(self._live_side(fx, p["id"]), home, label)
+                # The durable side's only slot is the one THIS ROW holds:
+                # an added occupancy gate would 403 here.
+                self.assertEqual(self._open(fx, home), 0, label)
+
+                opener = self._serve(fx, label)
+                status, body = self._req(
+                    opener, "POST", f"/api/games/{gid}/availability",
+                    {"player_id": p["id"],
+                     "availability_status": "available"})
+                self.assertEqual(status, 200, (label, body))
+                self.assertEqual(body["availability_status"], "available",
+                                 (label, body))
+                row = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(row.status.value, "confirmed", label)
+                self.assertEqual(row.team_side, home, label)
+                self.assertEqual(
+                    api.roster.compute_roster_status(
+                        gid, home).to_dict()["confirmed_skaters"], 1, label)
+            ran.append((label, ACCEPTED_CONFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=ACCEPTED_CONFIRM)
+
+
+class AlreadyConfirmedReaffirmOverTheRealHttpAvailabilityRoute(
+        _HttpAvailabilityHarness, unittest.TestCase):
+    """Decision 2 over the real route: head 5b26758 answered this request
+    with a 403. It must answer 200 again."""
+
+    def test_http_allows_the_reaffirm_though_the_live_side_moved_away(self):
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                api, gid, home = fx["api"], fx["gid"], fx["home"]
+                p = self._mover(fx, "Mover")
+                self.assertNotIn("error", api.select_roster(
+                    gid, [p["id"]], actor_id=ADMIN), label)
+                self.assertNotIn("error", api.set_availability(
+                    gid, p["id"], "available", actor_id=p["id"]), label)
+                self.assertEqual(api.store.roster_entry_for_player(
+                    gid, p["id"]).status.value, "confirmed", label)
+                self._move_to_the_other_side(fx, p["id"], fx["away"], label)
+                self.assertEqual(self._live_side(fx, p["id"]), fx["away"],
+                                 label)
+                home_before = api.roster.compute_roster_status(
+                    gid, home).to_dict()
+
+                opener = self._serve(fx, label)
+                status, body = self._req(
+                    opener, "POST", f"/api/games/{gid}/availability",
+                    {"player_id": p["id"],
+                     "availability_status": "available"})
+                self.assertEqual(status, 200, (label, body))
+                self.assertEqual(body["availability_status"], "available",
+                                 (label, body))
+                row = api.store.roster_entry_for_player(gid, p["id"])
+                self.assertEqual(row.status.value, "confirmed", label)
+                self.assertEqual(row.team_side, home, label)
+                self.assertEqual(
+                    api.roster.compute_roster_status(gid, home).to_dict(),
+                    home_before, label)
+            ran.append((label, CONFIRMED_REAFFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=CONFIRMED_REAFFIRM)
+
+
+class NullAttributionConfirmOverTheRealHttpAvailabilityRoute(
+        _HttpAvailabilityHarness, unittest.TestCase):
+    """Decision 3 over the real route: the blocker's input reached the
+    product through THIS request, and at head 5b26758 it answered 200 and
+    wrote. Both the mismatched and the would-have-matched cases must now
+    arrive as a structured 403 carrying ``attribution_missing`` -- not a
+    500, and not a silent success."""
+
+    def _selected_then_nulled(self, fx, label, move_to=None):
+        api, gid = fx["api"], fx["gid"]
+        p = self._mover(fx, "Legacy")
+        self.assertNotIn("error", api.select_roster(
+            gid, [p["id"]], actor_id=ADMIN), label)
+        self.assertEqual(api.store.roster_entry_for_player(
+            gid, p["id"]).team_side, fx["home"], label)
+        if move_to is not None:
+            self._move_to_the_other_side(fx, p["id"], move_to, label)
+        row = api.store.roster_entry_for_player(gid, p["id"])
+        row.team_side = None
+        row.seated_position = None
+        api.store.save_roster_entry(row)
+        reread = api.store.roster_entry_for_player(gid, p["id"])
+        self.assertIsNone(reread.attribution, label)
+        return p
+
+    def _assert_http_refused(self, fx, p, label):
+        api, gid = fx["api"], fx["gid"]
+        opener = self._serve(fx, label)
+        before = self._writes(api, gid)
+        status, body = self._req(
+            opener, "POST", f"/api/games/{gid}/availability",
+            {"player_id": p["id"], "availability_status": "available"})
+        self.assertEqual(status, 403, (label, body))
+        self.assertEqual(body["error"]["code"], "not_eligible",
+                         (label, body))
+        self.assertEqual(body["error"]["details"]["reason"],
+                         "attribution_missing", (label, body))
+        self.assertEqual(self._writes(api, gid), before, label)
+        self.assertIsNone(api.store.availability_for_player(gid, p["id"]),
+                          label)
+        self.assertEqual(api.store.roster_entry_for_player(
+            gid, p["id"]).status.value, "selected", label)
+
+    def test_http_refuses_the_confirm_when_the_live_side_moved_away(self):
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                p = self._selected_then_nulled(fx, label,
+                                               move_to=fx["away"])
+                self._assert_http_refused(fx, p, label)
+            ran.append((label, NULL_CONFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=NULL_CONFIRM)
+
+    def test_http_refuses_the_confirm_though_the_live_side_would_have_matched(
+            self):
+        """The unprovability half, over HTTP: the player never moved, so
+        the live side IS the seated side -- and the route still refuses,
+        because the row cannot prove it."""
+        ran = []
+        for label, fx in self._each(target_skaters=2):
+            with self.subTest(backend=label):
+                p = self._selected_then_nulled(fx, label)
+                self.assertEqual(self._live_side(fx, p["id"]), fx["home"],
+                                 label)
+                self._assert_http_refused(fx, p, label)
+            ran.append((label, NULL_CONFIRM[0].name))
+        self._assert_matrix_ran(ran, shapes=NULL_CONFIRM)
+
 
 
 if __name__ == "__main__":
