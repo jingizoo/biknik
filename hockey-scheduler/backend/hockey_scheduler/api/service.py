@@ -4467,15 +4467,21 @@ class ApiService:
     def get_board(self, game_id: str) -> dict:
         """Everything the Game Detail screen needs in one call.
 
-        Groups every team player into selected / substitute / available so
-        the iPhone UI can render Coach and Player views without extra round
+        Groups the home side's players into selected / substitute / available
+        so the iPhone UI can render Coach and Player views without extra round
         trips. This is a UI convenience over the contract endpoints; it does
         not introduce new domain rules.
+
+        WHO those players are is :meth:`_lineup_rows`, which now answers from
+        the four game-scoped authorities instead of the permanent
+        ``Player.team_id`` pointer. WHICH SIDE it answers for is still
+        hard-coded to home here — that is the separate half of this blocker,
+        closed in the next commit.
         """
         game = self.roster._require_game(game_id)
         status = self.roster.compute_roster_status(game_id).to_dict()
 
-        rows = self._lineup_rows(game_id, game.home_team_id)
+        rows = self._lineup_rows(game, game.home_team_id)
 
         notifications = [
             {"type": n.type.value, "audience": n.audience, "message": n.message,
@@ -4497,37 +4503,57 @@ class ApiService:
             "audit_count": len(audit),
         }
 
-    def _lineup_rows(self, game_id: str, team_id: str) -> list:
-        """Group a team's players into selected / substitute / available."""
-        roster = {e.player_id: e for e in self.store.roster_for_game(game_id)}
-        avail = {a.player_id: a for a in self.store.availability_for_game(game_id)}
-        subs = {s.player_id: s for s in self.store.substitutes_for_game(game_id)}
+    _GROUP_OF_SOURCE = {"roster": "selected", "substitute": "substitute",
+                        "candidate": "available"}
+
+    def _lineup_rows(self, game, team_id: str) -> list:
+        """Serialize ONE side's lineup population for the UI.
+
+        A THIN SERIALIZER, deliberately. WHO is on this side, WHICH authority
+        put them there, and WHICH position/jersey values are authoritative are
+        all business rules, and they live in
+        :meth:`RosterService.lineup_population` — the same delegation
+        :meth:`_availability_candidates` already makes to
+        ``_players_for_game_team``, and for the same reason: the two private
+        game surfaces must not each keep their own idea of who is on a team
+        for a game. Read that method for the four populations, the strict
+        side tests, the legacy-NULL omission rule and the ordering.
+
+        This method's only remaining jobs are the group label, the
+        availability join (which is per-``(game, player)``, not per-side, so
+        it has no side authority to get wrong) and the JSON shape.
+
+        ``position``/``jersey_number`` COME OFF THE ROW, never off
+        ``row.player``. On a bound game those are the seated/enrollment/
+        membership values; ``jersey_number`` is ``null`` when no seasonal
+        value exists rather than the permanent pointer's. Only the unbound
+        exhibition branch puts permanent values in these fields, and it does
+        so inside the service, on its own explicit branch.
+        """
+        avail = {a.player_id: a
+                 for a in self.store.availability_for_game(game.id)}
         rows = []
-        for p in self.store.players_for_team(team_id):
-            entry = roster.get(p.id)
-            a = avail.get(p.id)
-            s = subs.get(p.id)
-            backed_out = entry is not None and not entry.status.occupies_slot
-            active_sub = s is not None and s.status in (
-                SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED
-            )
-            if entry is not None:
-                group = "selected"
-            elif active_sub:
-                group = "substitute"
-            else:
-                group = "available"
+        for row in self.roster.lineup_population(game, team_id):
+            entry, sub = row.entry, row.enrollment
+            a = avail.get(row.player.id)
             rows.append({
-                "id": p.id,
-                "name": p.name,
-                "position": p.position.value,
-                "slot_type": p.slot_type.value,
-                "jersey_number": p.jersey_number,
-                "group": group,
+                "id": row.player.id,
+                "name": row.player.name,
+                "position": row.position.value,
+                "slot_type": row.position.slot_type.value,
+                "jersey_number": row.jersey_number,
+                "group": self._GROUP_OF_SOURCE[row.source],
                 "roster_status": entry.status.value if entry else None,
-                "backed_out": backed_out,
+                "backed_out": (entry is not None
+                               and not entry.status.occupies_slot),
                 "availability": a.availability_status.value if a else "pending",
-                "sub_status": s.status.value if s else None,
+                "sub_status": sub.status.value if sub else None,
+                # LIVE eligibility for THIS side, so the UI can show a
+                # durable row that has become unseatable as exactly that —
+                # visible for cleanup, labelled ineligible, and NOT offered
+                # an add/seat control the service would refuse (owner ruling,
+                # comment 5394947899).
+                "eligible": row.eligible,
             })
         return rows
 
@@ -4537,6 +4563,11 @@ class ApiService:
 
         Home and away rosters are managed separately; this returns each side's
         team, roster status, and player groups in one call for the roster UI.
+
+        WHO is on each side is :meth:`_lineup_rows`, which now answers from
+        the four game-scoped authorities instead of the permanent
+        ``Player.team_id`` pointer. WHICH sides a given caller may read is the
+        separate half of this blocker, closed in the next commit.
         """
         game = self.roster._require_game(game_id)
 
@@ -4545,8 +4576,9 @@ class ApiService:
             return {
                 "team_id": team_id,
                 "team_name": team.name if team else team_id,
-                "status": self.roster.compute_roster_status(game_id, team_id).to_dict(),
-                "players": self._lineup_rows(game_id, team_id),
+                "status": self.roster.compute_roster_status(
+                    game_id, team_id).to_dict(),
+                "players": self._lineup_rows(game, team_id),
             }
 
         result = self.store.result_for_game(game_id)

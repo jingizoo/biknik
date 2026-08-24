@@ -274,6 +274,45 @@ class GameMembershipContext(NamedTuple):
         return self.position.slot_type
 
 
+class LineupRow(NamedTuple):
+    """ONE player on ONE side's lineup screen, with the authority that put
+    them there (#427 blocker, owner comments 5390696775 / 5394947899).
+
+    Produced only by :meth:`RosterService.lineup_population`, which is the
+    place to read for what each field means and why. In short:
+
+    ``source``  which of the four populations this row came from —
+                ``"roster"`` (durable ``GameRosterEntry.attribution``),
+                ``"substitute"`` (durable ``SubstituteEnrollment.team_id``),
+                or ``"candidate"`` (live game-season membership). The
+                unbound-exhibition branch reuses the same three labels over
+                permanent-pointer data.
+
+    ``position``/``jersey_number``  ALREADY RESOLVED to the authority the
+                ruling assigns to this row's source. A caller must render
+                these and must not re-read ``player.position`` /
+                ``player.jersey_number`` — doing so is the defect. ``player``
+                is carried for identity (id, name, ``is_active``) only.
+
+    ``eligible``  whether this side has a LIVE membership context for this
+                player right now. ``False`` is reachable on a durable row
+                whose occupant's participation has ended: the row stays
+                visible so the owning Coach can clean it up, but it is not
+                seatable and the service would refuse an add/seat on it, so
+                a UI that offers one is offering a rejected action. Distinct
+                from ``source``, which says how the row got here, not
+                whether it may still be acted on.
+    """
+    player: Player
+    source: str
+    position: Position
+    jersey_number: Optional[int]
+    entry: Optional[GameRosterEntry]
+    enrollment: Optional[SubstituteEnrollment]
+    context: Optional[GameMembershipContext]
+    eligible: bool
+
+
 class RosterService:
     def __init__(self, store: InMemoryStore, clock: Callable[[], datetime] = _utcnow):
         self.store = store
@@ -1222,10 +1261,7 @@ class RosterService:
             )
 
         existing = self.store.substitute_for_player(game_id, player_id)
-        if existing and existing.status in (
-            SubstituteStatus.ENROLLED,
-            SubstituteStatus.OFFERED,
-        ):
+        if existing and existing.status.is_active_enrollment:
             raise ValidationError(f"{player.name} is already enrolled as a substitute.")
 
         sub = SubstituteEnrollment(
@@ -1604,10 +1640,7 @@ class RosterService:
         game = self._guard_mutable(game)
         player = self._require_active_player(player_id)   # fail closed on deactivation
         sub = self.store.substitute_for_player(game_id, player_id)
-        if sub is None or sub.status not in (
-            SubstituteStatus.ENROLLED,
-            SubstituteStatus.OFFERED,
-        ):
+        if sub is None or not sub.status.is_active_enrollment:
             raise NotEnrolledError(
                 "Player must be an enrolled/offered substitute to be added."
             )
@@ -1687,10 +1720,7 @@ class RosterService:
         self, game_id: str, player_id: str
     ) -> SubstituteEnrollment:
         sub = self.store.substitute_for_player(game_id, player_id)
-        if sub is None or sub.status not in (
-            SubstituteStatus.ENROLLED,
-            SubstituteStatus.OFFERED,
-        ):
+        if sub is None or not sub.status.is_active_enrollment:
             raise NotEnrolledError("Player is not currently enrolled as a substitute.")
         return sub
 
@@ -2456,6 +2486,261 @@ class RosterService:
         contexts = self.resolve_membership_contexts_for_game(game)
         return [(ctx.player, ctx) for _pid, ctx in sorted(contexts.items())
                 if ctx.team_id == team_id]
+
+    # -- the lineup population (#427 blocker, comments 5390696775 /
+    #    5394947899) -------------------------------------------------------
+    def lineup_population(self, game, team_id: str) -> List["LineupRow"]:
+        """WHO is on ONE side's lineup screen for ``game`` — the whole
+        population, each row carrying the AUTHORITY that put it there.
+
+        THE DEFECT THIS REPLACES. ``ApiService._lineup_rows`` enumerated
+        ``store.players_for_team(team_id)`` — the permanent ``Player.team_id``
+        pointer — for both ``GET /api/games/{id}/lineups`` and ``GET
+        /api/games/{id}/board``. Reproduced tri-store (Memory, SQLite, real
+        PostgreSQL) over a real authenticated Coach session at head 337374a,
+        in TWO contradictions at once on ONE fixture:
+
+        * ACROSS ENDPOINTS — the already-cut-over ``/availability-summary``
+          named ``[Current Member, Enrolled Sub, Legacy Seat, Legacy Sub]``
+          while ``/lineups`` and ``/board`` named
+          ``[Departed Player, Away Member, Pointer Ghost]``. Not an overlap
+          problem: the two sets were DISJOINT.
+        * WITHIN ONE RESPONSE — ``home.status`` reported
+          ``open_skater_slots=1`` against ``target_skaters=3`` (two durably
+          seated bodies) and ``substitutes_enrolled=2``, while
+          ``home.players`` listed ZERO selected and ZERO substitute rows and
+          three strangers marked "available". ``status`` came from
+          ``_side_data``'s durable/live authorities; ``players`` came from the
+          pointer. One JSON document, two irreconcilable answers.
+
+        FOUR POPULATIONS, FOUR AUTHORITIES, and they are combined — never
+        substituted for one another:
+
+        (a) SELECTED ROWS -> ``GameRosterEntry.attribution``, the durable
+            ``(team_side, seated_position)`` written at seating time from the
+            context that authorized it (migration 061). Tested STRICTLY:
+            ``attribution is not None and attribution[0] == team_id``.
+
+            *** NOT ``_side_data.matched_entries``, DELIBERATELY. *** That
+            list is built for SLOT ACCOUNTING and charges a pre-061
+            NULL-attribution row to EVERY side of its game, in BOTH buckets,
+            on purpose — over-refusing can only close slots, never reopen
+            them. Verified tri-store, ``_side_data(HOME).matched_entries ==
+            _side_data(AWAY).matched_entries`` for such a row. Feeding that
+            into a READ would put ONE player in BOTH ``home.players`` AND
+            ``away.players`` of a single ``/lineups`` response — a new
+            cross-side leak manufactured out of the fix for one. A count that
+            fails closed and an identity that names a side are different
+            questions; only the second one is asked here.
+
+        (b) ACTIVE SUBSTITUTE ROWS -> ``SubstituteEnrollment.team_id``, the
+            durable authorizing-side snapshot (OFFERED since migration 060,
+            ENROLLED since a90f314). "Active" is
+            :attr:`SubstituteStatus.is_active_enrollment` — ENROLLED and
+            OFFERED only; an ACCEPTED row is a SEATED row and arrives through
+            (a) instead. Tested STRICTLY: ``sub.team_id == team_id``.
+
+            LEGACY NULL OWNERSHIP: OMITTED FROM BOTH SIDES (owner ruling,
+            comment 5394947899). A row that cannot name its owner belongs to
+            neither side response. It is not placed on both, and no
+            attribution marker is attached to one guessed side — including
+            the ``sub_status`` badge, which is itself a side assertion about a
+            private workflow. If that player independently holds a current
+            valid membership they may still surface through (c), as an
+            ordinary live candidate and nothing more. Operator repair
+            visibility, if it is ever needed, is a separate unattributed
+            collection, never a side assertion here.
+
+        (c) UNSEATED CANDIDATES -> the LIVE exact game-season membership,
+            ``resolve_membership_contexts_for_game`` filtered to
+            ``ctx.team_id == team_id`` — the same batched resolution
+            ``_players_for_game_team`` and ``_availability_candidates``
+            already consume, so the pool a coach reads here and the pool they
+            are asked about on the availability screen cannot drift.
+
+        (d) UNBOUND EXHIBITION -> :meth:`_unbound_lineup_population`, an
+            EXPLICITLY SEPARATE branch, never a fallback. A BOUND game never
+            reaches the permanent pointer by any path through this method.
+
+        DEDUP AND PRECEDENCE. A player can hold a roster row AND an active
+        enrollment AND a live membership at once, so the union is keyed by
+        ``player_id`` with precedence (a) > (b) > (c) — the SAME order the
+        old grouping used, which is what keeps ``group``/``roster_status``/
+        ``sub_status``/``backed_out`` unambiguous on the one row that
+        survives.
+
+        ORDERING IS IMPOSED, NEVER INHERITED. :meth:`_ordered_candidates`,
+        reused rather than copied — ``(name, player_id)``, the same total
+        order ``list_addable_players`` and ``auto_build_roster`` already use.
+        The old code sorted NOTHING and inherited store order, which is not
+        cosmetic: measured tri-store, Memory yielded ``player_1, player_2,
+        …, player_10, player_11`` (dict insertion) while SQLite and
+        PostgreSQL both yielded ``player_1, player_10, player_11, player_2,
+        …`` (lexicographic TEXT id).
+
+        SEASONAL FIELDS ONLY, ON A BOUND GAME (owner ruling 2). ``position``
+        is the row's own durable/live source — ``entry.seated_position`` for
+        (a), ``enrollment.position`` for (b), ``ctx.position`` for (c) — never
+        ``Player.position``. ``jersey_number`` is the exact bound
+        membership's, and ``None`` when no authoritative seasonal value
+        exists; it NEVER falls back to ``Player.jersey_number``. A seated row
+        whose occupant's membership has since ended keeps its seat and its
+        durable position and reports ``jersey_number=None``, because there is
+        no longer a seasonal record to read one from and the permanent
+        pointer is not an answer to a seasonal question.
+
+        Raises ``ValidationError`` if ``team_id`` is not one of this game's
+        two sides — the same participation check ``_availability_candidates``
+        applies, so a caller cannot ask for a third team's private pool.
+        """
+        if team_id not in (game.home_team_id, game.away_team_id):
+            raise ValidationError("That team is not playing in this game.")
+        entries = {e.player_id: e
+                   for e in self.store.roster_for_game(game.id)}
+        subs = {s.player_id: s
+                for s in self.store.substitutes_for_game(game.id)}
+        if not season_guard.game_is_league_season_bound(game):
+            return self._unbound_lineup_population(
+                game, team_id, entries, subs)
+
+        contexts = self.resolve_membership_contexts_for_game(game)
+
+        def side_context(player_id):
+            """The live context ONLY when it names THIS side. A player whose
+            membership has moved to the opponent has no seasonal record on
+            this side, so this side has no seasonal jersey to report and no
+            live eligibility to claim for them."""
+            ctx = contexts.get(player_id)
+            return ctx if ctx is not None and ctx.team_id == team_id else None
+
+        def owned_sub(player_id):
+            """The enrollment row ONLY when it is durably owned by THIS side.
+            A NULL-owner legacy row resolves ``None`` here, which is what
+            keeps its ``sub_status`` off a guessed side's response."""
+            sub = subs.get(player_id)
+            return sub if sub is not None and sub.team_id == team_id else None
+
+        rows: Dict[str, "LineupRow"] = {}
+
+        # (a) durable seated rows
+        for player_id, entry in entries.items():
+            attribution = entry.attribution
+            if attribution is None or attribution[0] != team_id:
+                continue
+            player = self.store.get_player(player_id)
+            if player is None:
+                continue
+            ctx = side_context(player_id)
+            rows[player_id] = LineupRow(
+                player=player, source="roster",
+                # Durable, and guaranteed present: `attribution` is None
+                # unless BOTH halves were written.
+                position=entry.seated_position,
+                jersey_number=self._season_jersey(ctx),
+                entry=entry, enrollment=owned_sub(player_id),
+                context=ctx, eligible=ctx is not None)
+
+        # (b) durably owned ACTIVE enrollments
+        for player_id, sub in subs.items():
+            if player_id in rows or not sub.status.is_active_enrollment:
+                continue
+            if sub.team_id is None or sub.team_id != team_id:
+                continue
+            player = self.store.get_player(player_id)
+            if player is None:
+                continue
+            ctx = side_context(player_id)
+            rows[player_id] = LineupRow(
+                player=player, source="substitute",
+                position=sub.position,
+                jersey_number=self._season_jersey(ctx),
+                entry=None, enrollment=sub,
+                context=ctx, eligible=ctx is not None)
+
+        # (c) live unseated candidates
+        for player_id, ctx in contexts.items():
+            if player_id in rows or ctx.team_id != team_id:
+                continue
+            rows[player_id] = LineupRow(
+                player=ctx.player, source="candidate",
+                position=ctx.position,
+                jersey_number=self._season_jersey(ctx),
+                # NO ROSTER ROW, BY CONSTRUCTION AND BY RULE. Any row durably
+                # attributed to this side already claimed this player in (a),
+                # so the only entry that could be attached here is one this
+                # side does NOT own — a pre-061 NULL-attribution row, or a row
+                # seated on the OPPONENT. Attaching either would publish
+                # `roster_status: "selected"` on a side that cannot show the
+                # row is hers, which is the guessed-side attribution marker
+                # the ruling forbids, in the field a Coach reads as "this
+                # player is on my roster". Such a player appears here as what
+                # this side can actually prove they are: a live candidate.
+                entry=None,
+                # Same rule, same reason: `owned_sub` is `None` for a legacy
+                # NULL-owner enrollment, so no `sub_status` badge is asserted
+                # on a guessed side either.
+                enrollment=owned_sub(player_id),
+                context=ctx, eligible=True)
+
+        return [rows[pid] for pid in self._ordered_candidates(rows)]
+
+    @staticmethod
+    def _season_jersey(ctx) -> Optional[int]:
+        """The SEASON-scoped jersey for a bound game, or ``None``.
+
+        ``None`` when there is no context on this side, and ``None`` again
+        when the membership itself carries no number — a legacy/backfilled
+        stint may genuinely have none. Both answers are "no authoritative
+        seasonal value exists", and the ruling's instruction for that case is
+        ``null``, not ``Player.jersey_number``. Deliberately unlike
+        :meth:`_context_for`'s treatment of POSITION, which does fall back to
+        the permanent value INSIDE a valid context because every slot
+        computation needs some position to bucket by; a jersey number has no
+        such consumer, so the honest answer is simply the absent one."""
+        if ctx is None or ctx.membership is None:
+            return None
+        return ctx.membership.jersey_number
+
+    def _unbound_lineup_population(
+        self, game, team_id, entries, subs
+    ) -> List["LineupRow"]:
+        """Population (d): the EXPLICIT unbound-exhibition branch.
+
+        An unbound game has no LeagueSeason and therefore no membership
+        authority to consult at all, so the permanent roster IS the pool and
+        the permanent ``Player.position``/``Player.jersey_number`` ARE the
+        fields — exactly pre-#205 behaviour, and the only place in this
+        method family where the pointer is read. It is reached by an
+        explicit ``game_is_league_season_bound`` test, never as a fallback
+        from a bound game whose resolution failed.
+
+        The pool comes from :meth:`_players_for_game_team`'s own unbound
+        branch rather than a second ``players_for_team`` call, so the one
+        rule about what "unbound" means lives in one place.
+
+        ORDERING IS THE ONE THING THAT CHANGES HERE. ``_players_for_game_team``
+        sorts its BOUND branch and not its unbound one, so delegating alone
+        would leave this path inheriting store order — the same tri-store
+        divergence :meth:`_ordered_candidates` exists to remove. The ruling
+        asks for deterministic ordering of the combined result without
+        carving out exhibitions, so the sort is applied here too."""
+        rows: Dict[str, "LineupRow"] = {}
+        for player, ctx in self._players_for_game_team(game, team_id):
+            entry = entries.get(player.id)
+            sub = subs.get(player.id)
+            if entry is not None:
+                source = "roster"
+            elif sub is not None and sub.status.is_active_enrollment:
+                source = "substitute"
+            else:
+                source = "candidate"
+            rows[player.id] = LineupRow(
+                player=player, source=source,
+                position=player.position,
+                jersey_number=player.jersey_number,
+                entry=entry, enrollment=sub,
+                context=ctx, eligible=ctx is not None)
+        return [rows[pid] for pid in self._ordered_candidates(rows)]
 
     # ====================================================================
     # coach controls
@@ -3362,8 +3647,8 @@ class RosterService:
             # view still shows it, with a Withdraw action). Distinct from the
             # ineligibility reasons substitute_block_reason covers.
             existing_sub = self.store.substitute_for_player(g.id, player_id)
-            if existing_sub is not None and existing_sub.status in (
-                    SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED):
+            if (existing_sub is not None
+                    and existing_sub.status.is_active_enrollment):
                 continue
             if self.substitute_block_reason(player_id, g.id) is None:
                 opportunities.append(g)
@@ -3489,7 +3774,7 @@ class RosterService:
             rstatus = self.compute_roster_status(game_id, team_id)
         already_sub = {
             s.player_id for s in self.store.substitutes_for_game(game_id)
-            if s.status in (SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED)
+            if s.status.is_active_enrollment
         }
         rows = []
         for player, ctx in self._players_for_game_team(game, team_id):
@@ -3620,7 +3905,7 @@ class RosterService:
         self.store.save_game(game)
         # Cancel any active substitute enrollments.
         for sub in self.store.substitutes_for_game(game_id):
-            if sub.status in (SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED):
+            if sub.status.is_active_enrollment:
                 sub.status = SubstituteStatus.CANCELLED
                 self.store.save_substitute(sub)
         self._audit(game_id, AuditAction.GAME_CANCELLED, actor_id=actor_id)

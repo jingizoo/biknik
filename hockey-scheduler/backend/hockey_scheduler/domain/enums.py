@@ -125,6 +125,32 @@ class SubstituteStatus(str, Enum):
     WITHDRAWN = "withdrawn"
     CANCELLED = "cancelled"
 
+    @property
+    def is_active_enrollment(self) -> bool:
+        """True while this enrollment is still a LIVE CANDIDACY — the row is
+        a body in the substitute pool right now.
+
+        ENROLLED and OFFERED, and exactly those two. The other five are not
+        omissions:
+
+        * ``ACCEPTED`` is not a separate population. Accepting an offer (and
+          a coach's add-to-roster override) writes a ``GameRosterEntry`` with
+          ``roster_role=SUBSTITUTE_ADDED`` and a DURABLE ``team_side``, so an
+          accepted substitute is a SEATED row and is counted, attributed and
+          displayed as one. Treating it as an active enrollment too would
+          double-count the same body.
+        * ``DECLINED``/``EXPIRED``/``WITHDRAWN``/``CANCELLED`` are terminal
+          history.
+
+        Hoisted here because the pair was spelled inline at six sites (five
+        in ``RosterService``, one in ``ApiService``) with no shared name, and
+        #427's lineup split adds a seventh reader — the side-scoped
+        substitute population — whose correctness depends on asking the same
+        question the enroll gate, the withdraw gate, the add-to-roster gate,
+        the outreach queue, the addable pool and game cancellation all ask.
+        One property, so "active" cannot come to mean two different sets."""
+        return self in {SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED}
+
 
 class GameStatus(str, Enum):
     DRAFT = "draft"
