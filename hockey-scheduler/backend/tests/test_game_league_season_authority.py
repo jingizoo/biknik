@@ -2068,15 +2068,32 @@ class RemindUnrespondedHonorsTheBindingItLocked(_Authority,
     """
 
     def _home_player(self, fx, name):
-        """A player ON HOME. ``remind_unresponded`` reminds
-        ``store.players_for_team(team_id)``, so the recipients must be the
-        Team's own players — not the fixture's "Mover" shape, whose permanent
-        pointer deliberately names THIRD."""
-        api = fx["api"]
-        p = Player(id=api.store.next_id("player"), team_id=fx["home"],
-                   name=name, position=Position.FORWARD)
-        api.store.add_player(p)
-        return {"id": p.id, "name": name}
+        """A player rostered on HOME **for this game** — the fixture's MOVER
+        shape (``_player``): permanent pointer on THIRD, active membership on
+        this game's exact LeagueSeason/HOME.
+
+        THIS HELPER USED TO BUILD THE OPPOSITE, AND THAT WAS THE HOLE. It
+        planted a pointer-HOME player with no seasonal membership at all,
+        with the comment "the recipients must be the Team's own players — not
+        the fixture's Mover shape". That was written against the behaviour of
+        the day (``remind_unresponded`` discovered recipients through
+        ``store.players_for_team``), and it made both tests below
+        STRUCTURALLY INCAPABLE of noticing that the discovery read the
+        permanent pointer: a fixture whose pointer AGREES with its membership
+        is satisfied by either authority. The owner's next review found
+        exactly that — "the new reminder tests seed pointer-HOME players and
+        therefore do not falsify this path" (comment 5387094674) — and both
+        tests kept passing under a mutation that restored the pointer as
+        recipient discovery.
+
+        Switching to the MOVER shape changes nothing about what these two
+        tests are ABOUT (the Game is re-fetched under the canonical Season
+        lock, and recipients are read inside the guarded transaction); it
+        only removes the accident that made them blind. They now fail under
+        that mutation too — the recipient becomes a player whose pointer says
+        THIRD, so a pointer-derived list is empty and the control's
+        ``reminded`` count collapses."""
+        return self._player(fx, name)
 
     def _second_competition(self, fx):
         """A real, ARCHIVED sibling competition to rebind the Game into: a

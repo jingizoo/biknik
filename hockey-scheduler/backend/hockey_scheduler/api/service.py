@@ -4091,23 +4091,100 @@ class ApiService:
         return self._availability_summary_of(
             self.roster._require_game(game_id), team_id)
 
+    def _availability_candidates(self, game, team_id: str) -> List["Player"]:
+        """WHO owes ``team_id`` an availability answer for ``game`` — the ONE
+        discovery both availability surfaces consume (PR #427 blocker, owner
+        comment 5387094674).
+
+        THE DEFECT THIS REPLACES. Discovery was
+        ``store.players_for_team(team_id)``, whose authority is the PERMANENT
+        ``Player.team_id`` pointer. Reproduced tri-store at head 11835a2, in
+        both mirrored directions at once: a player with pointer THIRD and an
+        active membership on this game's exact LeagueSeason/HOME was absent
+        from the HOME summary and got no reminder, while a player with
+        pointer HOME and an active THIRD membership was listed in the private
+        HOME summary and received the HOME reminder
+        (``current_member_listed=False``, ``departed_member_listed=True``,
+        ``current_member_notified=False``, ``departed_member_notified=True``,
+        one reminder sent, on Memory, SQLite and PostgreSQL alike). #205 moves
+        notifications and current eligibility onto the exact Game-LeagueSeason
+        membership; this was the last surface still answering from the pointer.
+
+        WHICH POPULATION, AND WHY IT IS NOT THE ROSTER'S. The question here is
+        "who is expected to tell this team whether they can play THIS game",
+        asked BEFORE anyone is seated and of people who may never be seated.
+        So a durable ``GameRosterEntry`` neither grants membership of this
+        population nor is required for it:
+
+        * a player can be eligible-and-unresponded while holding NO roster row
+          — that is the ordinary pre-selection case, and the whole point of
+          the summary;
+        * a roster row can be held by someone whose membership has since
+          ENDED. That row keeps its slot and its durable attribution for slot
+          accounting (``RosterService._side_data``, #205 blocker 5 round 2 —
+          re-resolving there erased attribution and admitted overfill), but
+          the person behind it is no longer a participant, so they must not
+          be asked, must not be reminded, and must not appear in a private
+          per-player summary of a team they have left.
+
+        The two surfaces therefore read DIFFERENT populations on purpose:
+        this one reads LIVE ELIGIBILITY, ``_side_data`` reads DURABLE
+        ATTRIBUTION. Neither is a fallback for the other.
+
+        BOUND vs UNBOUND is ``RosterService._players_for_game_team``'s split,
+        reused rather than re-derived so a third copy of the rule cannot
+        drift: for a LeagueSeason-bound game it is the batched
+        ``resolve_membership_contexts_for_game`` resolution — the exact
+        LeagueSeason, an eligible membership status, the membership's
+        denormalized Season agreeing, and the side's whole spine (Team,
+        Team-League, Program, a current ACTIVE registration) holding, all
+        through the shared eligibility classifier — and a bound game NEVER
+        falls back to the pointer. For an UNBOUND game (an exhibition by
+        design, or an unbound legacy row) there is no membership authority to
+        consult at all, so the permanent roster IS the pool: that is an
+        EXPLICITLY SEPARATE legacy path, not a fallback, and it is exactly
+        pre-#205 behaviour. Note the two coincide there by construction —
+        ``team_id`` is checked to be one of this game's two sides first, so
+        every player the pointer pool yields resolves an unbound context on
+        that same side.
+
+        LOCKS. This runs wherever its caller runs. :meth:`remind_unresponded`
+        calls it INSIDE the one transaction that already holds the canonical
+        Season row lock, which is what makes the recipient list linearizable
+        with the governed membership mutations:
+        ``SetupService.set_season_roster_membership_status`` locks the
+        membership row AND, via ``_require_active_season``, that SAME Season
+        row. The read surface calls it unlocked, exactly as before — an
+        availability rollup is a read, and #427's read half deliberately
+        checks identity without taking the write guard's lock.
+        """
+        if team_id not in (game.home_team_id, game.away_team_id):
+            raise ValidationError("That team is not playing in this game.")
+        return [player for player, _ctx
+                in self.roster._players_for_game_team(game, team_id)]
+
     def _availability_summary_of(self, game, team_id: str) -> dict:
         """The summary computed off an ALREADY-RESOLVED Game row.
 
         Split out of :meth:`get_availability_summary` for PR #427 so
         :meth:`remind_unresponded` can compute its recipient list from the row
         it holds under the canonical Season lock, rather than from a second,
-        earlier, unlocked read of the same Game. The read surface keeps its
-        exact previous behaviour: it passes the row its own locator produced.
+        earlier, unlocked read of the same Game.
+
+        ONE DISCOVERY, TWO CONSUMERS. The player identities come from
+        :meth:`_availability_candidates`, and ``remind_unresponded`` derives
+        its recipients from THIS summary rather than discovering its own — so
+        the private read surface and the notification audience are the same
+        set by construction and cannot drift into disagreeing about who is on
+        this team for this game.
         """
         game_id = game.id
-        if team_id not in (game.home_team_id, game.away_team_id):
-            raise ValidationError("That team is not playing in this game.")
+        candidates = self._availability_candidates(game, team_id)
         avail = {a.player_id: a
                  for a in self.store.availability_for_game(game_id)}
         counts = {"available": 0, "unavailable": 0, "maybe": 0, "no_response": 0}
         players = []
-        for p in sorted(self.store.players_for_team(team_id), key=lambda x: x.name):
+        for p in sorted(candidates, key=lambda x: x.name):
             a = avail.get(p.id)
             status = a.availability_status.value if a else "no_response"
             if status == "pending":  # never-responded reads as no_response
@@ -4154,7 +4231,22 @@ class ApiService:
         deliberately the SAME helper the fifteen bound mutation sites call:
         emitting a notification is a Season-owned write like any other, and a
         second hand-written copy of this sequence is exactly what #427
-        collapsed."""
+        collapsed.
+
+        WHO the recipients are is a SEPARATE question from WHICH ROW they are
+        read off, and the round that established the transaction above only
+        answered the second one (owner comment 5387094674). The recipient list
+        was still discovered by ``store.players_for_team`` — the permanent
+        ``Player.team_id`` pointer — so under a correct lock, on the correct
+        row, the reminder went to the player who had LEFT this side and not to
+        the one currently rostered on it. Discovery is now
+        :meth:`_availability_candidates`, the exact game-scoped membership,
+        consumed through the SAME summary the private read surface returns:
+        one discovery, two consumers, so the audience of a notification and
+        the contents of a private response cannot disagree. The transaction
+        and lock structure below is UNCHANGED — and it is what makes this
+        discovery linearizable with the governed membership mutations, which
+        take the very same canonical Season row lock."""
         with self.store.transaction():
             # A LOCATOR read only — `_guard_active_season` returns the row
             # re-fetched under the Season lock, and everything below uses that
