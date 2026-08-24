@@ -1088,6 +1088,328 @@ async function checkViewport(browser, viewport) {
         + `viewport: ${JSON.stringify(overflow)}`);
     }
 
+    // ============================================================
+    // Coach -- the GAME SHEET, own side rendered and OPPONENT REDACTED
+    // (#427 blocker, owner ruling comment 5394947899).
+    //
+    // /lineups used to hand either Coach BOTH sides' private candidate,
+    // availability and substitute state, and this file already fetched
+    // /lineups and /board without ever asserting WHICH players came back.
+    // Nothing in e2e/ opened the Game Sheet at all -- zero hits for
+    // switchTab("sheet"), .gs-row or .gs-side across the whole directory --
+    // so the screen the ruling is about had no journey coverage.
+    //
+    // Extended here rather than added as a new spec file on purpose: the
+    // journey list is enumerated BY HAND three times in
+    // .github/workflows/hockey-scheduler-ci.yml (a `node --check` line, a
+    // shard string, and e2e/package.json), so a new file silently skips CI
+    // until three separate edits land. This file already logs in as a real
+    // authenticated Coach with scope.team_id, already runs at BOTH viewports
+    // (desktop 1440x900 and phone 390x844), and is already registered.
+    // ============================================================
+    // A real keyboard activation of the real nav tab, the same discipline
+    // every other reachability claim in this file uses.
+    await tabToAndActivate(page, '.tab[data-tab="sheet"]', "Coach reach Game Sheet");
+    await waitForView(page, "sheet");
+    await waitForRealContent(page);
+    await page.waitForSelector(".game-sheet .gs-grid", { timeout: 10000 });
+
+    // The sheet render fires GET /api/officials for its assign control.
+    // That route carries no operator gate, so a Coach gets 200 -- asserted
+    // rather than assumed, because this file's failure tracker fails the
+    // whole run on any unregistered HTTP >= 400 and a silent 403 here would
+    // surface as an unrelated-looking failure at the end of the journey.
+    const officialsForCoach = await apiGet(page, "/api/officials");
+    if (officialsForCoach.status !== 200) {
+      fail(`Coach [${L}]: the Game Sheet's own /api/officials fetch returned `
+        + `${officialsForCoach.status} -- the sheet cannot render without it `
+        + `and this file's tracker fails on unregistered >= 400 responses`);
+    }
+
+    const sheet = await page.evaluate(() => {
+      const sides = Array.from(document.querySelectorAll(".gs-grid > section.gs-side"));
+      const read = (el) => ({
+        team: (el.querySelector(".gs-side-team") || {}).textContent || "",
+        label: (el.querySelector(".gs-side-label") || {}).textContent || "",
+        restricted: !!el.querySelector("[data-restricted]"),
+        restrictedClass: el.classList.contains("gs-side-restricted"),
+        rows: Array.from(el.querySelectorAll(".gs-roster > .gs-row")).map((r) => ({
+          num: (r.querySelector(".gs-num") || {}).textContent || "",
+          name: (r.querySelector(".gs-name") || {}).textContent || "",
+          pos: (r.querySelector(".pos-tag") || {}).className || "",
+        })),
+        text: (el.textContent || "").replace(/\s+/g, " ").trim(),
+      });
+      return {
+        count: sides.length,
+        sides: sides.map(read),
+        assign: document.querySelectorAll(".gs-assign").length,
+        offSlots: document.querySelectorAll(".gs-off-slot").length,
+      };
+    });
+    if (sheet.count !== 2) {
+      fail(`Coach [${L}]: the Game Sheet must still show BOTH sides -- which `
+        + `team you are playing is public, only their lineup is not -- got `
+        + `${sheet.count} side section(s)`);
+    }
+    const [ownSide, oppSide] = sheet.sides;
+    // OWN SIDE: real, named, seated rows.
+    if (!new RegExp(`Coach Team ${suffix}`).test(ownSide.team)) {
+      fail(`Coach [${L}]: expected the first sheet column to be the Coach's `
+        + `own team ("Coach Team ${suffix}"), got "${ownSide.team}"`);
+    }
+    if (ownSide.restricted) {
+      fail(`Coach [${L}]: the Coach's OWN side was redacted on the Game Sheet`);
+    }
+    const ownNames = ownSide.rows.map((r) => r.name);
+    if (ownNames.length !== 1 || !new RegExp(`Copy Keeper ${suffix}`).test(ownNames[0])) {
+      fail(`Coach [${L}]: expected the own side's submitted lineup to be the `
+        + `one seated player ("Copy Keeper ${suffix}"), got `
+        + `${JSON.stringify(ownNames)}`);
+    }
+    // OPPONENT SIDE: redacted, and redacted AS SUCH.
+    if (!new RegExp(`Rival Team ${suffix}`).test(oppSide.team)) {
+      fail(`Coach [${L}]: the redacted opponent must keep its PUBLIC team `
+        + `name so the sheet can still say who the game is against, got `
+        + `"${oppSide.team}"`);
+    }
+    if (!oppSide.restricted || !oppSide.restrictedClass) {
+      fail(`Coach [${L}]: the opponent side was not rendered as restricted: `
+        + `${JSON.stringify(oppSide)}`);
+    }
+    if (oppSide.rows.length !== 0) {
+      fail(`Coach [${L}]: the redacted opponent rendered ${oppSide.rows.length} `
+        + `player row(s) -- private identities leaked onto the Game Sheet`);
+    }
+    // THE POINT OF THE WHOLE REPRESENTATION: redaction must not read as the
+    // opponent having failed to submit a lineup, which is a different and
+    // materially misleading operational claim.
+    if (/No lineup submitted/i.test(oppSide.text)) {
+      fail(`Coach [${L}]: the redacted opponent is displayed as "No lineup `
+        + `submitted" -- an operational claim about the OPPONENT rather than `
+        + `about this reader's access: ${oppSide.text}`);
+    }
+    if (!/Restricted/i.test(oppSide.text)) {
+      fail(`Coach [${L}]: the redacted opponent does not say it is `
+        + `restricted: ${oppSide.text}`);
+    }
+    // And no AWAY player's name appears on the page at all. `Jamie Junior`
+    // is the rival team's own player -- a real body on the opponent side, so
+    // this is a positive absence and not a search for a string that could
+    // never have been there.
+    const sheetText = await page.evaluate(() =>
+      document.getElementById("content").textContent || "");
+    if (new RegExp(`Jamie Junior ${suffix}`).test(sheetText)) {
+      fail(`Coach [${L}]: an opponent player's name ("Jamie Junior ${suffix}") `
+        + `is rendered on the Coach's Game Sheet`);
+    }
+    // A free "unauthorized control absent" assertion while we are here: the
+    // assign control renders only for manage_schedule, which a Coach lacks,
+    // but the unassigned slots themselves are part of the sheet.
+    if (sheet.assign !== 0) {
+      fail(`Coach [${L}]: the officials ASSIGN control is rendered for a Coach `
+        + `(manage_schedule is not theirs)`);
+    }
+    if (sheet.offSlots === 0) {
+      fail(`Coach [${L}]: the officials panel rendered no slots at all, so the `
+        + `assertion above proves nothing`);
+    }
+    // The sheet fits the viewport -- at 390px as well as desktop. NO NEW
+    // BREAKPOINT exists or may exist (e2e/breakpoint-contract.js pins the
+    // four approved widths), so 390 is covered by the Game Sheet's existing
+    // 720px stacking rule and the redaction block's own wrapping.
+    const sheetOverflow = await page.evaluate(() => {
+      const el = document.querySelector(".gs-side-restricted");
+      return {
+        docScroll: document.documentElement.scrollWidth,
+        docClient: document.documentElement.clientWidth,
+        elRight: Math.ceil(el.getBoundingClientRect().right),
+        elScroll: el.scrollWidth, elClient: el.clientWidth,
+      };
+    });
+    if (sheetOverflow.docScroll > sheetOverflow.docClient) {
+      fail(`Coach [${L}]: the Game Sheet pushed the page into a horizontal `
+        + `scroll: ${JSON.stringify(sheetOverflow)}`);
+    }
+    if (sheetOverflow.elScroll > sheetOverflow.elClient + 1
+        || sheetOverflow.elRight > sheetOverflow.docClient) {
+      fail(`Coach [${L}]: the restricted-opponent block overflows at this `
+        + `viewport: ${JSON.stringify(sheetOverflow)}`);
+    }
+
+    // ------------------------------------------------------------
+    // The same redaction on the ROSTER view, where the empty state it must
+    // NOT be confused with is worded differently ("No players on the roster
+    // yet"). A scoped Coach must not LAND on the redacted tab, but must be
+    // able to OPEN it and read why it is closed.
+    // ------------------------------------------------------------
+    await page.evaluate(() => switchTab("roster"));
+    await waitForView(page, "roster");
+    await waitForRealContent(page);
+    await page.waitForSelector(".lineup-switch .ls", { timeout: 10000 });
+    const landed = await page.evaluate(() => ({
+      active: (document.querySelector(".lineup-switch .ls.active") || {}).dataset,
+      restrictedTabs: Array.from(document.querySelectorAll(".lineup-switch .ls.restricted"))
+        .map((b) => b.dataset.side),
+      panel: document.querySelectorAll("[data-restricted]").length,
+    }));
+    if (landed.active.side !== "home") {
+      fail(`Coach [${L}]: the roster view did not land on the Coach's own `
+        + `side, it landed on ${landed.active.side}`);
+    }
+    if (JSON.stringify(landed.restrictedTabs) !== JSON.stringify(["away"])) {
+      fail(`Coach [${L}]: expected exactly the opponent tab to be marked `
+        + `restricted, got ${JSON.stringify(landed.restrictedTabs)}`);
+    }
+    if (landed.panel !== 0) {
+      fail(`Coach [${L}]: the redaction panel is showing on the Coach's own `
+        + `side`);
+    }
+    // Opening the opponent tab deliberately explains the closure rather than
+    // showing an empty roster.
+    await tabToAndActivate(page, '.lineup-switch .ls[data-side="away"]',
+      "Coach open the opponent lineup tab");
+    await page.waitForSelector("[data-restricted]", { timeout: 10000 });
+    const opened = await page.evaluate(() => {
+      const el = document.querySelector(".restricted-side");
+      return {
+        text: (el.textContent || "").replace(/\s+/g, " ").trim(),
+        rows: document.querySelectorAll("#content .card .row").length,
+        emptyStates: Array.from(document.querySelectorAll("#content .empty"))
+          .map((e) => (e.textContent || "").replace(/\s+/g, " ").trim()),
+      };
+    });
+    if (!/Restricted/i.test(opened.text) || !/not shown/i.test(opened.text)) {
+      fail(`Coach [${L}]: the opponent roster tab does not explain the `
+        + `redaction: ${opened.text}`);
+    }
+    if (opened.emptyStates.some((t) => /No players on the roster yet/i.test(t))) {
+      fail(`Coach [${L}]: the redacted opponent roster is displayed as an `
+        + `empty roster: ${JSON.stringify(opened.emptyStates)}`);
+    }
+    if (opened.rows !== 0) {
+      fail(`Coach [${L}]: ${opened.rows} opponent player row(s) rendered on a `
+        + `restricted side`);
+    }
+    // Back to the Coach's own side for whatever runs after this leg.
+    await tabToAndActivate(page, '.lineup-switch .ls[data-side="home"]',
+      "Coach return to own lineup tab");
+    await page.waitForSelector('.lineup-switch .ls[data-side="home"].active',
+      { timeout: 10000 });
+
+    // ------------------------------------------------------------
+    // INELIGIBLE-BUT-VISIBLE substitute rows (#427). "Make that row
+    // non-actionable except for permitted cleanup and expose/label its
+    // ineligible state so the UI does not offer an add/seat action that the
+    // service must reject."
+    //
+    // The state is real and the SERVICE side of it is pinned tri-store
+    // (backend/tests/test_lineup_population_authority.py,
+    // ParticipationEndingDoesNotFlipTheDurableSide, which also proves the
+    // service really does refuse the seat). It cannot be REACHED from a
+    // browser journey, though: ending a participation stint means writing a
+    // SeasonRosterMembership status, and memberships have no HTTP surface at
+    // all -- there is no route to call. So the payload is produced by
+    // rewriting the real /lineups response in flight, which still drives the
+    // whole genuine path from fetch through render to DOM, and the SHAPE
+    // being injected is exactly the shape those Python tests pin.
+    await page.route("**/api/games/*/lineups", async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      const own = body.home;
+      if (own && Array.isArray(own.players)) {
+        own.players.push({
+          id: "e2e-ineligible", name: `Departed Sub ${suffix}`,
+          position: "forward", slot_type: "skater",
+          // null, not a permanent number: no seasonal value survives.
+          jersey_number: null, group: "substitute", roster_status: null,
+          backed_out: false, availability: "pending", sub_status: "enrolled",
+          eligible: false,
+        });
+        own.players.push({
+          id: "e2e-eligible", name: `Standing Sub ${suffix}`,
+          position: "forward", slot_type: "skater", jersey_number: 9,
+          group: "substitute", roster_status: null, backed_out: false,
+          availability: "pending", sub_status: "enrolled", eligible: true,
+        });
+        // An open skater slot, so "no slot" cannot be the reason the
+        // ineligible row is unactionable -- the ELIGIBLE row beside it must
+        // get its Add button from the very same counts.
+        own.status.open_skater_slots = Math.max(1, own.status.open_skater_slots);
+        own.status.target_skaters = own.status.target_skaters
+          + own.status.open_skater_slots;
+      }
+      await route.fulfill({ response, json: body });
+    });
+    // Force a real re-render through the real fetch.
+    await page.evaluate(() => switchTab("games"));
+    await waitForView(page, "games");
+    await page.evaluate(() => switchTab("roster"));
+    await waitForView(page, "roster");
+    await waitForRealContent(page);
+    await page.waitForSelector("[data-ineligible]", { timeout: 10000 });
+    const cleanup = await page.evaluate((names) => {
+      // The cleanup block is identified by the label it renders, not by a
+      // position, so re-ordering the coach surface cannot silently retarget
+      // this assertion at some other card.
+      const title = Array.from(document.querySelectorAll("#content .section-title"))
+        .find((t) => /Needs cleanup/i.test(t.textContent || ""));
+      const card = title && title.nextElementSibling;
+      const rows = card ? Array.from(card.querySelectorAll(".row")) : [];
+      return {
+        found: !!card,
+        titleText: title ? (title.textContent || "").trim() : null,
+        cardText: card ? (card.textContent || "").replace(/\s+/g, " ").trim() : null,
+        rows: rows.map((r) => ({
+          text: (r.textContent || "").replace(/\s+/g, " ").trim(),
+          ineligible: !!r.querySelector("[data-ineligible]"),
+          acts: Array.from(r.querySelectorAll("[data-act]")).map((b) => b.dataset.act),
+        })),
+        eligibleAnywhere: (document.getElementById("content").textContent || "")
+          .includes(names.ok),
+      };
+    }, { ok: `Standing Sub ${suffix}` });
+    if (!cleanup.found || cleanup.rows.length !== 1) {
+      fail(`Coach [${L}]: the durably-owned enrolment whose candidate can no `
+        + `longer play must stay VISIBLE to its owning Coach -- the live `
+        + `outreach queue drops it, so without this block it is actionable by `
+        + `nobody: ${JSON.stringify(cleanup)}`);
+    }
+    const stale = cleanup.rows[0];
+    if (!new RegExp(`Departed Sub ${suffix}`).test(stale.text)) {
+      fail(`Coach [${L}]: the cleanup block names the wrong row: `
+        + `${JSON.stringify(stale)}`);
+    }
+    // LABELLED, so the coach can see WHY it is here.
+    if (!stale.ineligible || !/Ineligible/i.test(stale.text)) {
+      fail(`Coach [${L}]: the stale enrolment is not labelled ineligible: `
+        + `${JSON.stringify(stale)}`);
+    }
+    // NON-ACTIONABLE EXCEPT FOR CLEANUP -- asserted as an exact set, so this
+    // fails both if a seat control appears AND if the cleanup control the
+    // ruling requires disappears. `data-act` is what the click handler
+    // dispatches on, so its presence/absence is what actually decides whether
+    // an action can be taken.
+    if (JSON.stringify(stale.acts) !== JSON.stringify(["withdraw"])) {
+      fail(`Coach [${L}]: expected the stale enrolment to offer EXACTLY the `
+        + `cleanup action and no seat/add, got ${JSON.stringify(stale.acts)}`);
+    }
+    // ...and the block really is eligibility-driven: the ELIGIBLE row
+    // injected alongside it is not swept in here. (It does not appear on this
+    // screen at all -- the outreach queue is its home, and that queue is
+    // built from a separate endpoint this rewrite does not touch.)
+    if (cleanup.eligibleAnywhere) {
+      fail(`Coach [${L}]: the eligible substitute was pulled into the cleanup `
+        + `block, so the block is not keyed on eligibility: `
+        + `${JSON.stringify(cleanup)}`);
+    }
+    // The block says, in operator language, what the coach may do about it.
+    if (!/can only be removed/i.test(cleanup.cardText)) {
+      fail(`Coach [${L}]: the cleanup block does not explain itself: `
+        + `${cleanup.cardText}`);
+    }
+    await page.unroute("**/api/games/*/lineups");
+
     // Direct-navigation bypass: Setup is hidden from nav (neither
     // manage_setup nor manage_arena) -- switchTab() must self-guard.
     await page.evaluate(() => switchTab("setup"));

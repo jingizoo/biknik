@@ -4,6 +4,11 @@
 let view = "dashboard";     // dashboard|setup|import|calendar|games|roster|activity|public|readiness|player_home
 let gameView = "coach";     // coach | player (roster)
 let rosterSide = "home";    // home | away — which lineup the roster tab shows (#25)
+// Whether the user CHOSE the side above, as opposed to landing on the
+// default. #427: a scoped Coach must not LAND on the redacted opponent tab,
+// but must still be able to open it deliberately and read why it is closed —
+// so the auto-correction below applies only while this is false.
+let rosterSideChosen = false;
 let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
 let currentGame = null;     // game id whose roster we're viewing
 // The last batch-seating outcome (copy-previous / auto-fill) for THIS game and
@@ -8215,23 +8220,73 @@ function rosterGamePicker(ov) {
   </div>`;
 }
 
+/* ---------- Opponent-side redaction (#427) ----------
+   TWO LEVELS OF "RESTRICTED", and they are different states. render()'s own
+   `lineups.error` branch below already shows a whole-screen "Restricted"
+   banner when the caller is outside the GAME entirely and the read 403s
+   (#73/#154). This is the narrower one: the caller is legitimately inside
+   the game and reads their OWN side in full, while the OPPONENT'S side --
+   and only that -- is withheld. Same word because it is the same idea at a
+   different scope; different markup, so neither assertion can be satisfied
+   by the other.
+
+   A side a scoped Coach/Player may not read comes back with
+   `restricted: true` and `players: null` -- deliberately NOT `players: []`,
+   because an empty list already means something else, and something
+   operationally different, on both of these screens ("No lineup submitted."
+   on the Game Sheet, "No players on the roster yet" on the roster view).
+   Rendering redaction as emptiness would tell a coach their opponent had
+   failed to submit a lineup. These two helpers are the ONE place that decides
+   how a redacted side looks, so the roster view and the Game Sheet cannot
+   drift apart about it. */
+function isRestrictedSide(side) {
+  return !!(side && side.restricted);
+}
+function restrictedNote(kind) {
+  // `kind` only changes the wording; both say the same thing -- WITHHELD,
+  // not absent.
+  const detail = kind === "sheet"
+    ? "Only your own team's lineup is shown to you. An operator or an assigned official sees both."
+    : "You manage your own team. The opposing lineup is private to their coach.";
+  return `<div class="restricted-side" data-restricted>
+    <div class="rs-head"><span class="badge gray">\u{1F512} Restricted</span></div>
+    <div class="rs-title">Opponent lineup not shown</div>
+    <div class="rs-note">${esc(detail)}</div></div>`;
+}
+
 function renderRoster(lineups, ov) {
   if (!lineups) return `<div class="empty">Select a game from the Games tab.</div>`;
   if (!(rosterSide in lineups)) rosterSide = "home";
+  // Never LAND a scoped caller on the redacted tab (#427): if the side we
+  // would show is restricted and the other is not, that other one is theirs.
+  // Only while the user has not chosen a side themselves -- opening the
+  // opponent tab deliberately must show them WHY it is closed, not bounce.
+  const otherSide = rosterSide === "home" ? "away" : "home";
+  if (!rosterSideChosen && isRestrictedSide(lineups[rosterSide])
+      && !isRestrictedSide(lineups[otherSide])) {
+    rosterSide = otherSide;
+  }
   const side = lineups[rosterSide];
   rosterTeamId = side.team_id;
   const tab = (key, icon, label) => {
     const l = lineups[key];
-    return `<button class="ls ${rosterSide === key ? "active" : ""}" data-side="${key}">
+    // A restricted side has no private `status` to summarise. Say why the tab
+    // is closed rather than printing a status it does not carry -- and never
+    // read `l.status.status` off a `null`.
+    const sub = isRestrictedSide(l) ? "Restricted" : prettyStatus(l.status.status);
+    return `<button class="ls ${rosterSide === key ? "active" : ""}${isRestrictedSide(l) ? " restricted" : ""}" data-side="${key}">
       <span class="ls-team">${icon} ${esc(l.team_name)}</span>
-      <span class="ls-sub">${label} · ${prettyStatus(l.status.status)}</span></button>`;
+      <span class="ls-sub">${label} \u00b7 ${sub}</span></button>`;
   };
-  return `${rosterGamePicker(ov)}<div class="lineup-switch">${tab("home", "🏠", "Home")}${tab("away", "✈️", "Away")}</div>
-    <div class="segmented">
+  const body = isRestrictedSide(side)
+    ? restrictedNote("roster")
+    : `<div class="segmented">
       <button class="seg ${gameView === "coach" ? "active" : ""}" data-view="coach">Coach</button>
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
     </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side, ov) : playerBody(side)}</div>
     ${renderAvailSummary()}`;
+  return `${rosterGamePicker(ov)}<div class="lineup-switch">${tab("home", "\u{1F3E0}", "Home")}${tab("away", "\u2708\uFE0F", "Away")}</div>
+    ${body}`;
 }
 
 /* ---------- Game Sheet (read-only, both lineups) (#48) ---------- */
@@ -8243,6 +8298,20 @@ function fmtDateTime(iso) {
   return `${date} · ${fmt(iso)}`;
 }
 function sheetSide(side, label) {
+  // A RESTRICTED side keeps its public team name and says it is withheld
+  // (#427). It must NOT fall through to the code below, whose "No lineup
+  // submitted." empty state is a claim about the opponent's preparedness
+  // rather than about this reader's access.
+  if (isRestrictedSide(side)) {
+    return `<section class="gs-side gs-side-restricted">
+      <header class="gs-side-head">
+        <div><div class="gs-side-team">${esc(side.team_name)}</div>
+          <div class="gs-side-label">${esc(label)}</div></div>
+        <span class="badge gray">\u{1F512} Restricted</span>
+      </header>
+      ${restrictedNote("sheet")}
+    </section>`;
+  }
   const s = side.status;
   const occupying = side.players
     .filter((p) => p.group === "selected" && !p.backed_out)
@@ -9918,7 +9987,7 @@ function availableGroups(available, s, locked) {
     if (!list.length) return "";
     const need = open > 0 ? `<span class="need">need ${open}</span>` : `<span class="need ok">full</span>`;
     const rows = list.map((p) => playerRow(p,
-      `${posTag(p)}${locked ? "" : `<button class="act primary" data-act="select" data-id="${esc(p.id)}">Add</button>`}`)).join("");
+      `${posTag(p)}${ineligibleBadge(p)}${locked || !isSeatable(p) ? "" : `<button class="act primary" data-act="select" data-id="${esc(p.id)}">Add</button>`}`)).join("");
     return `<div class="avail-group"><div class="avail-head">${label} ${need}</div>${rows}</div>`;
   };
   const body = available.length
@@ -9932,6 +10001,26 @@ function availableGroups(available, s, locked) {
 // /api/games/{gid}/substitute-candidates, with a Send Offer for each enrolled
 // candidate that fits an open slot (offer → the player accepts/declines), plus
 // the existing Add-now coach override. Falls back to nothing until loaded.
+/* ---------- Ineligible-but-visible rows (#427) ----------
+   A row can be DURABLY OWNED by this side and still be unseatable: an
+   enrollment survives its candidate's participation ending, so the owning
+   Coach can still clean it up, while `substitutes_enrolled` (a LIVE count)
+   correctly drops. The service refuses an add/seat on such a row, so a UI
+   that offers the control is offering a rejected action -- and the coach
+   learns that only by pressing it and reading an error.
+
+   `eligible: false` on the row is that state, and these two helpers are the
+   ONE place that renders it: a visible label, and NO `data-act` attribute at
+   all on the disabled control (not merely `disabled`), so neither a click
+   nor the keyboard traversal the e2e journey uses can dispatch a seat. */
+function ineligibleBadge(p) {
+  return p.eligible === false
+    ? '<span class="badge red" data-ineligible>Ineligible</span>' : "";
+}
+function isSeatable(p) {
+  return p.eligible !== false;
+}
+
 const SUB_STATUS_BADGE = {
   enrolled: '<span class="badge blue">Enrolled</span>',
   offered: '<span class="badge orange">Offered</span>',
@@ -10116,12 +10205,38 @@ function coachBody(board, ov) {
   // not computed on the common coach path where outreachPanel replaces it.
   const subPoolCard = () => `<div class="section-title">Substitute pool</div>
     <div class="card">${subs.length ? subs.map((p) => {
-      const canAdd = canEdit && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
-      const ctrl = SUB_STATUS_BADGE[p.sub_status] || SUB_STATUS_BADGE.enrolled;
+      // #427: an INELIGIBLE row is never addable, whatever the slot counts
+      // say -- the service would refuse the seat.
+      const canAdd = canEdit && isSeatable(p)
+        && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
+      const ctrl = `${SUB_STATUS_BADGE[p.sub_status] || SUB_STATUS_BADGE.enrolled}${ineligibleBadge(p)}`;
       const btn = !canEdit ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${esc(p.id)}">Add</button>`
+        : !isSeatable(p) ? `<button class="act ghost" disabled title="This player is no longer eligible for this game — remove the enrolment instead.">Can't add</button>`
         : `<button class="act ghost" disabled>No slot</button>`;
       return playerRow(p, `${posTag(p)}${ctrl}${btn}`);
     }).join("") : `<div class="empty">No substitutes enrolled.</div>`}</div>`;
+
+  // #427: enrolments this side DURABLY OWNS whose candidate can no longer
+  // play. `substitutes_enrolled` is a LIVE count and correctly drops them, and
+  // /substitute-candidates -- the outreach queue that normally replaces the
+  // pool card above -- drops them too, on purpose: they are not offerable.
+  // But the ROW is still ours and still there, and the owning Coach is the
+  // only person who can clear it. Without this block it would be invisible on
+  // the one screen that can act on it. Cleanup ONLY: withdraw, never add or
+  // seat, because the service refuses those (see
+  // ParticipationEndingDoesNotFlipTheDurableSide).
+  //
+  // Only needed on the OUTREACH path: the fallback pool card above already
+  // lists every substitute row this side owns, and already renders a stale
+  // one with its Ineligible badge and a disabled control. Rendering both
+  // would show the same body twice.
+  const staleSubs = subs.filter((p) => !isSeatable(p));
+  const cleanupCard = () => !staleSubs.length ? "" : `<div class="section-title">Needs cleanup (${staleSubs.length})</div>
+    <div class="card">${staleSubs.map((p) => playerRow(p,
+      `${posTag(p)}${ineligibleBadge(p)}${canEdit
+        ? `<button class="act danger ghost" data-act="withdraw" data-id="${esc(p.id)}">Remove enrolment</button>`
+        : ""}`)).join("")}
+      <div class="empty">No longer eligible for this game — these enrolments can only be removed.</div></div>`;
 
   // Footer: lock control for roster managers, else a read-only note by role/scope.
   let footer;
@@ -10150,7 +10265,7 @@ function coachBody(board, ov) {
     <div class="section-title">Roster (${onRoster.length}/${total})</div>
     <div class="card">${rosterRows}</div>
     ${availableGroups(available, s, !canEdit)}
-    ${subCandidates ? outreachPanel(canEdit) : subPoolCard()}
+    ${subCandidates ? outreachPanel(canEdit) + cleanupCard() : subPoolCard()}
     ${footer}
     ${renderReschedulePanel(canRoster, ov)}
     `;
@@ -10292,7 +10407,7 @@ function renderActivity(board, ov) {
       : "Open a game roster to see its game activity.";
     return operatorSection + `<div class="section-title">Game</div><div class="card"><div class="empty">${note}</div></div>`;
   }
-  const names = {}; board.players.forEach((p) => (names[p.id] = p.name));
+  const names = {}; (board.players || []).forEach((p) => (names[p.id] = p.name));
   const feed = [...(board.notifications || [])].reverse();
   const audit = [...(board.audit || [])].reverse();
   const dotFor = { coach: "var(--blue)", player: "var(--green)", team: "var(--purple)", guardian: "#b07bd6" };
@@ -10751,7 +10866,10 @@ async function render() {
     if (renderPass !== myRenderPass) return;  // superseded (#215)
     // Availability rollup for the roster screen's selected side (#89).
     availSummary = null;
-    if (view === "roster" && lineups && lineups[rosterSide] && !lineups.error) {
+    // #427: a RESTRICTED side has no availability rollup this caller may
+    // read, and asking anyway would be a guaranteed 403 on every render.
+    if (view === "roster" && lineups && lineups[rosterSide] && !lineups.error
+        && !isRestrictedSide(lineups[rosterSide])) {
       const tid = lineups[rosterSide].team_id;
       const s = await getJSON(
         `/api/games/${currentGame}/availability-summary?team_id=${tid}`);
@@ -10762,7 +10880,8 @@ async function render() {
     subCandidates = null;
     addableSubs = null;
     if (view === "roster" && gameView === "coach" && hasPerm("manage_roster")
-        && lineups && lineups[rosterSide] && !lineups.error) {
+        && lineups && lineups[rosterSide] && !lineups.error
+        && !isRestrictedSide(lineups[rosterSide])) {
       const tid = lineups[rosterSide].team_id;
       const q = await getJSON(
         `/api/games/${currentGame}/substitute-candidates?team_id=${tid}`);
@@ -11871,14 +11990,14 @@ async function render() {
   if (view === "setup") restorePendingCardWriteFocus();
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
-  c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
+  c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; rosterSideChosen = true; toast = ""; render(); });
   // Roster game picker (#154): switching the game resets the per-game view
   // state (side, availability filter, the coach's fetched sub queues) so the
   // new game's roster never renders against the previous game's data.
   const rosterGameSel = c.querySelector("#roster-game");
   if (rosterGameSel) rosterGameSel.onchange = () => {
     currentGame = rosterGameSel.value;
-    rosterSide = "home"; availFilter = "all";
+    rosterSide = "home"; rosterSideChosen = false; availFilter = "all";
     availSummary = null; subCandidates = null; addableSubs = null; rescheduleRequests = null;
     toast = ""; render();
   };
@@ -14545,6 +14664,7 @@ function resetTransientUiState() {
   // different operator's session could get published by a click the new
   // operator never meant to make.
   rosterSide = "home";
+  rosterSideChosen = false;
   availFilter = "all";
   gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };
   gamesExpanded = new Set();

@@ -203,6 +203,26 @@ body {
 .lineup-switch .ls .ls-team { font-size: 14px; font-weight: 700; color: var(--ink); }
 .lineup-switch .ls .ls-sub { font-size: 11px; color: var(--muted); }
 .lineup-switch .ls.active { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue) inset; background: #f2f8ff; }
+/* A side this caller may not read (#427). Muted and marked, never hidden:
+   the tab still names the opponent, because WHICH team you are playing is
+   public and only their lineup is not. */
+.lineup-switch .ls.restricted { background: #f7f8fa; border-style: dashed; }
+.lineup-switch .ls.restricted .ls-sub { color: var(--muted); font-style: italic; }
+
+/* ----- redacted opponent side (#427) -----
+   Deliberately does NOT reuse `.empty`, which is what "No lineup submitted."
+   and "No players on the roster yet" render as. A reader must be able to tell
+   "withheld from you" from "this team has not submitted one", so the two
+   states look different, and this one carries its own lock affordance.
+   NO NEW BREAKPOINT: this block is width-independent and the Game Sheet's
+   two columns already stack under the existing 720px rule, which is what
+   makes it readable at the 390px verification viewport. */
+.restricted-side { padding: 18px 14px; text-align: center; }
+.rs-head { margin-bottom: 8px; }
+.rs-title { font-size: 14px; font-weight: 700; color: var(--ink); }
+.rs-note { font-size: 12px; color: var(--muted); margin-top: 4px;
+  max-width: 34ch; margin-left: auto; margin-right: auto; line-height: 1.45; }
+.gs-side-restricted { border-style: dashed; }
 
 .content {
   flex: 1;
