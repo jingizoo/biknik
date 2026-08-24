@@ -92,21 +92,48 @@ WRITE ATTEMPTS, NOT SNAPSHOT DIFFS, on every refusal. Every surface here is
 ``@_transactional``, so a guard placed AFTER the first write still leaves an
 empty diff — the raise rolls it back on all three backends alike. "Zero
 writes" is an ORDERING property and only a spy on the ATTEMPTS can see it.
+The spy is ``helpers.write_attempt_spy``, shared with Part C so both files
+mean the same thing by the phrase.
+
+WHAT THE REVIEW ROUND ON THIS PR ADDED, and why each addition exists:
+
+  F-1  ``remind_unresponded`` was LISTED in the comparand table above and
+       ASSERTED NOWHERE. A reviewer deleted its gate outright and the entire
+       Memory/SQLite suite stayed green (reproduced here: 234 modules, 3
+       shards, 271s, OK); the same deletion now reddens
+       ``RemindUnrespondedRevalidatesTheNotifiedSideUnderTheLock`` on all
+       three backends. ``RemindOverRealAuthenticatedHttp`` pins the reachable
+       end-to-end behaviour and says plainly what it cannot prove.
+
+  F-3  the real-PostgreSQL interleaving covered 2 of the 14 service-reachable
+       surfaces. ``ATrueInterleavingOnRealPostgreSQL`` now races ALL of them,
+       in BOTH forced orders, asserting that the losing authorization leaves
+       substitute, roster, availability, audit AND notification state — the
+       feed and delivery tables included — identity-unchanged.
 """
 
-import contextlib
+import json
 import os
+import threading
 import unittest
+import urllib.error
+import urllib.request
+from http.cookiejar import CookieJar
+from http.server import ThreadingHTTPServer
+from types import SimpleNamespace
 
 from helpers import (BACKEND, FakeClock, end_membership_directly,  # noqa: F401
-                     fresh_sql_store, race_with_forced_order)
+                     fresh_sql_store, race_with_forced_order,
+                     write_attempt_spy)
 from test_substitute_membership_cutover import ADMIN, _at
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import MembershipStatus
+from hockey_scheduler.domain import MembershipStatus, Role
 from hockey_scheduler.services.roster_service import (ATTRIBUTION_MISSING,
                                                       TEAM_SCOPE_VIOLATION)
 from hockey_scheduler.store import InMemoryStore, SqlStore
+from hockey_scheduler.web import server as srv
+from hockey_scheduler.web.auth import DEMO_PASSWORD, DEMO_USERS
 
 _PG_SKIP = ("PostgreSQL not configured (TEST_DATABASE_URL); this assertion is "
             "NOT covered on the backend whose row locks it is about.")
@@ -180,7 +207,7 @@ class _CoachAuthHarness:
         assert "error" not in game, game
         assert game["league_season_id"], game
         api.publish_game(game["id"], actor_id=ADMIN)
-        return {"api": api, "season": season, "league": league,
+        return {"api": api, "season": season, "league": league, "rink": rink,
                 "game": game, "gid": game["id"],
                 "ls_id": game["league_season_id"],
                 "home": teams["home"]["id"], "away": teams["away"]["id"],
@@ -213,41 +240,14 @@ class _CoachAuthHarness:
                                 "inactive")
 
     # -- observation -------------------------------------------------------
-    _WRITE_PREFIXES = ("save_", "add_", "upsert_", "insert_", "update_",
-                       "delete_", "remove_", "clear_", "next_id")
-
-    @contextlib.contextmanager
     def _write_attempts(self, store):
-        """Record every STORE WRITE METHOD CALLED, whether or not it survived.
+        """Every STORE WRITE METHOD CALLED, whether or not it survived — see
+        the module docstring for why a snapshot diff cannot stand in for it.
 
-        A SNAPSHOT DIFF CANNOT PROVE WHAT IS ASSERTED HERE — see the module
-        docstring. Patched on the INSTANCE and restored in ``finally``; the
-        number of methods actually wrapped is asserted so a rename that
-        empties the prefix list fails loudly instead of turning this into a
-        spy that can never fire."""
-        calls = []
-        originals = {}
-        for name in dir(store):
-            if not name.startswith(self._WRITE_PREFIXES):
-                continue
-            attr = getattr(store, name, None)
-            if not callable(attr):
-                continue
-            originals[name] = attr
-
-            def make(n, orig):
-                def spy(*a, **kw):
-                    calls.append(n)
-                    return orig(*a, **kw)
-                return spy
-
-            setattr(store, name, make(name, attr))
-        self.assertGreater(len(originals), 10, sorted(originals))
-        try:
-            yield calls
-        finally:
-            for name in originals:
-                delattr(store, name)
+        The implementation is ``helpers.write_attempt_spy``, shared with
+        ``test_batch_effective_team`` so both files' "zero write attempts"
+        claims are the same claim, checked once."""
+        return write_attempt_spy(store)
 
     def _state(self, fx, pid):
         """Every durable class a refusal must leave untouched, as comparable
@@ -268,6 +268,51 @@ class _CoachAuthHarness:
             "notifications": sorted(
                 (n.id, n.type.value) for n in store.notifications_for_game(gid)),
         }
+
+    def _feed(self, fx):
+        """THE NOTIFICATION STATE THAT WOULD OTHERWISE BE WATCHED VACUOUSLY.
+
+        ``_state``'s ``notifications`` key reads ``notifications_for_game``,
+        the NotificationEvent table — and ``remind_unresponded`` NEVER WRITES
+        TO IT. Its whole durable footprint is the FEED notification
+        ``notifier.push`` inserts plus the delivery rows that push enqueues,
+        which live in different tables entirely. A refusal test for that
+        surface that watched only the event table would compare two empty
+        sets and pass no matter what the gate did, so the feed and the
+        delivery queue are snapshotted here as identity values and asserted
+        alongside the rest."""
+        store = fx["api"].store
+        return {
+            "feed": sorted((n.id, n.kind.value, n.audience.value,
+                            n.audience_ref, n.game_id)
+                           for n in store.all_notifications_feed()),
+            "deliveries": sorted(
+                (d.id, d.notification_id, d.channel.value, d.recipient_ref)
+                for d in store.all_notification_deliveries()),
+        }
+
+    def _game_state(self, fx):
+        """Every durable class this file cares about, GAME-WIDE rather than
+        for one player — what a side-targeting command
+        (``remind_unresponded``, the batch entry points) can touch. Identity
+        values throughout, never bare counts, and the feed/delivery tables
+        included for the reason ``_feed`` gives."""
+        store, gid = fx["api"].store, fx["gid"]
+        return {
+            "substitutes": sorted(
+                (s.id, s.player_id, s.status.value, s.team_id)
+                for s in store.substitutes_for_game(gid)),
+            "roster": sorted((e.id, e.player_id, e.status.value, e.team_side)
+                             for e in store.roster_for_game(gid)),
+            "availability": sorted(
+                (a.id, a.player_id, a.availability_status.value)
+                for a in store.availability_for_game(gid)),
+            "audit": sorted((a.id, a.action.value)
+                            for a in store.audit_for_game(gid)),
+            "notifications": sorted(
+                (n.id, n.type.value)
+                for n in store.notifications_for_game(gid)),
+        } | self._feed(fx)
 
     def _error(self, res):
         self.assertIsInstance(res, dict, res)
@@ -754,7 +799,22 @@ class ATrueInterleavingOnRealPostgreSQL(_CoachAuthHarness, unittest.TestCase):
     WHY NO NEW STORE PRIMITIVE WAS NEEDED: the schema agrees with the
     service. ``season_roster_memberships.season_id -> seasons(id)`` is a real
     FK, so even a raw INSERT takes ``FOR KEY SHARE`` on the Season row and
-    blocks behind the guard's ``FOR UPDATE``."""
+    blocks behind the guard's ``FOR UPDATE``.
+
+    COVERAGE: ALL 14 SERVICE-REACHABLE SURFACES, BOTH ORDERS (PR #427 review,
+    F-3). The first four tests below are the original two surfaces, kept for
+    their specific end-state assertions; everything after them is the full
+    matrix — see the comment block introducing it for which cell carries the
+    losing authorization on each comparand, and for why nothing is omitted.
+
+    THIS RACE DEMONSTRABLY BITES, and does not merely run.
+    ``test_the_batch_seats_the_mover_only_when_it_wins_the_race`` asserts
+    DIFFERENT durable outcomes for the two forced orders of the SAME call, so
+    it cannot pass unless the ordering is genuinely being forced. Measured
+    independently as well: switching ``remove_player``'s comparand from
+    durable attribution to a live re-resolution reddens exactly the
+    ``surface='remove', order='move_first'`` cells and leaves every
+    ``coach_first`` cell green."""
 
     @classmethod
     def setUpClass(cls):
@@ -903,6 +963,320 @@ class ATrueInterleavingOnRealPostgreSQL(_CoachAuthHarness, unittest.TestCase):
         entry, _sub = self._check(fx)
         self.assertEqual(entry, ("selected", fx["home"]), entry)
 
+    # ==================================================================== #
+    # THE FULL SURFACE MATRIX (PR #427 review, F-3)                        #
+    # ==================================================================== #
+    # The four tests above interleave TWO surfaces — enroll (create) and
+    # remove (response). The ruling names EVERY Coach-reachable
+    # player/row/batch mutation, in BOTH commit orders, with the losing
+    # authorization leaving substitute, roster, availability, audit AND
+    # notification state unchanged. What follows is that matrix: 14
+    # service-reachable surfaces, every one of them raced on two real
+    # PostgreSQL connections whose ordering is FORCED rather than sampled.
+    #
+    # WHICH CELL IS THE "LOSING AUTHORIZATION" DIFFERS BY COMPARAND, and
+    # that is the whole point of the two-comparand ruling:
+    #
+    #   CREATE surfaces authorize against the LOCKED LIVE context, so the
+    #   loser is the HOME coach once the move has COMMITTED (order
+    #   `move_first`), and the AWAY coach while it has NOT yet (order
+    #   `coach_first`). Both orders therefore carry a losing authorization,
+    #   and both are asserted.
+    #
+    #   RESPONSE surfaces authorize against DURABLE row attribution, which
+    #   the move cannot touch — so the loser is the OPPOSING coach in BOTH
+    #   orders, and the owning coach wins in both. An order-independent
+    #   outcome is not a weaker assertion here; it is the property that
+    #   makes durable attribution the right comparand, and it is asserted
+    #   in both directions rather than assumed.
+    #
+    #   BATCH surfaces authorize a SIDE before any candidate discovery, so
+    #   the losing authorization is an explicitly-named foreign team, in
+    #   both orders. Their positive test asserts the race genuinely bites:
+    #   the moved candidate is seated when the coach's transaction wins and
+    #   REPORTED AS A SKIP when the move's does.
+    #
+    #   `remind_unresponded` is included and its outcome is ORDER-
+    #   INDEPENDENT BY CONSTRUCTION — it targets a side, so its comparand is
+    #   the requested team and no membership move can change it. That is
+    #   stated rather than hidden: both orders are still forced and both are
+    #   asserted, and its POSITIVE test does what its authorization cannot,
+    #   pinning that the RECIPIENT list is linearized with the move (the
+    #   moved player is reminded when the coach wins and is not when the
+    #   move does).
+    #
+    # NOTHING IS OMITTED. All 14 surfaces the Coach can reach through the
+    # service are raced here; none proved unable to host an interleaving.
+    ORDERS = ("move_first", "coach_first")
+
+    def _surface_fixture(self, kind):
+        """A fresh PostgreSQL fixture carrying whatever row ``kind`` needs,
+        put there WHILE the player is still on HOME — so the HOME coach is
+        genuinely the owner at the moment the race starts."""
+        store = fresh_sql_store(self.url)
+        try:
+            self.assertEqual(store.backend, "postgres", store.backend)
+            fx = self._build(store)
+            pid = self._player(fx, fx["home"])
+            _prepare(self, fx, pid, kind)
+            return {k: v for k, v in fx.items() if k != "api"} | {
+                "pid": pid, "home_stint": self._stint(fx, pid),
+                "season_id": fx["season"]["id"]}
+        finally:
+            store.close()
+
+    def _coach_op(self, fx, kind, team):
+        """One Coach-reachable surface, on its OWN connection, entered at the
+        facade with an explicit ``authorized_team_id`` — the parameter the
+        ruling requires each command to revalidate under its own lock."""
+        def op(store):
+            api = ApiService(store)
+            api.roster.clock = FakeClock()
+            return _call(api, fx, fx["pid"], kind, team)
+        return op
+
+    def _pg_state(self, fx):
+        """All five durable classes, read back over a FRESH connection so the
+        assertion sees committed rows and not either racer's session."""
+        store = SqlStore(self.url)
+        try:
+            return self._game_state(
+                {"api": SimpleNamespace(store=store), "gid": fx["gid"]})
+        finally:
+            store.close()
+
+    def _interleave(self, fx, coach_op, order):
+        """Force one ordering, once, and return the coach side's result. The
+        move is always asserted to have succeeded, so a race that silently
+        failed to perform the interleaving cannot masquerade as a pass."""
+        move = self._move_op(fx)
+        if order == "move_first":
+            move_res, coach_res = race_with_forced_order(
+                self.url, "get_season_for_update", move, coach_op)
+        else:
+            coach_res, move_res = race_with_forced_order(
+                self.url, "get_season_for_update", coach_op, move)
+        self.assertEqual(move_res, {"moved": True}, move_res)
+        return coach_res
+
+    def _assert_lost(self, fx, res, before, where):
+        """THE LOSING AUTHORIZATION, asserted the same way in every cell: the
+        structured refusal, and every durable class IDENTITY-unchanged —
+        substitutes, roster, availability, audit, the notification event
+        table AND the feed/delivery rows."""
+        err = self._error(res)
+        self.assertEqual(err["code"], "forbidden", (where, res))
+        self.assertEqual(err["details"]["reason"], TEAM_SCOPE_VIOLATION,
+                         (where, res))
+        self.assertEqual(self._pg_state(fx), before, where)
+
+    def _assert_won(self, res, where):
+        if isinstance(res, dict):
+            self.assertNotIn("error", res, (where, res))
+
+    # -- create surfaces --------------------------------------------------
+    def test_every_create_surface_refuses_its_loser_in_both_orders(self):
+        """Six CREATE surfaces x both forced orders. The loser differs by
+        order — HOME once the move has committed, AWAY while it has not —
+        and in every cell the refusal leaves all five state classes
+        untouched."""
+        for kind in CREATE_SURFACES:
+            for order, side in (("move_first", "home"),
+                                ("coach_first", "away")):
+                with self.subTest(surface=kind, order=order, coach=side):
+                    fx = self._surface_fixture(kind)
+                    before = self._pg_state(fx)
+                    res = self._interleave(
+                        fx, self._coach_op(fx, kind, fx[side]), order)
+                    self._assert_lost(fx, res, before, (kind, order, side))
+
+    def test_every_create_surface_still_admits_the_coach_who_wins(self):
+        """...and the same six surfaces still COMMIT for the HOME coach whose
+        transaction takes the Season lock before the move does. Without this
+        cell the refusals above would also be satisfied by a gate that
+        refused everyone."""
+        for kind in CREATE_SURFACES:
+            with self.subTest(surface=kind):
+                fx = self._surface_fixture(kind)
+                res = self._interleave(
+                    fx, self._coach_op(fx, kind, fx["home"]), "coach_first")
+                self._assert_won(res, kind)
+
+    # -- response surfaces ------------------------------------------------
+    def test_every_response_surface_refuses_the_opponent_in_both_orders(self):
+        """Five RESPONSE surfaces x both forced orders, with the OPPOSING
+        coach acting. A committed membership move does not hand them the row:
+        durable attribution still names HOME, so they lose in the order most
+        favourable to them as well as the other."""
+        for kind in RESPONSE_SURFACES:
+            for order in self.ORDERS:
+                with self.subTest(surface=kind, order=order):
+                    fx = self._surface_fixture(kind)
+                    before = self._pg_state(fx)
+                    res = self._interleave(
+                        fx, self._coach_op(fx, kind, fx["away"]), order)
+                    self._assert_lost(fx, res, before, (kind, order, "away"))
+
+    def test_every_response_surface_keeps_the_owners_cleanup(self):
+        """THE CLEANUP PATH THE RULING PRESERVES, in both orders: "This
+        preserves the ordinary cleanup path after transfer/inactivation and
+        prevents a row from silently changing owners because eligibility
+        later changed." Order-independence is the property, so both are
+        forced rather than one being assumed from the other."""
+        for kind in RESPONSE_SURFACES:
+            for order in self.ORDERS:
+                with self.subTest(surface=kind, order=order):
+                    fx = self._surface_fixture(kind)
+                    res = self._interleave(
+                        fx, self._coach_op(fx, kind, fx["home"]), order)
+                    self._assert_won(res, (kind, order))
+
+    # -- batch surfaces ---------------------------------------------------
+    def _batch_fixture(self, route):
+        """TWO home candidates — one who MOVES and one who does not — so a
+        batch always has something real to seat whichever transaction wins,
+        and "was the mover seated?" is answerable from the response alone.
+        A zero-seat result could otherwise be mistaken for a correct one."""
+        store = fresh_sql_store(self.url)
+        try:
+            self.assertEqual(store.backend, "postgres", store.backend)
+            fx = self._build(store)
+            api = fx["api"]
+            mover = self._player(fx, fx["home"], "Mo Mover")
+            stayer = self._player(fx, fx["home"], "Sam Stayer")
+            self._player(fx, fx["away"], "Ava Away")
+            out = {k: v for k, v in fx.items() if k != "api"} | {
+                "pid": mover, "stayer": stayer,
+                "home_stint": self._stint(fx, mover),
+                "season_id": fx["season"]["id"]}
+            if route == "copy":
+                slot = api.create_ice_slot(
+                    fx["rink"]["id"], _at(2).isoformat(), _at(3).isoformat(),
+                    "game", actor_id=ADMIN)
+                prior = api.create_game(
+                    fx["season"]["id"], None, fx["home"], fx["away"],
+                    slot["id"], target_goalies=0, target_skaters=8,
+                    actor_id=ADMIN, league_id=fx["league"]["id"])
+                self.assertNotIn("error", prior, prior)
+                api.publish_game(prior["id"], actor_id=ADMIN)
+                seated = api.select_roster(prior["id"], [mover, stayer],
+                                           actor_id=ADMIN)
+                self.assertNotIsInstance(seated, dict, seated)
+                out["prior_gid"] = prior["id"]
+            return out
+        finally:
+            store.close()
+
+    def _batch_op(self, fx, route, team_id, authorized_team_id):
+        def op(store):
+            api = ApiService(store)
+            api.roster.clock = FakeClock()
+            if route == "build":
+                return api.auto_build_roster(
+                    fx["gid"], team_id, "coach",
+                    authorized_team_id=authorized_team_id)
+            return api.copy_previous_roster(
+                fx["gid"], team_id, "coach",
+                authorized_team_id=authorized_team_id)
+        return op
+
+    def test_a_foreign_batch_team_loses_in_both_orders(self):
+        """The AWAY coach names HOME explicitly on both batch entry points,
+        interleaved with a committing membership move in both directions.
+        The authorization is decided before candidate discovery, so neither
+        order can turn it into a seat — and nothing is written."""
+        for route in ("build", "copy"):
+            for order in self.ORDERS:
+                with self.subTest(route=route, order=order):
+                    fx = self._batch_fixture(route)
+                    before = self._pg_state(fx)
+                    res = self._interleave(
+                        fx, self._batch_op(fx, route, fx["home"], fx["away"]),
+                        order)
+                    self._assert_lost(fx, res, before, (route, order))
+
+    def test_the_batch_seats_the_mover_only_when_it_wins_the_race(self):
+        """THE PROOF THAT THIS RACE BITES rather than merely running. The
+        SAME authorized batch produces DIFFERENT durable state depending on
+        which transaction took the Season lock first: the moved candidate is
+        seated when the coach wins, and is a REPORTED SKIP — never a silent
+        omission and never a cross-side seat — when the move wins."""
+        for route in ("build", "copy"):
+            with self.subTest(route=route, order="coach_first"):
+                fx = self._batch_fixture(route)
+                res = self._interleave(
+                    fx, self._batch_op(fx, route, None, fx["home"]),
+                    "coach_first")
+                self.assertNotIn("error", res, (route, res))
+                self.assertEqual(sorted(res["seated"]),
+                                 sorted([fx["pid"], fx["stayer"]]),
+                                 (route, res))
+            with self.subTest(route=route, order="move_first"):
+                fx = self._batch_fixture(route)
+                res = self._interleave(
+                    fx, self._batch_op(fx, route, None, fx["home"]),
+                    "move_first")
+                self.assertNotIn("error", res, (route, res))
+                self.assertEqual(res["seated"], [fx["stayer"]], (route, res))
+                self.assertEqual([r["player_id"] for r in res["skipped"]],
+                                 [fx["pid"]], (route, res))
+
+    # -- the side-targeting surface ---------------------------------------
+    def _remind_fixture(self):
+        store = fresh_sql_store(self.url)
+        try:
+            self.assertEqual(store.backend, "postgres", store.backend)
+            fx = self._build(store)
+            mover = self._player(fx, fx["home"], "Mo Mover")
+            away = self._player(fx, fx["away"], "Ava Away")
+            return {k: v for k, v in fx.items() if k != "api"} | {
+                "pid": mover, "away_pid": away,
+                "home_stint": self._stint(fx, mover),
+                "season_id": fx["season"]["id"]}
+        finally:
+            store.close()
+
+    def _remind_op(self, fx, team_id, authorized_team_id):
+        def op(store):
+            api = ApiService(store)
+            api.roster.clock = FakeClock()
+            return api.remind_unresponded(
+                fx["gid"], team_id, "coach",
+                authorized_team_id=authorized_team_id)
+        return op
+
+    def test_remind_refuses_the_other_side_in_both_orders(self):
+        """ORDER-INDEPENDENT BY CONSTRUCTION, and said so rather than dressed
+        up: this surface's comparand is the REQUESTED side, which no
+        membership move can alter. Both orders are still forced, and in both
+        the refusal leaves the feed and the delivery queue — the tables this
+        surface actually writes — byte-identical."""
+        for order in self.ORDERS:
+            with self.subTest(order=order):
+                fx = self._remind_fixture()
+                before = self._pg_state(fx)
+                res = self._interleave(
+                    fx, self._remind_op(fx, fx["away"], fx["home"]), order)
+                self._assert_lost(fx, res, before, ("remind", order))
+
+    def test_the_reminders_recipients_are_linearized_with_the_move(self):
+        """What the AUTHORIZATION cannot show, the RECIPIENT LIST can: the
+        HOME coach's own reminder finds the mover when their transaction wins
+        the Season lock, and does not once the move has committed. That is
+        the same lock making the audience of a notification agree with the
+        membership it was computed from."""
+        with self.subTest(order="coach_first"):
+            fx = self._remind_fixture()
+            res = self._interleave(
+                fx, self._remind_op(fx, fx["home"], fx["home"]),
+                "coach_first")
+            self.assertEqual(res, {"reminded": 1}, res)
+        with self.subTest(order="move_first"):
+            fx = self._remind_fixture()
+            res = self._interleave(
+                fx, self._remind_op(fx, fx["home"], fx["home"]), "move_first")
+            self.assertEqual(res, {"reminded": 0}, res)
+
 
 class BothOrdersInSequenceOnMemoryAndSqlite(_CoachAuthHarness,
                                             unittest.TestCase):
@@ -963,6 +1337,284 @@ class BothOrdersInSequenceOnMemoryAndSqlite(_CoachAuthHarness,
             finally:
                 self._close(label, store)
         self._assert_ran(ran, "BOTH ORDERS / RESPONSE")
+
+
+# =========================================================================== #
+# remind_unresponded — the side-targeting surface (#427 review, F-1)         #
+# =========================================================================== #
+class RemindUnrespondedRevalidatesTheNotifiedSideUnderTheLock(
+        _CoachAuthHarness, unittest.TestCase):
+    """THE GATE THAT HAD NO TEST. The comparand table at the top of this file
+    has always LISTED ``remind_unresponded`` — "notifies one side; the
+    requested team IS the comparand" — but nothing in the tree ASSERTED it. A
+    reviewer deleted the gate outright and ran the entire Memory/SQLite suite
+    green (measured again here, 234 modules / 3 shards / 271s, with this
+    class's ancestor absent), so the correct code was carrying no falsifiable
+    coverage at all and a regression would have been invisible.
+
+    WHY THIS SURFACE NEEDS ITS OWN CLASS rather than a row in the surface
+    table above. Every other surface targets a PLAYER and is refused on that
+    player's side; this one targets a SIDE and creates state (a feed
+    notification plus its delivery rows) for everyone on it. There is no row
+    to consult and no player to resolve, so ``_call``/``_prepare`` cannot
+    express it and the comparand is the REQUESTED ``team_id`` itself.
+
+    WHAT KILLS EACH TEST BELOW — stated because this round exists precisely
+    because two correct gates had none:
+
+      * ``test_a_coach_cannot_remind_the_other_sides_players`` — deleting
+        ``_require_authorized_team`` from ``ApiService.remind_unresponded``
+        (api/service.py, immediately before ``_availability_summary_of``)
+        turns the refusal into ``{"reminded": 1}`` and writes an
+        AVAILABILITY_REMINDER for the other side's player.
+      * ``test_the_owning_coach_reminds_their_own_side_only`` — widening the
+        comparand from the requested team to, say, the coach's own team makes
+        the gate vacuous and this test's cross-side assertion still holds; it
+        is the NEGATIVE test above that kills that mutation. What this one
+        kills is a gate placed too tightly (refusing the legitimate owner).
+      * ``test_an_unscoped_league_admin_may_remind_either_side`` — gating on
+        anything other than ``authorized_team_id is None`` reddens it.
+
+    THE ZERO-WRITE ASSERTION IS NOT VACUOUS HERE, and is proven so: after the
+    refusal, the SAME call is repeated as an unscoped League Admin and must
+    report ``{"reminded": 1}``. So the refused call genuinely had a reminder
+    to write and the gate is what stopped it, not an empty recipient
+    list."""
+
+    def _sides(self, fx):
+        """One player on EACH side, neither having answered — so "which side
+        was notified" is answerable from the feed rows alone."""
+        return (self._player(fx, fx["home"], "Hana Home"),
+                self._player(fx, fx["away"], "Ava Away"))
+
+    def _reminders(self, fx):
+        return sorted(n.audience_ref
+                      for n in fx["api"].store.all_notifications_feed()
+                      if n.kind.value == "availability_reminder")
+
+    def test_a_coach_cannot_remind_the_other_sides_players(self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._build(store)
+                home_pid, away_pid = self._sides(fx)
+                before = self._game_state(fx)
+                with self.subTest(backend=label):
+                    with self._write_attempts(fx["api"].store) as calls:
+                        res = fx["api"].remind_unresponded(
+                            fx["gid"], fx["away"], "coach",
+                            authorized_team_id=fx["home"])
+                    err = self._error(res)
+                    self.assertEqual(err["code"], "forbidden", res)
+                    self.assertEqual((err.get("details") or {}).get("reason"),
+                                     TEAM_SCOPE_VIOLATION, res)
+                    # ZERO WRITE ATTEMPTS — an ordering property, not a diff.
+                    self.assertEqual(calls, [], calls)
+                    # ...and every durable class, INCLUDING the feed and the
+                    # delivery queue this surface actually writes to.
+                    self.assertEqual(self._game_state(fx), before, label)
+                    self.assertEqual(self._reminders(fx), [], label)
+                    # THE REFUSAL WAS NOT VACUOUS: the same reminder, sent by
+                    # someone entitled to send it, does real work.
+                    allowed = fx["api"].remind_unresponded(
+                        fx["gid"], fx["away"], ADMIN)
+                    self.assertEqual(allowed, {"reminded": 1}, allowed)
+                    self.assertEqual(self._reminders(fx), [away_pid], label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "REMIND / FOREIGN SIDE")
+
+    def test_the_owning_coach_reminds_their_own_side_only(self):
+        """The refusal above is about AUTHORITY, not about reminders being
+        impossible: the side's OWN coach still nudges their own players, and
+        the other side's player is not touched."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._build(store)
+                home_pid, away_pid = self._sides(fx)
+                with self.subTest(backend=label):
+                    res = fx["api"].remind_unresponded(
+                        fx["gid"], fx["home"], "coach",
+                        authorized_team_id=fx["home"])
+                    self.assertEqual(res, {"reminded": 1}, res)
+                    self.assertEqual(self._reminders(fx), [home_pid], label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "REMIND / OWN SIDE")
+
+    def test_an_unscoped_league_admin_may_remind_either_side(self):
+        """``authorized_team_id=None`` means NO team constraint, here as
+        everywhere else: the League Admin reminds both sides in turn."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._build(store)
+                home_pid, away_pid = self._sides(fx)
+                with self.subTest(backend=label):
+                    for team, pid in ((fx["home"], home_pid),
+                                      (fx["away"], away_pid)):
+                        res = fx["api"].remind_unresponded(
+                            fx["gid"], team, ADMIN)
+                        self.assertEqual(res, {"reminded": 1}, (team, res))
+                    self.assertEqual(self._reminders(fx),
+                                     sorted([home_pid, away_pid]), label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "REMIND / LEAGUE ADMIN")
+
+
+class RemindOverRealAuthenticatedHttp(_CoachAuthHarness, unittest.TestCase):
+    """THE SAME SURFACE END-TO-END, through a live ``ThreadingHTTPServer``
+    with a real cookie session, so the Coach scope under test is the one
+    ``_resolve_role`` actually produces rather than one a test asserted into
+    existence.
+
+    WHAT THIS CLASS CAN AND CANNOT PROVE, stated rather than implied. Over
+    HTTP the ``scope_violation`` PREFLIGHT refuses an explicit foreign
+    ``team_id`` before the request ever reaches the service, and an OMITTED
+    ``team_id`` is filled from the coach's own scope by the route itself
+    (``body.get("team_id") or scope.get("team_id")``). So on this route the
+    two possible bodies are the coach's own side or a preflight denial, and
+    the under-lock gate is NOT independently reachable through HTTP: it is
+    defence in depth, which is exactly the posture the ruling asks for ("the
+    scope preflight may remain for fast denial, but it cannot be the
+    authoritative write gate").
+
+    THEREFORE: deleting the service gate does NOT redden this class — it
+    reddens ``RemindUnrespondedRevalidatesTheNotifiedSideUnderTheLock``
+    above, which calls the facade directly and bypasses the preflight. What
+    THIS class pins is the reachable end-to-end behaviour: the 403 an
+    opposing coach actually receives, with nothing written on any durable
+    surface, and the 200 the owning coach receives touching only their own
+    side. Removing the preflight's ``body["team_id"]`` check reddens it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._saved_api = srv.STATE.api
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+        # server_close() as well as shutdown(): the latter only stops the
+        # serve loop, and a listening socket left for the GC surfaces as a
+        # ResourceWarning at interpreter shutdown (see run_parallel.py).
+        cls.httpd.server_close()
+        srv.STATE.api = cls._saved_api
+
+    def _accounts(self, fx):
+        api = fx["api"]
+        api.accounts.create_account("admin", DEMO_PASSWORD,
+                                    DEMO_USERS["admin"], scope={},
+                                    actor_id="test_seed",
+                                    account_id="user_admin")
+        api.accounts.create_account("coachhome", DEMO_PASSWORD, Role.COACH,
+                                    scope={"team_id": fx["home"]},
+                                    actor_id="test_seed",
+                                    account_id="user_coach_home")
+        api.accounts.create_account("coachaway", DEMO_PASSWORD, Role.COACH,
+                                    scope={"team_id": fx["away"]},
+                                    actor_id="test_seed",
+                                    account_id="user_coach_away")
+
+    def _req(self, opener, method, path, body=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            url, data=data, method=method,
+            headers={"Content-Type": "application/json"})
+        try:
+            with opener.open(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read() or b"{}")
+
+    def _login(self, fx, username):
+        srv.STATE.api = fx["api"]
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+        status, body = self._req(opener, "POST", "/api/auth/login",
+                                 {"username": username, "password": "demo"})
+        self.assertEqual(status, 200, (username, body))
+        return opener
+
+    def _fixture(self, store):
+        fx = self._build(store)
+        home_pid = self._player(fx, fx["home"], "Hana Home")
+        away_pid = self._player(fx, fx["away"], "Ava Away")
+        self._accounts(fx)
+        return fx, home_pid, away_pid
+
+    def _reminders(self, fx):
+        return sorted(n.audience_ref
+                      for n in fx["api"].store.all_notifications_feed()
+                      if n.kind.value == "availability_reminder")
+
+    def test_an_opposing_coach_naming_the_other_side_is_refused(self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx, home_pid, away_pid = self._fixture(store)
+                before = self._game_state(fx)
+                away = self._login(fx, "coachaway")
+                with self.subTest(backend=label):
+                    status, body = self._req(
+                        away, "POST",
+                        f"/api/games/{fx['gid']}/availability/remind",
+                        {"team_id": fx["home"]})
+                    self.assertEqual(status, 403, body)
+                    self.assertEqual(body["error"]["code"], "forbidden", body)
+                    self.assertEqual(self._game_state(fx), before, label)
+                    self.assertEqual(self._reminders(fx), [], label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "REMIND HTTP / FOREIGN SIDE")
+
+    def test_each_coachs_own_reminder_reaches_only_their_own_side(self):
+        """Both bodies the route accepts, for both coaches: the omitted
+        ``team_id`` is filled from the caller's OWN scope, so an AWAY coach's
+        empty body reminds AWAY and never HOME."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                for user, own_pid in (("coachhome", "home"),
+                                      ("coachaway", "away")):
+                    store.clear_all_data()
+                    fx, home_pid, away_pid = self._fixture(store)
+                    expected = home_pid if own_pid == "home" else away_pid
+                    opener = self._login(fx, user)
+                    with self.subTest(backend=label, user=user):
+                        status, body = self._req(
+                            opener, "POST",
+                            f"/api/games/{fx['gid']}/availability/remind", {})
+                        self.assertEqual(status, 200, body)
+                        self.assertEqual(body, {"reminded": 1}, body)
+                        self.assertEqual(self._reminders(fx), [expected],
+                                         (user, label))
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "REMIND HTTP / OWN SIDE")
 
 
 if __name__ == "__main__":

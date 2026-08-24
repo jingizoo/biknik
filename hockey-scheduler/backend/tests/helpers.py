@@ -1,5 +1,6 @@
 """Shared test helpers: a deterministic clock and a small game builder."""
 
+import contextlib
 import os
 import re
 import sys
@@ -451,3 +452,60 @@ def select_and_confirm(service, game_id, player_ids, coach="coach_1"):
 
     for pid in player_ids:
         service.set_availability(game_id, pid, AvailabilityStatus.AVAILABLE)
+
+
+# --------------------------------------------------------------------------
+# "zero write ATTEMPTS", the observation a snapshot diff cannot make
+# --------------------------------------------------------------------------
+WRITE_METHOD_PREFIXES = ("save_", "add_", "upsert_", "insert_", "update_",
+                         "delete_", "remove_", "clear_", "next_id")
+
+
+@contextlib.contextmanager
+def write_attempt_spy(store):
+    """Record every STORE WRITE METHOD CALLED on ``store``, whether or not it
+    survived, for the duration of the block.
+
+    A SNAPSHOT DIFF CANNOT PROVE WHAT THIS IS FOR. Every gated mutation in
+    the #205 family is wrapped in a single transaction, so a guard placed
+    AFTER the first write still leaves an empty before/after diff — the raise
+    rolls it back on Memory, SQLite and PostgreSQL alike. "Zero writes" is an
+    ORDERING property, and only a spy on the ATTEMPTS can see it.
+
+    Patched on the INSTANCE and removed in ``finally`` (``delattr`` restores
+    the bound class method). The number of methods actually wrapped is
+    asserted, so a store-layer rename that empties
+    ``WRITE_METHOD_PREFIXES`` fails loudly instead of quietly turning this
+    into a spy that can never fire.
+
+    Shared by ``test_coach_team_authorization`` and
+    ``test_batch_effective_team`` so both files' "zero write attempts" claims
+    mean exactly the same thing, checked by one implementation.
+    """
+    calls = []
+    originals = {}
+    for name in dir(store):
+        if not name.startswith(WRITE_METHOD_PREFIXES):
+            continue
+        attr = getattr(store, name, None)
+        if not callable(attr):
+            continue
+        originals[name] = attr
+
+        def make(n, orig):
+            def spy(*a, **kw):
+                calls.append(n)
+                return orig(*a, **kw)
+            return spy
+
+        setattr(store, name, make(name, attr))
+    if len(originals) <= 10:
+        raise AssertionError(
+            f"write_attempt_spy wrapped only {sorted(originals)} — the "
+            f"write prefixes no longer match this store's API, so this spy "
+            f"could never fire")
+    try:
+        yield calls
+    finally:
+        for name in originals:
+            delattr(store, name)

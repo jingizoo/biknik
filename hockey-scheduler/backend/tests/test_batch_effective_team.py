@@ -70,6 +70,18 @@ SQLite and — when TEST_DATABASE_URL is set — real PostgreSQL, through a live
 test is the one ``_resolve_role`` actually produces rather than one the test
 asserts into existence. ``_assert_backend`` PROVES the backend and
 ``_assert_ran`` fails a silently-narrowed loop. A SKIP IS NOT A PASS.
+
+...AND, SINCE THE REVIEW ROUND ON THIS PR, ALSO BELOW HTTP (finding F-2).
+Every case above enters through ``/api/games/{gid}/...``, where a truthy,
+foreign ``body["team_id"]`` is refused by the ``scope_violation`` PREFLIGHT
+before the service is ever reached — so a 403 there says nothing about the
+gate underneath, which the ruling insists is the authoritative one. A
+reviewer replaced ``_batch_team``'s refusal with a SILENT REWRITE to the
+coach's own side and the whole suite stayed green. See
+``AnExplicitForeignTeamIsRefusedBelowThePreflight`` at the bottom of this
+file: same tri-store discipline, but every call is a DIRECT facade call
+carrying ``authorized_team_id``, so the preflight is out of the picture and
+the same rewrite reddens it.
 """
 
 import json
@@ -81,12 +93,14 @@ import urllib.request
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND, FakeClock, fresh_sql_store  # noqa: F401
+from helpers import (BACKEND, FakeClock, fresh_sql_store,  # noqa: F401
+                     write_attempt_spy)
 from test_substitute_membership_cutover import ADMIN, _at
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import Player, Position, Role
 from hockey_scheduler.services import membership_spine as spine
+from hockey_scheduler.services.roster_service import TEAM_SCOPE_VIOLATION
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web import server as srv
 from hockey_scheduler.web.auth import DEMO_PASSWORD, DEMO_USERS
@@ -482,6 +496,196 @@ class OneBatchSeatsOneSide(_BatchTeamHarness, unittest.TestCase):
             finally:
                 self._close(label, store)
         self._assert_ran(ran, "ONE BATCH ONE SIDE")
+
+
+# =========================================================================== #
+# the refusal BELOW the preflight (PR #427 review, F-2)                       #
+# =========================================================================== #
+class AnExplicitForeignTeamIsRefusedBelowThePreflight(_BatchTeamHarness,
+                                                      unittest.TestCase):
+    """THE COMMIT MESSAGE'S CLAIM, FINALLY ASSERTED WHERE IT LIVES: "an
+    explicit foreign team is forbidden, not rewritten".
+
+    WHY THE HTTP TEST ABOVE COULD NOT MAKE THIS CLAIM.
+    ``test_away_coach_naming_home_explicitly_is_forbidden_zero_writes`` posts
+    ``{"team_id": HOME}`` as the AWAY coach and asserts 403 — but a truthy,
+    foreign ``body["team_id"]`` is exactly what ``scope_violation`` refuses at
+    the PREFLIGHT, so that 403 is produced before the request reaches the
+    service at all. A reviewer replaced ``_batch_team``'s refusal with a
+    SILENT REWRITE to the coach's own side and the ENTIRE suite stayed green
+    (measured here too: 234 modules, 3 shards, 271s, OK). The preflight is,
+    in the ruling's words, exactly what "cannot be the authoritative write
+    gate" — so a test that can only ever see the preflight's answer proves
+    nothing about the gate underneath it. This is the same shape as the
+    earlier blocker where a test routed through ``publish_game`` could never
+    reach the line it named.
+
+    SO EVERY CALL BELOW IS A DIRECT FACADE CALL with an explicit
+    ``authorized_team_id``, entering at ``ApiService`` and never touching
+    ``scope_violation``, ``web/server.py`` or an HTTP socket. That is also
+    the honest model of the contract: ``authorized_team_id`` is the parameter
+    the ruling requires every Coach-reachable command to revalidate, and a
+    service that is correct only when a particular front end happens to
+    filter its inputs first is not the contract that was asked for.
+
+    WHAT KILLS EVERY TEST HERE, precisely: replacing
+
+        if authorized_team_id is not None:
+            if team_id is not None and team_id != authorized_team_id:
+                self._require_authorized_team(...)
+            team_id = authorized_team_id
+
+    with the silent rewrite ``team_id = authorized_team_id`` — i.e. deleting
+    only the refusal and keeping the resolution. Under that mutation the
+    refusal tests receive a successful batch naming the coach's OWN side and
+    redden on the missing ``error``; the whole rest of the suite does not
+    move.
+
+    ZERO WRITE ATTEMPTS, not a snapshot diff: ``auto_build_roster`` and
+    ``copy_previous_roster`` are transactional, so a gate placed after the
+    first seat still leaves an empty before/after diff on every backend. The
+    spy is ``helpers.write_attempt_spy``, shared with
+    ``test_coach_team_authorization`` so both files mean the same thing by
+    the phrase.
+    """
+
+    def _fixture(self, store, route):
+        prior = route == "copy"
+        fx = self._build(store, prior=prior)
+        home_pid, away_pid = self._both_sides(fx)
+        if prior:
+            self._seat_prior(fx, [home_pid, away_pid])
+        return fx, home_pid, away_pid
+
+    def _batch(self, fx, route, team_id, authorized_team_id):
+        api = fx["api"]
+        if route == "build":
+            return api.auto_build_roster(
+                fx["gid"], team_id, "coach",
+                authorized_team_id=authorized_team_id)
+        return api.copy_previous_roster(
+            fx["gid"], team_id, "coach",
+            authorized_team_id=authorized_team_id)
+
+    ROUTES = ("build", "copy")
+
+    def test_the_service_refuses_an_explicit_foreign_team(self):
+        """The AWAY coach names HOME explicitly, straight at the facade. The
+        answer must be a structured ``team_scope_violation`` refusal with
+        zero write ATTEMPTS — never a 200 that quietly acted on AWAY."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                for route in self.ROUTES:
+                    store.clear_all_data()
+                    fx, home_pid, away_pid = self._fixture(store, route)
+                    before = self._writes(fx)
+                    with self.subTest(backend=label, route=route):
+                        with write_attempt_spy(fx["api"].store) as calls:
+                            res = self._batch(fx, route, fx["home"],
+                                              fx["away"])
+                        self.assertIsInstance(res, dict, res)
+                        self.assertIn("error", res, (route, res))
+                        err = res["error"]
+                        self.assertEqual(err["code"], "forbidden",
+                                         (route, res))
+                        self.assertEqual(err["details"]["reason"],
+                                         TEAM_SCOPE_VIOLATION, (route, res))
+                        self.assertEqual(err["details"]["owning_team_id"],
+                                         fx["home"], (route, res))
+                        # THE SILENT-REWRITE SIGNATURE, ruled out explicitly:
+                        # a rewritten request answers with the coach's OWN
+                        # side and a seated list. There is no response body
+                        # here at all.
+                        self.assertNotIn("team_id", res, (route, res))
+                        self.assertEqual(calls, [], (route, calls))
+                        self.assertEqual(self._writes(fx), before, route)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "BATCH SERVICE / EXPLICIT FOREIGN TEAM")
+
+    def test_naming_their_own_team_explicitly_still_works(self):
+        """The refusal is about WHOSE side was named, not about naming one:
+        the same explicit form, pointed at the coach's own team, succeeds and
+        seats only that side. Without this, deleting ``_batch_team``'s whole
+        ``authorized_team_id`` branch would still leave the test above
+        passing for the wrong reason."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                for route in self.ROUTES:
+                    store.clear_all_data()
+                    fx, home_pid, away_pid = self._fixture(store, route)
+                    with self.subTest(backend=label, route=route):
+                        res = self._batch(fx, route, fx["away"], fx["away"])
+                        self.assertNotIn("error", res, (route, res))
+                        self.assertEqual(res["team_id"], fx["away"],
+                                         (route, res))
+                        self.assertEqual(res["seated"], [away_pid],
+                                         (route, res))
+                        self.assertEqual(
+                            [r for r in self._rows(fx) if r[2] == fx["home"]],
+                            [], (route, self._rows(fx)))
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "BATCH SERVICE / EXPLICIT OWN TEAM")
+
+    def test_an_omitted_team_is_the_coachs_own_side_at_the_service_too(self):
+        """The PINNED omission behaviour, asserted below the preflight as
+        well as through it: ``team_id=None`` with a Coach constraint resolves
+        to the coach's own side — never HOME by fallback, and never a
+        refusal. Restoring ``team_id = team_id or game.home_team_id`` for a
+        scoped caller reddens this on the AWAY coach."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                for route in self.ROUTES:
+                    store.clear_all_data()
+                    fx, home_pid, away_pid = self._fixture(store, route)
+                    with self.subTest(backend=label, route=route):
+                        res = self._batch(fx, route, None, fx["away"])
+                        self.assertNotIn("error", res, (route, res))
+                        self.assertEqual(res["team_id"], fx["away"],
+                                         (route, res))
+                        self.assertEqual(res["seated"], [away_pid],
+                                         (route, res))
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "BATCH SERVICE / OMITTED TEAM")
+
+    def test_a_team_not_playing_is_still_a_bad_request_not_a_refusal(self):
+        """The third team is neither the coach's nor in this game. An
+        unscoped caller naming it must still get the pre-existing
+        ``ValidationError`` — the gate must not have swallowed that path —
+        while a Coach naming it gets the authorization refusal, because
+        "not yours" is decided before "not playing"."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                for route in self.ROUTES:
+                    store.clear_all_data()
+                    fx, home_pid, away_pid = self._fixture(store, route)
+                    with self.subTest(backend=label, route=route):
+                        unscoped = self._batch(fx, route, fx["third"], None)
+                        self.assertEqual(
+                            unscoped["error"]["code"], "validation_error",
+                            (route, unscoped))
+                        coached = self._batch(fx, route, fx["third"],
+                                              fx["away"])
+                        self.assertEqual(coached["error"]["details"]["reason"],
+                                         TEAM_SCOPE_VIOLATION,
+                                         (route, coached))
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "BATCH SERVICE / THIRD TEAM")
 
 
 if __name__ == "__main__":
