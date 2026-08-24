@@ -3501,7 +3501,9 @@ _AUDIT_WAIVERS = {
         "the delete callable itself, reached as `mapper`'s own argument -- "
         "same ten-way `kind`-keyed dict selection, same reasoning as the "
         "two entries immediately above",
-    ("do_POST", "fn(gid, player_id, user_id)", "call_argument", "sub"):
+    ("do_POST",
+     "fn(gid, player_id, user_id, authorized_team_id=coach_team)",
+     "call_argument", "sub"):
         "#202 repair round 5, finding 2b -- `fn` is one of three "
         "`api.{accept,decline,add_substitute_to_roster}` functions, "
         "selected by `{...}[op]` keyed on `op` (`sub.group(2)`, captured "
@@ -3511,7 +3513,13 @@ _AUDIT_WAIVERS = {
         "fallback rather than this module's `.get()`-shaped recogniser. "
         "Not a routing decision: `gid`/`player_id` are already-captured "
         "ids handed to the already-selected implementation, the route "
-        "was decided upstream by `sub`'s own regex alternation",
+        "was decided upstream by `sub`'s own regex alternation. #205 adds "
+        "`authorized_team_id=coach_team` -- the COACH'S OWN SCOPED TEAM, "
+        "handed to the service so it can REVALIDATE it under its own "
+        "Season lock before any write. Also an authorization input and "
+        "not a routing test, and threaded through this ONE shared call "
+        "rather than bound into the dict's three values, so the three "
+        "methods reached as VALUES stay a single reviewed site",
     ("do_POST", "coach(gid, user_id)", "call_argument", "coach"):
         "#202 repair round 5, finding 2b -- `coach` is one of "
         "`api.{lock_roster,unlock_roster,cancel_game}`, selected by "
@@ -3814,21 +3822,21 @@ _AUDIT_WAIVERS = {
         "already returned above); `op == 'accept'` here is a VALUE passed "
         "to the service (True/False), not a further routing test -- oa's "
         "own match already fully decided the route",
-    ('do_POST', "api.set_availability(gid, pid, status_val, body.get('response_source', 'player'), user_id)", 'call_argument', "action == 'availability'"):
+    ('do_POST', "api.set_availability(gid, pid, status_val, body.get('response_source', 'player'), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'availability'"):
         "gid/action captured off the SAME /api/games/{gid}/<action> match "
         "as every other action-dispatch entry below; `action == "
         "'availability'` already selects this leaf, after its own strict "
         "body-schema and enum-membership checks just above",
-    ('do_POST', "api.remind_unresponded(gid, body.get('team_id') or scope.get('team_id'), user_id)", 'call_argument', "action == 'availability/remind'"):
+    ('do_POST', "api.remind_unresponded(gid, body.get('team_id') or scope.get('team_id'), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'availability/remind'"):
         "gid/action captured off the SAME match; `action == "
         "'availability/remind'` already selects this leaf",
     ('do_POST', "api.auto_build_roster(gid, body.get('team_id'), user_id)", 'call_argument', "action == 'build-roster'"):
         "gid/action captured off the SAME match; `action == 'build-roster'` "
         "already selects this leaf",
-    ('do_POST', "api.select_roster(gid, body.get('player_ids', []), user_id)", 'call_argument', "action == 'roster/select'"):
+    ('do_POST', "api.select_roster(gid, body.get('player_ids', []), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'roster/select'"):
         "gid/action captured off the SAME match; `action == "
         "'roster/select'` already selects this leaf",
-    ('do_POST', 'api.remove_player(gid, pid, user_id)', 'call_argument', "action == 'roster/remove'"):
+    ('do_POST', 'api.remove_player(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'roster/remove'"):
         "gid/action captured off the SAME match; `action == "
         "'roster/remove'` already selects this leaf",
     ('do_POST', "api.copy_previous_roster(gid, body.get('team_id'), user_id)", 'call_argument', "action == 'roster/copy-previous'"):
@@ -3852,19 +3860,19 @@ _AUDIT_WAIVERS = {
     ('do_POST', "api.request_reschedule(gid, body.get('team_id'), body.get('reason', ''), user_id)", 'call_argument', "action == 'reschedule/request'"):
         "gid/action captured off the SAME match; `action == "
         "'reschedule/request'` already selects this leaf",
-    ('do_POST', 'api.enroll_substitute(gid, pid, user_id)', 'call_argument', "action == 'substitutes/enroll'"):
+    ('do_POST', 'api.enroll_substitute(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'substitutes/enroll'"):
         "gid/action captured off the SAME match; `action == "
         "'substitutes/enroll'` already selects this leaf (the "
         "coach/operator side of enrollment -- distinct actor/permission "
         "from the player self-service /api/me/substitute-opportunities/... "
         "route above, same service call)",
-    ('do_POST', 'api.withdraw_substitute(gid, pid, user_id)', 'call_argument', "action == 'substitutes/withdraw'"):
+    ('do_POST', 'api.withdraw_substitute(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'substitutes/withdraw'"):
         "gid/action captured off the SAME match; `action == "
         "'substitutes/withdraw'` already selects this leaf",
-    ('do_POST', 'api.add_substitute_candidate(gid, pid, user_id)', 'call_argument', "action == 'substitutes/add-candidate'"):
+    ('do_POST', 'api.add_substitute_candidate(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'substitutes/add-candidate'"):
         "gid/action captured off the SAME match; `action == "
         "'substitutes/add-candidate'` already selects this leaf",
-    ('do_POST', "api.offer_substitute(gid, player_id, user_id, expires_at=body.get('expires_at'))", 'call_argument', "op == 'offer'"):
+    ('do_POST', "api.offer_substitute(gid, player_id, user_id, expires_at=body.get('expires_at'), authorized_team_id=coach_team)", 'call_argument', "op == 'offer'"):
         "gid captured off the outer action match, player_id/op off the "
         "nested `sub` match on the SAME already-selected `action == "
         "'substitutes/<player_id>/<op>'` shape; `op == 'offer'` already "

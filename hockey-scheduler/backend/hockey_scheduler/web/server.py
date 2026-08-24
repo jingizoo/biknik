@@ -4199,6 +4199,33 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/games/([^/]+)/(.+)$", path)
         if m:
             gid, action = m.group(1), m.group(2)
+            # THE AUTHORIZED TEAM, threaded into every Coach-reachable
+            # roster/substitute command below so each one can REVALIDATE it
+            # under its own Season lock, before any write (#205, owner
+            # comments 5373064375 and 5391127041). `scope_violation` above
+            # stays exactly as it is — a cheap PREFLIGHT for fast denial —
+            # but it is no longer the authoritative gate: it takes no locks,
+            # runs outside every transaction, and DISCARDS the team it
+            # resolves.
+            #
+            # ONLY FOR A COACH, and `None` for everyone else. `None` means
+            # "impose no team constraint", which is the correct and only
+            # correct answer for the callers whose authority was established
+            # elsewhere and never came from a team: Player self-service
+            # (`/api/me/substitute-opportunities/...`, `_require_player_
+            # scope`), Guardian (`/api/me/guardian/...`, `_require_guardian_
+            # scope` + `_guardian_link_or_403`) — both of which are handled
+            # EARLIER in do_POST and never reach this block at all — and the
+            # unscoped League Admin/Arena Manager, who by design are "not
+            # resource-scoped here" (web/scope.py) and reach these rows under
+            # their own permissions.
+            #
+            # It costs no new lookup: `scope["team_id"]` is the coach's
+            # permanently-bound team and is already in hand. The service is
+            # deliberately NOT asked to infer it from `actor_id` — the ruling
+            # forbids that, and the coach<->team binding only exists up here.
+            coach_team = (scope or {}).get("team_id") \
+                if role == Role.COACH else None
             if action == "availability":
                 # Strict schema (#271): reject unknown keys so a typo'd status
                 # field can't be silently recorded as the default `pending`, and
@@ -4224,19 +4251,23 @@ class Handler(BaseHTTPRequestHandler):
                     }}, 400)
                 return self._send_api(api.set_availability(
                     gid, pid, status_val,
-                    body.get("response_source", "player"), user_id))
+                    body.get("response_source", "player"), user_id,
+                    authorized_team_id=coach_team))
             if action == "availability/remind":
                 # One-click reminder to players who haven't responded (#89).
                 return self._send_api(api.remind_unresponded(
-                    gid, body.get("team_id") or scope.get("team_id"), user_id))
+                    gid, body.get("team_id") or scope.get("team_id"), user_id,
+                    authorized_team_id=coach_team))
             if action == "build-roster":
                 return self._send_api(api.auto_build_roster(
                     gid, body.get("team_id"), user_id))
             if action == "roster/select":
                 return self._send_api(api.select_roster(
-                    gid, body.get("player_ids", []), user_id))
+                    gid, body.get("player_ids", []), user_id,
+                    authorized_team_id=coach_team))
             if action == "roster/remove":
-                return self._send_api(api.remove_player(gid, pid, user_id))
+                return self._send_api(api.remove_player(
+                    gid, pid, user_id, authorized_team_id=coach_team))
             if action == "roster/copy-previous":
                 return self._send_api(api.copy_previous_roster(
                     gid, body.get("team_id"), user_id))
@@ -4274,26 +4305,35 @@ class Handler(BaseHTTPRequestHandler):
                     new_ice_slot_id=body.get("new_ice_slot_id"),
                     note=body.get("note"), actor_id=user_id))
             if action == "substitutes/enroll":
-                return self._send_api(api.enroll_substitute(gid, pid, user_id))
+                return self._send_api(api.enroll_substitute(
+                    gid, pid, user_id, authorized_team_id=coach_team))
             if action == "substitutes/withdraw":
-                return self._send_api(api.withdraw_substitute(gid, pid, user_id))
+                return self._send_api(api.withdraw_substitute(
+                    gid, pid, user_id, authorized_team_id=coach_team))
             if action == "substitutes/add-candidate":
                 # Coach/operator adds an arbitrary eligible team player
                 # directly to the substitute pool (#114) — same enroll, a
                 # different (coach-side) actor and permission than the
                 # player's own self-service substitutes/enroll above.
                 return self._send_api(
-                    api.add_substitute_candidate(gid, pid, user_id))
+                    api.add_substitute_candidate(
+                        gid, pid, user_id, authorized_team_id=coach_team))
             sub = re.match(r"^substitutes/([^/]+)/(offer|accept|decline|add-to-roster)$", action)
             if sub:
                 player_id, op = sub.group(1), sub.group(2)
                 if op == "offer":
                     return self._send_api(api.offer_substitute(
-                        gid, player_id, user_id, expires_at=body.get("expires_at")))
+                        gid, player_id, user_id, expires_at=body.get("expires_at"),
+                        authorized_team_id=coach_team))
                 fn = {"accept": api.accept_substitute,
                       "decline": api.decline_substitute,
                       "add-to-roster": api.add_substitute_to_roster}[op]
-                return self._send_api(fn(gid, player_id, user_id))
+                # Threaded through the SHARED `fn(...)` call, deliberately,
+                # never bound into the dict above: three different methods are
+                # reached as VALUES there, so binding it per-value would be
+                # three call sites to keep in step instead of one.
+                return self._send_api(fn(gid, player_id, user_id,
+                                         authorized_team_id=coach_team))
             coach = {"roster/lock": api.lock_roster,
                      "roster/unlock": api.unlock_roster,
                      "cancel": api.cancel_game}.get(action)

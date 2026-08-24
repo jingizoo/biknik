@@ -2169,11 +2169,28 @@ class TheRulingDidNotRelaxIndividualMutations(_BatchHarness,
     def test_no_skip_flag_reached_the_seating_primitive(self):
         """A source-level tripwire for the same rule, because a future
         caller could reintroduce the flag without any behavioural test
-        noticing until it was already used."""
+        noticing until it was already used.
+
+        ``authorized_team_id`` (#205) IS ADMITTED HERE DELIBERATELY, and
+        this list is the record of that decision rather than a rubber
+        stamp. What the tripwire forbids is a parameter that would let a
+        caller ask ``select_roster`` to SKIP an ineligible player and seat
+        the rest — a partial success this primitive must never offer,
+        because "which players are eligible" is a question its callers
+        answer BEFORE it, in ``_partition_candidates``.
+        ``authorized_team_id`` is the opposite kind of argument: it can
+        only ever make the method REFUSE MORE (it adds the coach-team
+        check the owner's transactional blocker requires, revalidated
+        under the Season lock), never seat anything it would otherwise
+        have rejected, and never turn a raise into a skip. The
+        behavioural half of the same rule is
+        ``test_select_roster_still_refuses_the_whole_call``
+        immediately above, which still passes unchanged."""
         import inspect
         sig = inspect.signature(RosterService.select_roster)
         self.assertEqual(list(sig.parameters),
-                         ["self", "game_id", "player_ids", "actor_id"],
+                         ["self", "game_id", "player_ids", "actor_id",
+                          "authorized_team_id"],
                          list(sig.parameters))
 
 

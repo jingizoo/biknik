@@ -4054,14 +4054,20 @@ class ApiService:
 
     @catch
     def select_roster(self, game_id: str, player_ids: List[str],
-                      actor_id: Optional[str] = None) -> List[dict]:
-        entries = self.roster.select_roster(game_id, player_ids, actor_id)
+                      actor_id: Optional[str] = None,
+                      authorized_team_id: Optional[str] = None) -> List[dict]:
+        entries = self.roster.select_roster(
+            game_id, player_ids, actor_id,
+            authorized_team_id=authorized_team_id)
         return [_serialize(e) for e in entries]
 
     @catch
     def remove_player(self, game_id: str, player_id: str,
-                      actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.remove_player(game_id, player_id, actor_id))
+                      actor_id: Optional[str] = None,
+                      authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.remove_player(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def copy_previous_roster(self, game_id: str, team_id: Optional[str] = None,
@@ -4196,7 +4202,8 @@ class ApiService:
 
     @catch
     def remind_unresponded(self, game_id: str, team_id: str,
-                           actor_id: Optional[str] = None) -> dict:
+                           actor_id: Optional[str] = None,
+                           authorized_team_id: Optional[str] = None) -> dict:
         """Nudge the players who haven't set availability (#89): emit one
         player-targeted AVAILABILITY_REMINDER per no-response player, so the
         reminder actually reaches them (delivery honors each player's channel
@@ -4262,6 +4269,19 @@ class ApiService:
             # transaction that writes the notifications. Participation is
             # re-checked here too: `team_id` must be playing in the Game as it
             # stands under the lock, not as the caller's earlier read saw it.
+            # THE COACH GATE, under the SAME Season lock the reminders are
+            # written beneath (#205). `scope_violation` already refuses an
+            # explicit foreign `team_id` at the preflight, but the ruling is
+            # that the preflight "cannot be the authoritative write gate" —
+            # so the team this method is about to notify is revalidated here,
+            # inside the transaction and before the first `_push_notification`.
+            #
+            # COMPARAND: the REQUESTED team itself. This command targets a
+            # SIDE rather than a row, and it creates new state (notification
+            # + delivery rows) for that side, so "is this side mine?" is the
+            # whole question and there is no durable row to consult.
+            self.roster._require_authorized_team(
+                authorized_team_id, team_id, "team")
             summary = self._availability_summary_of(game, team_id)
             unresponded = [p for p in summary["players"]
                            if p["status"] == "no_response"]
@@ -4277,12 +4297,14 @@ class ApiService:
     @catch
     def set_availability(self, game_id: str, player_id: str,
                          availability_status: str, response_source: str = "player",
-                         actor_id: Optional[str] = None) -> dict:
+                         actor_id: Optional[str] = None,
+                         authorized_team_id: Optional[str] = None) -> dict:
         av = self.roster.set_availability(
             game_id, player_id,
             _parse_enum(AvailabilityStatus, availability_status,
                         "availability_status"),
             response_source, actor_id,
+            authorized_team_id=authorized_team_id,
         )
         return _serialize(av)
 
@@ -4294,38 +4316,55 @@ class ApiService:
 
     @catch
     def enroll_substitute(self, game_id: str, player_id: str,
-                          actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.enroll_substitute(game_id, player_id, actor_id))
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.enroll_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def withdraw_substitute(self, game_id: str, player_id: str,
-                            actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.withdraw_substitute(game_id, player_id, actor_id))
+                            actor_id: Optional[str] = None,
+                            authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.withdraw_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def offer_substitute(self, game_id: str, player_id: str,
                          actor_id: Optional[str] = None,
-                         expires_at: Optional[str] = None) -> dict:
+                         expires_at: Optional[str] = None,
+                         authorized_team_id: Optional[str] = None) -> dict:
         return _serialize(self.roster.offer_substitute(
             game_id, player_id, actor_id,
             offer_expires_at=_parse_dt(expires_at, "expires_at"),
+            authorized_team_id=authorized_team_id,
         ))
 
     @catch
     def accept_substitute(self, game_id: str, player_id: str,
-                          actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.accept_substitute(game_id, player_id, actor_id))
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.accept_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def decline_substitute(self, game_id: str, player_id: str,
-                           actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.decline_substitute(game_id, player_id, actor_id))
+                           actor_id: Optional[str] = None,
+                           authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.decline_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def add_substitute_to_roster(self, game_id: str, player_id: str,
-                                 actor_id: Optional[str] = None) -> dict:
+                                 actor_id: Optional[str] = None,
+                                 authorized_team_id: Optional[str] = None) -> dict:
         return _serialize(
-            self.roster.add_substitute_to_roster(game_id, player_id, actor_id)
+            self.roster.add_substitute_to_roster(
+                game_id, player_id, actor_id,
+                authorized_team_id=authorized_team_id)
         )
 
     # -- roster status -----------------------------------------------------
@@ -6703,9 +6742,11 @@ class ApiService:
 
     @catch
     def add_substitute_candidate(self, game_id: str, player_id: str,
-                                 actor_id: Optional[str] = None) -> dict:
+                                 actor_id: Optional[str] = None,
+                                 authorized_team_id: Optional[str] = None) -> dict:
         return _serialize(self.roster.add_substitute_candidate(
-            game_id, player_id, actor_id))
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def assign_official(self, game_id: str, official_id: str, role: str,

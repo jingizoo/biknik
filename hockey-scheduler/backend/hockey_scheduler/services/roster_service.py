@@ -42,6 +42,7 @@ from ..domain.errors import (
     AlreadySelectedError,
     GameCancelledError,
     InvalidTransitionError,
+    NotAuthorizedError,
     NotEligibleError,
     NotEnrolledError,
     NotFoundError,
@@ -152,6 +153,26 @@ _PLAYER_CONFIRM_SOURCE_STATES = frozenset({
     RosterEntryStatus.SELECTED,
     RosterEntryStatus.ACCEPTED,
 })
+
+
+# ==========================================================================
+# COACH-TEAM AUTHORIZATION (#205, owner comments 5373064375 + 5391127041)
+# ==========================================================================
+# The two machine-readable reasons every Coach-authorization refusal in this
+# module carries. Both are raised by ONE function
+# (:meth:`RosterService._require_authorized_team`), so a change to either
+# message or reason breaks every surface's tests together.
+#
+# ``attribution_missing`` is DELIBERATELY THE EXISTING STRING already minted
+# by :meth:`RosterService._refuse_unattributed` for the player-driven
+# confirm gate — the ruling asks for "structured ``attribution_missing``",
+# and a row that cannot name its side is the same fact whichever gate
+# observes it. The two raise different ERROR CODES on purpose, because they
+# answer different questions: the confirm gate's is ``not_eligible`` (about
+# the PLAYER), this one's is ``forbidden`` (about the COACH, who is refused
+# even though the player may be perfectly eligible).
+ATTRIBUTION_MISSING = "attribution_missing"
+TEAM_SCOPE_VIOLATION = "team_scope_violation"
 
 
 def _transactional(fn):
@@ -324,6 +345,86 @@ class RosterService:
             raise RosterLockedError("Roster is locked. Unlock to make changes.")
         return game
 
+    def _require_authorized_team(
+        self, authorized_team_id: Optional[str],
+        owning_team_id: Optional[str], what: str,
+    ) -> None:
+        """THE Coach-team authorization gate, re-checked UNDER THE LOCK.
+
+        The owner's transactional blocker (comment 5373064375): "bind
+        coach-team authorization and the mutation to one transaction and one
+        locked, re-fetched membership/registration context (or pass the
+        expected authorized team into a service command that revalidates it
+        under those locks before any write). The scope preflight may remain
+        for fast denial, but it cannot be the authoritative write gate."
+
+        WHY THE ANSWER IS PASSED IN rather than derived here. These methods
+        receive only ``actor_id``, an ACCOUNT id, and nothing in this service
+        can turn that into "the team this actor may act for" — the
+        coach<->team binding lives in the session scope resolved by
+        ``web/server.py``, and ``web/scope.py``'s layering note deliberately
+        keeps that arrow pointing the other way. So the caller passes the
+        team it already holds and this revalidates it. The ruling is explicit:
+        "Do not make the service infer an account's team from ``actor_id``."
+
+        WHY THIS IS ALREADY ATOMIC, with no new store primitives.
+        ``season_guard.guard_game_season`` locks the canonical Season row and
+        holds it to commit, and EVERY production membership mutation
+        (``create_season_roster_membership``,
+        ``set_season_roster_membership_status``,
+        ``update_season_roster_membership``) goes through
+        ``_require_active_season`` and takes that same row. The schema half
+        agrees: ``season_roster_memberships.season_id -> seasons(id)`` is a
+        real FK, so even a raw INSERT takes ``FOR KEY SHARE`` on the Season
+        row and blocks behind ``FOR UPDATE``. A check placed anywhere AFTER
+        ``_guard_mutable`` inside the existing ``@_transactional`` body is
+        therefore already serialized against every membership writer —
+        Memory on its per-instance RLock, SQLite on ``BEGIN IMMEDIATE``'s
+        RESERVED lock, PostgreSQL on the Season row.
+
+        ``authorized_team_id is None`` MEANS NO COACH CONSTRAINT, and it is
+        the default so that no call site is silently gated by omission. It is
+        the correct answer for the paths whose authority was established
+        elsewhere and never came from a team at all: Player self-service
+        (``/api/me/substitute-opportunities/...``, guarded by
+        ``_require_player_scope``), Guardian (``/api/me/guardian/...``,
+        guarded by ``_require_guardian_scope`` + ``_guardian_link_or_403``),
+        and the unscoped League Admin/operator (``web/scope.py``: "League
+        admins and arena managers are not resource-scoped here"). This
+        mirrors ``setup_guarded_mutation``'s own convention, where a ``None``
+        role is completely ungated and completely untouched. A Coach HTTP
+        route always passes its scoped team.
+
+        ``owning_team_id`` IS THE COMPARAND EACH CALLER CHOOSES, and the
+        choice is the ruling's: "Row-removal/response commands compare
+        against durable row attribution; commands creating new state compare
+        against the locked live context." Each call site names which it is
+        passing and why.
+
+        A NULL comparand FAILS CLOSED for a Coach. It is only ever reachable
+        for a LEGACY row written before durable attribution existed
+        (migration 060/061, both additive with no backfill), and such a row
+        cannot prove whose it is. Guessing from ``Player.team_id`` or current
+        membership is exactly what the ruling forbids, so the Coach is
+        refused with zero writes while player self-service and an unscoped
+        League Admin — neither of whom needs this column to be authorized —
+        keep working.
+        """
+        if authorized_team_id is None:
+            return
+        if owning_team_id is None:
+            raise NotAuthorizedError(
+                f"This {what} predates durable team attribution, so the team "
+                f"that owns it can't be identified — ask a league admin.",
+                details={"reason": ATTRIBUTION_MISSING,
+                         "authorized_team_id": authorized_team_id})
+        if owning_team_id != authorized_team_id:
+            raise NotAuthorizedError(
+                "A coach can only manage their own team's players.",
+                details={"reason": TEAM_SCOPE_VIOLATION,
+                         "authorized_team_id": authorized_team_id,
+                         "owning_team_id": owning_team_id})
+
     def _audit(
         self,
         game_id: str,
@@ -367,7 +468,8 @@ class RosterService:
     # ====================================================================
     @_transactional
     def select_roster(
-        self, game_id: str, player_ids: List[str], actor_id: Optional[str] = None
+        self, game_id: str, player_ids: List[str], actor_id: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> List[GameRosterEntry]:
         game = self._require_game(game_id)
         game = self._guard_mutable(game)
@@ -420,13 +522,45 @@ class RosterService:
         contexts = (self.resolve_membership_contexts_for_game(game)
                     if bound else {})
 
+        # AUTHORIZE EVERY TARGET BEFORE SEATING ANY OF THEM (#205, the
+        # transactional blocker). Selection is a BATCH, and the write loop
+        # below seats each player as it goes: a Coach check made inside that
+        # loop would let player 1 be written before player 2's refusal, and
+        # while `@_transactional` rolls the row back, "zero write ATTEMPTS on
+        # refusal" is an ORDERING property a rollback cannot satisfy. So the
+        # contexts are resolved ONCE here, up front, and reused below —
+        # which also removes the second per-player resolution the unbound
+        # path used to pay.
+        #
+        # COMPARAND: THE LOCKED LIVE CONTEXT, per player. Selection CREATES
+        # NEW STATE (it seats rows on `ctx.team_id`), so the ruling's create
+        # half applies; the same `ctx` becomes the row's durable attribution
+        # below, so authorization and attribution are one decision.
+        #
+        # A player who resolves to NO context passes `None` and fails closed
+        # for a Coach — an unresolvable player cannot be shown to be theirs.
+        # RAISING NOTHING ELSE HERE IS DELIBERATE: with
+        # `authorized_team_id=None` this pass is a pure read and every
+        # existing error and its ORDER are preserved exactly, because the
+        # ctx-missing / not-found / inactive refusals still happen in the
+        # caller's player order in the write loop below.
+        resolved: Dict[str, Optional["GameMembershipContext"]] = {}
+        for player_id in player_ids:
+            player = locked_players.get(player_id)
+            ctx = None
+            if player is not None:
+                ctx = (contexts.get(player_id) if bound
+                       else self.resolve_membership_context(game, player))
+            resolved[player_id] = ctx
+            self._require_authorized_team(
+                authorized_team_id, ctx.team_id if ctx else None, "player")
+
         entries: List[GameRosterEntry] = []
         for player_id in player_ids:
             player = locked_players[player_id]
             if player is None:
                 raise NotFoundError(f"Player {player_id} not found.")
-            ctx = (contexts.get(player_id) if bound
-                   else self.resolve_membership_context(game, player))
+            ctx = resolved[player_id]
             if ctx is None:
                 raise NotEligibleError(
                     f"{player.name} is not on either team in this game."
@@ -497,6 +631,7 @@ class RosterService:
         response_source: str = "player",
         actor_id: Optional[str] = None,
         notes: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> GameAvailability:
         game = self._require_game(game_id)
         game = self._guard_active_season(game)  # #159/#427 guard + re-fetch
@@ -509,6 +644,39 @@ class RosterService:
         # Validate the roster-entry transition BEFORE persisting anything so a
         # rejected re-confirm leaves no partial availability/audit state.
         entry = self.store.roster_entry_for_player(game_id, player_id)
+
+        # COMPARAND: THE ROW WHEN THERE IS ONE, THE LIVE CONTEXT WHEN THERE
+        # IS NOT — this surface spans both halves of the ruling, so it takes
+        # both answers rather than forcing one.
+        #
+        #   AN EXISTING ROW makes this a RESPONSE command: it confirms or
+        #   backs out a seat that already exists, so "is this seat MINE?" is
+        #   answered by `entry.team_side`, the durable attribution
+        #   (migration 061) — the same source `remove_player` uses, and for
+        #   the same reason. This is what preserves the coach's ordinary
+        #   cleanup path: marking a transferred player unavailable still
+        #   works for the side whose slot they are still occupying.
+        #
+        #   NO ROW makes it a CREATE: nothing is seated, only a
+        #   GameAvailability is recorded, and there is no durable side to
+        #   consult. The honest question is then whether the player is on
+        #   this coach's side right now, under the Season lock — so the live
+        #   context answers, and it fails closed when there is none.
+        #
+        # Placed BEFORE the transition-validation block and therefore before
+        # `upsert_availability`, this method's first write. Note this is a
+        # COACH gate and is entirely separate from `_authorize_seated_side`
+        # below, which asks the PLAYER question ("may this player still hold
+        # the side this row sits on?") — two different subjects, two gates.
+        if authorized_team_id is not None:
+            if entry is not None:
+                owning = entry.team_side
+            else:
+                ctx = self.resolve_membership_context(game, player)
+                owning = ctx.team_id if ctx is not None else None
+            self._require_authorized_team(authorized_team_id, owning,
+                                          "roster row")
+
         reconfirming = (
             entry is not None
             and availability_status == AvailabilityStatus.AVAILABLE
@@ -932,7 +1100,8 @@ class RosterService:
     # ====================================================================
     @_transactional
     def enroll_substitute(
-        self, game_id: str, player_id: str, actor_id: Optional[str] = None
+        self, game_id: str, player_id: str, actor_id: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
         game = self._guard_mutable(game)
@@ -949,6 +1118,21 @@ class RosterService:
                 f"{player.name} is not eligible (no membership with a team "
                 f"in this game; cross-team borrowing is off)."
             )
+        # COMPARAND: THE LOCKED LIVE CONTEXT. Enrolling CREATES NEW STATE, so
+        # the ruling's second half applies — "commands creating new state
+        # compare against the locked live context". The row this method is
+        # about to write does not exist yet and has no durable side to
+        # consult; the only honest question is whether the player is on this
+        # coach's side RIGHT NOW, under the Season lock `_guard_mutable`
+        # already holds. It is the SAME `ctx` the gate above accepted and
+        # that the row's `position`/`team_id` are written from, so the side
+        # authorized and the side recorded are provably one decision.
+        #
+        # Placed before the is_active/already-selected/already-enrolled
+        # checks so an unauthorized coach learns nothing about a player who
+        # is not theirs.
+        self._require_authorized_team(authorized_team_id, ctx.team_id,
+                                      "player")
         if not player.is_active:
             raise NotEligibleError(f"{player.name} is not an active player.")
 
@@ -1022,11 +1206,38 @@ class RosterService:
 
     @_transactional
     def withdraw_substitute(
-        self, game_id: str, player_id: str, actor_id: Optional[str] = None
+        self, game_id: str, player_id: str, actor_id: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
         game = self._guard_mutable(game)
         sub = self._require_active_enrollment(game_id, player_id)
+        # COMPARAND: THE ROW'S DURABLE ATTRIBUTION, never a live lookup.
+        # Withdrawing is a ROW-REMOVAL/RESPONSE command, so the ruling's
+        # first half applies — and it is the case the ruling was written
+        # around: "For an ENROLLED row, that stored side — not a later live
+        # membership lookup — is the Coach-authorization authority for
+        # withdrawal. Once OFFERED, the existing offer-owner snapshot
+        # remains authoritative for that phase."
+        #
+        # ONE FIELD ANSWERS BOTH PHASES. `sub.team_id` is the enroll-time
+        # snapshot while ENROLLED (Part A) and the offer-owner snapshot once
+        # OFFERED (migration 060) — in both phases it is the side that owns
+        # this row, which is exactly the question "is this row MINE?".
+        #
+        # LIVE RESOLUTION HERE WOULD BE WRONG IN BOTH DIRECTIONS, which is
+        # why the ruling names it: it would refuse the HOME coach cleaning up
+        # a HOME enrollment after the player transferred away (the row is
+        # still HOME's to clean up — "This preserves the ordinary cleanup
+        # path after transfer/inactivation"), and it would hand that same row
+        # to the AWAY coach the player has just moved to ("prevents a row
+        # from silently changing owners because eligibility later changed").
+        #
+        # A LEGACY NULL fails closed for a Coach with `attribution_missing`
+        # and zero writes; player self-service (`authorized_team_id=None`)
+        # withdraws its own enrollment exactly as before.
+        self._require_authorized_team(authorized_team_id, sub.team_id,
+                                      "substitute enrollment")
         was_offered = sub.status == SubstituteStatus.OFFERED
         sub.status = SubstituteStatus.WITHDRAWN
         self.store.save_substitute(sub)
@@ -1054,6 +1265,7 @@ class RosterService:
         player_id: str,
         actor_id: Optional[str] = None,
         offer_expires_at: Optional[datetime] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
         game = self._guard_mutable(game)
@@ -1064,6 +1276,13 @@ class RosterService:
                 "Only an enrolled substitute can be offered a slot."
             )
         team_id = self._require_membership_context(game, player).team_id
+        # COMPARAND: THE LOCKED LIVE CONTEXT. Making an offer CREATES NEW
+        # STATE — it is the transition that MINTS the offer-owner snapshot
+        # written three lines below — so the side that may issue it is the
+        # side the player is genuinely on now. The SAME `team_id` is used for
+        # the slot gate and for `sub.team_id`, so the coach authorized to
+        # offer and the team recorded as owning the offer cannot diverge.
+        self._require_authorized_team(authorized_team_id, team_id, "player")
         self._require_open_slot(game_id, sub.slot_type, team_id)
         sub.status = SubstituteStatus.OFFERED
         sub.offered_at = self.clock()
@@ -1099,7 +1318,8 @@ class RosterService:
         return sub
 
     def accept_substitute(
-        self, game_id: str, player_id: str, actor_id: Optional[str] = None
+        self, game_id: str, player_id: str, actor_id: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> GameRosterEntry:
         # The whole read → validate → decide → write path runs inside ONE
         # transaction, so no concurrent request can cancel/lock the game or
@@ -1116,10 +1336,31 @@ class RosterService:
         with self.store.transaction():
             game = self._require_game(game_id)
             game = self._guard_mutable(game)
-            self._require_active_player(player_id)   # fail closed on deactivation
+            player = self._require_active_player(player_id)   # fail closed on deactivation
             sub = self.store.substitute_for_player(game_id, player_id)
             if sub is None or sub.status != SubstituteStatus.OFFERED:
                 raise InvalidTransitionError("No active offer to accept.")
+            # COMPARAND: THE LOCKED LIVE CONTEXT. Accepting CREATES NEW STATE
+            # — it seats a roster row — and `_accept_offered_substitute`
+            # below deliberately re-resolves live for exactly that reason
+            # (see its comment, and decline_substitute's on why the two
+            # transitions differ). Authorizing against the same live side
+            # keeps the coach who may accept and the side the seat is
+            # counted on identical by construction.
+            #
+            # RESOLVED HERE, NOT INSIDE THE SEATING HELPER, because the
+            # EXPIRED transition below is itself a WRITE and the ruling
+            # requires the refusal to precede every write. Guarded on
+            # `is not None` so the player/guardian paths — which carry no
+            # Coach constraint — resolve nothing extra and keep the
+            # expire-then-raise behaviour byte-for-byte: a lapsed offer must
+            # still durably record EXPIRED for them even when membership has
+            # ended, which an unconditional resolution here would prevent.
+            if authorized_team_id is not None:
+                self._require_authorized_team(
+                    authorized_team_id,
+                    self._require_membership_context(game, player).team_id,
+                    "player")
             # A game whose start has passed can't be joined — an offer with no
             # expiry (offer_expires_at=None) would otherwise stay acceptable
             # forever, letting a player onto a game that already happened (#112).
@@ -1182,13 +1423,29 @@ class RosterService:
 
     @_transactional
     def decline_substitute(
-        self, game_id: str, player_id: str, actor_id: Optional[str] = None
+        self, game_id: str, player_id: str, actor_id: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
         game = self._guard_mutable(game)
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status != SubstituteStatus.OFFERED:
             raise InvalidTransitionError("No active offer to decline.")
+        # COMPARAND: `sub.team_id`, THE OFFER-OWNER SNAPSHOT — never a live
+        # re-resolution. Declining is the TERMINAL RESPONSE to an offer, the
+        # ruling's row-removal/response half, and this method's own standing
+        # ruling (#205 blocker 3, round 3) already makes that snapshot
+        # authoritative for the ENTIRE LIFETIME of the offer — it is the
+        # value the coach notification below is addressed from.
+        #
+        # AUTHORIZING LIVE HERE WOULD RE-OPEN THE EXACT LEAK THAT RULING
+        # CLOSED, one layer up: after a reassignment the live side is the
+        # OPPONENT, so a live comparand would let the opponent's coach
+        # decline — and refuse — an offer that was never theirs, while the
+        # coach who actually issued it and must advance their queue would be
+        # locked out of their own row. Same value, same reason, one authority.
+        self._require_authorized_team(authorized_team_id, sub.team_id,
+                                      "substitute offer")
         sub.status = SubstituteStatus.DECLINED
         sub.declined_at = self.clock()
         self.store.save_substitute(sub)
@@ -1263,7 +1520,8 @@ class RosterService:
 
     @_transactional
     def add_substitute_to_roster(
-        self, game_id: str, player_id: str, actor_id: Optional[str] = None
+        self, game_id: str, player_id: str, actor_id: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> GameRosterEntry:
         """Coach override: offer + accept in one step (audited)."""
         game = self._require_game(game_id)
@@ -1281,6 +1539,13 @@ class RosterService:
         # attribution written into the row are provably the same decision
         # (#205 blocker 5 round 2) rather than two independent lookups.
         ctx = self._require_membership_context(game, player)
+        # COMPARAND: THE LOCKED LIVE CONTEXT. This is the coach-override
+        # SEATING — it CREATES NEW STATE (an ACCEPTED roster row on
+        # `ctx.team_id`) — so the ruling's create half applies, and it is the
+        # same `ctx` the slot gate and the row's durable attribution are
+        # taken from. A coach may only seat into their OWN side's slots.
+        self._require_authorized_team(authorized_team_id, ctx.team_id,
+                                      "player")
         self._require_open_slot(game_id, sub.slot_type, ctx.team_id)
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
@@ -2121,13 +2386,30 @@ class RosterService:
     # ====================================================================
     @_transactional
     def remove_player(
-        self, game_id: str, player_id: str, actor_id: Optional[str] = None
+        self, game_id: str, player_id: str, actor_id: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> GameRosterEntry:
         game = self._require_game(game_id)
         game = self._guard_mutable(game)
         entry = self.store.roster_entry_for_player(game_id, player_id)
         if entry is None:
             raise NotFoundError("Player is not on this game's roster.")
+        # COMPARAND: `entry.team_side`, THE ROW'S DURABLE ATTRIBUTION
+        # (migration 061). Removal is the ruling's ROW-REMOVAL case, and the
+        # question a coach asks here is "is this seat MINE?" — which only the
+        # side the row is actually counted in can answer.
+        #
+        # LIVE RESOLUTION WOULD BREAK THE ORDINARY CLEANUP PATH the ruling
+        # names: a HOME coach removing a HOME row from a player who has since
+        # transferred away would be refused, even though the seat is still
+        # HOME's and still occupying HOME's slot. Symmetrically it would let
+        # the AWAY coach the player just moved to delete HOME's row.
+        #
+        # A pre-061 row with NULL `team_side` cannot identify its seat, so a
+        # Coach is refused `attribution_missing` with zero writes; an
+        # unscoped League Admin still removes it under its existing authority.
+        self._require_authorized_team(authorized_team_id, entry.team_side,
+                                      "roster row")
         self._back_out_entry(game, entry, actor_id, removed=True)
         return entry
 
@@ -3067,7 +3349,8 @@ class RosterService:
         return rows
 
     def add_substitute_candidate(
-        self, game_id: str, player_id: str, actor_id: Optional[str] = None
+        self, game_id: str, player_id: str, actor_id: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> SubstituteEnrollment:
         """Coach/operator adds an eligible same-team player directly to the
         substitute pool (#114) — reuses enroll_substitute (the same method
@@ -3083,11 +3366,22 @@ class RosterService:
 
         NOT @_transactional itself: enroll_substitute already is, and the
         in-memory/SQL transaction() context managers are not reentrant
-        (matches copy_previous_roster's call to select_roster, above)."""
+        (matches copy_previous_roster's call to select_roster, above).
+
+        AND THAT IS WHY ``authorized_team_id`` IS ONLY FORWARDED HERE, never
+        checked here (#205, the transactional blocker). ``substitute_block_
+        reason`` above is an UNLOCKED read OUTSIDE any transaction, so a
+        Coach-team check placed beside it would be a SECOND PREFLIGHT — the
+        very shape the ruling refuses ("The scope preflight may remain for
+        fast denial, but it cannot be the authoritative write gate"). The
+        authoritative comparison happens inside ``enroll_substitute``, after
+        ``_guard_mutable`` has taken the canonical Season lock and before any
+        write."""
         reason = self.substitute_block_reason(player_id, game_id)
         if reason is not None:
             raise NotEligibleError(reason)
-        return self.enroll_substitute(game_id, player_id, actor_id=actor_id)
+        return self.enroll_substitute(game_id, player_id, actor_id=actor_id,
+                                      authorized_team_id=authorized_team_id)
 
     def _game_label(self, game) -> str:
         # A pure read helper — must NOT be @_transactional. It is called from
