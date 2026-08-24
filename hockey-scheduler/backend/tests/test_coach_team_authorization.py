@@ -1504,7 +1504,15 @@ class RemindOverRealAuthenticatedHttp(_CoachAuthHarness, unittest.TestCase):
     THIS class pins is the reachable end-to-end behaviour: the 403 an
     opposing coach actually receives, with nothing written on any durable
     surface, and the 200 the owning coach receives touching only their own
-    side. Removing the preflight's ``body["team_id"]`` check reddens it."""
+    side.
+
+    WHAT KILLS THIS CLASS, stated precisely because an earlier draft of this
+    sentence was wrong and a reviewer measured it: removing the preflight's
+    ``body["team_id"]`` check ALONE does NOT redden it. The request falls
+    through to the service gate, which refuses with the same ``forbidden``,
+    and the assertions here are satisfied. That is defence in depth working
+    as intended, not a hole. Only removing BOTH layers -- the preflight check
+    AND ``_require_authorized_team`` in ``remind_unresponded`` -- reddens it."""
 
     @classmethod
     def setUpClass(cls):
@@ -1709,7 +1717,20 @@ class EveryRefusalDescribesItsActualCase(_CoachAuthHarness, unittest.TestCase):
         player who simply is not on this coach's side of this game must
         produce BYTE-IDENTICAL refusals — same code, same reason, same
         message, same details. The moment they differ, the route becomes an
-        existence oracle for any coach who can post to it."""
+        existence oracle for any coach who can post to it.
+
+        SCOPE, STATED HONESTLY: this pins ``select_roster`` AND NOTHING ELSE.
+        It is the surface where a coach can name an arbitrary player id and
+        this gate is the first thing to answer, which is what makes the
+        oracle reachable there. Sibling surfaces at the same facade do NOT
+        hold this property today and did not before the commit that added
+        this test -- a reviewer measured, for an unauthorized coach,
+        ``set_availability(<unknown id>)`` answering ``not_found`` with
+        "Player {id} not found." while a real player gets
+        ``forbidden``/``attribution_missing``, and ``enroll_substitute``
+        naming a third-team player OUT LOUD in its refusal. Both are
+        pre-existing and outside this round's ruling; neither was created or
+        widened here. Do not read this test as a system-wide guarantee."""
         ran = []
         for label, store in self._stores():
             try:
