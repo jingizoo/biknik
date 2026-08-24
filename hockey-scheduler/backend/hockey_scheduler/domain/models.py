@@ -216,11 +216,30 @@ class SubstituteEnrollment:
     offer_expires_at: Optional[datetime] = None
     accepted_at: Optional[datetime] = None
     declined_at: Optional[datetime] = None
-    # #205 blocker 3: THE OFFER'S OWNING TEAM — the side offer_substitute
-    # validated the offer against, snapshotted at the moment
-    # _require_team_for_game resolved it (same pattern position_for_game
-    # already established for `position` above — resolve once, at the point
-    # the context is genuinely valid, and store it).
+    # #205: THE ENROLLMENT'S OWNING TEAM — the side this row was admitted
+    # on, snapshotted from the SAME GameMembershipContext that authorized
+    # the transition, at the moment that context was genuinely valid (the
+    # pattern `position` above already established: resolve once, store it).
+    #
+    # WRITTEN TWICE, ONE FIELD, TWO PHASES, and each phase's value is the
+    # authority for that phase:
+    #
+    #   ENROLLED — written by `enroll_substitute` from the context its
+    #     eligibility gate accepted (owner ruling, PR #427, comment
+    #     5391127041). This is what makes an ENROLLED row's owner
+    #     answerable at all: before it, `team_id` was NULL until an offer
+    #     was made, so `withdraw_substitute` had NO durable side to
+    #     authorize a Coach against and would have had to re-resolve
+    #     membership live — which is exactly the substitution the ruling
+    #     forbids, because it hands a row to whichever coach the player
+    #     happens to belong to NOW rather than the one who owns the row.
+    #
+    #   OFFERED — REPLACED by `offer_substitute` with the side IT validated
+    #     the offer against. "Once OFFERED, the existing offer-owner
+    #     snapshot remains authoritative for that phase" (same ruling), so
+    #     the offer phase keeps the #205 blocker-3 contract below unchanged.
+    #
+    # #205 blocker 3: FOR AN OFFER, this is THE OFFER'S OWNING TEAM —
     #
     # AUTHORITATIVE FOR THE OFFER'S WHOLE LIFETIME. decline_substitute
     # addresses its coach notification from this value and ONLY this value:
@@ -233,11 +252,22 @@ class SubstituteEnrollment:
     # ending after the offer can no longer make that audience_ref come back
     # None and crash the decline.
     #
-    # None until an offer has been made, and for any row enrolled/offered
-    # before migration 060 (which is additive with no backfill — there is no
-    # honest historical source to backfill FROM). decline_substitute commits
-    # and suppresses its targeted push for such a legacy row rather than
-    # guessing an audience.
+    # NULL ONLY FOR LEGACY ROWS — any row enrolled/offered before migration
+    # 060, and any row enrolled before the Part A change above. Migration
+    # 060 is additive with NO backfill and Part A adds none either: there is
+    # no honest historical source to backfill FROM, and `Player.team_id` /
+    # current membership answer a DIFFERENT question than "which side was
+    # this row admitted on" (owner ruling: "Legacy enrollment attribution
+    # must remain honest: do not backfill from `Player.team_id` or current
+    # membership"). The column stays nullable and legacy rows stay NULL.
+    #
+    # A NULL therefore means "this row cannot name its owner", and every
+    # consumer fails closed on it in its own way: decline_substitute commits
+    # and SUPPRESSES its targeted push rather than guessing an audience, and
+    # a COACH acting on such a row is refused `attribution_missing` with
+    # zero writes (RosterService._require_authorized_team). Player
+    # self-service and an unscoped League Admin are unaffected — their
+    # authority never came from this column.
     team_id: Optional[str] = None
 
     @property

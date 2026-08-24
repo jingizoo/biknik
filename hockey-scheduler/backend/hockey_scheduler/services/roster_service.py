@@ -976,6 +976,31 @@ class RosterService:
             # stint, taken off the SAME context the gate above accepted —
             # never a second, independently-resolved read.
             position=ctx.position,
+            # PART A (owner ruling, PR #427, comment 5391127041): "When
+            # `enroll_substitute` accepts the exact game membership
+            # context, record that context's `team_id` on the enrollment in
+            # the same transaction. For an ENROLLED row, that stored side —
+            # not a later live membership lookup — is the Coach-
+            # authorization authority for withdrawal."
+            #
+            # Free, and taken off the SAME `ctx` the eligibility gate above
+            # accepted and that `position` is already read from — never a
+            # second, independently-resolved read that could name a
+            # different side than the one this enrollment was admitted on.
+            #
+            # Before this, `team_id` was written ONLY by `offer_substitute`
+            # (migration 060), so an ENROLLED-but-never-OFFERED row carried
+            # NO durable side at all and `withdraw_substitute` had nothing
+            # to authorize a Coach against. Measured on this branch at head
+            # 22bd6de, tri-store: after `enroll_substitute` the row read
+            # back `status='enrolled' team_id=None`, and only
+            # `offer_substitute` gave it a team.
+            #
+            # ONCE OFFERED, THIS VALUE IS REPLACED by `offer_substitute`'s
+            # own snapshot and that offer-owner side is authoritative for
+            # the offer phase (the standing #205 blocker-3 ruling, which
+            # `decline_substitute` depends on) — see that method.
+            team_id=ctx.team_id,
             status=SubstituteStatus.ENROLLED,
             enrolled_at=self.clock(),
         )
