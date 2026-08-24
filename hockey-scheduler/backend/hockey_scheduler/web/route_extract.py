@@ -3216,36 +3216,62 @@ _AUDIT_WAIVERS = {
         "sub-resource (board/roster/etc, all already enumerated as "
         "separate leaves under the SAME `m` match), not which route was "
         "chosen",
-    ("_dispatch_get", "api.store.get_game(gid)", "assign_rhs",
-     "sub == 'availability-summary'"):
-        "#205 blocker 1: re-fetches the SAME already-selected game (`gid`, "
-        "captured by `m`'s own regex match two waivers above) so the "
-        "availability-summary sub-scope can resolve the caller's OWN team "
-        "against THIS game (`game_scoped_own_team_id`) instead of the "
-        "permanent player.team_id pointer -- a data lookup that feeds the "
-        "team-level scope check below, the same 'produces a RESULT, not a "
+    ("_dispatch_get", "api.store.get_game(gid)", "assign_rhs", "m"):
+        "#205 blocker 1, hoisted to the whole private-game family by #427: "
+        "re-fetches the SAME already-selected game (`gid`, captured by "
+        "`m`'s own regex match one waiver above) so the family can resolve "
+        "the caller's OWN team against THIS game "
+        "(`game_scoped_own_team_id`) instead of the permanent "
+        "player.team_id pointer -- a data lookup that feeds the "
+        "availability-summary team-level scope check AND the board/lineups "
+        "trusted-side projection below, the same 'produces a RESULT, not a "
         "routing decision' shape as the `can_read_private_game_data` waiver "
         "immediately above: the route (this sub-resource, this game) was "
-        "already fully decided upstream by `m` and `sub`",
-    ("_dispatch_get", "sub_game is not None", "if_test",
-     "sub == 'availability-summary'"):
-        "#205 blocker 1: guards whether the re-fetched game (waived two "
-        "entries above) still existed to resolve the caller's own team "
-        "against -- a facade not_found case, not a routing decision; the "
-        "route (this sub-resource, this game) was already fully decided "
-        "upstream by `m` and `sub`",
+        "already fully decided upstream by `m` and `sub`. It moved OUT of "
+        "the `sub == 'availability-summary'` branch and into `m`'s own body "
+        "in #427, which is why this key's enclosing-if fingerprint changed "
+        "-- exactly the relocation the four-part key is designed to make "
+        "visible in the diff rather than silently re-match",
+    ("_dispatch_get", "sub_game is not None", "if_test", "m"):
+        "#205 blocker 1, hoisted by #427: guards whether the re-fetched "
+        "game (waived immediately above) still existed to resolve the "
+        "caller's own team against -- a facade not_found case, not a "
+        "routing decision; the route (this sub-resource, this game) was "
+        "already fully decided upstream by `m` and `sub`. Same guard as "
+        "before, moved out of the `sub == 'availability-summary'` branch "
+        "into `m`'s own body, which is why the enclosing-if fingerprint "
+        "changed",
     ("_dispatch_get",
      "game_scoped_own_team_id(role, scope, sub_game, api.store)",
      "boolop", "sub_game is not None"):
-        "#205 blocker 1: the SAME re-fetched game (waived immediately "
-        "above) feeds `game_scoped_own_team_id` to resolve the caller's "
-        "own team for the team-level availability-summary scope check "
-        "below -- a RESULT the waiver above's own docstring notes keeps "
-        "propagating ('a waiver silences the call, not the result'), not a "
-        "second routing decision; the `if sub_game is not None:` guard "
-        "only decides between resolving the caller's team or leaving it "
-        "empty when the already-selected game vanished mid-request (a "
-        "facade not_found case), never which route was chosen",
+        "#205 blocker 1, hoisted by #427 to serve the whole private-game "
+        "family: the SAME re-fetched game (waived immediately above) feeds "
+        "`game_scoped_own_team_id` to resolve the caller's own team ONCE -- "
+        "the team-level availability-summary scope check AND the "
+        "board/lineups trusted-side projection both read this one answer, "
+        "instead of each resolving its own. A RESULT the waiver above's own "
+        "docstring notes keeps propagating ('a waiver silences the call, "
+        "not the result'), not a second routing decision; the `if sub_game "
+        "is not None:` guard only decides between resolving the caller's "
+        "team or leaving it empty when the already-selected game vanished "
+        "mid-request (a facade not_found case), never which route was "
+        "chosen. This key is UNCHANGED by the hoist -- the expression, its "
+        "`or \"\"` boolop parent and its immediate guard all moved together",
+    ("_dispatch_get", "lineup_visibility.own_side(role, own_team, *side_ids)",
+     "assign_rhs", "sub == 'board'"):
+        "#427 blocker: picks WHICH SIDE of the already-selected game the "
+        "single-sided /board read answers for -- the caller's own team when "
+        "they have one (Coach/Player), else None so the facade keeps its "
+        "existing home default (unscoped operator, assigned official). It "
+        "consumes `own_team`/`side_ids`, both derived from the re-fetched "
+        "game waived above, and produces a RESULT the facade uses to "
+        "PROJECT the response; it never decides which route was chosen -- "
+        "the route (this sub-resource, this game) was already fully decided "
+        "upstream by `m` and `sub`, and BOTH possible values of this call "
+        "return through the very same `api.get_board` leaf. Same 'produces "
+        "a RESULT, not a routing decision' shape as the "
+        "`game_scoped_own_team_id` waiver above, which is the call feeding "
+        "it",
     ("do_GET", "not is_context_scoped_read(path)", "if_test", ""):
         "do_GET's own PHASE A context-gate arrival ticket (#159): BOTH "
         "arms of this if unconditionally call self._dispatch_get() "
@@ -3759,12 +3785,30 @@ _AUDIT_WAIVERS = {
         "gid is captured by the enclosing /api/games/{gid}[/<sub>] match; "
         "`sub is None` (no sub-resource segment) is the bare game-detail "
         "leaf, already a distinct route from every sibling below",
-    ('_dispatch_get', 'api.get_board(gid)', 'call_argument', "sub == 'board'"):
+    ('_dispatch_get',
+     'api.get_board(gid, team_id=board_team, viewer_role=role)',
+     'call_argument', "sub == 'board'"):
         "gid captured off the SAME match as get_game above; `sub == "
-        "'board'` already selects this exact leaf",
-    ('_dispatch_get', 'api.get_lineups(gid)', 'call_argument', "sub == 'lineups'"):
+        "'board'` already selects this exact leaf. #427 blocker added the "
+        "two projection arguments: `board_team` is the already-waived "
+        "TRUSTED SIDE (`lineup_visibility.own_side`, waived above) and "
+        "`role` the session-resolved caller -- together they decide what "
+        "this caller may SEE of the already-selected game, never which "
+        "route was chosen; every value of both returns through this one "
+        "leaf. Same 'service call consuming an already-waived own-team "
+        "scope value' shape as `api.get_availability_summary(gid, "
+        "team_id)` above",
+    ('_dispatch_get',
+     'api.get_lineups(gid, viewer_role=role, viewer_team_id=own_team)',
+     'call_argument', "sub == 'lineups'"):
         "gid captured off the SAME match; `sub == 'lineups'` already "
-        "selects this exact leaf",
+        "selects this exact leaf. #427 blocker added the projection "
+        "arguments: `own_team` is the already-waived trusted side and "
+        "`role` the session-resolved caller, so the facade can project "
+        "each side (own side in full, opponent RESTRICTED, an assigned "
+        "official's submitted-lineup only, an unscoped operator both in "
+        "full) -- same shape and same reasoning as the `api.get_board` "
+        "waiver immediately above",
     ('_dispatch_get', 'api.get_officials_for_game(gid)', 'dict_value', "sub == 'officials'"):
         "gid captured off the SAME match; `sub == 'officials'` already "
         "selects this leaf -- reached as a dict VALUE (`{'officials': "

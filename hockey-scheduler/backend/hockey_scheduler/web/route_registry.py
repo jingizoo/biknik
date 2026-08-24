@@ -297,21 +297,41 @@ REGISTRY = (
                     "team_id) -- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/board$", "/api/games/{}/board",
               "get_games_id_board", "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: _resolve_role (server.py:2070) then "
-                    "can_read_private_game_data (scope.py:122-152; "
-                    "server.py:2078) -- operators any, coach/player only "
-                    "their own team via the game, official only if "
-                    "assigned. get_board (service.py:8052-8064ish) is a "
-                    "per-game UI convenience, game-keyed -- no P/S/L "
-                    "concept, not applicable.")),
+              auth="session+own-side-projection", scope_axis="none",
+              note=("#202: _resolve_role then can_read_private_game_data "
+                    "(scope.py) -- operators any, coach/player only their "
+                    "own team via the game, official only if assigned. "
+                    "#427 blocker: that gate proves the caller belongs to "
+                    "*a* team in this game but does NOT bound WHICH side "
+                    "they may read, and get_board used to hard-code "
+                    "game.home_team_id for everybody -- an AWAY Coach got "
+                    "HOME's private pool. The server now resolves the "
+                    "caller's own game-scoped team "
+                    "(game_scoped_own_team_id, hoisted to serve this whole "
+                    "sub-family) and passes that TRUSTED side plus the "
+                    "session role into the read; a Coach/Player is "
+                    "answered for their own side only, an unscoped "
+                    "operator keeps the home default, an assigned official "
+                    "gets the submitted-lineup projection "
+                    "(services/lineup_visibility.py). Still game-keyed -- "
+                    "no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/lineups$", "/api/games/{}/lineups",
               "get_games_id_lineups", "_dispatch_get",
-              auth="session", scope_axis="none",
+              auth="session+own-side-projection", scope_axis="none",
               note=("#202: same _resolve_role + can_read_private_game_data "
-                    "gate as get_games_id_board (server.py:2070-2078, "
-                    "2085-2086; scope.py:122-152). get_lineups is "
-                    "game-keyed -- no P/S/L concept, not applicable.")),
+                    "gate as get_games_id_board (scope.py). #427 blocker: "
+                    "the same trusted side is passed here too, and each "
+                    "side is PROJECTED per role -- an unscoped operator "
+                    "reads both sides in full (unchanged), a Coach/Player "
+                    "reads their own side in full with the opponent marked "
+                    "restricted (public team metadata kept, private "
+                    "status/players null -- never [], which both screens "
+                    "already render as 'no lineup submitted'), an assigned "
+                    "official reads both sides' submitted lineup but "
+                    "neither side's unselected candidates, availability or "
+                    "substitute state (services/lineup_visibility.py). "
+                    "Still game-keyed -- no P/S/L concept, not "
+                    "applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/officials$",
               "/api/games/{}/officials", "get_games_id_officials",
               "_dispatch_get",

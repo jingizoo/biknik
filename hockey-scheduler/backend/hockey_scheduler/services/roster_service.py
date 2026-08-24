@@ -4130,12 +4130,27 @@ class RosterService:
         )
 
     @staticmethod
-    def _open_slot_phrase(goalie: SlotSummary, skater: SlotSummary) -> str:
+    def open_slot_phrase(open_goalies: int, open_skaters: int) -> str:
+        """"2 skater slots open." — the SUBSTITUTE-FREE half of an
+        open-slot message, from the two counts alone.
+
+        Split out of :meth:`_derive_status`'s two open-slot branches (#427)
+        because both of the messages it builds go on to assert SUBSTITUTE
+        state — "Substitutes are available — coach decision needed." and
+        "No substitutes enrolled." — and the assigned-official projection may
+        report that a side is short without disclosing either. Numeric
+        arguments rather than :class:`SlotSummary` for exactly that reason:
+        the projection has the counts and deliberately does not have the
+        substitute-bearing summaries."""
         parts = []
-        if goalie.open_count > 0:
-            unit = "goalie slot" if goalie.open_count == 1 else "goalie slots"
-            parts.append(f"{goalie.open_count} {unit} open.")
-        if skater.open_count > 0:
-            unit = "skater slot" if skater.open_count == 1 else "skater slots"
-            parts.append(f"{skater.open_count} {unit} open.")
+        if open_goalies > 0:
+            unit = "goalie slot" if open_goalies == 1 else "goalie slots"
+            parts.append(f"{open_goalies} {unit} open.")
+        if open_skaters > 0:
+            unit = "skater slot" if open_skaters == 1 else "skater slots"
+            parts.append(f"{open_skaters} {unit} open.")
         return " ".join(parts)
+
+    @classmethod
+    def _open_slot_phrase(cls, goalie: SlotSummary, skater: SlotSummary) -> str:
+        return cls.open_slot_phrase(goalie.open_count, skater.open_count)

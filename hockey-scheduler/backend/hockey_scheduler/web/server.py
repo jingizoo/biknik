@@ -56,6 +56,7 @@ from .auth import (
 from .authz import authorize, required_permission
 from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
+from ..services import lineup_visibility
 from .rate_limit import LoginThrottle, RateLimiter
 from .route_registry import REGISTRY
 from .scope import (
@@ -2860,10 +2861,59 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "forbidden",
                     "message": "You cannot view private data for this game.",
                     "details": {"role": role.value}}}, 403)
+            # THE CALLER'S OWN SIDE, RESOLVED ONCE FOR THE WHOLE PRIVATE-GAME
+            # FAMILY (#427 blocker, owner ruling comment 5394947899).
+            #
+            # The gate above proves the caller belongs to *a* team in this
+            # game. It does NOT bound WHICH side's private data they may read,
+            # and the route registry records that honestly for every leaf
+            # below (`scope_axis="none"`). `/board` then hard-coded
+            # `game.home_team_id` for everybody, so an AWAY Coach was handed
+            # HOME's private pool and a `status` block naming HOME; `/lineups`
+            # returned BOTH sides' private candidates, availability and
+            # substitute state to either Coach. Reproduced tri-store over a
+            # real authenticated session.
+            #
+            # So the SERVER resolves the side — never the client. This was
+            # already the availability-summary leaf's own private resolution
+            # (#160/#205 blocker 1); hoisting it here makes it ONE resolution
+            # shared by all three consumers, so the side that bounds an
+            # availability rollup and the side that bounds a lineup read
+            # cannot drift apart. `sub_game` is a re-fetch of the SAME
+            # already-selected game; `None` (deleted mid-request) leaves the
+            # caller with no own side, which every consumer treats as
+            # fail-closed.
+            sub_game = api.store.get_game(gid)
+            # An if/else statement rather than a ternary on purpose:
+            # route_extract does not model ternaries that test a dispatch
+            # subject, and this is the same statement shape the
+            # availability-summary leaf used before the hoist.
+            if sub_game is not None:
+                own_team = game_scoped_own_team_id(
+                    role, scope, sub_game, api.store) or ""
+                side_ids = (sub_game.home_team_id, sub_game.away_team_id)
+            else:
+                own_team = ""
+                side_ids = (None, None)
             if sub == "board":
-                return self._send_api(api.get_board(gid))
+                # A single-sided read: answer for the caller's OWN side.
+                # `own_side` returns None for a caller who has no side of
+                # their own (unscoped operator, assigned official), which
+                # leaves the facade's existing home default in place — those
+                # are exactly the callers who may read either side anyway.
+                board_team = lineup_visibility.own_side(
+                    role, own_team, *side_ids)
+                return self._send_api(api.get_board(
+                    gid, team_id=board_team, viewer_role=role))
             if sub == "lineups":
-                return self._send_api(api.get_lineups(gid))
+                # Two-sided, projected per role by the facade
+                # (`services/lineup_visibility.py`): own side only for a
+                # Coach/Player with the opponent marked RESTRICTED, the
+                # submitted-lineup projection for an assigned official, and
+                # the unchanged full two-side private read for an unscoped
+                # operator.
+                return self._send_api(api.get_lineups(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "officials":
                 return self._send_api({"officials": api.get_officials_for_game(gid)})
             if sub == "roster-status":
@@ -2889,7 +2939,7 @@ class Handler(BaseHTTPRequestHandler):
                 # scope when not specified.
                 from urllib.parse import parse_qs, urlparse
                 qs = parse_qs(urlparse(self.path).query)
-                # Resolve the caller's own team authoritatively, AGAINST THIS
+                # The caller's own team, resolved authoritatively AGAINST THIS
                 # GAME (#160, refined by #205 blocker 1): a Coach's stored
                 # team_id (permanent — unchanged); a Player's team resolved
                 # through the SAME game-scoped membership resolver the
@@ -2897,12 +2947,13 @@ class Handler(BaseHTTPRequestHandler):
                 # pointer, which a mid-season transfer can leave stale for
                 # this exact game — so the opponent-summary block holds for a
                 # Mover whose membership has moved, in either direction.
-                sub_game = api.store.get_game(gid)
-                if sub_game is not None:
-                    own_team = game_scoped_own_team_id(
-                        role, scope, sub_game, api.store) or ""
-                else:
-                    own_team = ""
+                #
+                # #427: this resolution now happens ONCE above, for the whole
+                # private-game family, rather than only here — the lineup
+                # reads need the very same trusted side, and two copies of
+                # "which side is the caller's" is exactly the drift this
+                # blocker is about. The comparison below is byte-for-byte the
+                # one that stood here before the hoist.
                 team_id = (qs.get("team_id") or [own_team])[0]
                 if role in (Role.COACH, Role.PLAYER) and own_team \
                         and team_id != own_team:

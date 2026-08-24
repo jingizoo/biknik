@@ -287,6 +287,14 @@ _VALID_AUTH_VALUES = frozenset({
     "session+RESPOND_AVAILABILITY",
     "session+guardian-scope",
     "session+guardian-scope+verified-link",
+    # #427 blocker: the private-game gate admits the caller, then the SERVER
+    # resolves their own game-scoped side and the response is PROJECTED to
+    # it -- own side in full for a Coach/Player with the opponent marked
+    # restricted, submitted-lineup only for an assigned official, both sides
+    # in full for an unscoped operator. A narrowing of the same shape as
+    # `session+player-scope`: nobody's 403 changes, what changes is which
+    # subject's private data the 200 may contain.
+    "session+own-side-projection",
     "session+player-scope",
 })
 
@@ -309,8 +317,14 @@ _EXPECTED_CLASSIFICATION = {
     ("GET", '/api/demo/overview'): ('session', 'cross'),  # get_demo_overview
     ("GET", '/api/games/{}'): ('none', 'none'),  # get_games_id
     ("GET", '/api/games/{}/availability-summary'): ('session', 'none'),  # get_games_id_availability_summary
-    ("GET", '/api/games/{}/board'): ('session', 'none'),  # get_games_id_board
-    ("GET", '/api/games/{}/lineups'): ('session', 'none'),  # get_games_id_lineups
+    # #427 blocker: both were bare 'session' while get_board hard-coded the
+    # HOME side and get_lineups returned both sides' private state to either
+    # Coach. The gate is unchanged; the response is now projected to the
+    # server-resolved own side.
+    ("GET", '/api/games/{}/board'):
+        ('session+own-side-projection', 'none'),  # get_games_id_board
+    ("GET", '/api/games/{}/lineups'):
+        ('session+own-side-projection', 'none'),  # get_games_id_lineups
     ("GET", '/api/games/{}/officials'): ('session', 'none'),  # get_games_id_officials
     ("GET", '/api/games/{}/reschedule'): ('session', 'none'),  # get_games_id_reschedule
     ("GET", '/api/games/{}/roster'): ('session', 'none'),  # get_games_id_roster
