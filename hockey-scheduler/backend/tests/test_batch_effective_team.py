@@ -14,8 +14,7 @@ a race at all:
      confirm another team's roster without any interleaving."
 
 REPRODUCED AGAIN at head 22bd6de, through authenticated HTTP, on Memory,
-SQLite AND real PostgreSQL, on BOTH routes (``tests/_repro205.py``
-reproduction (i))::
+SQLite AND real PostgreSQL, on BOTH routes::
 
     route      = /api/games/{gid}/build-roster   body={}
     coach      = AWAY (team_2)

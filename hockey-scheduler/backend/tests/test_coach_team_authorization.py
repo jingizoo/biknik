@@ -20,8 +20,8 @@ AND THE COMPARAND RULING (owner comment 5391127041)
      Row-removal/response commands compare against durable row attribution;
      commands creating new state compare against the locked live context."
 
-WHAT WAS MEASURED RED at head 22bd6de, tri-store (``tests/_repro205.py``
-reproduction (ii)). ``scope_violation`` passed while the player was still on
+WHAT WAS MEASURED RED at head 22bd6de, tri-store. ``scope_violation``
+passed while the player was still on
 HOME; the membership then moved HOME->AWAY; and EVERY ONE of ten surfaces
 COMMITTED anyway, because not one of them re-checked any authority inside its
 transaction::

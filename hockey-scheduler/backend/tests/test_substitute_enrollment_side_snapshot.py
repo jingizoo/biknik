@@ -10,7 +10,7 @@ THE RULING
     offer-owner snapshot remains authoritative for that phase."
 
 WHAT WAS MEASURED RED, at head 22bd6de, on Memory, SQLite and real
-PostgreSQL (``tests/_repro205.py`` reproduction (iii))::
+PostgreSQL::
 
     after enroll : status='enrolled' team_id=None    position='forward'
     after offer  : status='offered'  team_id='team_1' (HOME='team_1')
