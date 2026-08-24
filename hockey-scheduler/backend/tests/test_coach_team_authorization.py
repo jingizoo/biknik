@@ -61,7 +61,9 @@ THE COMPARAND EACH SURFACE USES, and why — the table this file pins:
     remove_player              entry.team_side (migration 061)
     set_availability           entry.team_side when a row exists; the live
                                context only when there is NO row to respond
-                               to (nothing is seated, so nothing is owned)
+                               to (nothing is seated, so nothing is owned).
+                               Both branches word an unattributed refusal
+                               IDENTICALLY — see F-5 below
 
   WHY OFFER IS A CREATE AND NOT A RESPONSE, since the enrollment row already
   exists and already names HOME: because using the durable side here would
@@ -110,6 +112,11 @@ WHAT THE REVIEW ROUND ON THIS PR ADDED, and why each addition exists:
        in BOTH forced orders, asserting that the losing authorization leaves
        substitute, roster, availability, audit AND notification state — the
        feed and delivery tables included — identity-unchanged.
+
+  F-5  two refusals described a case that was not theirs. See
+       ``EveryRefusalDescribesItsActualCase`` for the wording, and
+       ``roster_service._ATTRIBUTION_MISSING_LIVE`` for the
+       existence-disclosure argument that keeps the cases merged.
 """
 
 import json
@@ -129,8 +136,9 @@ from test_substitute_membership_cutover import ADMIN, _at
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import MembershipStatus, Role
-from hockey_scheduler.services.roster_service import (ATTRIBUTION_MISSING,
-                                                      TEAM_SCOPE_VIOLATION)
+from hockey_scheduler.services.roster_service import (
+    _ATTRIBUTION_MISSING_DURABLE, _ATTRIBUTION_MISSING_LIVE,
+    ATTRIBUTION_MISSING, TEAM_SCOPE_VIOLATION)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web import server as srv
 from hockey_scheduler.web.auth import DEMO_PASSWORD, DEMO_USERS
@@ -1615,6 +1623,204 @@ class RemindOverRealAuthenticatedHttp(_CoachAuthHarness, unittest.TestCase):
             finally:
                 self._close(label, store)
         self._assert_ran(ran, "REMIND HTTP / OWN SIDE")
+
+
+# =========================================================================== #
+# what a refusal SAYS — and the existence it must not disclose               #
+# =========================================================================== #
+class EveryRefusalDescribesItsActualCase(_CoachAuthHarness, unittest.TestCase):
+    """PR #427 review, F-5. Both refusals below already failed CLOSED and
+    neither leaked existence; what was wrong was the SENTENCE.
+
+    ``_require_authorized_team`` raised ONE message for a NULL comparand —
+    "This {what} predates durable team attribution" — which is true only when
+    a row was actually FOUND and cannot name its side (a pre-060/061 row, no
+    backfill). At the two LIVE-comparand sites the same NULL means something
+    else entirely:
+
+      * ``select_roster`` with an id that names NOBODY answered "This player
+        predates durable team attribution" instead of anything about the
+        player not being theirs. The preflight ``continue``s past a missing
+        player, so this is the REACHABLE HTTP behaviour, not a theoretical
+        path.
+      * ``set_availability`` for a player with no roster row and no context
+        said "This roster row predates durable team attribution" ABOUT A ROW
+        THAT DOES NOT EXIST.
+
+    Either would send an operator to repair a legacy-attribution problem that
+    was never there.
+
+    THE EXISTENCE-DISCLOSURE TENSION, DECIDED. The obvious "accurate" fix —
+    ``not_found`` for an unknown player id — is refused deliberately: it
+    would answer "does this player id exist?" for exactly the caller this
+    gate has just decided is not entitled to an answer, i.e. hand a coach a
+    player-id enumeration oracle. The same argument applies WITHIN
+    ``set_availability``, where a distinct sentence for the no-row branch
+    would tell an unauthorized coach whether the player holds a roster row in
+    this game. So the cases stay MERGED behind one reason
+    (``attribution_missing``) and one INVARIANT sentence that interpolates no
+    subject noun, and what the refusal now describes is the decision rather
+    than the cause. The durable sites, where the subject provably exists and
+    the legacy explanation is both true and actionable, keep their original
+    wording.
+
+    WHAT KILLS EACH TEST: reverting either live call site to the default
+    ``comparand="durable"`` reddens the three wording tests; making
+    ``select_roster`` raise ``NotFoundError`` before the gate (or letting the
+    live message interpolate ``what``) reddens the non-disclosure test;
+    switching the durable sites to ``comparand="live"`` reddens the last one.
+    """
+
+    _LEGACY_PHRASE = "predates durable team attribution"
+
+    def _refusal(self, res):
+        err = self._error(res)
+        self.assertEqual(err["code"], "forbidden", res)
+        self.assertEqual((err.get("details") or {}).get("reason"),
+                         ATTRIBUTION_MISSING, res)
+        return err
+
+    def test_an_unknown_player_is_not_blamed_on_legacy_attribution(self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._build(store)
+                before = self._game_state(fx)
+                with self.subTest(backend=label):
+                    with self._write_attempts(fx["api"].store) as calls:
+                        res = fx["api"].select_roster(
+                            fx["gid"], ["player_that_does_not_exist"],
+                            "coach", authorized_team_id=fx["home"])
+                    err = self._refusal(res)
+                    self.assertEqual(err["message"],
+                                     _ATTRIBUTION_MISSING_LIVE, res)
+                    self.assertNotIn(self._LEGACY_PHRASE, err["message"], res)
+                    self.assertEqual(calls, [], calls)
+                    self.assertEqual(self._game_state(fx), before, label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "F-5 / SELECT UNKNOWN PLAYER")
+
+    def test_the_refusal_does_not_disclose_whether_the_player_exists(self):
+        """THE CONSERVATIVE CHOICE, PINNED. An id naming nobody and a REAL
+        player who simply is not on this coach's side of this game must
+        produce BYTE-IDENTICAL refusals — same code, same reason, same
+        message, same details. The moment they differ, the route becomes an
+        existence oracle for any coach who can post to it."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._build(store)
+                # A player who genuinely exists, on a team registered for
+                # this Season but NOT playing in this game — so no context
+                # resolves for them here, exactly as for an unknown id.
+                real_pid = self._player(fx, fx["third"], "Tia Third")
+                with self.subTest(backend=label):
+                    unknown = fx["api"].select_roster(
+                        fx["gid"], ["player_that_does_not_exist"], "coach",
+                        authorized_team_id=fx["home"])
+                    existing = fx["api"].select_roster(
+                        fx["gid"], [real_pid], "coach",
+                        authorized_team_id=fx["home"])
+                    self._refusal(unknown)
+                    self._refusal(existing)
+                    self.assertEqual(unknown, existing,
+                                     (label, unknown, existing))
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "F-5 / NO EXISTENCE ORACLE")
+
+    def test_a_missing_roster_row_is_not_described_as_a_legacy_row(self):
+        """``set_availability`` for a player with no roster row and no
+        context in this game — and, on the SAME assertion, for a player whose
+        row exists but carries a legacy NULL ``team_side``. The two must read
+        IDENTICALLY: letting them differ would disclose whether the row
+        exists. Neither may claim a row "predates durable team attribution",
+        because in the first case there is no row to predate anything."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._build(store)
+                no_row_pid = self._player(fx, fx["third"], "Tia Third")
+                legacy_pid = self._player(fx, fx["home"], "Lee Legacy")
+                fx["api"].select_roster(fx["gid"], [legacy_pid], ADMIN)
+                entry = store.roster_entry_for_player(fx["gid"], legacy_pid)
+                with store.transaction():
+                    entry.team_side = None
+                    entry.seated_position = None
+                    store.save_roster_entry(entry)
+                self.assertIsNone(
+                    store.roster_entry_for_player(
+                        fx["gid"], legacy_pid).team_side, label)
+                with self.subTest(backend=label):
+                    no_row = fx["api"].set_availability(
+                        fx["gid"], no_row_pid, "unavailable", "coach",
+                        "coach", authorized_team_id=fx["home"])
+                    legacy = fx["api"].set_availability(
+                        fx["gid"], legacy_pid, "unavailable", "coach",
+                        "coach", authorized_team_id=fx["home"])
+                    for res in (no_row, legacy):
+                        err = self._refusal(res)
+                        self.assertEqual(err["message"],
+                                         _ATTRIBUTION_MISSING_LIVE, res)
+                        self.assertNotIn(self._LEGACY_PHRASE, err["message"],
+                                         res)
+                    self.assertEqual(no_row["error"]["message"],
+                                     legacy["error"]["message"], label)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "F-5 / AVAILABILITY WORDING")
+
+    def test_a_genuinely_legacy_row_keeps_the_wording_that_fits_it(self):
+        """THE OTHER HALF OF THE CHANGE, so it cannot be over-applied. On the
+        DURABLE comparand sites the row was FOUND and its NULL side really is
+        a pre-060/061 artefact, so "predates durable team attribution" is
+        literally true and tells an operator what to fix. Those messages must
+        NOT be flattened into the live one."""
+        cases = {"withdraw_enrolled": "substitute enrollment",
+                 "decline": "substitute offer",
+                 "remove": "roster row"}
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                for kind, what in cases.items():
+                    store.clear_all_data()
+                    fx = self._build(store)
+                    pid = self._player(fx, fx["home"])
+                    _prepare(self, fx, pid, kind)
+                    if kind == "remove":
+                        row = store.roster_entry_for_player(fx["gid"], pid)
+                        with store.transaction():
+                            row.team_side = None
+                            row.seated_position = None
+                            store.save_roster_entry(row)
+                    else:
+                        row = store.substitute_for_player(fx["gid"], pid)
+                        with store.transaction():
+                            row.team_id = None
+                            store.save_substitute(row)
+                    with self.subTest(backend=label, surface=kind):
+                        res = _call(fx["api"], fx, pid, kind, fx["home"])
+                        err = self._refusal(res)
+                        self.assertEqual(
+                            err["message"],
+                            _ATTRIBUTION_MISSING_DURABLE.format(what=what),
+                            res)
+                        self.assertIn(self._LEGACY_PHRASE, err["message"], res)
+                ran.append(label)
+            finally:
+                self._close(label, store)
+        self._assert_ran(ran, "F-5 / DURABLE WORDING PRESERVED")
 
 
 if __name__ == "__main__":

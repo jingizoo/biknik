@@ -175,6 +175,50 @@ _PLAYER_CONFIRM_SOURCE_STATES = frozenset({
 ATTRIBUTION_MISSING = "attribution_missing"
 TEAM_SCOPE_VIOLATION = "team_scope_violation"
 
+# THE TWO HUMAN MESSAGES `attribution_missing` CAN CARRY, and why there are
+# two of them but only ONE machine-readable reason (PR #427 review, finding
+# F-5).
+#
+# A NULL comparand fails closed for a Coach either way — that posture is not
+# up for negotiation here and neither message weakens it. What differs is
+# WHAT THE NULL MEANS, and the single message this gate used to raise
+# described only one of the two cases:
+#
+#   DURABLE comparand (withdraw / decline / remove): the row was FOUND and
+#   cannot name its side, which happens only for a row written before
+#   migrations 060/061, neither of which backfills. "Predates durable team
+#   attribution" is then literally true and tells an operator exactly what to
+#   go fix.
+#
+#   LIVE comparand (select_roster, and set_availability): NOTHING WAS FOUND
+#   TO ATTRIBUTE. The player id may name nobody; the player may exist with no
+#   membership resolving onto either side of this game. Neither is a
+#   legacy-attribution problem, and the old wording sent an operator to
+#   repair a migration artefact that does not exist — in set_availability's
+#   case, describing a "roster row" that does not exist at all.
+#
+# WHY THE CASES STAY MERGED BEHIND ONE REASON AND ONE FIXED STRING — the
+# existence-disclosure tension, decided rather than dodged. Splitting the
+# LIVE case further, into `not_found` for an unknown player id versus
+# "exists but not yours", would answer "does this player id exist?" for any
+# coach who can post to these routes: a player-id enumeration oracle handed
+# to precisely the caller this gate has just decided is not entitled to the
+# answer. The same applies inside set_availability, where a distinct string
+# for the no-row branch would tell an unauthorized coach whether the player
+# holds a roster row in this game. So: ONE reason (`attribution_missing`),
+# and a LIVE message that is deliberately INVARIANT — it interpolates no
+# subject noun, because letting it say "player" in one branch and "roster
+# row" in another would rebuild the same oracle out of prose. What the
+# refusal now describes is the DECISION ("your team could not be confirmed
+# as this player's"), never the cause, and it is identical for every input
+# that reaches it.
+_ATTRIBUTION_MISSING_DURABLE = (
+    "This {what} predates durable team attribution, so the team that owns it "
+    "can't be identified — ask a league admin.")
+_ATTRIBUTION_MISSING_LIVE = (
+    "This player can't be confirmed as one of your team's players for this "
+    "game, so a coach can't act on them here — ask a league admin.")
+
 
 def _transactional(fn):
     """Wrap a mutating service method in a single store transaction."""
@@ -349,6 +393,7 @@ class RosterService:
     def _require_authorized_team(
         self, authorized_team_id: Optional[str],
         owning_team_id: Optional[str], what: str,
+        *, comparand: str = "durable",
     ) -> None:
         """THE Coach-team authorization gate, re-checked UNDER THE LOCK.
 
@@ -402,21 +447,32 @@ class RosterService:
         against the locked live context." Each call site names which it is
         passing and why.
 
-        A NULL comparand FAILS CLOSED for a Coach. It is only ever reachable
-        for a LEGACY row written before durable attribution existed
-        (migration 060/061, both additive with no backfill), and such a row
-        cannot prove whose it is. Guessing from ``Player.team_id`` or current
-        membership is exactly what the ruling forbids, so the Coach is
-        refused with zero writes while player self-service and an unscoped
-        League Admin — neither of whom needs this column to be authorized —
-        keep working.
+        A NULL comparand FAILS CLOSED for a Coach, whichever comparand
+        produced it. For a DURABLE one it is reachable only for a LEGACY row
+        written before durable attribution existed (migration 060/061, both
+        additive with no backfill), and such a row cannot prove whose it is.
+        For a LIVE one it means no side could be resolved for this player in
+        this game at all. Guessing from ``Player.team_id`` or current
+        membership is exactly what the ruling forbids in either case, so the
+        Coach is refused with zero writes while player self-service and an
+        unscoped League Admin — neither of whom needs this column to be
+        authorized — keep working.
+
+        ``comparand`` selects only WHICH SENTENCE that refusal carries, never
+        whether it happens: see ``_ATTRIBUTION_MISSING_DURABLE`` /
+        ``_ATTRIBUTION_MISSING_LIVE`` above for the two cases, and for why
+        both keep the SAME machine-readable ``attribution_missing`` reason
+        rather than splitting into one an unauthorized caller could mine for
+        player/row existence.
         """
+        if comparand not in ("durable", "live"):
+            raise ValueError(f"unknown comparand {comparand!r}")
         if authorized_team_id is None:
             return
         if owning_team_id is None:
             raise NotAuthorizedError(
-                f"This {what} predates durable team attribution, so the team "
-                f"that owns it can't be identified — ask a league admin.",
+                _ATTRIBUTION_MISSING_DURABLE.format(what=what)
+                if comparand == "durable" else _ATTRIBUTION_MISSING_LIVE,
                 details={"reason": ATTRIBUTION_MISSING,
                          "authorized_team_id": authorized_team_id})
         if owning_team_id != authorized_team_id:
@@ -553,8 +609,14 @@ class RosterService:
                 ctx = (contexts.get(player_id) if bound
                        else self.resolve_membership_context(game, player))
             resolved[player_id] = ctx
+            # ``comparand="live"``: a NULL here is NEVER a pre-061 row — this
+            # site reads no row at all. It means the id names nobody, or names
+            # a player with no membership resolving onto either side of this
+            # game. Both are refused identically and worded as what they are;
+            # see ``_ATTRIBUTION_MISSING_LIVE`` for why they stay merged.
             self._require_authorized_team(
-                authorized_team_id, ctx.team_id if ctx else None, "player")
+                authorized_team_id, ctx.team_id if ctx else None, "player",
+                comparand="live")
 
         entries: List[GameRosterEntry] = []
         for player_id in player_ids:
@@ -669,6 +731,19 @@ class RosterService:
         # COACH gate and is entirely separate from `_authorize_seated_side`
         # below, which asks the PLAYER question ("may this player still hold
         # the side this row sits on?") — two different subjects, two gates.
+        # THE UNATTRIBUTED WORDING IS THE SAME ON BOTH BRANCHES, DELIBERATELY
+        # (PR #427 review, finding F-5). This site is the one place where a
+        # durable NULL (a pre-061 row that was found) and a live NULL (no row
+        # at all, and no resolvable side) can BOTH reach the gate, so letting
+        # the sentence differ would tell an unauthorized coach whether the
+        # player holds a roster row in this game — the exact disclosure the
+        # gate is refusing to make. ``comparand="live"`` is therefore passed
+        # unconditionally: it is the honest description of the merged case
+        # ("your team could not be confirmed as this player's"), and it never
+        # claims a nonexistent row "predates durable team attribution", which
+        # is what the previous single message said about a row that does not
+        # exist. The reason code is `attribution_missing` on both branches,
+        # unchanged, and both still fail closed with zero writes.
         if authorized_team_id is not None:
             if entry is not None:
                 owning = entry.team_side
@@ -676,7 +751,7 @@ class RosterService:
                 ctx = self.resolve_membership_context(game, player)
                 owning = ctx.team_id if ctx is not None else None
             self._require_authorized_team(authorized_team_id, owning,
-                                          "roster row")
+                                          "player", comparand="live")
 
         reconfirming = (
             entry is not None
@@ -2888,8 +2963,15 @@ class RosterService:
              has the same target-selection shape."
 
         Reproduced again here at head 22bd6de on Memory, SQLite and real
-        PostgreSQL before the fix (``tests/_repro205.py`` reproduction (i)),
-        on BOTH routes. The two halves each looked reasonable alone: the
+        PostgreSQL before the fix, on BOTH routes. That reproduction is now
+        re-runnable in a stronger form than the scratch harness it used to
+        cite: rewriting the branch below to ``team_id = authorized_team_id``
+        unconditionally — the silent rewrite this refusal prevents —
+        reddens ``AnExplicitForeignTeamIsRefusedBelowThePreflight`` in
+        ``tests/test_batch_effective_team.py``, which calls this method's
+        callers DIRECTLY and never touches ``scope_violation``.
+
+        The two halves each looked reasonable alone: the
         preflight abstained because a falsy ``team_id`` is "no target to
         constrain", and the service defaulted because HOME is the documented
         default (#25). Together they let an opposing coach create and confirm
