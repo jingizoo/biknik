@@ -134,6 +134,28 @@ MEMBERSHIP_STATUS_REASONS = {
 # open question 4 is unruled), so it is a skip, not a seat.
 MEMBERSHIP_OTHER_TEAM = "membership_other_team"
 
+# The player DOES hold current participation in this game — but on the
+# OPPOSITE SIDE of it, and this batch is seating one named side (#205 Part C).
+#
+# DELIBERATELY DISTINCT FROM ``MEMBERSHIP_OTHER_TEAM`` immediately above,
+# whose contract is "on a team that is not playing in this game". Here the
+# team IS playing; it is simply the other bench, so reusing that reason would
+# tell an operator something false about a player standing right in front of
+# them, and the remedy differs (there is nothing to fix — the opposing coach
+# seats them).
+#
+# WHY IT IS NEEDED AT ALL. Batch candidate DISCOVERY is deliberately not
+# spine-derived (see the batch-seating section header in roster_service.py):
+# copy-previous reads the prior game's durable ``team_side`` and auto-fill
+# reads the union of permanent pointers and every membership naming the team.
+# Both can therefore surface a candidate whose CURRENT context resolves onto
+# the other side of this same game, and ``_partition_candidates`` used to
+# call that candidate seatable because a context merely EXISTED. Measured on
+# Memory and SQLite at head a90f314, auto-filling HOME with a pointer-HOME /
+# membership-AWAY player: the response said ``team_id=HOME seated=[player_1]
+# skipped=[]`` while storage held ``team_side=AWAY`` — one batch, two sides.
+MEMBERSHIP_OTHER_SIDE = "membership_other_side"
+
 # The player holds membership rows, but NONE of them names this game's
 # LeagueSeason — the owner's "wrong-LeagueSeason" shape. Distinct from
 # ``MEMBERSHIP_OTHER_TEAM`` because the remedy is different: this player is
@@ -286,6 +308,7 @@ SKIP_REASON_PRECEDENCE = (
     MEMBERSHIP_STATUS_REASONS[MembershipStatus.INJURED],
     MEMBERSHIP_STATUS_REASONS[MembershipStatus.APPLICANT],
     MEMBERSHIP_OTHER_TEAM,
+    MEMBERSHIP_OTHER_SIDE,
     MEMBERSHIP_OTHER_LEAGUE_SEASON,
     NO_ELIGIBLE_MEMBERSHIP,
     PLAYER_INACTIVE,

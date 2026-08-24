@@ -4071,8 +4071,11 @@ class ApiService:
 
     @catch
     def copy_previous_roster(self, game_id: str, team_id: Optional[str] = None,
-                             actor_id: Optional[str] = None) -> dict:
-        return self.roster.copy_previous_roster(game_id, team_id, actor_id)
+                             actor_id: Optional[str] = None,
+                             authorized_team_id: Optional[str] = None) -> dict:
+        return self.roster.copy_previous_roster(
+            game_id, team_id, actor_id,
+            authorized_team_id=authorized_team_id)
 
     @catch
     def set_roster_status(self, game_id: str, player_id: str, status: str,
@@ -4374,7 +4377,8 @@ class ApiService:
 
     @catch
     def auto_build_roster(self, game_id: str, team_id: Optional[str] = None,
-                          actor_id: Optional[str] = None) -> dict:
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
         """Select + confirm a roster for one side, up to the game's targets.
 
         Picks the team's goalies and skaters up to the game's targets so a
@@ -4394,7 +4398,9 @@ class ApiService:
         ``seated``/``skipped``/``deferred``/``already_seated``/
         ``candidate_count`` are ADDITIVE — every existing caller reading
         ``status``/``open_*_slots``/``short_roster`` is unaffected."""
-        result = self.roster.auto_build_roster(game_id, team_id, actor_id)
+        result = self.roster.auto_build_roster(
+            game_id, team_id, actor_id,
+            authorized_team_id=authorized_team_id)
         status = self.roster.compute_roster_status(
             game_id, result["team_id"]).to_dict()
         # Coach-friendly classification of a short roster.

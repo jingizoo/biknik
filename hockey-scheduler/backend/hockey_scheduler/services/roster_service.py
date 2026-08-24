@@ -55,6 +55,7 @@ from .membership_spine import (
     DENORMALIZED_SEASON_MISMATCH,
     LEAGUE_SEASON_MISSING,
     MEMBERSHIP_OTHER_LEAGUE_SEASON,
+    MEMBERSHIP_OTHER_SIDE,
     MEMBERSHIP_OTHER_TEAM,
     NO_ELIGIBLE_MEMBERSHIP,
     PLAYER_INACTIVE,
@@ -2596,7 +2597,7 @@ class RosterService:
         return {pid: self.store.get_player_for_update(pid)
                 for pid in sorted(set(player_ids))}
 
-    def _partition_candidates(self, game, candidates, locked,
+    def _partition_candidates(self, game, team_id, candidates, locked,
                               preclassified=None):
         """``(seatable, skipped, contexts)`` — the REVALIDATION, run under
         the locks and BEFORE the first write.
@@ -2657,6 +2658,28 @@ class RosterService:
                 # is tested first and deactivation second, so a candidate
                 # failing both is reported under the context reason.
                 skipped.append((pid, PLAYER_INACTIVE))
+                continue
+            if ctx.team_id != team_id:
+                # ONE BATCH SEATS ONE SIDE (#205 Part C). Discovery is
+                # deliberately NOT spine-derived (see the section header), so
+                # both pools can surface a candidate whose CURRENT context
+                # resolves onto the OTHER side of this same game: a
+                # copy-previous candidate seated on HOME last game who has
+                # since moved to AWAY, or an auto-fill candidate whose
+                # permanent pointer still names HOME while their membership
+                # names AWAY.
+                #
+                # Until now a context merely EXISTING made such a candidate
+                # seatable, and `select_roster` then wrote the row on
+                # `ctx.team_id` — so a batch that reported `team_id=HOME`
+                # durably seated `team_side=AWAY`, counted against HOME's
+                # remaining capacity. Measured on Memory and SQLite at head
+                # a90f314; see `MEMBERSHIP_OTHER_SIDE`.
+                #
+                # It is a REPORTED SKIP, not a raise: the ruling's "never a
+                # silent partial success" applies, and an opposing-side
+                # candidate is a fact about the cohort, not a bad request.
+                skipped.append((pid, MEMBERSHIP_OTHER_SIDE))
                 continue
             seatable.append(pid)
             chosen[pid] = ctx
@@ -2783,7 +2806,7 @@ class RosterService:
         "already_seated"}``."""
         locked = self._lock_candidates(candidates)
         seatable, skipped, contexts = self._partition_candidates(
-            game, candidates, locked, preclassified)
+            game, team_id, candidates, locked, preclassified)
         deferred: List[Tuple[str, str]] = []
         already: List[Tuple[str, str]] = []
         if cap_to_open_slots:
@@ -2847,12 +2870,62 @@ class RosterService:
             "already_seated": already_rows,
         }
 
-    def _batch_team(self, game, team_id) -> str:
-        """The side a batch entry point acts on: the caller's, or the home
-        side by default (#25). A team not playing in this game is refused —
-        that is a bad REQUEST, not an ineligible candidate, so it keeps
-        raising rather than becoming a skip."""
-        team_id = team_id or game.home_team_id
+    def _batch_team(self, game, team_id,
+                    authorized_team_id: Optional[str] = None) -> str:
+        """THE ONE EFFECTIVE TEAM a batch entry point acts on, resolved
+        BEFORE authorization and before any candidate discovery or write.
+
+        THE DEFECT THIS CLOSES (owner ruling, PR #427, comment 5391127041) —
+        a STEADY-STATE hole, not a race:
+
+            "``scope_violation`` checks ``team_id`` only when the body value
+             is truthy, while ``_batch_team`` turns an omitted value into
+             ``game.home_team_id``. I reproduced this through authenticated
+             HTTP on this head: an AWAY Coach posted ``{}`` to
+             ``/api/games/{id}/build-roster``, received 200, the response
+             named HOME, and a current HOME player was durably written as
+             ``confirmed`` with ``team_side=HOME``. ``roster/copy-previous``
+             has the same target-selection shape."
+
+        Reproduced again here at head 22bd6de on Memory, SQLite and real
+        PostgreSQL before the fix (``tests/_repro205.py`` reproduction (i)),
+        on BOTH routes. The two halves each looked reasonable alone: the
+        preflight abstained because a falsy ``team_id`` is "no target to
+        constrain", and the service defaulted because HOME is the documented
+        default (#25). Together they let an opposing coach create and confirm
+        another team's roster with an empty body and no interleaving at all.
+
+        SO THE DEFAULT AND THE AUTHORIZATION ARE DECIDED IN ONE PLACE, and
+        the caller passes the result straight into the locked mutation:
+
+        * FOR A COACH (``authorized_team_id`` set), OMISSION MEANS THEIR OWN
+          SIDE — never HOME by fallback. PINNED BEHAVIOUR, and the ruling
+          requires the choice to be pinned either way: an empty body seats
+          the coach's own team rather than refusing. That is the action they
+          are unambiguously authorized for, it is what every existing
+          one-click coach flow already intends, and a refusal would trade a
+          security hole for a usability one while making the AWAY coach's
+          ``{}`` and the HOME coach's ``{}`` behave differently for no reason
+          a user could see.
+        * AN EXPLICIT DIFFERENT TEAM IS FORBIDDEN for a Coach, with the same
+          structured ``team_scope_violation`` every other surface raises —
+          not silently rewritten to their own side, which would turn a
+          mistaken (or malicious) request into a successful one.
+        * FOR AN UNSCOPED ROLE (``None`` — League Admin/operator) THE HOME
+          DEFAULT IS PRESERVED EXACTLY, byte-for-byte the pre-existing #25
+          behaviour the ruling asks to keep.
+
+        A team not playing in this game is still refused as a bad REQUEST,
+        not an ineligible candidate, so it keeps raising rather than becoming
+        a skip.
+        """
+        if authorized_team_id is not None:
+            if team_id is not None and team_id != authorized_team_id:
+                self._require_authorized_team(authorized_team_id, team_id,
+                                              "team")
+            team_id = authorized_team_id
+        else:
+            team_id = team_id or game.home_team_id
         if team_id not in (game.home_team_id, game.away_team_id):
             raise ValidationError("That team is not playing in this game.")
         return team_id
@@ -2939,6 +3012,7 @@ class RosterService:
     def copy_previous_roster(
         self, game_id: str, team_id: Optional[str] = None,
         actor_id: Optional[str] = None,
+        authorized_team_id: Optional[str] = None,
     ) -> dict:
         """Seed one side's roster from that team's most recent earlier game —
         SKIPPING each currently ineligible player, seating the eligible
@@ -2977,7 +3051,9 @@ class RosterService:
         existing consumer of this plain dict keeps working."""
         game = self._require_game(game_id)
         game = self._guard_mutable(game)          # <- the SEASON ROW LOCK
-        team_id = self._batch_team(game, team_id)
+        # ONE effective team, resolved AND authorized under that lock, BEFORE
+        # candidate discovery and before any write (#205 Part C).
+        team_id = self._batch_team(game, team_id, authorized_team_id)
         src, candidates, preclassified = self._newest_prior_source(
             game, team_id)
         if src is None:
@@ -3018,7 +3094,8 @@ class RosterService:
 
     @_transactional
     def auto_build_roster(self, game_id: str, team_id: Optional[str] = None,
-                          actor_id: Optional[str] = None) -> dict:
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
         """Select + confirm a roster for one side up to the game's targets,
         skipping each currently ineligible candidate and reporting every one
         of them (owner ruling, PR #427).
@@ -3067,7 +3144,9 @@ class RosterService:
         to fix in Setup, not a partial outcome."""
         game = self._require_game(game_id)
         game = self._guard_mutable(game)          # <- the SEASON ROW LOCK
-        team_id = self._batch_team(game, team_id)
+        # ONE effective team, resolved AND authorized under that lock, BEFORE
+        # candidate discovery and before any write (#205 Part C).
+        team_id = self._batch_team(game, team_id, authorized_team_id)
         candidates = self._auto_build_candidates(game, team_id)
         if not candidates:
             raise ValidationError(

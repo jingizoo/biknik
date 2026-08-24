@@ -3830,7 +3830,7 @@ _AUDIT_WAIVERS = {
     ('do_POST', "api.remind_unresponded(gid, body.get('team_id') or scope.get('team_id'), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'availability/remind'"):
         "gid/action captured off the SAME match; `action == "
         "'availability/remind'` already selects this leaf",
-    ('do_POST', "api.auto_build_roster(gid, body.get('team_id'), user_id)", 'call_argument', "action == 'build-roster'"):
+    ('do_POST', "api.auto_build_roster(gid, body.get('team_id'), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'build-roster'"):
         "gid/action captured off the SAME match; `action == 'build-roster'` "
         "already selects this leaf",
     ('do_POST', "api.select_roster(gid, body.get('player_ids', []), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'roster/select'"):
@@ -3839,7 +3839,7 @@ _AUDIT_WAIVERS = {
     ('do_POST', 'api.remove_player(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'roster/remove'"):
         "gid/action captured off the SAME match; `action == "
         "'roster/remove'` already selects this leaf",
-    ('do_POST', "api.copy_previous_roster(gid, body.get('team_id'), user_id)", 'call_argument', "action == 'roster/copy-previous'"):
+    ('do_POST', "api.copy_previous_roster(gid, body.get('team_id'), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'roster/copy-previous'"):
         "gid/action captured off the SAME match; `action == 'roster/copy- "
         "previous'` already selects this leaf",
     ('do_POST', "api.assign_official(gid, body.get('official_id'), body.get('role', 'referee'), user_id, override_unavailable=bool(body.get('override_unavailable')))", 'call_argument', "action == 'officials/assign'"):

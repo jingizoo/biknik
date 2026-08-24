@@ -4260,7 +4260,8 @@ class Handler(BaseHTTPRequestHandler):
                     authorized_team_id=coach_team))
             if action == "build-roster":
                 return self._send_api(api.auto_build_roster(
-                    gid, body.get("team_id"), user_id))
+                    gid, body.get("team_id"), user_id,
+                    authorized_team_id=coach_team))
             if action == "roster/select":
                 return self._send_api(api.select_roster(
                     gid, body.get("player_ids", []), user_id,
@@ -4270,7 +4271,8 @@ class Handler(BaseHTTPRequestHandler):
                     gid, pid, user_id, authorized_team_id=coach_team))
             if action == "roster/copy-previous":
                 return self._send_api(api.copy_previous_roster(
-                    gid, body.get("team_id"), user_id))
+                    gid, body.get("team_id"), user_id,
+                    authorized_team_id=coach_team))
             if action == "officials/assign":
                 return self._send_api(api.assign_official(
                     gid, body.get("official_id"), body.get("role", "referee"),

@@ -652,6 +652,12 @@ class ThePrecedenceLadderIsClosedOverEveryProducibleReason(unittest.TestCase):
                 spine.REGISTRATION_CONFLICT, spine.PLAYER_MISSING,
                 spine.DENORMALIZED_SEASON_MISMATCH,
                 spine.MEMBERSHIP_OTHER_TEAM,
+                # #205 Part C: current participation, but on the OPPOSITE
+                # SIDE of this same game — distinct from
+                # MEMBERSHIP_OTHER_TEAM ("a team not playing in this game")
+                # because the team IS playing, so reusing that reason would
+                # misdescribe the player to an operator.
+                spine.MEMBERSHIP_OTHER_SIDE,
                 spine.MEMBERSHIP_OTHER_LEAGUE_SEASON,
                 spine.PLAYER_INACTIVE, spine.NO_ELIGIBLE_MEMBERSHIP,
                 spine.PRIOR_SEAT_UNATTRIBUTED,
