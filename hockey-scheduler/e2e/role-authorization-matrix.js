@@ -1410,6 +1410,116 @@ async function checkViewport(browser, viewport) {
     }
     await page.unroute("**/api/games/*/lineups");
 
+    // ------------------------------------------------------------
+    // GAME ACTIVITY (#427 final blocker). "/board: scoped callers and
+    // officials must not receive game-wide notifications, audit, or
+    // audit_count... audit_count must not survive as a covert cardinality
+    // oracle over omitted rows."
+    //
+    // The SERVER side is pinned tri-store over real authenticated HTTP
+    // (backend/tests/test_private_game_sibling_routes.py). What can only be
+    // proven here is the RENDERING of the two projections it now sends,
+    // because both had an empty state that would have MISREPRESENTED them:
+    // `notifications: []` renders as "No notifications yet." and `audit: []`
+    // as "No audit entries." -- claims that THIS GAME has had no activity,
+    // when the truth is that this READER is not being shown it.
+    // ------------------------------------------------------------
+    await page.evaluate(() => switchTab("activity"));
+    await waitForView(page, "activity");
+    await waitForRealContent(page);
+    const ownActivity = await page.evaluate(() => {
+      const titles = Array.from(document.querySelectorAll("#content .section-title"))
+        .map((t) => (t.textContent || "").trim());
+      const auditTitle = titles.find((t) => /^Game audit/.test(t)) || "";
+      const m = /\((\d+)\)/.exec(auditTitle);
+      const card = Array.from(document.querySelectorAll("#content .section-title"))
+        .find((t) => /^Game audit/.test(t.textContent || ""));
+      return {
+        scopeNote: document.querySelectorAll("[data-activity-scope]").length,
+        restricted: document.querySelectorAll("[data-restricted]").length,
+        auditTitle,
+        claimed: m ? Number(m[1]) : null,
+        rendered: card && card.nextElementSibling
+          ? card.nextElementSibling.querySelectorAll(".tl-item").length : -1,
+      };
+    });
+    // A Coach reads their OWN side's activity, and is told so -- otherwise a
+    // short list reads as a claim about the whole game.
+    if (ownActivity.scopeNote !== 1) {
+      fail(`Coach [${L}]: the own-side activity feed must say it is scoped to `
+        + `this team, found ${ownActivity.scopeNote} scope note(s): `
+        + `${JSON.stringify(ownActivity)}`);
+    }
+    // THE CARDINALITY ORACLE, closed at the surface the coach actually reads:
+    // the number in the heading is the number of rows on the screen, never a
+    // count of the whole game's log.
+    if (ownActivity.claimed === null
+        || ownActivity.claimed !== ownActivity.rendered) {
+      fail(`Coach [${L}]: "Game audit (N)" must count the rows actually sent, `
+        + `not the whole game's log: ${JSON.stringify(ownActivity)}`);
+    }
+
+    // THE WITHHELD PROJECTION. An assigned official receives all three fields
+    // as null. No browser journey can BE an assigned official mid-run (this
+    // page holds a real Coach session and officials are assigned through a
+    // separate operator flow), so the payload is injected by rewriting the
+    // real /board response in flight -- the same technique, and the same
+    // justification, as the ineligible-row leg above: the fetch-to-DOM path
+    // is entirely real and the SHAPE injected is exactly the one the Python
+    // tests pin for an official.
+    await page.route("**/api/games/*/board", async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.audit_scope = "withheld";
+      body.notifications = null;
+      body.audit = null;
+      body.audit_count = null;
+      await route.fulfill({ response, json: body });
+    });
+    await page.evaluate(() => switchTab("games"));
+    await waitForView(page, "games");
+    await page.evaluate(() => switchTab("activity"));
+    await waitForView(page, "activity");
+    await waitForRealContent(page);
+    const withheldActivity = await page.evaluate(() => {
+      const text = (document.getElementById("content").textContent || "")
+        .replace(/\s+/g, " ");
+      const titles = Array.from(document.querySelectorAll("#content .section-title"))
+        .map((t) => (t.textContent || "").trim());
+      return {
+        restricted: document.querySelectorAll("[data-restricted]").length,
+        scopeNote: document.querySelectorAll("[data-activity-scope]").length,
+        auditTitle: titles.find((t) => /^Game audit/.test(t)) || "",
+        saysNoNotifications: /No notifications yet\./.test(text),
+        saysNoAudit: /No audit entries\./.test(text),
+        saysWithheld: /Game activity not shown/.test(text),
+      };
+    });
+    // WITHHELD IS NOT EMPTY. Both collections get the redacted treatment, and
+    // the two misleading empty-state sentences must be gone -- this is the
+    // assertion that fails if someone "simplifies" the server back to [].
+    if (withheldActivity.restricted !== 2 || !withheldActivity.saysWithheld) {
+      fail(`Coach [${L}]: a withheld activity log must render as WITHHELD in `
+        + `both cards: ${JSON.stringify(withheldActivity)}`);
+    }
+    if (withheldActivity.saysNoNotifications || withheldActivity.saysNoAudit) {
+      fail(`Coach [${L}]: withheld activity rendered as an EMPTY OPERATIONAL `
+        + `STATE -- "no notifications"/"no audit entries" claims this game has `
+        + `had no activity, which is a different and false statement: `
+        + `${JSON.stringify(withheldActivity)}`);
+    }
+    // ...and no count survives in the heading, which would be the same oracle
+    // in string form.
+    if (/\(/.test(withheldActivity.auditTitle)) {
+      fail(`Coach [${L}]: the withheld audit heading still carries a count: `
+        + `${JSON.stringify(withheldActivity)}`);
+    }
+    if (withheldActivity.scopeNote !== 0) {
+      fail(`Coach [${L}]: the own-side scope note must not appear when the `
+        + `whole log is withheld: ${JSON.stringify(withheldActivity)}`);
+    }
+    await page.unroute("**/api/games/*/board");
+
     // Direct-navigation bypass: Setup is hidden from nav (neither
     // manage_setup nor manage_arena) -- switchTab() must self-guard.
     await page.evaluate(() => switchTab("setup"));

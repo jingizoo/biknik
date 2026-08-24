@@ -102,9 +102,46 @@ The facade supports the three required screen states:
 
 - **Loading** — client concern; the facade is synchronous.
 - **Empty** — `GET /roster` returns `[]` and `roster-status` reports
-  `status = "draft"` with `message = "No players selected yet."`.
+  `status = "draft"` with `message = "No players selected yet."`. This is a
+  claim that the roster **is** empty, and it is therefore never used to
+  express withheld data — see *Private game visibility* below.
 - **Error** — any structured error shape above; the screen shows the
   `error.message`.
+
+## Private game visibility (#427)
+
+`board`, `lineups`, `roster-status`, `roster` and `substitutes` all expose one
+game's **private** state. Passing the session + participation gate proves the
+caller belongs to *a* team in the game; it does **not** decide *which side*
+they may read. The server resolves the caller's own side once
+(`game_scoped_own_team_id`) and every one of these routes is projected on it.
+**A side is never read from the query string or the body** — a `?team_id=` or
+`?side=` naming the opponent is ignored, not honoured and not rejected.
+
+| Caller | board / lineups | roster-status | roster | substitutes |
+|---|---|---|---|---|
+| League Admin, Arena Manager | both sides, full | full | full | full |
+| Coach, Player | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows |
+| Assigned official | both sides' submitted lineup | **403** | both sides' submitted lineup | **403** |
+
+Two rules govern how withheld data is represented, and both exist because an
+empty collection is an *operational claim about the game* rather than a
+statement about the reader:
+
+- **Never `[]`, never `0`.** A redacted lineup side carries
+  `restricted: true` with `players: null` and `status: null`. A route with no
+  readable projection for the caller answers **403 `forbidden`**.
+- **Nothing is counted that was not sent.** `board.audit_scope` is `full`,
+  `own_side` or `withheld`; `notifications`, `audit` and `audit_count` are all
+  `null` when `withheld`, and `audit_count` otherwise counts the rows actually
+  returned, so it cannot report the size of what was omitted.
+
+An event is retained for a side only when **every player identity it discloses
+is durably attributed to that side, and it discloses at least one**.
+Attribution comes from the stored `GameRosterEntry.team_side` and
+`SubstituteEnrollment.team_id` — never live membership and never
+`Player.team_id`. A legacy row with NULL attribution names no side, so it is
+withheld from **both** rather than guessed onto one.
 
 ## Named schedule scenarios (#378)
 

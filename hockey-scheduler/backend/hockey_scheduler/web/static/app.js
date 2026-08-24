@@ -8243,14 +8243,27 @@ function isRestrictedSide(side) {
   return !!(side && side.restricted);
 }
 function restrictedNote(kind) {
-  // `kind` only changes the wording; both say the same thing -- WITHHELD,
-  // not absent.
-  const detail = kind === "sheet"
-    ? "Only your own team's lineup is shown to you. An operator or an assigned official sees both."
-    : "You manage your own team. The opposing lineup is private to their coach.";
+  // `kind` only changes the WORDING; every one of them says the same thing --
+  // WITHHELD, not absent. One function, so the redacted look cannot drift
+  // between the screens that show it.
+  const COPY = {
+    sheet: ["Opponent lineup not shown",
+      "Only your own team's lineup is shown to you. An operator or an assigned official sees both."],
+    roster: ["Opponent lineup not shown",
+      "You manage your own team. The opposing lineup is private to their coach."],
+    // #427 final blocker: /board withholds `notifications`, `audit` and
+    // `audit_count` from a caller with no side of their own (an assigned
+    // official). Rendering that as `[]` would print "No notifications yet."
+    // and "No audit entries." -- claims that this GAME has had no activity,
+    // which is a different and false statement, and exactly the
+    // empty-operational-state mistake the redacted lineup already avoids.
+    activity: ["Game activity not shown",
+      "This game's notification and audit trail is private to the teams playing and the league office."],
+  };
+  const [title, detail] = COPY[kind] || COPY.roster;
   return `<div class="restricted-side" data-restricted>
     <div class="rs-head"><span class="badge gray">\u{1F512} Restricted</span></div>
-    <div class="rs-title">Opponent lineup not shown</div>
+    <div class="rs-title">${esc(title)}</div>
     <div class="rs-note">${esc(detail)}</div></div>`;
 }
 
@@ -10407,19 +10420,36 @@ function renderActivity(board, ov) {
       : "Open a game roster to see its game activity.";
     return operatorSection + `<div class="section-title">Game</div><div class="card"><div class="empty">${note}</div></div>`;
   }
+  // WHICH activity this caller is being shown, stated by the server (#427
+  // final blocker) rather than inferred from a short list: "full" for an
+  // unscoped operator, "own_side" for a Coach/Player, "withheld" for a caller
+  // entitled to none of it. `audit_count` is counted over what was SENT, so
+  // it is never a count of rows that were withheld.
+  const withheld = board.audit_scope === "withheld";
+  const ownSide = board.audit_scope === "own_side";
   const names = {}; (board.players || []).forEach((p) => (names[p.id] = p.name));
   const feed = [...(board.notifications || [])].reverse();
   const audit = [...(board.audit || [])].reverse();
   const dotFor = { coach: "var(--blue)", player: "var(--green)", team: "var(--purple)", guardian: "#b07bd6" };
-  const fHtml = feed.length ? feed.map((n) => tlRow(fmt(n.at),
+  // An OWN-SIDE feed that happens to be empty must not claim the game has had
+  // no activity -- it means "none of it was yours".
+  const emptyFeed = ownSide ? "No activity for your team yet." : "No notifications yet.";
+  const emptyAudit = ownSide ? "No audit entries for your team yet." : "No audit entries.";
+  const fHtml = withheld ? restrictedNote("activity") : (feed.length ? feed.map((n) => tlRow(fmt(n.at),
     `${esc(n.message)} <span style="color:var(--muted)">· to ${esc(n.audience)}${n.subject_player_id && names[n.subject_player_id] ? " · " + esc(names[n.subject_player_id]) : ""}</span>`,
-    dotFor[n.audience])).join("") : `<div class="empty">No notifications yet.</div>`;
-  const aHtml = audit.length ? audit.map((a) => tlRow(fmt(a.at),
+    dotFor[n.audience])).join("") : `<div class="empty">${esc(emptyFeed)}</div>`);
+  const aHtml = withheld ? restrictedNote("activity") : (audit.length ? audit.map((a) => tlRow(fmt(a.at),
     `<strong>${esc(AUDIT_LABEL[a.action] || a.action)}</strong>${a.subject_player_id && names[a.subject_player_id] ? " · " + esc(names[a.subject_player_id]) : ""}`,
-    "#94a3b8")).join("") : `<div class="empty">No audit entries.</div>`;
+    "#94a3b8")).join("") : `<div class="empty">${esc(emptyAudit)}</div>`);
+  // No count at all when the collection was withheld -- printing "(null)" or
+  // "(0)" would be the cardinality claim the server deliberately does not make.
+  const auditTitle = withheld ? "Game audit" : `Game audit (${board.audit_count})`;
+  const scopeNote = ownSide
+    ? `<div class="empty" data-activity-scope>Your own team's entries only. An operator sees the whole game's log.</div>`
+    : "";
   return `${operatorSection}
-    <div class="section-title">Game notifications</div><div class="card">${fHtml}</div>
-    <div class="section-title">Game audit (${board.audit_count})</div><div class="card">${aHtml}</div>
+    <div class="section-title">Game notifications</div><div class="card">${scopeNote}${fHtml}</div>
+    <div class="section-title">${esc(auditTitle)}</div><div class="card">${aHtml}</div>
     <div class="section-title">Delivery</div><div class="card">${stub("📨", "Push / email delivery", "Worker + device tokens", 32)}</div>`;
 }
 

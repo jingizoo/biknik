@@ -2916,12 +2916,28 @@ class Handler(BaseHTTPRequestHandler):
                     gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "officials":
                 return self._send_api({"officials": api.get_officials_for_game(gid)})
+            # THE THREE FLAT-LIST SIBLINGS (#427 final blocker). They sat
+            # behind the SAME single gate as /board and /lineups and carried
+            # the same absent team-level narrowing, so projecting only the two
+            # lineup reads left the identical pivot one path segment away:
+            # /roster-status hard-coded HOME for everybody exactly as
+            # get_board used to, /roster returned both sides' seats, and
+            # /substitutes returned both sides' substitute workflow to either
+            # Coach AND to an assigned official. Each now receives the SAME
+            # trusted `own_team` the two reads above receive — resolved once,
+            # for the whole family, never from the query string or the body —
+            # and the facade projects on it (`lineup_visibility.
+            # route_audience`). An unscoped operator is unchanged on all
+            # three.
             if sub == "roster-status":
-                return self._send_api(api.get_roster_status(gid))
+                return self._send_api(api.get_roster_status(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "roster":
-                return self._send_api(api.get_roster(gid))
+                return self._send_api(api.get_roster(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "substitutes":
-                return self._send_api(api.get_substitutes(gid))
+                return self._send_api(api.get_substitutes(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "reschedule":
                 # A game's own reschedule-request history/current pending
                 # request (#29) — same private-game-data gate as roster/

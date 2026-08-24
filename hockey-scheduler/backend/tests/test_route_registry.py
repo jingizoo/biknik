@@ -327,11 +327,19 @@ _EXPECTED_CLASSIFICATION = {
         ('session+own-side-projection', 'none'),  # get_games_id_lineups
     ("GET", '/api/games/{}/officials'): ('session', 'none'),  # get_games_id_officials
     ("GET", '/api/games/{}/reschedule'): ('session', 'none'),  # get_games_id_reschedule
-    ("GET", '/api/games/{}/roster'): ('session', 'none'),  # get_games_id_roster
-    ("GET", '/api/games/{}/roster-status'): ('session', 'none'),  # get_games_id_roster_status
+    # #427 final blocker: the three flat-list siblings of the two leaves
+    # above. All three were bare 'session' while /roster returned both sides'
+    # seats, /substitutes both sides' substitute workflow (to officials too),
+    # and /roster-status hard-coded HOME for everybody. The gate is unchanged;
+    # each response is now projected on the server-resolved own side.
+    ("GET", '/api/games/{}/roster'):
+        ('session+own-side-projection', 'none'),  # get_games_id_roster
+    ("GET", '/api/games/{}/roster-status'):
+        ('session+own-side-projection', 'none'),  # get_games_id_roster_status
     ("GET", '/api/games/{}/substitute-addable'): ('session+MANAGE_ROSTER-or-self', 'none'),  # get_games_id_substitute_addable
     ("GET", '/api/games/{}/substitute-candidates'): ('session+MANAGE_ROSTER-or-self', 'none'),  # get_games_id_substitute_candidates
-    ("GET", '/api/games/{}/substitutes'): ('session', 'none'),  # get_games_id_substitutes
+    ("GET", '/api/games/{}/substitutes'):
+        ('session+own-side-projection', 'none'),  # get_games_id_substitutes
     ("GET", '/api/guardians/links'): ('operator_only', 'none'),  # get_guardians_links
     ("GET", '/api/health'): ('none', 'none'),  # get_health
     ("GET", '/api/import/hierarchy-codes'): ('operator_only', 'none'),  # get_import_hierarchy_codes

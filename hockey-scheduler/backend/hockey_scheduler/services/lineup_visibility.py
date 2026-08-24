@@ -60,6 +60,11 @@ FULL = "full"
 SUBMITTED_LINEUP = "submitted_lineup"
 RESTRICTED = "restricted"
 
+#: A team-scoped caller's OWN side, and only it. Used by the flat-list sibling
+#: routes, which have no per-side envelope to hang a ``restricted`` marker on
+#: and therefore narrow the ROWS instead of labelling a side.
+OWN_SIDE = "own_side"
+
 #: Roles whose authority is league-wide rather than team-scoped. They are the
 #: only callers who keep the full two-side private read, and they are exactly
 #: the two roles ``can_read_private_game_data`` short-circuits to ``True``.
@@ -102,6 +107,61 @@ def side_projections(role, viewer_team_id, home_team_id, away_team_id) -> dict:
             "away": FULL if viewer_team_id == away_team_id else RESTRICTED,
         }
     return {"home": RESTRICTED, "away": RESTRICTED}
+
+
+def route_audience(role, viewer_team_id, home_team_id, away_team_id):
+    """WHICH AUDIENCE this caller belongs to on a FLAT-LIST private-game
+    sibling — ``/roster-status``, ``/roster``, ``/substitutes`` (#427 final
+    blocker, owner ruling: "the acceptance boundary is the caller's obtainable
+    private game state, not only `/board` and `/lineups`; leaving F2/F3 would
+    make the fix bypassable through sibling routes").
+
+    THE DEFECT THIS EXISTS TO CLOSE. All three siblings sat behind the SAME
+    single ``can_read_private_game_data`` gate as ``/board`` and ``/lineups``,
+    and like them carried no team-level narrowing at all — so once the two
+    lineup reads were projected, an identical pivot remained one path segment
+    away: ``/roster`` handed either Coach the opponent's seated rows,
+    ``/substitutes`` handed either Coach *and* an assigned official the
+    opponent's substitute workflow rows, and ``/roster-status`` hard-coded HOME
+    for everybody exactly as ``get_board`` used to.
+
+    Returns one of the SAME four labels :func:`side_projections` uses, so the
+    two-sided and flat-list reads cannot describe one caller differently:
+
+    ``FULL``
+        Unscoped operator (or an in-process caller with no role) — the whole
+        game, unchanged. Narrowing the operator would be its own regression.
+    ``OWN_SIDE``
+        Coach / Player — rows this game DURABLY attributes to their own side.
+    ``SUBMITTED_LINEUP``
+        Assigned official. Servable only where the submitted lineup is
+        genuinely what the route is for (``/roster``); the routes whose whole
+        subject is candidate or substitute workflow state refuse it instead,
+        because an official referees the game and does not manage anyone's
+        roster. Each route names its own choice — that is a per-route
+        decision, not a property of the role.
+    ``RESTRICTED``
+        Nothing on this route. A flat list has no per-side envelope to carry a
+        ``restricted: true`` marker the way ``/lineups`` does, so the honest
+        answer is an explicit refusal — never ``[]``, which asserts the
+        operationally different "there is none".
+
+    FAIL CLOSED, on the same clause order and for the same reason
+    :func:`side_projections` gives: ``viewer_team_id is not None`` is tested
+    FIRST, because a Game may carry a NULL side and ``None in (home, None)``
+    is ``True`` — which would hand a caller whose own team never resolved the
+    full whole-game read.
+    """
+    if role is None or role in _UNSCOPED_OPERATORS:
+        return FULL
+    if role == Role.OFFICIAL:
+        # Assignment to THIS game is proven upstream by
+        # `can_read_private_game_data`'s OFFICIAL branch.
+        return SUBMITTED_LINEUP
+    if role in _TEAM_SCOPED and viewer_team_id is not None \
+            and viewer_team_id in (home_team_id, away_team_id):
+        return OWN_SIDE
+    return RESTRICTED
 
 
 def own_side(role, viewer_team_id, home_team_id, away_team_id):

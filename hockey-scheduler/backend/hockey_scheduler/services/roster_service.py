@@ -2487,6 +2487,53 @@ class RosterService:
         return [(ctx.player, ctx) for _pid, ctx in sorted(contexts.items())
                 if ctx.team_id == team_id]
 
+    def durable_game_sides(self, game_id: str) -> Dict[str, str]:
+        """``{player_id: team_side}`` for every player THIS GAME can attribute
+        to exactly ONE side from a DURABLE record (#427 final blocker, owner
+        ruling: "Omit them unless an event can be durably attributed to the
+        permitted side").
+
+        THE TWO DURABLE AUTHORITIES, and only these two — the same pair
+        :meth:`lineup_population` keys its (a) and (b) populations on:
+
+        * ``GameRosterEntry.attribution[0]`` — the side a seat was written
+          against, from the validated context that authorized the seating;
+        * ``SubstituteEnrollment.team_id`` — the side an enrollment was
+          admitted on.
+
+        NEITHER LIVE MEMBERSHIP NOR THE PERMANENT POINTER, deliberately.
+        This map exists to decide who may READ an event that has ALREADY
+        happened, and a live membership answers a different question — "whose
+        player is this NOW" — which a mid-season transfer moves. Attributing a
+        past event by present membership would hand an event about the
+        opponent's game to whichever coach the subject happens to belong to
+        today. Migration 060/061 wrote these columns precisely so the question
+        "which side was this row admitted on" has a stored answer.
+
+        NULL IS OMITTED, NEVER GUESSED. A legacy pre-060/061 row cannot name
+        its owner, so its occupant simply does not appear here and every event
+        that names them is withheld from BOTH sides — the standing ruling
+        ("Legacy NULL attribution is omitted, never guessed"), and the same
+        rule ``lineup_population`` already applies to the rows themselves.
+
+        AMBIGUITY IS OMITTED TOO. A player carrying durable records that name
+        DIFFERENT sides (a substitute enrolled for one side and later seated
+        by the other) has no single durable side, so they are dropped rather
+        than resolved by precedence. Picking a winner here would be guessing
+        with extra steps, and this map's whole job is to be the thing that
+        does not guess.
+        """
+        claims: Dict[str, set] = {}
+        for entry in self.store.roster_for_game(game_id):
+            attribution = entry.attribution
+            if attribution is not None:
+                claims.setdefault(entry.player_id, set()).add(attribution[0])
+        for sub in self.store.substitutes_for_game(game_id):
+            if sub.team_id is not None:
+                claims.setdefault(sub.player_id, set()).add(sub.team_id)
+        return {player_id: next(iter(sides))
+                for player_id, sides in claims.items() if len(sides) == 1}
+
     # -- the lineup population (#427 blocker, comments 5390696775 /
     #    5394947899) -------------------------------------------------------
     def lineup_population(self, game, team_id: str) -> List["LineupRow"]:

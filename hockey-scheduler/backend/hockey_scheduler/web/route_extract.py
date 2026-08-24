@@ -3815,15 +3815,35 @@ _AUDIT_WAIVERS = {
         "api.get_officials_for_game(gid), ...}.get(sub)`-shaped table one "
         "line up), not a bare call, but the SAME captured-only argument "
         "either way",
-    ('_dispatch_get', 'api.get_roster_status(gid)', 'call_argument', "sub == 'roster-status'"):
+    ('_dispatch_get',
+     'api.get_roster_status(gid, viewer_role=role, viewer_team_id=own_team)',
+     'call_argument', "sub == 'roster-status'"):
         "gid captured off the SAME match; `sub == 'roster-status'` already "
-        "selects this exact leaf",
-    ('_dispatch_get', 'api.get_roster(gid)', 'call_argument', "sub == 'roster'"):
+        "selects this exact leaf. #427 final blocker added the two "
+        "projection arguments: `own_team` is the already-waived TRUSTED SIDE "
+        "and `role` the session-resolved caller, so the facade can answer "
+        "for the caller's own side instead of the hard-coded HOME this leaf "
+        "returned to everybody -- they decide what this caller may SEE of "
+        "the already-selected game, never which route was chosen; every "
+        "value of both returns through this one leaf. Identical shape and "
+        "reasoning to the `api.get_board` waiver above",
+    ('_dispatch_get',
+     'api.get_roster(gid, viewer_role=role, viewer_team_id=own_team)',
+     'call_argument', "sub == 'roster'"):
         "gid captured off the SAME match; `sub == 'roster'` already selects "
-        "this exact leaf",
-    ('_dispatch_get', 'api.get_substitutes(gid)', 'call_argument', "sub == 'substitutes'"):
+        "this exact leaf. #427 final blocker added the same two projection "
+        "arguments as the get_roster_status waiver immediately above -- same "
+        "trusted side, same session-resolved role, same 'what may be seen, "
+        "not which route' reasoning",
+    ('_dispatch_get',
+     'api.get_substitutes(gid, viewer_role=role, viewer_team_id=own_team)',
+     'call_argument', "sub == 'substitutes'"):
         "gid captured off the SAME match; `sub == 'substitutes'` already "
-        "selects this exact leaf",
+        "selects this exact leaf. #427 final blocker added the same two "
+        "projection arguments as the two waivers immediately above -- and "
+        "here `role` also carries the OFFICIAL refusal, which is still a "
+        "decision about what this caller may see of an already-selected "
+        "route, not a selection between routes",
     ('_dispatch_get', 'api.list_reschedule_requests(gid)', 'dict_value', "sub == 'reschedule'"):
         "gid captured off the SAME match; `sub == 'reschedule'` already "
         "selects this leaf -- reached as a dict VALUE, the same shape as "
