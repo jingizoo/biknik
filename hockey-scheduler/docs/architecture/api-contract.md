@@ -208,6 +208,21 @@ honest single-side answer (one enum, a two-sided entitlement), and the value it
 would carry is `needs_substitute`, which `_submitted_lineup_status` neutralises
 by name one route away.
 
+### The side rule is machine-enforced (#205)
+
+The four defects above were each found by hand, one round at a time, and each
+was the same shape: a private-state read reaching a side by default or by a
+client hint instead of by the server's resolution. That rule is now a build
+gate — `backend/hockey_scheduler/services/side_provenance.py`, driven by
+`backend/tests/test_side_provenance_guard.py`. It fails on any read of
+roster / availability / substitute / audit state whose side did not come from
+`game_scoped_own_team_id` or an adjudicated decision, on any new
+`x or <game>.home_team_id` default, and on any new leaf of the
+`/api/games/{id}/…` dispatch. Its accepted-site ledger is empty and may only
+shrink; the legitimate cases (unscoped-operator defaults, the live-membership
+discoveries, the create-state side) are documented exemptions whose conditions
+are checked rather than asserted.
+
 ### Which side a substitute enrollment belongs to
 
 `SubstituteEnrollment.team_id` — the side the row was **admitted** on — and
