@@ -981,6 +981,32 @@ async function checkViewport(browser, viewport) {
       fail(`Coach: expected the Roster view to be on the Coach's own side `
         + `${coachTeam.body.id}, got ${onTarget.team}`);
     }
+    // ------------------------------------------------------------
+    // THE COACH'S OWN SIDE IS NAMED IN THE SCHEDULE ROW (#205, round 4) --
+    // the positive half of the withheld-render leg the assigned official
+    // runs below, and it is here so that leg cannot pass because the field
+    // is simply broken for everybody. This Coach IS in this game, so they
+    // are entitled to a value, the value is THEIR side's, and the screen
+    // renders a real checklist state rather than the withheld marker.
+    // ------------------------------------------------------------
+    const coachOverview = await apiGet(page, "/api/demo/overview");
+    if (coachOverview.status !== 200 || coachOverview.body.error) {
+      fail(`Coach [${L}]: /api/demo/overview failed: `
+        + `${JSON.stringify(coachOverview).slice(0, 200)}`);
+    }
+    const coachRow = (coachOverview.body.schedule || [])
+      .find((g) => g.game_id === game.body.id);
+    if (!coachRow) {
+      fail(`Coach [${L}]: the fixture game is absent from this Coach's `
+        + `schedule, so nothing here is being asserted`);
+    }
+    if (coachRow.roster_status_restricted !== false
+        || coachRow.roster_status_team_id !== coachTeam.body.id
+        || typeof coachRow.roster_status !== "string") {
+      fail(`Coach [${L}]: the schedule row must carry THIS Coach's own side's `
+        + `roster status (team ${coachTeam.body.id}), got `
+        + `${JSON.stringify(coachRow)}`);
+    }
     // No warning before the action -- so the assertions below cannot be
     // satisfied by something that was already on screen.
     if (await page.$(".ros-partial")) {
@@ -1846,6 +1872,113 @@ async function checkViewport(browser, viewport) {
           + `an empty summary is a claim about the team, not about the `
           + `reader: ${JSON.stringify(probe.body)}`);
       }
+    }
+
+    // ------------------------------------------------------------
+    // THE GAMES LIST RENDERS THE WITHHELD ROSTER STATUS AS WITHHELD
+    // (#205, round 4).
+    //
+    // WHAT ONLY A BROWSER CAN PROVE. The server side -- that
+    // /api/demo/overview omits `schedule[].roster_status` for a caller
+    // entitled to no side -- is pinned tri-store over real authenticated
+    // HTTP (backend/tests/test_overview_schedule_side.py). What that cannot
+    // show is what the SHIPPED SCREEN does with the omission, and that is
+    // the whole reason the field carries an explicit marker rather than
+    // just disappearing: every consumer of it asks
+    // `["roster_confirmed","locked"].includes(g.roster_status)`, which a
+    // missing key answers `false` -- so a naive omission renders as the
+    // badge "Roster open" and the checklist line "Roster -- Not confirmed".
+    // That is restricted data displayed as an EMPTY OPERATIONAL STATE, and
+    // it is a false claim about the other team rather than a true one about
+    // this reader.
+    //
+    // The Games tab is where it shows: `gateChrome()` never hides it, so an
+    // official reaches this list, and before the fix its rows carried the
+    // HOME side's real private status for every game in the Program --
+    // including games this official was never assigned to.
+    //
+    // Nothing is faked: a real assigned official's real session, the real
+    // route, the real render.
+    // ------------------------------------------------------------
+    const officialOverview = await apiGet(page, "/api/demo/overview");
+    if (officialOverview.status !== 200 || officialOverview.body.error) {
+      fail(`Assigned official [${L}]: /api/demo/overview failed, so the `
+        + `render assertions below would prove nothing: `
+        + `${JSON.stringify(officialOverview).slice(0, 200)}`);
+    }
+    const officialRow = (officialOverview.body.schedule || [])
+      .find((g) => g.game_id === game.body.id);
+    if (!officialRow) {
+      fail(`Assigned official [${L}]: the fixture game is absent from this `
+        + `official's schedule, so nothing below is being asserted`);
+    }
+    if ("roster_status" in officialRow) {
+      fail(`Assigned official [${L}]: schedule[].roster_status was served to `
+        + `a caller entitled to no side of this game -- `
+        + `${JSON.stringify(officialRow.roster_status)}`);
+    }
+    if (officialRow.roster_status_restricted !== true
+        || officialRow.roster_status_team_id !== null) {
+      fail(`Assigned official [${L}]: the withheld row carries no explicit `
+        + `marker, so the screen has nothing to distinguish it from a real `
+        + `unconfirmed roster: ${JSON.stringify(officialRow)}`);
+    }
+    await page.evaluate(() => switchTab("games"));
+    await waitForView(page, "games");
+    await waitForRealContent(page);
+    await page.waitForSelector(".games-row", { timeout: 10000 });
+    // Expand THIS game's row -- clicked by its own game id, so re-ordering
+    // the list cannot silently retarget the assertion at another game.
+    await page.click(`.games-row[data-games-toggle="${game.body.id}"]`);
+    await page.waitForSelector(".games-detail", { timeout: 10000 });
+    const officialGames = await page.evaluate((gid) => {
+      const head = document.querySelector(`.games-row[data-games-toggle="${gid}"]`);
+      const detail = head && head.nextElementSibling;
+      const checks = Array.from(
+        (detail || document).querySelectorAll(".games-detail .check"));
+      const roster = checks.find((c) => {
+        const lbl = c.querySelector(".lbl");
+        return lbl && lbl.textContent.trim() === "Roster";
+      });
+      return {
+        badge: head ? (head.querySelector(".pill") || {}).textContent : null,
+        rosterClass: roster ? roster.className : null,
+        rosterMeta: roster
+          ? ((roster.querySelector(".meta") || {}).textContent || "").trim()
+          : null,
+        detailText: (detail ? detail.textContent : "").replace(/\s+/g, " "),
+      };
+    }, game.body.id);
+    if (!officialGames.rosterClass) {
+      fail(`Assigned official [${L}]: no "Roster" checklist line rendered, so `
+        + `the withheld state has no proven rendering: `
+        + `${JSON.stringify(officialGames)}`);
+    }
+    // THE THIRD STATE, and it is the point: `check todo` is the rendering of
+    // "this roster is not confirmed", which is exactly the false claim.
+    if (!/\bunknown\b/.test(officialGames.rosterClass)
+        || /\btodo\b/.test(officialGames.rosterClass)
+        || /\bok\b/.test(officialGames.rosterClass)) {
+      fail(`Assigned official [${L}]: a withheld roster status rendered as a `
+        + `done/to-do checklist state ("${officialGames.rosterClass}") -- `
+        + `restricted data must never be shown as an empty operational `
+        + `state`);
+    }
+    if (!/not shown/i.test(officialGames.rosterMeta || "")) {
+      fail(`Assigned official [${L}]: the withheld roster line does not say `
+        + `it was withheld, got "${officialGames.rosterMeta}"`);
+    }
+    if (/not confirmed/i.test(officialGames.detailText)
+        || /Draft — no players/i.test(officialGames.detailText)) {
+      fail(`Assigned official [${L}]: the game row asserts an operational `
+        + `roster state this reader was never shown: `
+        + `${officialGames.detailText.slice(0, 200)}`);
+    }
+    // And the row's own badge claims neither readiness nor an open roster.
+    if (/Roster open/i.test(officialGames.badge || "")
+        || /^\s*Ready\s*$/i.test(officialGames.badge || "")) {
+      fail(`Assigned official [${L}]: the row badge "${officialGames.badge}" `
+        + `states a readiness verdict whose roster half was withheld`);
     }
     await logout(page);
 

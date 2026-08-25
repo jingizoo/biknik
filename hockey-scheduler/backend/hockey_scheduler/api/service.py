@@ -57,6 +57,12 @@ from ..domain.errors import (
 from ..services import season_guard
 from ..services import lineup_visibility
 from ..services import visibility_policy
+# THE SERVER'S TRUSTED SIDE RESOLUTION, imported from `services/` rather than
+# from `web/scope.py` where it used to live: the Dashboard read below resolves
+# a side PER SCHEDULE ROW inside this facade, and the facade imports nothing
+# from `web/`. See `services/game_side_scope.py` for why it moved instead of
+# being copied.
+from ..services.game_side_scope import game_scoped_own_team_id
 from ..services import (
     ACTOR_TYPES,
     AccountService,
@@ -10290,6 +10296,118 @@ class ApiService:
             return False
         return True
 
+    #: The Dashboard schedule row's roster-status block when the caller is
+    #: entitled to NO side of that game. The ``roster_status`` key is ABSENT
+    #: — not ``null``, not an enum value — and an explicit marker says so.
+    #:
+    #: WHY A MARKER AND NOT JUST OMISSION. ``roster_status`` is a string enum
+    #: and every consumer of it in ``web/static/app.js`` asks the same kind of
+    #: question: ``["roster_confirmed", "locked"].includes(g.roster_status)``.
+    #: A missing key and a ``null`` both answer that ``false``, which renders
+    #: as the badge "Roster open" and the checklist line "Roster — not
+    #: confirmed": restricted data represented as an EMPTY OPERATIONAL STATE,
+    #: the exact failure the owner's ruling names, and a false claim about the
+    #: other team rather than a true one about the reader. The flag is what
+    #: lets the screen say "not shown" instead of guessing, and it is present
+    #: on EVERY row — entitled or not — so a consumer never has to infer
+    #: withholding from a missing key.
+    _ROSTER_STATUS_WITHHELD = {"roster_status_restricted": True,
+                               "roster_status_team_id": None}
+
+    def _schedule_roster_status(self, game, role, scope) -> dict:
+        """The Dashboard schedule row's roster-status fields, for the side
+        THIS caller is entitled to IN THIS GAME (#205 blocker, round 4).
+
+        THE DEFECT THIS CLOSES, and it is the owner's shape verbatim. The
+        schedule loop called ``compute_roster_status(g.id)`` with NO team, and
+        that method applies ``team_id = team_id or game.home_team_id`` — the
+        identical silent home default this blocker spent three rounds removing
+        from ``get_board``, ``/roster-status`` and
+        ``list_substitute_candidates``. There was no participation gate, no
+        side narrowing, no audience test and no ``APP_MODE`` gate: the "demo"
+        in the path is historical, and ``web/static/app.js`` fetches this
+        route unconditionally on every render pass for every role. Reproduced
+        tri-store over real authenticated sessions with the two sides made to
+        DIFFER (HOME ``needs_substitute`` / AWAY ``open_slot``): an AWAY
+        Coach, an AWAY Player, an assigned official, a linked guardian AND a
+        coach of a third team not playing in the game each received
+        ``roster_status: "needs_substitute"`` — HOME's value — while
+        ``/roster-status`` one route away answered them ``team_2``,
+        ``team_2``, 403, 403 and 403 respectively.
+
+        A PER-ROW DECISION, not one side for the response. This is a
+        CROSS-GAME list: a Coach is in some of these games and not others, and
+        their side is HOME in one and AWAY in the next. So the side is
+        resolved per row, from ``game_scoped_own_team_id`` against THAT game,
+        and classified by the SAME ``lineup_visibility.route_audience`` the
+        seven leaves of the private-game family use — so the Dashboard and
+        ``/roster-status`` cannot describe one caller two ways.
+
+        ``FULL`` — an unscoped operator (or an in-process caller with no role,
+            the facade's own default) keeps exactly what they have today: the
+            home-side status, unchanged. Narrowing them would be its own
+            regression. The side is now NAMED rather than left to be inferred.
+
+        ``OWN_SIDE`` — a Coach or Player playing in this game gets THEIR OWN
+            side's status. This is a fix, not only a redaction: an AWAY
+            Coach's Dashboard used to report the opponent's roster as their
+            own, and their own "Rosters to confirm" tile counted the wrong
+            team's.
+
+        EVERYONE ELSE IS WITHHELD — and that includes an ASSIGNED OFFICIAL,
+        for whom ``route_audience`` returns ``SUBMITTED_LINEUP`` on the
+        family's own leaves. Three reasons, and the first is decisive:
+
+        1. THIS ROUTE HAS NO PER-GAME ASSIGNMENT GATE. The family's leaves sit
+           behind ``can_read_private_game_data``, which is what makes
+           ``SUBMITTED_LINEUP`` mean "an official ASSIGNED TO THIS GAME" —
+           :func:`services.lineup_visibility.route_audience` says so in its
+           own comment. The schedule here is scoped to a Program/Season/League
+           and lists every game in it, assigned or not. Honouring the label
+           would serve an official private state for games they were never
+           assigned to: strictly WIDER than the family, which is the same
+           complaint that put this route in scope.
+        2. THERE IS NO HONEST SINGLE-SIDE ANSWER. An official's entitlement is
+           a per-side submitted-lineup projection; this field is ONE enum for
+           the whole game. Picking a side to attach it to is the guess the
+           blocker exists to remove.
+        3. IT WOULD DEFEAT :meth:`_submitted_lineup_status` ONE ROUTE AWAY.
+           The value this field carries at HEAD is ``needs_substitute``, which
+           that method neutralises by name — its own docstring calls it "the
+           needs_substitute state, which exists precisely to say a substitute
+           pool is standing by". Serving it here recovers through a sibling
+           exactly what the projection removes.
+
+        NOTHING RENDERS IT FOR THEM, either, which is why withholding costs no
+        screen: ``gateChrome()`` hides Dashboard, Activity and Scheduler from
+        every role without ``manage_roster``/``manage_schedule`` — an
+        official, a player, a guardian and a viewer all — and the official's
+        own surfaces are My Assignments and the Game Sheet, which reads
+        ``/lineups``, where the projection already governs. The one surface
+        that renders ``roster_status`` and is reachable by them is the
+        ungated Games list, an operator readiness checklist, which now renders
+        the marker rather than a guess.
+        """
+        own_side = game_scoped_own_team_id(role, scope, game, self.store)
+        audience = lineup_visibility.route_audience(
+            role, own_side, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            side = game.home_team_id
+        elif audience == lineup_visibility.OWN_SIDE:
+            side = own_side
+        else:
+            return dict(self._ROSTER_STATUS_WITHHELD)
+        return {
+            "roster_status": self.roster.compute_roster_status(
+                game.id, side).status.value,
+            "roster_status_restricted": False,
+            # WHICH side this enum describes, stated rather than inferred —
+            # the same correction `get_board` made when it started returning
+            # an explicit `team_id`. For an unscoped operator this names the
+            # home default that has always been silently applied.
+            "roster_status_team_id": side,
+        }
+
     def get_demo_overview(self, user_id=None, role=None, scope=None) -> dict:
         """Assemble the League/Arena/Schedule/Public view for the E2E demo.
 
@@ -10545,7 +10663,9 @@ class ApiService:
             if not _in_scope_game(g):
                 continue
             div = divisions.get(g.division_id)
-            rstatus = self.roster.compute_roster_status(g.id)
+            # WHICH SIDE'S roster status THIS caller may read, decided PER ROW
+            # (#205 blocker, round 4). See `_schedule_roster_status`.
+            row_status = self._schedule_roster_status(g, role, scope)
             venue_name = None
             slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
             if slot and slot.rink_id in rinks:
@@ -10554,6 +10674,11 @@ class ApiService:
             g_active = self._active_officials(g.id)
             g_result = self.store.result_for_game(g.id)
             schedule.append({
+                # `roster_status` is spread FIRST so a withheld row simply has
+                # no such key at all — see `_schedule_roster_status`. Written
+                # ahead of the literal fields rather than merged after them
+                # so nothing below can be shadowed by it.
+                **row_status,
                 "game_id": g.id,
                 "home_team_id": g.home_team_id,
                 "away_team_id": g.away_team_id,
@@ -10564,7 +10689,6 @@ class ApiService:
                 "ice_slot_id": g.ice_slot_id,
                 "rink_name": g.rink, "venue_name": venue_name,
                 "start_time": g.start_time.isoformat(),
-                "roster_status": rstatus.status.value,
                 "published": g.published,
                 "cancelled": g.cancelled,  # Games view offers Cancel, not Delete (#215)
                 # Officials summary for the Games operations checklist (#30).

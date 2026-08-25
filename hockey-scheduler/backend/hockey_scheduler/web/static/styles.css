@@ -1209,6 +1209,10 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .check .ic { width: 20px; text-align: center; }
 .check.ok .ic { color: var(--green); }
 .check.todo .ic { color: var(--muted); }
+/* #205: a check whose answer is WITHHELD from this reader — neither done
+   nor to-do. Its own class so it can never be styled, or read, as either. */
+.check.unknown .ic { color: var(--muted); }
+.check.unknown .lbl { color: var(--muted); }
 .check .lbl { flex: 1; }
 .check .meta { font-size: 12px; color: var(--muted); }
 

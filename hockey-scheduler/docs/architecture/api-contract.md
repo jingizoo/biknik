@@ -159,6 +159,55 @@ Attribution comes from the stored `GameRosterEntry.team_side` and
 `Player.team_id`. A legacy row with NULL attribution names no side, so it is
 withheld from **both** rather than guessed onto one.
 
+### Per-side private state outside the `/games/{id}/…` family (#205)
+
+The boundary is the *state*, not the path. One route outside that dispatch
+carries a per-side private value:
+
+```http
+GET /api/demo/overview  ->  schedule[].roster_status
+```
+
+`roster_status` is the same per-side operational enum `roster-status`
+returns, and it is **not** public — `/api/public/schedule`,
+`/api/public/games/{id}` and this payload's own `public_fixtures` all omit it.
+It used to be computed with no side at all, so `RosterService`'s
+`team_id or game.home_team_id` default served the **home** side's value to
+every reader — including a coach whose team plays in the game as the away
+side, and a coach whose team is not in the game at all.
+
+The schedule is a **cross-game list**, so the side is resolved **per row**
+(`game_scoped_own_team_id` against that row's game) and classified by the same
+`route_audience` the family uses:
+
+| Caller | `schedule[].roster_status` |
+|---|---|
+| League Admin, Arena Manager | home side, unchanged; `roster_status_team_id` now names it |
+| Coach, Player — in that game | **their own side's** value |
+| Coach, Player — not in that game | **omitted** |
+| Assigned official | **omitted** |
+| Guardian, viewer | **omitted** |
+
+A withheld row **omits the `roster_status` key entirely** and carries
+`roster_status_restricted: true` with `roster_status_team_id: null`. The
+marker is not decoration: every consumer of this field asks
+`["roster_confirmed", "locked"].includes(g.roster_status)`, which a missing key
+and a `null` both answer `false` — rendering as "Roster open" / "not
+confirmed", i.e. the withheld state expressed as an *empty operational state*.
+The flag is what lets a screen say "not shown" instead. It is present on every
+row, entitled or not, so a consumer never infers withholding from a missing
+key. `roster_status_team_id` names which side the value describes on entitled
+rows.
+
+An **assigned official is withheld here** even though the family serves them a
+`submitted_lineup` projection, because this route has no per-game assignment
+gate: its schedule lists every game in the active Program/Season/League, so
+honouring that projection would serve an official private state for games they
+were never assigned to — strictly *wider* than the family. There is also no
+honest single-side answer (one enum, a two-sided entitlement), and the value it
+would carry is `needs_substitute`, which `_submitted_lineup_status` neutralises
+by name one route away.
+
 ### Which side a substitute enrollment belongs to
 
 `SubstituteEnrollment.team_id` — the side the row was **admitted** on — and

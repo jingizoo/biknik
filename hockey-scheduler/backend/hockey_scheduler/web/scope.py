@@ -19,6 +19,17 @@ from ..domain import Role
 # deliberately NOT used below for a game-scoped decision (#205 blocker 1) —
 # see `game_scoped_own_team_id`.
 from ..services.subject_scope import own_team_id, player_team_id  # noqa: F401
+# THE GAME-SCOPED resolution, and the reason it no longer lives in this file:
+# `GET /api/demo/overview` resolves a side PER SCHEDULE ROW inside the facade's
+# own loop, and `api/service.py` imports nothing from `web/`. Rather than write
+# a second answer to "which team does this caller act for" — the exact shape
+# four rounds of #427 were spent deleting — the ONE definition moved to
+# `services/game_side_scope.py` and is imported straight back out here, so
+# `can_read_private_game_data` below and every existing
+# `from .scope import game_scoped_own_team_id` caller are byte-for-byte
+# unchanged.
+from ..services.game_side_scope import (  # noqa: F401
+    _player_team_for_game, game_scoped_own_team_id)
 # `RosterService.team_for_game` is THE #205 game-scoped eligibility resolver
 # (`services/roster_service.py`) — the same one substitute enroll/offer/
 # accept already resolve through. No import-cycle risk: roster_service.py
@@ -167,63 +178,6 @@ def scope_violation(role, scope, path, body, store, *,
             assignment = store.get_official_assignment(m.group(1))
             if assignment is not None and assignment.official_id != own:
                 return "Officials can only respond to their own assignments."
-    return None
-
-
-def _player_team_for_game(scope, game, store):
-    """Which team a Player-scoped caller acts for, in THIS ``game``
-    specifically (#205 blocker 1) — resolved through the SAME game-scoped
-    membership resolver the substitute workflow itself uses
-    (``RosterService.team_for_game``), never the permanent ``Player.team_id``
-    pointer alone, which a mid-season transfer can leave stale for this exact
-    game in either direction (a real Mover wrongly denied, or a player whose
-    membership has since moved off the team wrongly still granted).
-
-    Preserves the #270 fail-closed posture ``player_team_id`` established — a
-    deactivated player's login must not outlive their roster exit — with the
-    SAME ``is_active`` check, so this is a strict refinement of that
-    function's contract, not a loosening of it. Falls back to the permanent
-    pointer only when ``game`` carries no LeagueSeason binding (exhibitions
-    and unbound legacy games), exactly as ``team_for_game`` itself does —
-    byte-for-byte pre-#205 behavior there.
-    """
-    scope = scope or {}
-    player_id = scope.get("player_id")
-    if not player_id:
-        return None
-    player = store.get_player(player_id)
-    if player is None or not player.is_active:
-        return None
-    return RosterService(store).team_for_game(game, player)
-
-
-def game_scoped_own_team_id(role, scope, game, store):
-    """The team the caller acts for, resolved specifically against ``game``
-    (#205 blocker 1) — the game-scoped analogue of ``own_team_id`` above.
-
-    A Coach's team is unchanged: still the permanently-bound
-    ``scope["team_id"]``. There is no ``CoachSeasonMembership`` (or any
-    season-scoped Coach model) anywhere in this codebase — a Coach's team
-    assignment genuinely IS permanent, so no game-scoped resolution applies
-    there. A Player's team is resolved live against ``game`` via
-    ``_player_team_for_game`` (``RosterService.team_for_game``), replacing
-    the permanent ``Player.team_id`` pointer ``own_team_id``/
-    ``player_team_id`` use.
-
-    NOT a drop-in replacement for the generic, game-agnostic
-    ``own_team_id`` — that function is correctly shared with the #159
-    active-context selector (``services/context_scope.py``), a different
-    surface with no single game to resolve against, and stays untouched.
-    This helper is for exactly the two HTTP call sites that must resolve
-    "own team" against ONE particular game's privacy/scope boundary:
-    ``can_read_private_game_data`` and the ``availability-summary``
-    sub-scope in ``web/server.py``.
-    """
-    scope = scope or {}
-    if role == Role.COACH:
-        return scope.get("team_id")
-    if role == Role.PLAYER:
-        return _player_team_for_game(scope, game, store)
     return None
 
 

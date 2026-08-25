@@ -1152,6 +1152,18 @@ const dayOf = (iso) => (iso || "").slice(0, 10);
 // zone and could print a different day than the time beside it.
 const fmtRowDate = (iso) => { const d = dayOf(iso); return d ? fmtDate(d) : ""; };
 
+/* A schedule row whose roster status this reader is not entitled to (#205).
+   The server OMITS `roster_status` entirely for such a row and flags it, so
+   nothing here may fall back to reading the absent key: every consumer below
+   asks `["roster_confirmed","locked"].includes(g.roster_status)`, and a
+   missing key answers that `false` — which would render as "Roster open" /
+   "not confirmed", i.e. the opponent's private state represented as an empty
+   operational state, the exact thing the omission exists to avoid. */
+const ROSTER_STATUS_HIDDEN = "Not shown for your role";
+const rosterStatusKnown = (g) => !g.roster_status_restricted;
+const rosterConfirmed = (g) => rosterStatusKnown(g)
+  && ["roster_confirmed", "locked"].includes(g.roster_status);
+
 // Per-game triage: derive a status badge + a staffing note from the schedule
 // row's real fields (officials assigned/accepted, roster status, result).
 function gameTriage(g) {
@@ -1159,11 +1171,17 @@ function gameTriage(g) {
     return { badge: "final", label: "Final", note: "Result final", noteCls: "ok" };
   const assigned = g.officials_assigned || 0;
   const accepted = g.officials_accepted || 0;
-  const rosterOk = ["roster_confirmed", "locked"].includes(g.roster_status);
+  const rosterOk = rosterConfirmed(g);
   if (assigned === 0)
     return { badge: "needs", label: "Needs staff", note: "No officials assigned", noteCls: "bad" };
   if (accepted < assigned)
     return { badge: "needs", label: "Needs staff", note: "Officials pending acceptance", noteCls: "warn" };
+  // The roster leg is UNKNOWN, not failed — so neither "Roster open" (which
+  // asserts that team has an unconfirmed roster) nor "Ready" (which asserts
+  // it is set) may be claimed. Its own badge says which of the two checks
+  // actually passed and which was withheld.
+  if (!rosterStatusKnown(g))
+    return { badge: "partial", label: "Officials set", note: "Roster status not shown", noteCls: "muted" };
   if (!rosterOk)
     return { badge: "needs", label: "Roster open", note: "Roster not confirmed", noteCls: "warn" };
   return { badge: "ready", label: "Ready", note: "Officials & roster set", noteCls: "ok" };
@@ -3078,8 +3096,11 @@ function renderDashboard(ov, standings) {
 
   // Staffing gaps across all scheduled games.
   const needStaff = games.filter((g) => g.result_status !== "final" && gameTriage(g).badge === "needs");
+  // A row whose roster status is WITHHELD is not counted as "to confirm":
+  // that would assert an unconfirmed roster for a team this reader cannot
+  // see, and would put a number on this tile that no screen can explain.
   const toConfirm = games.filter((g) =>
-    g.result_status !== "final" && !["roster_confirmed", "locked"].includes(g.roster_status));
+    g.result_status !== "final" && rosterStatusKnown(g) && !rosterConfirmed(g));
 
   const pill = (cls, txt) => `<span class="ds-pill ${cls}">${esc(txt)}</span>`;
   const stat = (label, n, sub, pillHtml) => `
@@ -8051,7 +8072,8 @@ function renderWizard(ov) {
 // its own Open-Roster/Publish buttons are never nested inside a button.
 function gamesRow(g) {
   const t = gameTriage(g);
-  const badgeCls = { final: "gray", needs: "blocked", ready: "available" }[t.badge] || "gray";
+  const badgeCls = { final: "gray", needs: "blocked", ready: "available",
+                     partial: "gray" }[t.badge] || "gray";
   const expanded = gamesExpanded.has(g.game_id);
   const head = `<button class="li li-btn games-row" data-games-toggle="${esc(g.game_id)}" aria-expanded="${expanded}">
     <span class="li-time">${fmt(g.start_time)}</span>
@@ -8060,9 +8082,17 @@ function gamesRow(g) {
     <span class="pill ${badgeCls}">${esc(t.label)}</span>
     <span class="games-caret" aria-hidden="true">${expanded ? "▲" : "▼"}</span></button>`;
   if (!expanded) return head;
-  const confirmed = g.roster_status === "roster_confirmed" || g.roster_status === "locked";
-  const ck = (ok, lbl, meta) => `<div class="check ${ok ? "ok" : "todo"}"><span class="ic">${ok ? "✓" : "○"}</span>
+  const confirmed = rosterConfirmed(g);
+  // THREE states, not two (#205): `ok === null` is "withheld", which is
+  // neither done nor to-do. `ck(false, …)` renders ○ + the "todo" class and
+  // would claim this team's roster is not confirmed — a false operational
+  // claim about the other team rather than a true one about the reader.
+  const ck = (ok, lbl, meta) => {
+    const cls = ok === null ? "unknown" : ok ? "ok" : "todo";
+    const ic = ok === null ? "–" : ok ? "✓" : "○";
+    return `<div class="check ${cls}"><span class="ic">${ic}</span>
     <span class="lbl">${lbl}</span>${meta ? `<span class="meta">${meta}</span>` : ""}</div>`;
+  };
   // #277: the schedule review shows the same derived reserved span as the
   // calendar and the scheduler's draft rows (one backend derivation).
   const rsv = g.reserved
@@ -8070,7 +8100,9 @@ function gamesRow(g) {
     : "";
   const detail = `<div class="games-detail">
     ${ck(true, "Ice slot allocated")}${rsv}
-    ${ck(confirmed, "Roster", prettyStatus(g.roster_status))}
+    ${rosterStatusKnown(g)
+       ? ck(confirmed, "Roster", prettyStatus(g.roster_status))
+       : ck(null, "Roster", ROSTER_STATUS_HIDDEN)}
     ${ck((g.officials_assigned || 0) > 0 && (g.officials_accepted || 0) === g.officials_assigned, "Officials",
          g.officials_assigned ? `${g.officials_accepted}/${g.officials_assigned} accepted` : "None assigned")}
     ${ck(false, "Locker rooms", "Follow-up")}
@@ -8100,7 +8132,12 @@ function renderGames(ov) {
   // derived from the data actually present; status uses gameTriage's own label
   // so the filter and the row badge can never disagree.
   const f = gamesFilter;
-  const STATUSES = ["Needs staff", "Roster open", "Ready", "Final"];
+  // "Officials set" is gameTriage's label for a row whose roster status is
+  // withheld (#205). Offered only when such a row is actually present, per
+  // this block's own rule that the options come from the data — for an
+  // operator, who is entitled to every row's status, the list is unchanged.
+  const STATUSES = ["Needs staff", "Roster open", "Ready", "Final"]
+    .concat(all.some((g) => !rosterStatusKnown(g)) ? ["Officials set"] : []);
   const rinkNames = [...new Set(all.map((g) => g.rink_name).filter(Boolean))].sort();
   const shown = all.filter((g) => {
     if (f.division !== "all" && g.division_id !== f.division) return false;

@@ -200,10 +200,15 @@ body[data-view="games"] .main > .content { max-width: 1480px; }
 .tg-note.warn { color: #b4690e; }
 .tg-note.bad { color: #c62828; }
 .tg-note.ok { color: #1a8a44; }
+/* #205: a note about what was WITHHELD, not about the game. */
+.tg-note.muted { color: var(--muted); }
 .tg-status { flex: 0 0 auto; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 20px; }
 .tg-status.ready { background: #e7f7ec; color: #1a8a44; }
 .tg-status.needs { background: #fdf0dd; color: #b4690e; }
 .tg-status.final { background: #eef0f4; color: #6b7280; }
+/* #205: the roster leg of readiness was withheld from this reader, so the
+   row claims neither "Ready" nor "Roster open". */
+.tg-status.partial { background: #eef0f4; color: #6b7280; }
 
 /* needs attention rows */
 .na-row { display: flex; gap: 12px; padding: 13px 18px; border-bottom: 1px solid var(--line); }
