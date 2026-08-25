@@ -115,8 +115,27 @@ from hockey_scheduler.services.roster_service import RosterService
 #: obtainable private game state". ``availability-summary`` joined the list in
 #: round 2: it is the fifth leaf of the same ``re.match`` block, behind the
 #: same gate, and it was the last one still answering around the projection.
+#: ``substitute-candidates`` and ``substitute-addable`` joined in round 3 —
+#: the SIXTH and SEVENTH leaves of that same block, and the last two still
+#: binding a side their own way. Every leaf of the block that carries private
+#: player data is now in this tuple, which is the point: the boundary is the
+#: BLOCK, not a list of routes someone remembered.
 PRIVATE_SIBLINGS = ("board", "roster-status", "roster", "substitutes",
-                    "availability-summary")
+                    "availability-summary", "substitute-candidates",
+                    "substitute-addable")
+
+#: The two leaves whose whole subject is substitute WORKFLOW state and which
+#: additionally require ``MANAGE_ROSTER`` — so a Player and an assigned
+#: Official are refused by a capability gate BEFORE the side question is even
+#: asked. Named separately because that makes their expected answers
+#: different from the other five for a reason that has nothing to do with the
+#: side projection.
+WORKFLOW_SIBLINGS = ("substitute-candidates", "substitute-addable")
+
+#: The list key each workflow leaf answers with. Both must be absent from a
+#: refusal: an empty one claims "this team has nobody left to call".
+WORKFLOW_PAYLOAD_KEY = {"substitute-candidates": "candidates",
+                        "substitute-addable": "addable"}
 
 #: Query strings that NAME A SIDE. Every one of them is a client hint and
 #: every one must be ignored: `team_id` because that is the parameter the
@@ -364,6 +383,102 @@ class _SiblingHarness(_ProjectionHarness):
                             viewer_team_id=viewer_team_id)
             target, attr, patch = (api, "get_availability_summary",
                                    _catching(summary))
+        elif kind == "workflow_hint_honoured":
+            # ROUND 3, the hint half: the side comes from whatever the client
+            # named, with the audience refusal left INTACT -- so a test that
+            # only drove the official cannot cover for it. This is the shape
+            # the two leaves really had: their inline check compared the hint
+            # to the session's own team and 403'd on a mismatch, which is a
+            # hint that SELECTS (or refuses) rather than one that is ignored.
+            real = api._workflow_side
+
+            def workflow_side(self, game, team_id, viewer_role,
+                              viewer_team_id, refusal):
+                audience = lineup_visibility.route_audience(
+                    viewer_role, viewer_team_id, game.home_team_id,
+                    game.away_team_id)
+                if audience in (lineup_visibility.OWN_SIDE,
+                                lineup_visibility.FULL):
+                    return team_id or viewer_team_id or game.home_team_id
+                return real(self, game, team_id, viewer_role, viewer_team_id,
+                            refusal)
+            target, attr, patch = api, "_workflow_side", workflow_side
+        elif kind == "workflow_home_defaulted":
+            # ROUND 3, the SILENT HOME FALLBACK, alone: the trusted side is
+            # dropped on the way in and `team_id or game.home_team_id` --
+            # still live in `list_substitute_candidates` /
+            # `list_addable_players` for the unscoped operator it is correct
+            # for -- becomes reachable by a SCOPED caller again. This is
+            # `get_board`'s original defect, in the last place its shape
+            # survives, and it is a DIFFERENT claim from the hint one: a
+            # caller who names nothing at all still gets HOME.
+            def workflow_side(self, game, team_id, viewer_role,
+                              viewer_team_id, refusal):
+                audience = lineup_visibility.route_audience(
+                    viewer_role, viewer_team_id, game.home_team_id,
+                    game.away_team_id)
+                if audience in (lineup_visibility.OWN_SIDE,
+                                lineup_visibility.FULL):
+                    return team_id or game.home_team_id
+                from hockey_scheduler.domain.errors import NotAuthorizedError
+                raise NotAuthorizedError(refusal)
+            target, attr, patch = api, "_workflow_side", workflow_side
+        elif kind == "workflow_served_to_any_audience":
+            # ROUND 3, the audience half: no audience test at all, exactly as
+            # these two leaves stood -- the side is whatever the caller
+            # supplied or their session carried, whoever they are. The
+            # MANAGE_ROSTER gate hides this over HTTP today, which is
+            # precisely why the facade is driven DIRECTLY here: the side rule
+            # must not be contingent on a permission table that lives
+            # somewhere else and can change without it.
+            def workflow_side(self, game, team_id, viewer_role,
+                              viewer_team_id, refusal):
+                return team_id or viewer_team_id or game.home_team_id
+            target, attr, patch = api, "_workflow_side", workflow_side
+        elif kind in ("candidates_empty_instead_of_forbidden",
+                      "addable_empty_instead_of_forbidden"):
+            # THE RULING'S NAMED FAILURE MODE on these two: refuse by
+            # answering an empty pool, which asserts "this team has nobody
+            # left to call" -- an operational claim about the team rather
+            # than a fact about the reader.
+            #
+            # ONE FALSIFIER PER ROUTE, not one covering both: they are two
+            # routes with two refusals, and a single entry would let either
+            # one's refusal go unfalsified while the name still reported
+            # "broke". Same reason `substitute-candidates` and
+            # `substitute-addable` carry separate route_extract waivers.
+            if kind.startswith("candidates"):
+                method, key = "get_substitute_candidates", "candidates"
+            else:
+                method, key = "get_addable_substitutes", "addable"
+            real = getattr(api, method)
+
+            def emptied(self, game_id, team_id=None, viewer_role=None,
+                        viewer_team_id=None):
+                out = real(self, game_id, team_id, viewer_role=viewer_role,
+                           viewer_team_id=viewer_team_id)
+                if isinstance(out, dict) and "error" in out:
+                    return {"game_id": game_id, "team_id": team_id,
+                            "locked": False, "cancelled": False, key: []}
+                return out
+            target, attr, patch = api, method, emptied
+        elif kind == "workflow_operator_narrowed":
+            # THE OTHER DIRECTION, and its own falsifier for the same reason
+            # the availability rollup has one: narrowing the UNSCOPED
+            # OPERATOR is its own regression, not a milder version of the
+            # fix. The shape restored is `get_board`'s hard-coded HOME,
+            # applied to the operator branch only.
+            real = api._workflow_side
+
+            def workflow_side(self, game, team_id, viewer_role,
+                              viewer_team_id, refusal):
+                if lineup_visibility.route_audience(
+                        viewer_role, viewer_team_id, game.home_team_id,
+                        game.away_team_id) == lineup_visibility.FULL:
+                    return game.home_team_id
+                return real(self, game, team_id, viewer_role, viewer_team_id,
+                            refusal)
+            target, attr, patch = api, "_workflow_side", workflow_side
         elif kind == "candidates_by_live_membership":
             # F5, the read half: the outreach queue attributed by LIVE
             # membership, which is what served a NULL-owner row to whichever
@@ -1340,6 +1455,244 @@ class ANullOwnerEnrollmentIsServedCountedAndActedOnByNobody(
             finally:
                 self._close(label, store)
         self._assert_matrix_ran(ran, ["null_owner_nowhere"])
+
+
+# ---------------------------------------------------------------------------
+# 9. F6 — /substitute-candidates and /substitute-addable, the SIXTH and
+#    SEVENTH leaves, bind their side the same way as the other five.
+# ---------------------------------------------------------------------------
+class TheWorkflowPoolsAreProjectedLikeTheirSiblings(_SiblingHarness,
+                                                    unittest.TestCase):
+    """The LAST two leaves of the private-game ``re.match`` block, and the
+    only other one besides the availability rollup that reads a side from the
+    query string.
+
+    WHY THEY WERE STILL OPEN AFTER ROUND 2, stated exactly. Round 2 closed the
+    rollup and, IN THE SAME COMMIT, wrote the family rule into
+    ``docs/architecture/api-contract.md`` over a route list that NAMES
+    ``substitute-candidates``::
+
+        "A side is never trusted from the query string or the body -- a
+        `?team_id=` or `?side=` naming the opponent is *ignored* for a scoped
+        caller, so a hinted request returns exactly what the un-hinted one
+        returns."
+
+    That was false for this route the day it was written. Measured over real
+    authenticated sessions at e8953ac, tri-store: an AWAY Coach's
+    ``GET /substitute-candidates`` answered ``200`` with their own queue,
+    while ``?team_id=<home>`` answered ``403 "You can only view your own
+    team's queue."`` — a hinted call answered DIFFERENTLY from an un-hinted
+    one, on a route the shipped contract listed as one where it is not. Same
+    on ``/substitute-addable``. So the family had two hint-reading leaves
+    adjudicating a hint two different ways, which is the drift this whole
+    blocker exists to remove, and a contract that described only one of them.
+
+    FOUR SEPARATE PROPERTIES, four falsifiers, because they are four
+    independent claims and any one of them could pass while another failed:
+
+    * a Coach's hint is IGNORED — a hinted call is byte-identical to an
+      un-hinted one, on BOTH routes, in BOTH directions;
+    * the side is the TRUSTED one and never the silent ``team_id or
+      game.home_team_id`` default that still lives in the service layer for
+      the unscoped operator it is correct for. Driven at the FACADE with no
+      hint at all and a trusted AWAY side, which is the only way to reach
+      that default: over HTTP the leaf's own own-team default masks it, and a
+      defence that is only reachable through one caller is not a proof;
+    * an audience that may not read a private candidate pool is REFUSED, not
+      handed ``candidates: []`` / ``addable: []``. Driven at the FACADE too,
+      deliberately: over HTTP the ``MANAGE_ROSTER`` capability gate refuses an
+      official and a player first, and the entire lesson of this blocker is
+      that the side rule must not be contingent on a check that lives
+      somewhere else and can change without it;
+    * the UNSCOPED OPERATOR is byte-for-byte unchanged, proven against the
+      facade's own un-projected read rather than against a literal — and
+      still reaches BOTH sides, which a Coach cannot.
+    """
+
+    def _pool(self, body, route):
+        return {row["player_id"] for row in body[WORKFLOW_PAYLOAD_KEY[route]]}
+
+    def test_both_workflow_leaves_answer_only_the_trusted_side(self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                api = fx["api"]
+                from hockey_scheduler.domain import Role
+
+                # THE PREMISE: each side really has a non-empty pool on each
+                # route, and the two sides' pools are DISJOINT -- otherwise
+                # "own side only" could pass on an empty or identical answer.
+                for route in WORKFLOW_SIBLINGS:
+                    call = (api.get_substitute_candidates
+                            if route == "substitute-candidates"
+                            else api.get_addable_substitutes)
+                    home = self._pool(call(fx["gid"], fx["home"]), route)
+                    away = self._pool(call(fx["gid"], fx["away"]), route)
+                    self.assertTrue(home and away, (route, home, away))
+                    self.assertFalse(home & away,
+                                     f"fixture: {route}'s two pools overlap")
+
+                # CAPTURED BEFORE ANY FALSIFIER RUNS, for the same reason the
+                # availability class gives: these expectations go through the
+                # very method the operator falsifier replaces, so recomputing
+                # them inside the check would rewrite the answer key along
+                # with the code.
+                unprojected = {
+                    (route, team): (api.get_substitute_candidates
+                                    if route == "substitute-candidates"
+                                    else api.get_addable_substitutes)(
+                                        fx["gid"], team)
+                    for route in WORKFLOW_SIBLINGS
+                    for team in (fx["home"], fx["away"])}
+
+                def check_hint_ignored():
+                    for user, team in (("homecoach", fx["home"]),
+                                       ("awaycoach", fx["away"])):
+                        other = (fx["away"] if team == fx["home"]
+                                 else fx["home"])
+                        theirs = self._durable(fx, other)
+                        for route in WORKFLOW_SIBLINGS:
+                            plain = self._ok(who[user], fx, route)
+                            self.assertEqual(
+                                plain["team_id"], team,
+                                f"[{label}] {user}'s {route} named the OTHER "
+                                "side")
+                            for hint in SIDE_HINTS:
+                                status, hinted = self._get(
+                                    who[user], fx, route, f"?{hint}={other}")
+                                self.assertEqual(
+                                    status, 200,
+                                    f"[{label}] {user}: {route}?{hint}= "
+                                    "naming the opponent must be IGNORED, "
+                                    "not refused -- every sibling answers a "
+                                    "hinted call exactly as an un-hinted "
+                                    f"one: {hinted!r}")
+                                self.assertEqual(
+                                    hinted, plain,
+                                    f"[{label}] {user}: {route}?{hint}= "
+                                    "changed the answer -- a client hint "
+                                    "selected a side")
+                            self._assert_absent(
+                                plain, theirs, f"{label}/{user}/{route}",
+                                "the opponent's private workflow pool")
+
+                def check_trusted_side_not_home_default():
+                    """NO HINT AT ALL, a trusted AWAY side, straight at the
+                    facade — the one shape that reaches the service layer's
+                    ``team_id or game.home_team_id``."""
+                    for route in WORKFLOW_SIBLINGS:
+                        call = (api.get_substitute_candidates
+                                if route == "substitute-candidates"
+                                else api.get_addable_substitutes)
+                        out = call(fx["gid"], None, viewer_role=Role.COACH,
+                                   viewer_team_id=fx["away"])
+                        self.assertNotIn("error", out, (route, out))
+                        self.assertEqual(
+                            out["team_id"], fx["away"],
+                            f"[{label}] {route} fell back to the HOME default "
+                            "for a caller whose TRUSTED side is AWAY -- the "
+                            "same silent default get_board carried")
+                        self.assertEqual(
+                            self._pool(out, route),
+                            self._pool(unprojected[(route, fx["away"])],
+                                       route), (label, route))
+
+                def check_refused_not_emptied():
+                    """The audiences with no claim on a private candidate
+                    pool, driven at the FACADE (see the class docstring for
+                    why not over HTTP)."""
+                    for route in WORKFLOW_SIBLINGS:
+                        call = (api.get_substitute_candidates
+                                if route == "substitute-candidates"
+                                else api.get_addable_substitutes)
+                        key = WORKFLOW_PAYLOAD_KEY[route]
+                        for who_label, viewer_role, viewer_team in (
+                                # An assigned official: SUBMITTED_LINEUP.
+                                ("official", Role.OFFICIAL, None),
+                                # A Coach whose own side is not one of this
+                                # game's two: RESTRICTED, the fail-closed
+                                # branch.
+                                ("stranger-coach", Role.COACH, fx["third"]),
+                                ("sideless-coach", Role.COACH, None)):
+                            for hint in (None, fx["home"], fx["away"]):
+                                out = call(fx["gid"], hint,
+                                           viewer_role=viewer_role,
+                                           viewer_team_id=viewer_team)
+                                self.assertIn(
+                                    "error", out,
+                                    f"[{label}] {route} answered "
+                                    f"{who_label} (hint={hint!r}) instead of "
+                                    f"refusing: {out!r}")
+                                self.assertEqual(
+                                    out["error"]["code"], "forbidden",
+                                    (label, route, who_label, out))
+                                self.assertNotIn(
+                                    key, out,
+                                    f"[{label}] {route}'s refusal carried a "
+                                    f"{key!r} list -- an empty pool claims "
+                                    "this team has nobody left to call, a "
+                                    "statement about the TEAM rather than "
+                                    "about the reader")
+
+                def check_operator():
+                    for route in WORKFLOW_SIBLINGS:
+                        for team in (fx["home"], fx["away"]):
+                            served = self._ok(who["operator"], fx, route,
+                                              f"?team_id={team}")
+                            self.assertEqual(
+                                served, unprojected[(route, team)],
+                                f"[{label}] the operator's {route} was "
+                                "narrowed")
+
+                with self.subTest(backend=label):
+                    check_hint_ignored()
+                    check_trusted_side_not_home_default()
+                    check_refused_not_emptied()
+                    check_operator()
+                    # THE CAPABILITY GATE IS UNCHANGED, and it is a different
+                    # refusal from the side one: a Player and an assigned
+                    # Official are refused these two routes outright, for
+                    # every hint, and never with an empty pool.
+                    for user in ("homeplayer", "awayplayer", "official"):
+                        for route in WORKFLOW_SIBLINGS:
+                            for query in [""] + [
+                                    f"?team_id={t}"
+                                    for t in (fx["home"], fx["away"])]:
+                                body = self._forbidden(
+                                    who[user], fx, route,
+                                    f"{label}/{user}", query)
+                                self.assertNotIn(
+                                    WORKFLOW_PAYLOAD_KEY[route], body, body)
+
+                self._require_falsifier_breaks(
+                    "workflow_hint_honoured", check_hint_ignored,
+                    f"[{label}] the ignored side hint on the workflow pools")
+                self._require_falsifier_breaks(
+                    "workflow_home_defaulted",
+                    check_trusted_side_not_home_default,
+                    f"[{label}] the trusted side beating the HOME default")
+                self._require_falsifier_breaks(
+                    "workflow_served_to_any_audience", check_refused_not_emptied,
+                    f"[{label}] the workflow-pool audience refusal")
+                self._require_falsifier_breaks(
+                    "candidates_empty_instead_of_forbidden",
+                    check_refused_not_emptied,
+                    f"[{label}] refusal-not-empty on /substitute-candidates")
+                self._require_falsifier_breaks(
+                    "addable_empty_instead_of_forbidden",
+                    check_refused_not_emptied,
+                    f"[{label}] refusal-not-empty on /substitute-addable")
+                self._require_falsifier_breaks(
+                    "workflow_operator_narrowed", check_operator,
+                    f"[{label}] the unchanged operator workflow pools")
+                ran.append((label, "workflow_pools_projected"))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, ["workflow_pools_projected"])
 
 
 def _enrollment(fx, player_id):

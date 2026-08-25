@@ -3836,7 +3836,21 @@ class RosterService:
         a slot right now, ordered enrolled-first. ``rstatus`` may be a
         pre-computed RosterStatus for this game/team so a caller that already
         has one avoids a second compute_roster_status pass. A pure read helper
-        — must NOT be @_transactional. Returns plain dicts."""
+        — must NOT be @_transactional. Returns plain dicts.
+
+        THE HOME DEFAULT BELOW IS AN OPERATOR DEFAULT, NOT A FALLBACK FOR A
+        SCOPED CALLER (#427 final blocker, round 3). ``team_id or
+        game.home_team_id`` is the same silent shape that made ``get_board``
+        hand an AWAY Coach the HOME pool, and it is retained here for the
+        one caller it is correct for: an unscoped operator who named no
+        side and may read either. A SCOPED caller never reaches it — the
+        facade (:meth:`ApiService._workflow_side`) resolves the audience
+        first and passes the TRUSTED server-resolved side for a Coach, so
+        ``team_id`` is never empty on that path and HOME can never be served
+        by default to a caller whose own side is AWAY. Proven by
+        ``tests/test_private_game_sibling_routes.py``'s
+        ``candidates_home_defaulted`` falsifier, which drops the trusted side
+        on the way in and reddens exactly that assertion."""
         game = self._require_game(game_id)
         team_id = team_id or game.home_team_id
         if rstatus is None:
@@ -3914,7 +3928,14 @@ class RosterService:
         they aren't already an enrolled/offered substitute (that pair of
         states already show up in the outreach queue with an Offer action;
         re-adding them here would just hit enroll_substitute's own duplicate
-        check). A pure read helper — must NOT be @_transactional."""
+        check). A pure read helper — must NOT be @_transactional.
+
+        Same home default, same rule, same reason as
+        :meth:`list_substitute_candidates` above: it is the UNSCOPED
+        OPERATOR's default for an un-hinted read, and a scoped caller's side
+        arrives already resolved by :meth:`ApiService._workflow_side`, so this
+        line can never answer an AWAY Coach with HOME's pool (#427 final
+        blocker, round 3)."""
         game = self._require_game(game_id)
         team_id = team_id or game.home_team_id
         if rstatus is None:

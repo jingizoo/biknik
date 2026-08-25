@@ -410,28 +410,53 @@ REGISTRY = (
     RouteSpec("GET", r"^/api/games/[^/]+/substitute-addable$",
               "/api/games/{}/substitute-addable",
               "get_games_id_substitute_addable", "_dispatch_get",
-              auth="session+MANAGE_ROSTER-or-self", scope_axis="none",
+              auth="session+MANAGE_ROSTER+own-side-projection",
+              scope_axis="none",
               note=("#202: _resolve_role + can_read_private_game_data gate "
                     "the whole games/{id}/... family first (server.py:"
-                    "2070-2078; scope.py:122-152), then this leaf's own "
-                    "narrower check (server.py:2146-2162): "
-                    "can(role, Permission.MANAGE_ROSTER) required (a "
-                    "player must not see this even for their own game), "
-                    "and a coach is further bound to team_id == their own "
-                    "scope['team_id']; operators may query any team. "
+                    "2851-2864; scope.py:230-259), then this leaf's own "
+                    "can(role, Permission.MANAGE_ROSTER) capability gate (a "
+                    "player and an assigned official must not see this even "
+                    "for a game they are in) -- both UNCHANGED. "
+                    "#427 final blocker round 3: what changed is the SIDE. "
+                    "This leaf bound it twice -- a local `own_team = "
+                    "scope.get('team_id')` beside the family's one trusted "
+                    "resolution, and an inline coach check that answered a "
+                    "HINTED call DIFFERENTLY from an un-hinted one (403 for "
+                    "the opponent's id), contradicting the contract round 2 "
+                    "shipped for this very family ('a ?team_id= naming the "
+                    "opponent is ignored ... a hinted request returns "
+                    "exactly what the un-hinted one returns'). It is now "
+                    "projected by the SAME lineup_visibility.route_audience "
+                    "as its six siblings, on the SAME trusted "
+                    "server-resolved own side: hint kept for an unscoped "
+                    "operator, IGNORED for a Coach in favour of their "
+                    "trusted side, refused for any other audience rather "
+                    "than answered with addable: []. "
                     "get_addable_substitutes is (game_id, team_id)-keyed "
                     "-- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/substitute-candidates$",
               "/api/games/{}/substitute-candidates",
               "get_games_id_substitute_candidates", "_dispatch_get",
-              auth="session+MANAGE_ROSTER-or-self", scope_axis="none",
+              auth="session+MANAGE_ROSTER+own-side-projection",
+              scope_axis="none",
               note=("#202: _resolve_role + can_read_private_game_data gate "
                     "the whole games/{id}/... family first (server.py:"
-                    "2070-2078; scope.py:122-152), then this leaf's own "
-                    "narrower check (server.py:2126-2144): "
-                    "can(role, Permission.MANAGE_ROSTER) required, and a "
-                    "coach is further bound to team_id == their own "
-                    "scope['team_id']; operators may query any team. "
+                    "2851-2864; scope.py:230-259), then this leaf's own "
+                    "can(role, Permission.MANAGE_ROSTER) capability gate -- "
+                    "both UNCHANGED. "
+                    "#427 final blocker round 3: the SIDE moves to the "
+                    "facade, exactly as for substitute-addable above and "
+                    "for the same reasons -- one trusted resolution instead "
+                    "of a second local `scope.get('team_id')`, and a client "
+                    "hint that is IGNORED for a Coach rather than answered "
+                    "with a 403 that varies with the side named. The ROWS "
+                    "were already fixed in round 2: this queue and "
+                    "/substitutes now name the SAME set because both key on "
+                    "SubstituteEnrollment.team_id, so a pre-060 NULL-owner "
+                    "row appears in NEITHER (it used to be served here, by "
+                    "LIVE membership, with can_offer: true, to whichever "
+                    "Coach its occupant belongs to today). "
                     "get_substitute_candidates is (game_id, team_id)-keyed "
                     "-- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/substitutes$",

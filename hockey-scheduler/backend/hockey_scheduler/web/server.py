@@ -2990,10 +2990,49 @@ class Handler(BaseHTTPRequestHandler):
                     gid, team_id,
                     viewer_role=role, viewer_team_id=own_team))
             if sub == "substitute-candidates":
-                # Coach outreach queue (#112): manage_roster only — a player
-                # must not see the operator candidate list even for their own
-                # game. A coach is further bound to their own team; operators
-                # (league admin / arena manager) may read any team's queue.
+                # THE SIXTH LEAF OF THE SAME FAMILY (#427 final blocker,
+                # round 3) — the second and last one that reads a side from
+                # the QUERY STRING.
+                #
+                # WHY IT IS HERE AT ALL. Round 2 closed the fifth leaf
+                # (`availability-summary`) and wrote the rule into
+                # `docs/architecture/api-contract.md` in the SAME commit:
+                # "A side is never trusted from the query string or the body
+                # — a `?team_id=` naming the opponent is *ignored* for a
+                # scoped caller, so a hinted request returns exactly what the
+                # un-hinted one returns", over a list of routes that NAMES
+                # `substitute-candidates`. This leaf did not do that. It kept
+                # its own inline narrowing, which answered a hinted call
+                # DIFFERENTLY from an un-hinted one (403 vs 200) — so the
+                # contract that shipped was false for one of the routes it
+                # names, and the family had two hint-reading leaves
+                # adjudicating a hint two different ways. That divergence is
+                # the exact shape this blocker exists to remove.
+                #
+                # WHAT CHANGES, PRECISELY. The MANAGE_ROSTER gate below is a
+                # ROLE-CAPABILITY question ("may this kind of caller manage a
+                # roster at all") and is untouched — a Player and an assigned
+                # Official are refused by it exactly as before, with the same
+                # message. What moves to the facade is the SIDE question,
+                # onto the SAME trusted `own_team` and the SAME
+                # `lineup_visibility.route_audience` the other five siblings
+                # use: an unscoped operator keeps the hint, a Coach has it
+                # IGNORED in favour of their trusted side, and any other
+                # audience is refused rather than served a `candidates: []`
+                # that would claim this team has nobody to call.
+                #
+                # AND THE LOCAL RE-RESOLUTION GOES WITH IT. This leaf used to
+                # rebind `own_team = scope.get("team_id")`, a SECOND answer to
+                # "which side is the caller's" standing beside the one the
+                # dispatch resolves once above. The two agree for a Coach
+                # today and nothing pinned that they must — which is the
+                # drift `game_scoped_own_team_id` was hoisted to end. The one
+                # behaviour this deletes is an operator whose session happens
+                # to carry a `team_id` defaulting to it: an operator role has
+                # NO own side by definition (`game_scoped_own_team_id`
+                # returns None for it), a stray scope value is not an
+                # authority, and their un-hinted default is now the same home
+                # default `/board` and `/roster-status` already give them.
                 from urllib.parse import parse_qs, urlparse
                 if not can(role, Permission.MANAGE_ROSTER):
                     return self._send_json({"error": {
@@ -3001,18 +3040,19 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "Only a coach or operator can view the "
                                    "substitute outreach queue."}}, 403)
                 qs = parse_qs(urlparse(self.path).query)
-                own_team = scope.get("team_id") or ""
                 team_id = (qs.get("team_id") or [own_team])[0] or None
-                if role == Role.COACH and own_team and team_id != own_team:
-                    return self._send_json({"error": {
-                        "code": "forbidden",
-                        "message": "You can only view your own team's queue."}}, 403)
-                return self._send_api(
-                    api.get_substitute_candidates(gid, team_id))
+                return self._send_api(api.get_substitute_candidates(
+                    gid, team_id,
+                    viewer_role=role, viewer_team_id=own_team))
             if sub == "substitute-addable":
-                # Eligible-but-not-yet-enrolled team players a coach could add
-                # as a substitute candidate (#114) — same manage_roster +
-                # own-team gate as substitute-candidates above.
+                # THE SEVENTH LEAF, and the same change for the same reason:
+                # eligible-but-not-yet-enrolled players of one side (#114) are
+                # that side's private candidate pool, named, and this leaf
+                # bound the side the same two ways
+                # `substitute-candidates` did. Same untouched MANAGE_ROSTER
+                # capability gate, same trusted `own_team`, same
+                # `route_audience` — see that leaf's comment above for the
+                # whole reasoning.
                 from urllib.parse import parse_qs, urlparse
                 if not can(role, Permission.MANAGE_ROSTER):
                     return self._send_json({"error": {
@@ -3020,14 +3060,10 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "Only a coach or operator can view "
                                    "addable substitutes."}}, 403)
                 qs = parse_qs(urlparse(self.path).query)
-                own_team = scope.get("team_id") or ""
                 team_id = (qs.get("team_id") or [own_team])[0] or None
-                if role == Role.COACH and own_team and team_id != own_team:
-                    return self._send_json({"error": {
-                        "code": "forbidden",
-                        "message": "You can only view your own team's roster."}}, 403)
-                return self._send_api(
-                    api.get_addable_substitutes(gid, team_id))
+                return self._send_api(api.get_addable_substitutes(
+                    gid, team_id,
+                    viewer_role=role, viewer_team_id=own_team))
         if path.startswith("/api/"):
             # Cross-method 405 (#271): a GET on a known POST-only path → 405 +
             # Allow; a truly unknown /api path → 404.

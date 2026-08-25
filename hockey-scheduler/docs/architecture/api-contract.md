@@ -111,22 +111,34 @@ The facade supports the three required screen states:
 ## Private game visibility (#427)
 
 `board`, `lineups`, `roster-status`, `roster`, `substitutes`,
-`availability-summary` and `substitute-candidates` all expose one game's
-**private** state. Passing the session + participation gate proves the caller
-belongs to *a* team in the game; it does **not** decide *which side* they may
-read. The server resolves the caller's own side once
-(`game_scoped_own_team_id`) and every one of these routes is projected on it.
+`availability-summary`, `substitute-candidates` and `substitute-addable` —
+every leaf of the `/api/games/{id}/…` dispatch that carries private player
+data — expose one game's **private** state. Passing the session +
+participation gate proves the caller belongs to *a* team in the game; it does
+**not** decide *which side* they may read. The server resolves the caller's
+own side once (`game_scoped_own_team_id`) and every one of these routes is
+projected on it.
 **A side is never trusted from the query string or the body** — a `?team_id=`
 or `?side=` naming the opponent is *ignored* for a scoped caller, so a hinted
 request returns exactly what the un-hinted one returns. It is deliberately not
 rejected: a 403 raised only for the opponent's id is itself an oracle for
 which team is playing, while an unchanged own-side answer discloses nothing.
 
-| Caller | board / lineups | roster-status | roster | substitutes | availability-summary |
-|---|---|---|---|---|---|
-| League Admin, Arena Manager | both sides, full | full | full | full | any side (hint honoured) |
-| Coach, Player | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows | own side only (hint ignored) |
-| Assigned official | both sides' submitted lineup | **403** | both sides' submitted lineup | **403** | **403** |
+| Caller | board / lineups | roster-status | roster | substitutes | availability-summary | substitute-candidates / -addable |
+|---|---|---|---|---|---|---|
+| League Admin, Arena Manager | both sides, full | full | full | full | any side (hint honoured) | any side (hint honoured) |
+| Coach | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows | own side only (hint ignored) | own side only (hint ignored) |
+| Player | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows | own side only (hint ignored) | **403** (no `MANAGE_ROSTER`) |
+| Assigned official | both sides' submitted lineup | **403** | both sides' submitted lineup | **403** | **403** | **403** |
+
+The last two carry a second, independent gate that the other five do not:
+`MANAGE_ROSTER`, a **role capability** ("may this kind of caller manage a
+roster at all"), checked before the side question is asked. That is why a
+Player is refused there but served their own side everywhere else. The two
+gates are deliberately not folded together — the side rule must not be
+contingent on a permission table that can change without it, so the facade
+refuses an audience with no claim on a private candidate pool even though the
+capability gate makes that unreachable over today's HTTP dispatch.
 
 Two rules govern how withheld data is represented, and both exist because an
 empty collection is an *operational claim about the game* rather than a
@@ -155,6 +167,8 @@ and liveness are different questions asked of the same row:
 
 - **Served** — `substitutes` and `substitute-candidates` are two views of one
   resource and name the **same** rows. A NULL-owner row appears in neither.
+  The two are also answered for the same side by the same rule, so they cannot
+  disagree about *whose* rows they are either.
 - **Counted** — `substitutes_enrolled` and `substitutes_available` count only
   rows this game durably attributes to the side *and* whose occupant is still
   a live member of it. Attribution is durable so a transfer cannot move an

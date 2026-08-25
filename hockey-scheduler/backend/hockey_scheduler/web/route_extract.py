@@ -3677,28 +3677,37 @@ _AUDIT_WAIVERS = {
         "route was chosen. Identical shape and reasoning to the "
         "`api.get_roster_status` / `api.get_substitutes` waivers below",
     ("_dispatch_get",
-     "role == Role.COACH and own_team and (team_id != own_team)", "if_test",
-     "sub == 'substitute-candidates'"):
-        "get_games_id_substitute_candidates (#112): own-team scoping for a "
-        "coach, operators exempt -- see this sub-group's own comment "
-        "above (a `MANAGE_ROSTER` permission gate runs first, independent "
-        "of this scoping check)",
-    ("_dispatch_get", "api.get_substitute_candidates(gid, team_id)",
+     "api.get_substitute_candidates(gid, team_id, viewer_role=role, "
+     "viewer_team_id=own_team)",
      "call_argument", "sub == 'substitute-candidates'"):
-        "the service call consuming the already-waived `team_id` scope "
-        "check immediately above -- not a routing decision",
+        "gid captured off the SAME match; `sub == 'substitute-candidates'` "
+        "already selects this exact leaf. #427 final blocker round 3 "
+        "REPLACED this leaf's inline own-team `if` (whose own waiver stood "
+        "here, and which answered a HINTED call differently from an "
+        "un-hinted one) and its local `own_team = scope.get('team_id')` "
+        "re-resolution with the SAME facade projection its five siblings "
+        "use: `own_team` is the already-waived TRUSTED SIDE resolved once "
+        "for the whole family and `role` the session-resolved caller, so "
+        "`lineup_visibility.route_audience` can keep the hint for an "
+        "unscoped operator, IGNORE it for a Coach in favour of their "
+        "trusted side, and refuse any other audience. The remaining "
+        "`qs.get('team_id')` is the CLIENT HINT passed in to be "
+        "adjudicated, never trusted -- and every value of all three "
+        "arguments returns through this one leaf, so they decide what this "
+        "caller may SEE of an already-selected route, not which route was "
+        "chosen. The `MANAGE_ROSTER` permission gate above is unchanged and "
+        "independent of all of this. Identical shape and reasoning to the "
+        "`api.get_availability_summary` waiver above",
     ("_dispatch_get",
-     "role == Role.COACH and own_team and (team_id != own_team)", "if_test",
-     "sub == 'substitute-addable'"):
-        "get_games_id_substitute_addable (#114): the same own-team scoping "
-        "as substitute-candidates immediately above, textually identical "
-        "but reached from a DIFFERENT `sub` branch -- the enclosing-if-"
-        "text fingerprint (`substitute-candidates` vs `substitute-"
-        "addable`) is what keeps the two from masquerading as one",
-    ("_dispatch_get", "api.get_addable_substitutes(gid, team_id)",
+     "api.get_addable_substitutes(gid, team_id, viewer_role=role, "
+     "viewer_team_id=own_team)",
      "call_argument", "sub == 'substitute-addable'"):
-        "the service call consuming the already-waived `team_id` scope "
-        "check immediately above -- not a routing decision",
+        "get_games_id_substitute_addable (#114): the same facade projection "
+        "as substitute-candidates immediately above, on the same trusted "
+        "`own_team`, reached from a DIFFERENT `sub` branch -- the "
+        "enclosing-if-text fingerprint (`substitute-candidates` vs "
+        "`substitute-addable`) is what keeps the two from masquerading as "
+        "one",
     # -- #202 repair round 6, finding 1's OTHER new shape: a bare Subscript
     # (no Call anywhere around it) keyed on a tracked name, independently
     # audited the same way an unlisted Call already is (see

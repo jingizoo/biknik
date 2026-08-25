@@ -1319,6 +1319,51 @@ async function checkViewport(browser, viewport) {
       { timeout: 10000 });
 
     // ------------------------------------------------------------
+    // A CLIENT SIDE HINT IS INERT ON THE TWO WORKFLOW LEAVES (#427 final
+    // blocker, round 3).
+    //
+    // The Roster tab really does send `?team_id=` on both of these, on every
+    // render, with the side toggle choosing the value -- so "the hint is
+    // ignored" is a claim about a parameter this SHIPPED SCREEN supplies,
+    // not a theoretical one, and it is worth proving from the same session
+    // that supplies it. Until round 3 these two answered a hinted call
+    // DIFFERENTLY from an un-hinted one (403 for the opponent's id) while
+    // the contract shipped in round 2 listed them among the routes where a
+    // hint is ignored.
+    //
+    // Byte equality against the un-hinted response, not "200 and looks
+    // right": that is the only assertion that cannot be satisfied by a
+    // second, differently-narrowed answer.
+    // ------------------------------------------------------------
+    for (const leaf of ["substitute-candidates", "substitute-addable"]) {
+      const path = `/api/games/${game.body.id}/${leaf}`;
+      const plain = await apiGet(page, path);
+      if (plain.status !== 200 || plain.body.error) {
+        fail(`Coach [${L}]: un-hinted GET ${leaf} failed, so the hint `
+          + `comparison below would prove nothing: `
+          + `${JSON.stringify(plain)}`);
+      }
+      if (plain.body.team_id !== coachTeam.body.id) {
+        fail(`Coach [${L}]: ${leaf} answered for ${plain.body.team_id} `
+          + `rather than this Coach's own team ${coachTeam.body.id}`);
+      }
+      for (const hinted of [rivalTeam.body.id, coachTeam.body.id]) {
+        const probe = await apiGet(page, `${path}?team_id=${hinted}`);
+        if (probe.status !== 200 || probe.body.error) {
+          fail(`Coach [${L}]: ${leaf}?team_id=${hinted} was REFUSED rather `
+            + `than answered identically to the un-hinted call -- a 403 that `
+            + `appears only for the opponent's id is a side selector by `
+            + `another name: ${JSON.stringify(probe)}`);
+        }
+        if (JSON.stringify(probe.body) !== JSON.stringify(plain.body)) {
+          fail(`Coach [${L}]: ${leaf}?team_id=${hinted} changed the answer -- `
+            + `a client hint selected a side: `
+            + `${JSON.stringify(probe.body)} vs ${JSON.stringify(plain.body)}`);
+        }
+      }
+    }
+
+    // ------------------------------------------------------------
     // INELIGIBLE-BUT-VISIBLE substitute rows (#427). "Make that row
     // non-actionable except for permitted cleanup and expose/label its
     // ineligible state so the UI does not offer an add/seat action that the

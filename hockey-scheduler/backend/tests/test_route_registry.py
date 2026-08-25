@@ -277,7 +277,16 @@ _VALID_AUTH_VALUES = frozenset({
     "session",
     "session+MANAGE_ARENA",
     "session+MANAGE_ROSTER",
-    "session+MANAGE_ROSTER-or-self",
+    # #427 final blocker round 3 RETIRED "session+MANAGE_ROSTER-or-self" and
+    # replaced it with this. The old label's "-or-self" named an own-team
+    # comparison the leaf made ITSELF, from its own second reading of the
+    # session scope, and answered a mismatching hint with a 403 -- which is
+    # exactly what round 3 removed. Both leaves still require MANAGE_ROSTER
+    # (a role capability: a Player and an assigned Official are refused
+    # outright, unchanged), and the SIDE is now decided by the same
+    # projection the rest of the family uses. Two facts, so two components:
+    # dropping either half would understate the gate.
+    "session+MANAGE_ROSTER+own-side-projection",
     "session+MANAGE_SCHEDULE",
     "session+MANAGE_SCHEDULE+real-account",
     "session+MANAGE_SCHEDULE-or-self",
@@ -348,8 +357,17 @@ _EXPECTED_CLASSIFICATION = {
         ('session+own-side-projection', 'none'),  # get_games_id_roster
     ("GET", '/api/games/{}/roster-status'):
         ('session+own-side-projection', 'none'),  # get_games_id_roster_status
-    ("GET", '/api/games/{}/substitute-addable'): ('session+MANAGE_ROSTER-or-self', 'none'),  # get_games_id_substitute_addable
-    ("GET", '/api/games/{}/substitute-candidates'): ('session+MANAGE_ROSTER-or-self', 'none'),  # get_games_id_substitute_candidates
+    # #427 final blocker round 3: the sixth and seventh leaves of the same
+    # dispatch, and the last two binding a side their own way. The
+    # MANAGE_ROSTER capability gate is unchanged -- what changed is that the
+    # side comes from the family's one trusted resolution and a client hint
+    # is IGNORED for a Coach rather than answered with a 403 that varies with
+    # the side named (which contradicted the contract round 2 shipped for
+    # this very family, in the same commit, naming this very route).
+    ("GET", '/api/games/{}/substitute-addable'):
+        ('session+MANAGE_ROSTER+own-side-projection', 'none'),  # get_games_id_substitute_addable
+    ("GET", '/api/games/{}/substitute-candidates'):
+        ('session+MANAGE_ROSTER+own-side-projection', 'none'),  # get_games_id_substitute_candidates
     ("GET", '/api/games/{}/substitutes'):
         ('session+own-side-projection', 'none'),  # get_games_id_substitutes
     ("GET", '/api/guardians/links'): ('operator_only', 'none'),  # get_guardians_links

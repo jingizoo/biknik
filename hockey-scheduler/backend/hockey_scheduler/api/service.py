@@ -265,6 +265,17 @@ _ROSTER_STATUS_REFUSAL = (
 _AVAILABILITY_REFUSAL = (
     "Per-player availability is private to each team's coach and the league "
     "office — an assigned official reads the submitted lineup instead.")
+#: Round 3's two, for the last two leaves of the same dispatch. Both name a
+#: side's private candidate pool, so both say WHO may read it rather than
+#: answering with an empty pool — `candidates: []` / `addable: []` would
+#: claim this team has nobody left to call.
+_CANDIDATE_REFUSAL = (
+    "The substitute outreach queue is private to each team's coach and the "
+    "league office — an assigned official reads the submitted lineup "
+    "instead.")
+_ADDABLE_REFUSAL = (
+    "A team's addable substitute pool is private to its coach and the league "
+    "office — an assigned official reads the submitted lineup instead.")
 
 #: Key-name suffixes that mark a value as a PLAYER identity in an audit
 #: entry's free-form ``detail`` payload. Every player-bearing key the service
@@ -7258,17 +7269,84 @@ class ApiService:
             "blocked_reason": blocked,
         }
 
+    def _workflow_side(self, game, team_id, viewer_role, viewer_team_id,
+                       refusal: str) -> str:
+        """WHICH SIDE's substitute-workflow pool this caller may read — the
+        shared adjudication behind ``get_substitute_candidates`` and
+        ``get_addable_substitutes`` (#427 final blocker, round 3).
+
+        ONE function rather than two copies precisely because these two
+        routes are the same question asked of two populations: who is already
+        enrolled and could be offered, and who is eligible and could be
+        enrolled. They were the last two leaves of the private-game dispatch
+        binding a side their own way, and a second copy of "which side is the
+        caller's" is what this blocker exists to remove — not something to
+        reintroduce twice while removing it.
+
+        ``FULL``
+            Unscoped operator — the client hint is KEPT, and when it is
+            absent the caller's own resolved side is used before the
+            service-layer home default, byte-for-byte the pre-existing #112 /
+            #114 behaviour. Narrowing an operator would be its own
+            regression: they may read either side anyway.
+        ``OWN_SIDE``
+            Coach (a Player never reaches here — MANAGE_ROSTER refuses them
+            at the route) — the hint is IGNORED and the TRUSTED
+            server-resolved side is used, so a hinted call is byte-identical
+            to an un-hinted one exactly as it is on the other five siblings.
+            THIS IS THE BEHAVIOUR CHANGE: the route used to answer a hinted
+            call **differently** (403 for the opponent's id), which both
+            contradicted the contract round 2 shipped for this very route and
+            made the hint a probe whose answer varied with the side named.
+            Ignoring is also what makes the service layer's silent
+            ``team_id or game.home_team_id`` fallback unreachable for a
+            scoped caller: the trusted side is always passed, so HOME can
+            never be served to an AWAY Coach by default.
+        ``SUBMITTED_LINEUP`` / ``RESTRICTED``
+            Refused — never ``candidates: []`` / ``addable: []``, which
+            asserts "this team has nobody to call", an operational claim
+            about the team rather than a fact about the reader.
+
+            NOT REACHABLE THROUGH TODAY'S DISPATCH, and deliberately kept:
+            the MANAGE_ROSTER capability gate refuses an official and a
+            player before the facade is called. That is a ROLE-PERMISSION
+            table agreeing with the side rule by coincidence, and the whole
+            lesson of this blocker is that the side rule must not be
+            contingent on a check that lives somewhere else and can change
+            without it. ``tests/test_private_game_sibling_routes.py`` drives
+            this branch at the FACADE, so it is proven rather than assumed.
+
+        ``viewer_role`` of ``None`` is the in-process default and resolves
+        ``FULL``, so every non-HTTP caller is unchanged."""
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.OWN_SIDE:
+            return viewer_team_id
+        if audience == lineup_visibility.FULL:
+            return team_id or viewer_team_id or game.home_team_id
+        raise NotAuthorizedError(refusal)
+
     @catch
     def get_substitute_candidates(self, game_id: str,
-                                  team_id: Optional[str] = None) -> dict:
+                                  team_id: Optional[str] = None,
+                                  viewer_role=None,
+                                  viewer_team_id: Optional[str] = None) -> dict:
         """The coach outreach queue for a game/team (#112): open slots by
         position plus the ordered substitute candidates (who can be offered
-        right now). Operator-facing — gated at the route by MANAGE_ROSTER +
-        team scope."""
+        right now) — projected onto the audience this caller belongs to
+        (#427 final blocker, round 3; see :meth:`_workflow_side`).
+
+        THE ROWS THEMSELVES are already durably attributed: round 2 made this
+        queue and ``/substitutes`` name the SAME set by keying both on
+        ``SubstituteEnrollment.team_id`` (see
+        ``RosterService.list_substitute_candidates``). What was still bound
+        the old way is WHICH SIDE the caller is asking about, and that is
+        what moves here."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError("Game not found.")
-        team_id = team_id or game.home_team_id
+        team_id = self._workflow_side(game, team_id, viewer_role,
+                                      viewer_team_id, _CANDIDATE_REFUSAL)
         rstatus = self.roster.compute_roster_status(game_id, team_id)
         return {
             "game_id": game_id, "team_id": team_id,
@@ -7281,16 +7359,25 @@ class ApiService:
 
     @catch
     def get_addable_substitutes(self, game_id: str,
-                                team_id: Optional[str] = None) -> dict:
+                                team_id: Optional[str] = None,
+                                viewer_role=None,
+                                viewer_team_id: Optional[str] = None) -> dict:
         """Active same-team players a coach could add as a substitute
         candidate right now (#114) — the roster the outreach queue's own
         Enroll doesn't cover, since enroll_substitute only ever runs from the
-        player's own self-service action. Operator-facing — gated at the
-        route the same way get_substitute_candidates is."""
+        player's own self-service action. Projected onto the caller's
+        audience by the SAME :meth:`_workflow_side` the outreach queue uses
+        (#427 final blocker, round 3).
+
+        This list is a side's private candidate pool WITH NAMES — the same
+        class of data ``_submitted_lineup_rows`` strips one path segment
+        away — so it is bound by the same rule and refused rather than
+        emptied for an audience that may not read it."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError("Game not found.")
-        team_id = team_id or game.home_team_id
+        team_id = self._workflow_side(game, team_id, viewer_role,
+                                      viewer_team_id, _ADDABLE_REFUSAL)
         rstatus = self.roster.compute_roster_status(game_id, team_id)
         return {
             "game_id": game_id, "team_id": team_id,
