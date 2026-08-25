@@ -4236,11 +4236,6 @@ class ApiService:
 
     # -- availability ------------------------------------------------------
     @catch
-    def get_availability(self, game_id: str) -> List[dict]:
-        self.roster._require_game(game_id)
-        return [_serialize(a) for a in self.store.availability_for_game(game_id)]
-
-    @catch
     def get_availability_summary(self, game_id: str,
                                  team_id: Optional[str] = None,
                                  viewer_role=None,

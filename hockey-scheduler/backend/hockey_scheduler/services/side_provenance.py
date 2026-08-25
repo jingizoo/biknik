@@ -1,26 +1,55 @@
 """WHERE THE SIDE CAME FROM — a fail-closed AST gate over every read of a
-game's per-side private state (#205, round 4).
+game's per-side private state (#205, rebuilt round 6).
 
-FOUR ROUNDS, FOUR LEAKS, EACH FOUND BY HAND
-===========================================
-``/board`` hard-coded ``game.home_team_id``. Then three sibling routes did
-the same thing one path segment away. Then ``/availability-summary`` took its
-side from the QUERY STRING. Then ``/substitute-candidates`` and
-``-addable``. Then ``GET /api/demo/overview``, outside the family entirely,
-called ``compute_roster_status(g.id)`` with no side at all and served the
-home team's private state to an away coach, an assigned official, a guardian
-and a coach whose team was not in the game.
+WHAT THIS MODULE IS, AND WHAT IT IS NOT
+=======================================
+IT IS THE SUPPLEMENT, NOT THE PROOF. The PRIMARY protection for the side rule
+is the behavioural sweep in
+``tests/test_authenticated_side_noninterference.py``: every authenticated GET
+route, eight principals, both side-perturbation directions, three backends,
+diffed between two worlds. That sweep reasons about what actually comes out of
+the server. This module reasons about how a value is SPELLED at a call site,
+which is a strictly weaker thing to know — and the owner's 2026-08-25 ruling
+inverted the two after round 5, for a reason worth stating in the module
+itself:
 
-Every one was the SAME SHAPE: **a private-state read that reached a side by
-default, or by a client hint, instead of by the server's trusted
-resolution.** Every one was found by a human enumerating routes. Finding the
-fifth that way is not a strategy, so this module fails the build instead.
+    THE FIFTH LEAK WAS BLESSED BY AN EARLIER VERSION OF THIS FILE.
+    ``GET /api/me/player-home`` derived its side from ``Player.team_id`` and
+    served a transferred player the OPPONENT's private per-side state. The
+    exemption class it carried, ``SUBJECT_OWN_SIDE``, had exactly one machine
+    condition: "the function accepts no caller-supplied side parameter". That
+    was TRUE, and it proved only that the CLIENT had not NAMED the side. It
+    said nothing about whether the side the function DERIVED was the one the
+    subject is entitled to. The sweep found that leak; this file had passed
+    it.
+
+WHAT IT CAN PROVE, precisely:
+
+* that every producer call's side ARGUMENT traces, by intraprocedural
+  dataflow, to the canonical trusted resolution, to a verified adjudicated
+  decision, or to a declared and machine-checked exemption;
+* that every function reaching TWO-SIDED game storage is enumerated and
+  carries a class whose condition holds of its own body;
+* that the name ``game_scoped_own_team_id`` is bound, everywhere in the
+  package, to the one canonical definition and nothing else;
+* that the private-game dispatch hoists one trusted side and hands THAT to
+  every leaf, and that every leaf is declared.
+
+WHAT IT CANNOT PROVE, and does not claim: **source-to-output authorization.**
+It cannot tell you that the value reaching a response body is the value the
+CALLER is entitled to. A function can satisfy every rule here and still
+derive the wrong side from a correctly-provenanced input — which is what
+``get_player_home`` did. Where a class needs a fact about entitlement rather
+than about spelling, the class says so and names the behavioural test that
+carries it.
 
 THE RULE
 ========
     A side may ENTER the private-state read chain only from the server's
     trusted resolution or from an adjudicated decision. Every other way a
     side enters must be DECLARED here, with a machine-checked condition.
+    Separately: every reach into TWO-SIDED game storage must be declared too,
+    because a read with no side argument has no provenance to check.
 
 Stated as a closure property, which is what makes it catch a route nobody
 thought of: to read one side's private state you must call a **producer**
@@ -34,83 +63,74 @@ thought of: to read one side's private state you must call a **producer**
   :data:`SIDE_FORWARDERS` entry, which moves the obligation to *its* callers
   and keeps the chain enumerated.
 
-So a NEW route that reads side-private state cannot be silently correct-
-looking: it either introduces a side (and is classified) or forwards one
-(and must be declared). Neither is possible by accident.
-
-WHAT "TRUSTED" MEANS, AND WHY IT IS NOT A MAGIC WORD
-====================================================
-Three trusted origins, and the second and third are VERIFIED rather than
-asserted — a name cannot be added to either list unless the code really does
-what the name claims:
+WHAT "TRUSTED" MEANS, AND WHY IT IS NOT A NAME
+==============================================
+Three trusted origins, each VERIFIED rather than asserted:
 
 ``call:…game_scoped_own_team_id``
     :func:`services.game_side_scope.game_scoped_own_team_id`, the server's
-    resolution. It reads a session-resolved role, the session's own scope
-    binding and the already-selected game — never a request field.
+    resolution — and specifically THE canonical binding of it, RESOLVED
+    (:class:`_ModuleContext`) rather than matched by name. Round 5 compared
+    the callee's last name component to that string, so a nested ``def``, a
+    method on ``ApiService``, a local lambda or an ``import x as
+    game_scoped_own_team_id`` were all trusted unconditionally. Now a call is
+    trusted only when it reaches the ONE module-level definition, and
+    :func:`audit_trusted_binding` separately reports every other binding of
+    that name in the package.
 
 ``call:…<adjudicator>``
-    A declared :data:`ADJUDICATORS` entry. VERIFIED: the function's own body
-    must call ``lineup_visibility.route_audience``. An adjudicator is the one
-    place a client hint may be *laundered* — it takes the untrusted hint and
-    the trusted side, and returns the trusted side or raises.
+    A declared :data:`ADJUDICATORS` entry, called as ``self.<name>()`` from
+    the module that declares it. VERIFIED: the function's own body must call
+    ``lineup_visibility.route_audience``.
 
 ``param:<f>.<p>``
     A parameter of a declared :data:`ADJUDICATED_READERS` entry. VERIFIED:
     ``f``'s body must pass ``p`` to ``route_audience``/``side_projections``
-    as the viewer's side. This is what makes ``viewer_team_id`` trustworthy
-    INSIDE the facade, and :func:`audit_dispatch` closes the other half of
-    that loop by proving every dispatch site that fills it passes the one
-    hoisted ``game_scoped_own_team_id`` result.
+    as the viewer's side. :func:`audit_dispatch` closes the other half of
+    that loop.
 
-NOT FALSE-GREEN, and this is the #433 review's lesson applied. That review
-found that "a close appears SOMEWHERE in the handler" accepts a handler that
-closes on only one path. Nothing here is satisfied by a token appearing
-nearby:
+NOT FALSE-GREEN: origins are computed by real intraprocedural dataflow over
+the argument expression — through ``or``/ternary alternatives, through local
+aliases, through a parameter REBOUND above the call — not by matching a name.
+A site is trusted only when **every** origin is trusted, so ``trusted or
+game.home_team_id`` fails on the second disjunct and ``hint if flag else
+trusted()`` fails on the first; an ALIAS of the trusted side PASSES, which is
+the same machinery proving it is provenance and not spelling.
 
-* origins are computed by real intraprocedural dataflow over the argument
-  expression — through ``or``/ternary alternatives, through local aliases,
-  through a parameter REBOUND above the call — not by matching a name;
-* a site is trusted only when **every** origin is trusted, so
-  ``trusted or game.home_team_id`` fails on the second disjunct and
-  ``hint if flag else trusted()`` fails on the first;
-* an alias of the trusted side PASSES (``mine = viewer_team_id``), which is
-  the same machinery proving it is provenance and not spelling.
+THE FIVE DETECTORS
+==================
+1. :func:`audit_side_provenance` — the side ARGUMENT of every producer call.
+2. :func:`audit_home_fallback` — the ``x or <expr>.home_team_id`` shape
+   ANYWHERE in the package, whether or not it reaches a producer.
+3. :func:`audit_trusted_binding` — the trusted symbol is the only thing
+   wearing its name.
+4. :func:`audit_two_sided_store_reads` — every function that reaches
+   two-sided game storage is enumerated with a class. THIS is the detector
+   round 5 lacked: F1 and F3 shipped as ``def get_roster(self, game_id):
+   return [... for e in self.store.roster_for_game(game_id)]``, which has NO
+   side argument for detector 1 to classify. Measured against the real
+   sources at 337374a and 23935a1, detector 1 alone reported nothing naming
+   ``get_roster``/``get_substitutes``; detector 4 reports all three.
+5. :func:`audit_dispatch` — the private-game dispatch hoists ONE trusted
+   side, every leaf is declared, and every ``viewer_team_id=`` is that
+   hoisted name.
 
-THE OTHER TWO DETECTORS
-=======================
-:func:`audit_home_fallback` is independent of the producer set: it finds the
-``x or <expr>.home_team_id`` shape ANYWHERE in the package, which is the
-literal defect all four rounds shared, and fails on a new one even in a
-function that calls no producer at all.
+THE LEGITIMATE CASES ARE TYPED CLASSIFICATIONS, NOT ACCUMULATING EXEMPTIONS
+==========================================================================
+Every class carries a condition checked against the code, and every class has
+a dedicated test that fails if a site stops matching it
+(``tests/test_side_provenance_guard.py``, ``EveryClassConditionIsEnforced``):
 
-:func:`audit_dispatch` reads ``web/server.py``'s private-game dispatch block
-and requires (a) every leaf to be declared in :data:`PRIVATE_GAME_LEAVES`,
-(b) the hoisted ``own_team`` to be assigned from nothing but
-``game_scoped_own_team_id``, and (c) every ``viewer_team_id=`` in the block
-to be that hoisted name. A new sibling leaf fails the build the day it ships.
-
-THE LEGITIMATE CASES ARE FIRST-CLASS, NOT DEBT
-==============================================
-Three kinds of "this is correct" are recorded rather than ledgered, each with
-a machine-checked condition rather than an assertion:
-
-* :data:`EXEMPTIONS` — a site that introduces a side for a documented reason
-  (the unscoped-operator home default, a subject's own resolved side, a row's
-  own durable attribution, a write's authorized side, a two-sided answer to a
-  two-sided audience). Each names a CLASS, and each class's condition is
-  enforced: SUBJECT_OWN_SIDE fails if the function accepts a caller-supplied
-  side, AUTHORIZED_WRITE fails without an authorization argument anywhere on
-  the path, OPERATOR_ONLY_ROUTE fails if the route it names is not recorded
-  ``auth="operator_only"`` in ``web/route_registry.py``.
-* :data:`SIDE_FORWARDERS` — functions that hand a side on unchanged, so the
-  chain stays enumerated.
-* :data:`LIVE_MEMBERSHIP_READERS` — a DESIGN RECORD, not an exemption from
-  this rule at all: ``_availability_candidates`` and ``list_addable_players``
-  obey the side rule and read LIVE membership for their POPULATION on
-  purpose, as does the create-state side of the standing ruling. Recorded so
-  the distinction is visibly deliberate and cannot silently become the model
-  for a new reader that should have used durable attribution.
+* :data:`EXEMPTIONS` — a site that introduces a side for a documented reason.
+  ``SUBJECT_MEMBERSHIP_CONTEXT`` replaced ``SUBJECT_OWN_SIDE`` and requires
+  the side to be a resolved membership context's own ``team_id``;
+  ``AUTHORIZED_WRITE`` requires authorization anywhere on the path;
+  ``OPERATOR_ONLY_ROUTE`` requires ``web/route_registry.py`` to record that
+  route ``auth="operator_only"``.
+* :data:`SIDE_FORWARDERS` — functions that hand a side on unchanged.
+* :data:`TWO_SIDED_READERS` — every reach into two-sided storage.
+* :data:`LIVE_MEMBERSHIP_READERS` — a DESIGN RECORD: reads that answer "who
+  owes an answer" / "who could be enrolled" from LIVE membership on purpose.
 
 :data:`LEDGER` — accepted-but-unclassified — is EMPTY, which is the strongest
 state it can be in.
@@ -120,26 +140,35 @@ MONOTONIC SHRINK
 Every declaration is checked for LIVENESS as well as for coverage
 (:func:`verify_registry_liveness`): a producer that no longer exists with the
 declared side parameter, an adjudicator that stopped adjudicating, a
-forwarder or exemption that matches nothing any more, an AMBIGUOUS
-declaration resolving to two same-named functions, or a :data:`LEDGER` entry
-that is no longer needed is an ERROR, not a silent pass. The ledger therefore
-cannot rot, and the only direction it can move is down.
+forwarder, exemption or two-sided entry that matches nothing any more, an
+AMBIGUOUS declaration resolving to two same-named functions, or a
+:data:`LEDGER` entry that is no longer needed is an ERROR, not a silent pass.
 
 EXEMPTIONS and LEDGER are keyed on ``(function, producer, origin
 fingerprint)`` rather than on the pair — see :func:`origin_key`. One function
 routinely calls one producer twice on two different branches, and a
 pair-keyed entry would silently cover a third, new call in the same function.
+A forged binding gets a DIFFERENT fingerprint from the honest one
+(:data:`UNRESOLVED_BINDING`), so an exemption written for the honest site can
+never cover a forgery of it.
 
 EVIDENCE
 ========
-``tests/test_side_provenance_guard.py`` reconstructs all FOUR of the defects
-this blocker actually fixed in the live source and requires each to be
-reported — two by the provenance detector, two by the liveness check — and
-then NEUTERS each detector in turn to prove the guard's own tests can fail.
+``tests/test_side_provenance_guard.py`` reconstructs all FIVE defects this
+blocker fixed and requires each to be reported, drives twenty-two adversarial
+shapes, gives each of the nine typed classes a test that breaks its condition
+on purpose, and NEUTERS each detector in turn to prove its own tests can
+fail.
+The measurement against the REAL historical sources (``git archive``, not
+text-mutating today's tree) is in that file's
+``TheGuardIsMeasuredAgainstTheRealVulnerableTrees`` and in this round's
+commit message.
+
 """
 
 import ast
 import os
+import re
 from pathlib import Path
 
 #: The package root this gate scans. Everything under it except tests and
@@ -261,10 +290,36 @@ AUTHORIZED_WRITE = "authorized_write"
 #: parameter — a write that takes a side and NO authorization argument does
 #: not get this class.
 
-SUBJECT_OWN_SIDE = "subject_own_side"
-#: A ``/api/me/*``-shaped read that answers for the SIGNED-IN SUBJECT's own
-#: resolved side. CONDITION: the function must take no side parameter at all,
-#: so no caller can hand it a side; the side is derived from the subject.
+SUBJECT_MEMBERSHIP_CONTEXT = "subject_membership_context"
+#: THE CLASS THAT REPLACED ``SUBJECT_OWN_SIDE`` (owner ruling, 2026-08-25).
+#:
+#: ``SUBJECT_OWN_SIDE``'s only machine condition was "the function accepts no
+#: ``team_id``/``side``/``team_side``/``viewer_team_id`` parameter". That
+#: proves the CLIENT did not NAME the side, and NOTHING about whether the
+#: side the function derived is the one the subject is entitled to — which is
+#: exactly how it blessed the fifth leak: ``get_player_home`` accepted no side
+#: parameter and derived the OPPONENT's, from ``Player.team_id``.
+#:
+#: This class says something a machine can actually check about the DERIVED
+#: value: the side is the ``team_id`` of a
+#: :class:`~services.roster_service.GameMembershipContext` that this same
+#: function resolved for the SUBJECT against THIS game — the authoritative
+#: game-scoped membership, the same authority ``game_scoped_own_team_id``
+#: uses for a Player. CONDITIONS, all three:
+#:
+#: 1. every origin of the side must be a context field
+#:    (:data:`_SUBJECT_CONTEXT_ORIGINS`) — not a pointer, not a request field;
+#: 2. the function's own body must resolve that context through a declared
+#:    membership resolver (:data:`_MEMBERSHIP_RESOLVERS`), so the context is
+#:    the server's answer rather than something handed in whole;
+#: 3. the function must identify its SUBJECT by a ``player_id``/``player``
+#:    parameter and accept no caller-supplied side.
+#:
+#: A site that derives its side from ``player.team_id`` fails condition 1,
+#: which is the check the fifth leak needed and did not have.
+
+#: Origins that ARE a resolved membership context's own side.
+_SUBJECT_CONTEXT_ORIGINS = ("attr:ctx.team_id",)
 
 DURABLE_ROW_SIDE = "durable_row_side"
 #: The side comes from the ROW's own durable attribution — the authority the
@@ -355,9 +410,9 @@ SIDE_FORWARDERS = {
 
 #: The forwarder classes whose condition is checked per function.
 _FORWARDER_CONDITIONS = {
-    PRODUCER_INTERNAL, ADJUDICATED, AUTHORIZED_WRITE, SUBJECT_OWN_SIDE,
-    BOTH_SIDES_BY_AUDIENCE, OPERATOR_ONLY_ROUTE, DURABLE_ROW_SIDE,
-    OPERATOR_DEFAULT, LIVE_MEMBERSHIP_BY_DESIGN,
+    PRODUCER_INTERNAL, ADJUDICATED, AUTHORIZED_WRITE,
+    SUBJECT_MEMBERSHIP_CONTEXT, BOTH_SIDES_BY_AUDIENCE, OPERATOR_ONLY_ROUTE,
+    DURABLE_ROW_SIDE, OPERATOR_DEFAULT, LIVE_MEMBERSHIP_BY_DESIGN,
 }
 
 
@@ -447,13 +502,19 @@ EXEMPTIONS = {
         "`authorized_team_id` gated, read back to report the outcome."),
     ("get_substitute_opportunity", "compute_roster_status",
      "attr:ctx.team_id"): (
-        SUBJECT_OWN_SIDE, None,
-        "`ctx.team_id` — the subject's own membership context for THIS "
-        "game. No side parameter, same as above."),
+        SUBJECT_MEMBERSHIP_CONTEXT, None,
+        "`ctx.team_id` — the side of the GameMembershipContext this method "
+        "resolves ITSELF, for the subject named by its own `player_id`, "
+        "against THIS game. Re-examined when SUBJECT_OWN_SIDE was removed: "
+        "the side is the authoritative game-scoped membership, not the "
+        "permanent pointer, which is what the old class could not tell."),
     ("substitute_block_reason", "compute_roster_status",
      "attr:ctx.team_id"): (
-        SUBJECT_OWN_SIDE, None,
-        "the same subject's own context, one layer down."),
+        SUBJECT_MEMBERSHIP_CONTEXT, None,
+        "the same subject's own resolved context one layer down: `ctx` may "
+        "be handed in by a caller that already resolved it for this exact "
+        "(game, player), and this method resolves it itself when it is "
+        "not."),
     ("_back_out_entry", "compute_roster_status",
      "attr:entry.team_side"): (
         DURABLE_ROW_SIDE, None,
@@ -688,6 +749,20 @@ class _Scope:
             self.params.add(args.vararg.arg)
         if args.kwarg:
             self.params.add(args.kwarg.arg)
+        # Names REBOUND inside this function by a nested `def`/`lambda`/
+        # `class` — Hole B: a nested definition named exactly like the trusted
+        # resolver used to be trusted on the strength of its NAME alone.
+        self.shadowed = set()
+        for stmt in ast.walk(fn):
+            if stmt is fn:
+                continue
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                self.shadowed.add(stmt.name)
+            elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                for alias in stmt.names:
+                    self.shadowed.add((alias.asname or alias.name)
+                                      .split(".")[0])
         # name -> [(lineno, depth, value_expr)]
         self.assigns = {}
         top = {id(stmt) for stmt in fn.body}
@@ -732,27 +807,149 @@ def _bound_names(target):
     return []
 
 
-def _origins(expr, scope, line, seen=None):
+#: Modules allowed to RE-EXPORT the canonical resolver, and therefore to be
+#: an honest import source for it. Verified, not asserted: each must itself
+#: import the name from :data:`TRUSTED_RESOLVER_MODULE` (see
+#: :func:`audit_trusted_binding`), so the chain always ends at the one
+#: definition. ``web/scope.py`` is the historical home the function moved out
+#: of; every `from .scope import game_scoped_own_team_id` caller still works.
+TRUSTED_REEXPORTS = ("web/scope.py",)
+
+
+class _ModuleContext:
+    """WHICH NAMES IN THIS MODULE REALLY ARE THE CANONICAL TRUSTED SYMBOL —
+    Hole B, closed.
+
+    Before this existed, ``_trusted_origin`` compared a call's LAST NAME
+    COMPONENT to the string ``"game_scoped_own_team_id"``. Anything whose
+    final component matched was trusted unconditionally: a nested ``def`` in
+    the same function, a method on ``ApiService``, a local lambda, a module
+    alias of something else entirely, an ``import x as game_scoped_own_team_id``.
+    ``verify_registry_liveness`` checked that the REAL resolver still existed;
+    nothing checked that it was the ONLY thing wearing its name.
+
+    A binding is trusted here only when it can be RESOLVED to the one
+    module-level definition in :data:`TRUSTED_RESOLVER_MODULE`:
+
+    * a bare ``game_scoped_own_team_id(...)`` in a module that imports the
+      name from the canonical module (or from a declared, verified re-export
+      of it), and that is NOT shadowed inside the enclosing function;
+    * ``<alias>.game_scoped_own_team_id(...)`` where ``<alias>`` is that
+      module imported as a module;
+    * the canonical module's own body.
+
+    Every OTHER binding of that name anywhere in the package is reported by
+    :func:`audit_trusted_binding` as a forgery, so the two halves together say
+    "this call reaches the canonical symbol" rather than "this call is spelled
+    like it".
+    """
+
+    def __init__(self, path, tree):
+        self.path = path
+        self.trusted_names = set()
+        self.trusted_modules = set()
+        self.forgeries = []
+        if path == TRUSTED_RESOLVER_MODULE:
+            self.trusted_names.add(TRUSTED_RESOLVER)
+        canonical_mod = Path(TRUSTED_RESOLVER_MODULE).stem
+        honest_sources = {canonical_mod}
+        honest_sources |= {Path(m).stem for m in TRUSTED_REEXPORTS}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                source = (node.module or "").split(".")[-1]
+                for alias in node.names:
+                    bound = alias.asname or alias.name
+                    if alias.name == TRUSTED_RESOLVER:
+                        if source in honest_sources \
+                                and bound == TRUSTED_RESOLVER:
+                            self.trusted_names.add(bound)
+                        else:
+                            self.forgeries.append(
+                                (node.lineno,
+                                 f"imports {TRUSTED_RESOLVER!r} from "
+                                 f"{node.module!r} as {bound!r}"))
+                    elif bound == TRUSTED_RESOLVER:
+                        self.forgeries.append(
+                            (node.lineno,
+                             f"binds the name {TRUSTED_RESOLVER!r} to "
+                             f"{alias.name!r}"))
+                    elif alias.name in honest_sources:
+                        self.trusted_modules.add(bound)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    bound = alias.asname or alias.name.split(".")[0]
+                    if bound == TRUSTED_RESOLVER:
+                        self.forgeries.append(
+                            (node.lineno,
+                             f"binds the name {TRUSTED_RESOLVER!r} to the "
+                             f"module {alias.name!r}"))
+                    elif alias.name.split(".")[-1] in honest_sources:
+                        self.trusted_modules.add(bound)
+
+    def resolves_to_canonical(self, func, scope):
+        """Does THIS call expression reach the one canonical definition?"""
+        if isinstance(func, ast.Name):
+            if func.id != TRUSTED_RESOLVER:
+                return False
+            if scope is not None and (func.id in scope.params
+                                      or func.id in scope.shadowed
+                                      or func.id in scope.assigns):
+                return False
+            return TRUSTED_RESOLVER in self.trusted_names
+        if isinstance(func, ast.Attribute):
+            if func.attr != TRUSTED_RESOLVER:
+                return False
+            base = _dotted(func.value)
+            return base in self.trusted_modules
+        return False
+
+    def resolves_to_adjudicator(self, func, name):
+        """An ADJUDICATOR is a method of the module that declares it, and is
+        trusted only when called AS one: ``self.<name>(...)`` inside that same
+        module. A same-named function anywhere else — or a local rebinding —
+        is not the adjudicator whose ``route_audience`` call was verified."""
+        if not isinstance(func, ast.Attribute) or func.attr != name:
+            return False
+        if not isinstance(func.value, ast.Name) or func.value.id != "self":
+            return False
+        return self.path == ADJUDICATORS.get(name)
+
+
+#: The suffix a call origin carries when its callee WEARS a trusted name but
+#: does not RESOLVE to the trusted symbol. Deliberately part of the origin
+#: string, so a forged binding gets its own EXEMPTIONS fingerprint and can
+#: never be covered by the honest site's entry.
+UNRESOLVED_BINDING = "!not-the-canonical-binding"
+
+
+def _origins(expr, scope, line, seen=None, ctx=None):
     """Every ROOT this side expression can have come from.
 
     A set of tagged strings rather than AST nodes, so a verdict is a set
     membership test a reader can check by eye and a failure message can
-    print."""
+    print.
+
+    ``ctx`` is the enclosing module's :class:`_ModuleContext`. A call whose
+    callee merely WEARS a trusted name but does not RESOLVE to the canonical
+    symbol is tagged :data:`UNRESOLVED_BINDING`, so it is a different origin
+    from the honest one — untrusted, and with its own exemption fingerprint.
+    ``None`` means "no binding information", which is the FAIL-CLOSED
+    direction: nothing resolves, so nothing is trusted."""
     seen = seen if seen is not None else set()
     if expr is None:
         return {"absent"}
     if isinstance(expr, ast.BoolOp):
         out = set()
         for value in expr.values:
-            out |= _origins(value, scope, line, seen)
+            out |= _origins(value, scope, line, seen, ctx)
         return out
     if isinstance(expr, ast.IfExp):
-        return (_origins(expr.body, scope, line, seen)
-                | _origins(expr.orelse, scope, line, seen))
+        return (_origins(expr.body, scope, line, seen, ctx)
+                | _origins(expr.orelse, scope, line, seen, ctx))
     if isinstance(expr, ast.Tuple):
         out = set()
         for elt in expr.elts:
-            out |= _origins(elt, scope, line, seen)
+            out |= _origins(elt, scope, line, seen, ctx)
         return out
     if isinstance(expr, ast.Name):
         key = (expr.id, line)
@@ -766,15 +963,26 @@ def _origins(expr, scope, line, seen=None):
         if dominating:
             # A rebind at the top of the body: the parameter is gone.
             for lineno, _depth, value in dominating:
-                out |= _origins(value, scope, lineno, seen)
+                out |= _origins(value, scope, lineno, seen, ctx)
             return out or {f"unresolved:{expr.id}"}
         for lineno, _depth, value in candidates:
-            out |= _origins(value, scope, lineno, seen)
+            out |= _origins(value, scope, lineno, seen, ctx)
         if expr.id in scope.params:
             out.add(f"param:{scope.name}.{expr.id}")
         return out or {f"unresolved:{expr.id}"}
     if isinstance(expr, ast.Call):
-        return {f"call:{_final_name(expr.func) or '?'}"}
+        name = _final_name(expr.func) or "?"
+        if name == TRUSTED_RESOLVER:
+            resolved = ctx is not None and ctx.resolves_to_canonical(
+                expr.func, scope)
+            return {f"call:{name}" if resolved
+                    else f"call:{name}{UNRESOLVED_BINDING}"}
+        if name in ADJUDICATORS:
+            resolved = ctx is not None and ctx.resolves_to_adjudicator(
+                expr.func, name)
+            return {f"call:{name}" if resolved
+                    else f"call:{name}{UNRESOLVED_BINDING}"}
+        return {f"call:{name}"}
     if isinstance(expr, ast.Attribute):
         return {f"attr:{_dotted(expr)}"}
     if isinstance(expr, ast.Subscript):
@@ -909,6 +1117,7 @@ def audit_side_provenance(sources=None):
     violations = []
     used_forwarders, used_exemptions, used_ledger = set(), set(), set()
     for path, text in sorted(sources.items()):
+        ctx = _ModuleContext(path, parse(text))
         for fn, parent in functions_in(text):
             scope = _Scope(fn)
             for call in _calls_in(fn):
@@ -918,7 +1127,7 @@ def audit_side_provenance(sources=None):
                 if fn.name == producer:
                     continue  # a producer's own recursive/self reference
                 arg = _side_argument(call, producer)
-                origins = _origins(arg, scope, call.lineno)
+                origins = _origins(arg, scope, call.lineno, ctx=ctx)
                 trusted = all(
                     _trusted_origin(o, ADJUDICATED_READERS, ADJUDICATORS)
                     for o in origins)
@@ -1016,7 +1225,398 @@ def audit_home_fallback(sources=None):
 
 
 # ---------------------------------------------------------------------------
-# Detector 3 — the private-game dispatch
+# Detector 3 — EVERY REACH INTO TWO-SIDED GAME STORAGE IS ENUMERATED
+#
+# HOLE A, the one the ship-date counterfactual exposed. The provenance
+# detector above classifies the SIDE ARGUMENT of a producer call — so it is
+# blind, by construction, to a read that takes NO SIDE AT ALL because it goes
+# straight to the store:
+#
+#     def get_roster(self, game_id):
+#         return [_serialize(e) for e in self.store.roster_for_game(game_id)]
+#
+# That is F1 and F3 verbatim, and against the real 2f8eb73 source the
+# detectors reported ZERO violations naming `get_roster`/`get_substitutes`/
+# `get_board`. They only appear "caught" at HEAD because the FIX already
+# landed and left registry entries whose LIVENESS check fires when the fix is
+# undone — which proves nothing about a NEW route of that shape, and nothing
+# at all about a route outside the games family, where rounds 4 and 5 both
+# came from.
+#
+# The closure property here is about REACHING the storage rather than about
+# naming a side: these store methods return rows spanning BOTH sides of a
+# game, so any function that calls one holds two-sided private state and must
+# say, in a machine-checked class, what it does with it.
+# ---------------------------------------------------------------------------
+#: Store reads that return rows for BOTH sides of one game.
+TWO_SIDED_STORE_READS = ("roster_for_game", "substitutes_for_game",
+                         "availability_for_game", "audit_for_game",
+                         "notifications_for_game")
+
+NARROWS_BY_TRUSTED_SIDE = "narrows_by_trusted_side"
+#: The function immediately narrows the rows to ONE side. CONDITION: it must
+#: be a declared PRODUCER or SIDE_FORWARDER, so detector 1 gates the side it
+#: narrows by and its own callers are enumerated.
+
+TWO_SIDED_BY_AUDIENCE_READER = "two_sided_by_audience_reader"
+#: The function reads both sides and then PROJECTS by audience. CONDITION: it
+#: must be a declared ADJUDICATED_READER, whose ``route_audience`` call is
+#: separately verified.
+
+GAME_WIDE_WRITE = "game_wide_write"
+#: A lifecycle write over the whole game (cancel, delete) that touches both
+#: sides because the GAME does. CONDITION: the function must take an
+#: ``actor_id`` — a read cannot claim this class.
+
+ATTRIBUTION_PRIMITIVE = "attribution_primitive"
+#: The function IS the durable-attribution authority: it answers "which side
+#: is this row on", which is the question the side rule is decided by, so it
+#: necessarily reads both. CONDITION: every caller must itself be classified
+#: — a declared producer, forwarder, adjudicated reader, or an entry in this
+#: registry — so the two-sided value never escapes an enumerated chain.
+
+IDENTITY_RECOVERY_ONLY = "identity_recovery_only"
+#: The function reads both sides only to RECOGNISE player identities so an
+#: event mentioning an unattributable or opponent player can be WITHHELD. The
+#: value never leaves as content. CONDITION: the same closure as
+#: ATTRIBUTION_PRIMITIVE — every caller classified.
+
+OUT_OF_BAND_TOOLING = "out_of_band_tooling"
+#: A seeding/demo script that is not part of any request path. CONDITION: the
+#: module must not be imported by ``web/server.py``, so no route can reach it.
+
+#: ``{(module, function): (class, reason)}`` — every function in the package
+#: that reaches two-sided game storage. Keyed by MODULE and function so a
+#: same-named facade wrapper and service method are never confused, and so a
+#: DORMANT entry (a site that no longer exists) is an error.
+TWO_SIDED_READERS = {
+    ("api/service.py", "get_board"): (
+        TWO_SIDED_BY_AUDIENCE_READER,
+        "reads the game-wide audit and notification streams and hands them "
+        "to `_activity_projection`, which withholds every event it cannot "
+        "durably attribute to the audience's own side."),
+    ("api/service.py", "get_roster"): (
+        TWO_SIDED_BY_AUDIENCE_READER,
+        "F1's own route. It now takes `viewer_team_id`, consults "
+        "`route_audience` and answers one side; the raw store read is "
+        "narrowed before anything is serialized."),
+    ("api/service.py", "get_substitutes"): (
+        TWO_SIDED_BY_AUDIENCE_READER,
+        "F3's own route, narrowed the same way and by the same audience "
+        "decision."),
+    ("api/service.py", "_availability_summary_of"): (
+        NARROWS_BY_TRUSTED_SIDE,
+        "a declared producer: it answers ONE side's availability rollup for "
+        "the side it was handed, and decides nothing about which."),
+    ("api/service.py", "_lineup_rows"): (
+        NARROWS_BY_TRUSTED_SIDE,
+        "a declared producer: the availability join is per (game, player), "
+        "and the population it joins onto is already one side's."),
+    ("api/service.py", "_game_player_universe"): (
+        IDENTITY_RECOVERY_ONLY,
+        "the VALUE half of `_player_ids_in`'s two-way identity recovery. "
+        "Deliberately wider than the durable sides: a player with NO side "
+        "must still be RECOGNISED, precisely so the event naming them is "
+        "withheld rather than passed through."),
+    ("services/roster_service.py", "_side_data"): (
+        NARROWS_BY_TRUSTED_SIDE,
+        "a declared producer: it partitions the game's rows against the side "
+        "it was handed and returns only that side's."),
+    ("services/roster_service.py", "lineup_population"): (
+        NARROWS_BY_TRUSTED_SIDE,
+        "a declared producer: the four populations are computed for the one "
+        "side it was handed."),
+    ("services/roster_service.py", "_prior_side_candidates"): (
+        NARROWS_BY_TRUSTED_SIDE,
+        "a declared producer: the copy-roster source rows for the side the "
+        "write already authorized."),
+    ("services/roster_service.py", "list_substitute_candidates"): (
+        NARROWS_BY_TRUSTED_SIDE,
+        "a declared producer: the outreach queue for one side."),
+    ("services/roster_service.py", "list_addable_players"): (
+        NARROWS_BY_TRUSTED_SIDE,
+        "a declared producer: the addable pool for one side."),
+    ("services/roster_service.py", "_seat_batch"): (
+        NARROWS_BY_TRUSTED_SIDE,
+        "a declared SIDE_FORWARDER of class AUTHORIZED_WRITE: the batch "
+        "seating engine reads the game's existing rows to avoid double "
+        "seating, for the side its public entry points already authorized."),
+    ("services/roster_service.py", "durable_game_sides"): (
+        ATTRIBUTION_PRIMITIVE,
+        "THE durable-attribution authority — `GameRosterEntry.team_side` and "
+        "`SubstituteEnrollment.team_id`, never live membership and never the "
+        "permanent pointer. Answering 'which side is this row on' for a game "
+        "requires reading the game."),
+    ("services/roster_service.py", "cancel_game"): (
+        GAME_WIDE_WRITE,
+        "cancelling a GAME cancels both sides' enrollments, because the "
+        "cancellation is a fact about the game rather than about a side."),
+    ("services/setup_service.py", "delete_game"): (
+        GAME_WIDE_WRITE,
+        "deleting a draft game removes both sides' rows with it, for the "
+        "same reason."),
+    ("demo.py", "main"): (
+        OUT_OF_BAND_TOOLING,
+        "the deterministic demo seeder. It prints a summary of the world it "
+        "just built; it is not reachable from any request path."),
+}
+
+#: The classes detector 3 knows, and the condition behind each is checked in
+#: :func:`_two_sided_condition`.
+_TWO_SIDED_CLASSES = {
+    NARROWS_BY_TRUSTED_SIDE, TWO_SIDED_BY_AUDIENCE_READER, GAME_WIDE_WRITE,
+    ATTRIBUTION_PRIMITIVE, IDENTITY_RECOVERY_ONLY, OUT_OF_BAND_TOOLING,
+}
+
+
+def audit_two_sided_store_reads(sources=None):
+    """Every function that reaches two-sided game storage, and whether it is
+    declared with a class whose condition holds."""
+    sources = package_sources() if sources is None else sources
+    violations, used = [], set()
+    for path, text in sorted(sources.items()):
+        for fn, _parent in functions_in(text):
+            reads = sorted({_final_name(c.func) for c in _calls_in(fn)}
+                           & set(TWO_SIDED_STORE_READS))
+            if not reads:
+                continue
+            key = (path, fn.name)
+            entry = TWO_SIDED_READERS.get(key)
+            if entry is None:
+                violations.append(Violation(
+                    "undeclared_two_sided_read", path, fn.lineno, fn.name,
+                    f"store.{'/'.join(reads)}(game_id) — rows for BOTH sides "
+                    f"of the game, read with no side argument at all",
+                    "this is the shape F1 and F3 shipped as ("
+                    "`get_roster`/`get_substitutes` returning the whole "
+                    "game's rows), and the side-provenance detector cannot "
+                    "see it because there is no side argument to classify. "
+                    f"Declare ({path!r}, {fn.name!r}) in "
+                    "side_provenance.TWO_SIDED_READERS with the class that "
+                    "says what this function does with two-sided state; each "
+                    "class's condition is machine-checked"))
+                continue
+            used.add(key)
+            klass, _reason = entry
+            if klass not in _TWO_SIDED_CLASSES:
+                violations.append(Violation(
+                    "undeclared_two_sided_read", path, fn.lineno, fn.name,
+                    f"an unknown two-sided class {klass!r}",
+                    f"use one of {sorted(_TWO_SIDED_CLASSES)}"))
+                continue
+            for problem in _two_sided_condition(klass, path, fn, sources):
+                violations.append(Violation(
+                    "two_sided_class_broken", path, fn.lineno, fn.name,
+                    problem,
+                    "the class this site claims is machine-checked; a site "
+                    "that stops matching its class is a violation even "
+                    "though it is listed"))
+    return violations, used
+
+
+#: Registries whose members are already enumerated by another detector — the
+#: closure ATTRIBUTION_PRIMITIVE and IDENTITY_RECOVERY_ONLY require of every
+#: caller.
+def _is_enumerated(path, name):
+    return (name in PRODUCERS or name in SIDE_FORWARDERS
+            or name in ADJUDICATED_READERS
+            or (path, name) in TWO_SIDED_READERS)
+
+
+def _two_sided_condition(klass, path, fn, sources):
+    args = [a.arg for a in fn.args.posonlyargs + fn.args.args
+            + fn.args.kwonlyargs]
+    problems = []
+    if klass == NARROWS_BY_TRUSTED_SIDE:
+        if fn.name not in PRODUCERS and fn.name not in SIDE_FORWARDERS:
+            problems.append(
+                f"{fn.name}() claims NARROWS_BY_TRUSTED_SIDE but is neither "
+                f"a declared PRODUCER nor a declared SIDE_FORWARDER, so "
+                f"nothing gates the side it narrows by or enumerates its "
+                f"callers")
+        # …and it must REALLY take a side. Membership of a registry is not
+        # the check — a function that lost its side parameter narrows by
+        # nothing, whatever the registry still says about it.
+        elif fn.name in PRODUCERS and PRODUCERS[fn.name][0] not in args:
+            problems.append(
+                f"{fn.name}() claims NARROWS_BY_TRUSTED_SIDE but its "
+                f"signature ({', '.join(args)}) carries no "
+                f"{PRODUCERS[fn.name][0]!r} to narrow BY, so it reads both "
+                f"sides and answers with both")
+    elif klass == TWO_SIDED_BY_AUDIENCE_READER:
+        if fn.name not in ADJUDICATED_READERS:
+            problems.append(
+                f"{fn.name}() claims TWO_SIDED_BY_AUDIENCE_READER but is not "
+                f"a declared ADJUDICATED_READER, so no audience decision is "
+                f"verified before it answers with two-sided state")
+        # THE CHECK THAT MAKES THIS DETECTOR WORK ON A TREE THE REGISTRY WAS
+        # NOT WRITTEN FOR, and the reason it catches F1/F3 rather than
+        # excusing them: the condition is a property of THIS function's body,
+        # not of a name appearing in a table maintained alongside the fix.
+        # At the trees where `get_roster`/`get_substitutes`/`get_board`
+        # returned the whole game's rows, they consulted no audience at all.
+        elif not (_body_calls(fn) & (set(_AUDIENCE_CALLS)
+                                     | set(ADJUDICATORS))):
+            problems.append(
+                f"{fn.name}() claims TWO_SIDED_BY_AUDIENCE_READER but its "
+                f"body calls none of {_AUDIENCE_CALLS} and delegates to no "
+                f"declared adjudicator, so it reads BOTH sides of the game "
+                f"and answers with them unprojected — the shape F1 and F3 "
+                f"shipped as")
+    elif klass == GAME_WIDE_WRITE:
+        if "actor_id" not in args:
+            problems.append(
+                f"{fn.name}() claims GAME_WIDE_WRITE but takes no "
+                f"`actor_id`; a READ of both sides does not get this class")
+    elif klass in (ATTRIBUTION_PRIMITIVE, IDENTITY_RECOVERY_ONLY):
+        escapes = _unenumerated_callers(sources, fn.name)
+        if escapes:
+            problems.append(
+                f"{fn.name}() claims {klass} — whose whole condition is that "
+                f"its two-sided answer never escapes an enumerated chain — "
+                f"but it is called from {sorted(escapes)}, which no other "
+                f"registry covers")
+    elif klass == OUT_OF_BAND_TOOLING:
+        # Checked against the IMPORT GRAPH, not against a word search: the
+        # transport layer legitimately mentions the string "demo" all over
+        # (`/api/demo/overview`, `DEMO_USERS`) without importing `demo.py`.
+        # One hop, and stated as such: no serving module may import it.
+        importers = sorted(
+            other for other in sources
+            if (other.startswith(("api/", "web/"))
+                and Path(path).stem in _imported_module_names(sources[other])))
+        if importers:
+            problems.append(
+                f"{path} claims OUT_OF_BAND_TOOLING but {', '.join(importers)}"
+                f" import(s) it, so a request path may reach it")
+    return problems
+
+
+def _imported_module_names(text):
+    """Every module simple-name this source imports."""
+    names = set()
+    for node in ast.walk(parse(text)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.update(alias.name.split("."))
+        elif isinstance(node, ast.ImportFrom):
+            names.update((node.module or "").split("."))
+            for alias in node.names:
+                names.add(alias.name)
+    return names - {""}
+
+
+def _unenumerated_callers(sources, name):
+    """Callers of ``name`` that no registry enumerates. A function nothing "
+    calls returns the empty set, which is the honest answer: there is no
+    escape."""
+    escapes = set()
+    for path, text in sorted(sources.items()):
+        for fn, parent in functions_in(text):
+            for call in _calls_in(fn):
+                if _final_name(call.func) != name:
+                    continue
+                if _is_enumerated(path, fn.name):
+                    continue
+                if parent is not None and _is_enumerated(path, parent.name):
+                    continue
+                escapes.add(f"{path}:{fn.name}")
+    return escapes
+
+
+# ---------------------------------------------------------------------------
+# Detector 3 — THE TRUSTED SYMBOL IS THE ONLY THING WEARING ITS NAME
+#
+# Hole B, reported at its source rather than only at the call sites it
+# poisons. `_ModuleContext` already refuses to TRUST a binding it cannot
+# resolve to the canonical definition; this detector additionally says WHERE
+# the forgery is, so the failure names the def rather than the read.
+# ---------------------------------------------------------------------------
+def audit_trusted_binding(sources=None):
+    """Every binding of :data:`TRUSTED_RESOLVER` in the package, and whether
+    it is the one canonical definition.
+
+    Exactly ONE module-level ``def`` may carry that name, in
+    :data:`TRUSTED_RESOLVER_MODULE`. A nested def, a method, a class, a
+    lambda assigned to it, an ``import … as`` and an import from an
+    undeclared module are each reported — and a declared re-export must
+    really re-export the canonical symbol, so the chain always terminates at
+    the one definition."""
+    sources = package_sources() if sources is None else sources
+    violations = []
+    canonical = []
+    for path, text in sorted(sources.items()):
+        tree = parse(text)
+        ctx = _ModuleContext(path, tree)
+        for lineno, what in ctx.forgeries:
+            violations.append(Violation(
+                "forged_trusted_resolver", path, lineno, "<module>",
+                f"this module {what}",
+                f"{TRUSTED_RESOLVER} is the ONE resolution everything this "
+                f"gate calls TRUSTED traces back to. Import it from "
+                f"{TRUSTED_RESOLVER_MODULE} (or a declared re-export: "
+                f"{', '.join(TRUSTED_REEXPORTS)}) under its own name, or the "
+                f"name stops meaning the canonical symbol"))
+        for fn, parent in functions_in(text):
+            if fn.name != TRUSTED_RESOLVER:
+                continue
+            if path == TRUSTED_RESOLVER_MODULE and parent is None \
+                    and _is_module_level(tree, fn):
+                canonical.append((path, fn.lineno))
+                continue
+            where = ("nested inside " + parent.name + "()" if parent
+                     else "at class scope" if not _is_module_level(tree, fn)
+                     else "at module scope")
+            violations.append(Violation(
+                "forged_trusted_resolver", path, fn.lineno, fn.name,
+                f"a SECOND definition of {TRUSTED_RESOLVER}, {where}",
+                f"there may be exactly one, module-level, in "
+                f"{TRUSTED_RESOLVER_MODULE}. A same-named nested def, method "
+                f"or lambda used to be trusted on the strength of its name "
+                f"alone — that is the hole this detector closes"))
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = [t for t in node.targets]
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                targets = [node.target]
+            elif isinstance(node, ast.NamedExpr):
+                targets = [node.target]
+            for target in targets:
+                if TRUSTED_RESOLVER in _bound_names(target):
+                    violations.append(Violation(
+                        "forged_trusted_resolver", path, node.lineno,
+                        "<assignment>",
+                        f"the name {TRUSTED_RESOLVER} is ASSIGNED here",
+                        f"the trusted resolution is a function, not a "
+                        f"rebindable name. Assigning it — to a lambda, to a "
+                        f"method, to anything — makes every call spelled "
+                        f"like it mean something else"))
+        if path in TRUSTED_REEXPORTS \
+                and TRUSTED_RESOLVER not in ctx.trusted_names:
+            violations.append(Violation(
+                "forged_trusted_resolver", path, 0, "<module>",
+                f"declared a TRUSTED_REEXPORT but does not import "
+                f"{TRUSTED_RESOLVER} from {TRUSTED_RESOLVER_MODULE}",
+                "a re-export that no longer re-exports the canonical symbol "
+                "turns every importer of it into an unchecked binding"))
+    if len(canonical) != 1:
+        violations.append(Violation(
+            "forged_trusted_resolver", TRUSTED_RESOLVER_MODULE, 0,
+            "<module>",
+            f"{len(canonical)} canonical definitions of {TRUSTED_RESOLVER} "
+            f"(expected exactly 1): {canonical}",
+            "everything this gate calls TRUSTED is trusted because it traces "
+            "back to ONE function"))
+    return violations
+
+
+def _is_module_level(tree, fn):
+    return any(node is fn for node in tree.body)
+
+
+# ---------------------------------------------------------------------------
+# Detector 4 — the private-game dispatch
 # ---------------------------------------------------------------------------
 def _private_game_block(tree):
     """The ``if sub == …`` chain of ``_dispatch_get``'s private-game family,
@@ -1041,6 +1641,7 @@ def audit_dispatch(source=None):
         source = (PACKAGE_ROOT / "web" / "server.py").read_text()
     path = "web/server.py"
     tree = parse(source)
+    ctx = _ModuleContext(path, tree)
     fn, hoist = _private_game_block(tree)
     violations, seen_leaves = [], set()
     if fn is None:
@@ -1058,7 +1659,7 @@ def audit_dispatch(source=None):
                    for t in node.targets):
             continue
         scope = _Scope(fn)
-        origins = _origins(node.value, scope, node.lineno + 1)
+        origins = _origins(node.value, scope, node.lineno + 1, ctx=ctx)
         bad = sorted(o for o in origins
                      if o != f"call:{TRUSTED_RESOLVER}"
                      and not o.startswith("const:"))
@@ -1317,6 +1918,12 @@ def verify_registry_liveness(sources=None, usage=None, dispatch_leaves=None):
             errors.append(
                 f"LEDGER[{key!r}] is DORMANT: the site it accepted is gone. "
                 f"Delete the entry — this ledger may only shrink.")
+    if usage is not None and "two_sided" in usage:
+        for key in sorted(set(TWO_SIDED_READERS) - usage["two_sided"]):
+            errors.append(
+                f"TWO_SIDED_READERS[{key!r}] is DORMANT: that function no "
+                f"longer reaches two-sided game storage, or no longer "
+                f"exists. Delete the entry — this registry may only shrink.")
     if usage is not None and "home_fallbacks" in usage:
         for key in sorted(set(HOME_FALLBACKS) - usage["home_fallbacks"]):
             errors.append(
@@ -1356,10 +1963,18 @@ def _class_condition(klass, name, fn, parent, sources, origins, route):
     """The machine-checked condition behind one class. Returns error strings.
 
     THIS is what stops a class being a rubber stamp: a site cannot claim
-    SUBJECT_OWN_SIDE while accepting a caller-supplied side, or
-    AUTHORIZED_WRITE without an authorization argument, or
+    SUBJECT_MEMBERSHIP_CONTEXT without resolving the subject's side for THIS
+    game, or AUTHORIZED_WRITE without an authorization argument, or
     OPERATOR_ONLY_ROUTE on a route the registry does not record as
-    operator-only."""
+    operator-only.
+
+    The first example used to read ``SUBJECT_OWN_SIDE``, which is exactly the
+    class this module removed: its only machine condition was "the function
+    accepts no caller-supplied side", which proves the client did not NAME a
+    side and says nothing about whether the side is AUTHORIZED -- and it
+    blessed the player-home leak on that basis. Citing it here as a live
+    example of a condition that bites would have been the same overclaim in
+    miniature."""
     args = [a.arg for a in fn.args.posonlyargs + fn.args.args
             + fn.args.kwonlyargs]
     errors = []
@@ -1383,15 +1998,35 @@ def _class_condition(klass, name, fn, parent, sources, origins, route):
                 f"does neither. A write that takes a side and no "
                 f"authorization anywhere on the path into it does not get "
                 f"this class.")
-    elif klass == SUBJECT_OWN_SIDE:
+    elif klass == SUBJECT_MEMBERSHIP_CONTEXT:
         offered = [a for a in args
                    if a in ("team_id", "side", "team_side", "viewer_team_id")]
         if offered:
             errors.append(
-                f"{name}() claims SUBJECT_OWN_SIDE but accepts a "
-                f"caller-supplied side ({', '.join(offered)}). The class "
-                f"means the side is derived from the SIGNED-IN SUBJECT and "
-                f"cannot be named by a caller.")
+                f"{name}() claims SUBJECT_MEMBERSHIP_CONTEXT but accepts a "
+                f"caller-supplied side ({', '.join(offered)}).")
+        if origins and not all(o in _SUBJECT_CONTEXT_ORIGINS
+                               for o in origins):
+            errors.append(
+                f"{name}() claims SUBJECT_MEMBERSHIP_CONTEXT but its side "
+                f"comes from {sorted(origins)}, and only "
+                f"{', '.join(_SUBJECT_CONTEXT_ORIGINS)} is a resolved "
+                f"membership context's own side. This is the check the "
+                f"fifth leak needed: `attr:player.team_id` is the permanent "
+                f"pointer, not the game-scoped membership, and the old "
+                f"SUBJECT_OWN_SIDE class could not tell them apart.")
+        if not _body_calls(fn) & set(_MEMBERSHIP_RESOLVERS):
+            errors.append(
+                f"{name}() claims SUBJECT_MEMBERSHIP_CONTEXT but its body "
+                f"never resolves a membership context "
+                f"({'/'.join(sorted(_MEMBERSHIP_RESOLVERS))}), so the "
+                f"context it reads was handed in whole rather than resolved "
+                f"for the subject here.")
+        if not ({"player_id", "player"} & set(args)):
+            errors.append(
+                f"{name}() claims SUBJECT_MEMBERSHIP_CONTEXT but names no "
+                f"SUBJECT (`player_id`/`player`), so there is nothing for "
+                f"the side to be the subject's own side OF.")
     elif klass == DURABLE_ROW_SIDE:
         if not any(o in _DURABLE_ATTRIBUTION_ORIGINS for o in origins) \
                 and origins:
@@ -1551,10 +2186,13 @@ def audit(sources=None, server_source=None, verify_liveness=None):
     provenance, usage = audit_side_provenance(sources)
     fallbacks, used_fallbacks = audit_home_fallback(sources)
     usage["home_fallbacks"] = used_fallbacks
+    two_sided, used_two_sided = audit_two_sided_store_reads(sources)
+    usage["two_sided"] = used_two_sided
+    binding = audit_trusted_binding(sources)
     dispatch, leaves = audit_dispatch(
         server_source if server_source is not None
         else sources.get("web/server.py"))
-    violations = provenance + fallbacks + dispatch
+    violations = provenance + fallbacks + binding + two_sided + dispatch
     errors = (verify_registry_liveness(sources, usage, leaves)
               if verify_liveness else [])
     return violations, errors

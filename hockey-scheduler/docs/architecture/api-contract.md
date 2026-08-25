@@ -232,8 +232,8 @@ a pointer that has outlived the membership grants nothing:
 |---|---|
 | pointer HOME, membership AWAY | the **away** side |
 | pointer names a team in neither game, membership HOME | the **home** side |
-| pointer HOME, membership moved to another team | **no game, neither side** |
-| pointer HOME, membership ended or absent | **no game, neither side** |
+| pointer HOME, membership moved to another team | **no BOUND game, neither side** (an unbound exhibition the pointer still names is unaffected) |
+| pointer HOME, membership ended or absent | **no BOUND game, neither side** (an unbound exhibition the pointer still names is unaffected) |
 | pointer and membership agree | that side, unchanged |
 | no player binding on the session (including an unscoped operator) | the empty stub |
 

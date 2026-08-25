@@ -1,60 +1,86 @@
-"""#205, ROUND 4 — the STRUCTURAL guard, and its own falsification.
+"""#205, ROUND 6 — the SUPPLEMENTAL structural gate, and its own
+falsification.
 
-FOUR ROUNDS, FOUR LEAKS, EACH FOUND BY HAND: three sibling routes, then the
-fifth leaf, then the candidates path, then a route outside the family
-entirely. Every one was the same shape — a private-state read reaching a side
-by default or by a client hint instead of by the server's trusted resolution.
-Finding the fifth that way is not a strategy, so
-``services/side_provenance.py`` fails the build instead, and this file is
-what makes that claim checkable.
+WHERE THIS SITS. ``services/side_provenance.py`` is the SUPPLEMENT. The
+PRIMARY protection for the side rule is the behavioural sweep in
+``test_authenticated_side_noninterference.py``, which measures what actually
+comes out of the server. This file is what makes the supplement's narrower
+claim checkable — and, this round, what makes the previous round's version of
+that claim HONEST.
+
+TWO THINGS THE PREVIOUS ROUND GOT WRONG, and both are pinned here now:
+
+* **The commit message overclaimed.** It said all four shipped defects were
+  reconstructed and required to be reported. The class that claimed it never
+  tested F1's ``get_roster`` or F3's ``get_substitutes``, both of which
+  shipped as a RAW STORE READ WITH NO SIDE ARGUMENT — a shape the gate could
+  not see at all, because there was no side argument to classify.
+  :class:`TheGuardCatchesEveryLeakThisBlockerFixed` now covers all FIVE, and
+  :class:`TheGuardIsMeasuredAgainstTheRealVulnerableTrees` re-measures them
+  against the REAL bytes of each vulnerable commit with ``git archive``
+  rather than by text-mutating today's tree.
+* **``SUBJECT_OWN_SIDE`` blessed the fifth leak.** Its only machine condition
+  was "the function accepts no caller-supplied side", which is a fact about
+  the CLIENT and not about the DERIVED value. It is gone; the class that
+  replaced it is checked against where the side actually came from, and
+  :class:`EveryClassConditionIsEnforced` breaks that condition on purpose to
+  prove the check is real.
 
 THE ORDER THIS WAS BUILT IN, because it is the only order that proves
-anything: the adversarial cases below were written FIRST and confirmed to
-pass against the un-guarded tree (there was no guard, so every one of them
-was accepted silently). The gate was then built until each is caught. What
-is pinned here is therefore not "the guard runs" but "the guard catches these
+anything: the adversarial cases were written FIRST and confirmed to pass
+against the un-guarded tree. The gate was then built until each is caught.
+What is pinned here is not "the guard runs" but "the guard catches these
 exact regressions and does not catch these exact legitimate shapes".
 
 WHAT EACH CLASS PROVES
 ======================
 :class:`TheGuardIsCleanOnHead`
-    The whole package passes, with an EMPTY unclassified ledger. Runs first
-    so a later red is a real regression, not accumulated noise.
+    The whole package passes, with an EMPTY unclassified ledger.
 
 :class:`ANewLeakFailsTheBuild`
-    A dozen adversarial mutations of the REAL source. Each asserts the kind
-    AND the site, so a guard that fires for some other reason does not count
-    as catching it.
+    TWENTY-TWO adversarial mutations of the REAL source, each asserting the
+    kind AND the site. Ten are new this round: three for HOLE A (a raw
+    two-sided store read, the same shape in a module OUTSIDE the games
+    family, and a declared audience reader that stops projecting), six for
+    HOLE B (a nested def, a method, a lambda and a redirected import all
+    wearing the trusted name, the last reported both at its definition and at
+    every call site it poisons) and one for the removed exemption. Eight of
+    the ten ESCAPED the round-5 gate, measured by running both gates over the
+    same mutated sources.
 
 :class:`TheGuardDoesNotFightLegitimateCases`
     The alias case (the trusted side through a local name) is NOT flagged,
-    which is what proves the check is provenance and not spelling; and every
-    documented exemption's machine condition really is enforced.
+    which is what proves the check is provenance and not spelling.
 
 :class:`TheRegistriesCannotRot`
-    Monotonic shrink, per registry: a dormant entry, a renamed producer, an
-    adjudicator that stopped adjudicating, and an ambiguous declaration are
-    each an ERROR.
+    Monotonic shrink, per registry.
 
 :class:`TheGuardsOwnTestsCanFail`
-    THE POINT OF THE WHOLE EXERCISE. Each detector is NEUTERED in turn and
-    the adversarial cases are required to go green — a guard whose own tests
-    cannot fail is exactly the thing this task exists to prevent.
+    Each detector is NEUTERED in turn and the adversarial cases it owns are
+    required to go green.
 
-:class:`TheGuardCatchesTheFourLeaksThisBlockerFixed`
-    The strongest evidence available: all four of the defects that actually
-    shipped and were actually found by hand, reconstructed in the live
-    source and required to be reported. Two are caught by the provenance
-    detector and two by the registry-liveness check.
+:class:`TheGuardCatchesEveryLeakThisBlockerFixed`
+    All five shipped defects, reconstructed in the live source.
+
+:class:`EveryClassConditionIsEnforced`
+    One dedicated test per typed classification — the ruling's "not
+    accumulating exemptions".
+
+:class:`TheGuardIsMeasuredAgainstTheRealVulnerableTrees`
+    The detectors, over the actual bytes of six commits of this branch.
 
 NO SOCKET, NO STORE, NO BACKEND: this is a source-level contract, so it is
 the same on Memory, SQLite and PostgreSQL by construction. The BEHAVIOUR the
-guard protects is pinned tri-store over authenticated HTTP in
-``test_overview_schedule_side.py`` and ``test_private_game_sibling_routes.py``.
+guard supplements is pinned tri-store over authenticated HTTP in
+``test_authenticated_side_noninterference.py``,
+``test_player_home_side_authority.py``, ``test_overview_schedule_side.py``
+and ``test_private_game_sibling_routes.py``.
+
 """
 
 import contextlib
 import unittest
+from pathlib import Path
 
 from helpers import BACKEND  # noqa: F401
 
@@ -222,6 +248,149 @@ def case_producer_reached_through_an_alias_of_the_hint(sources):
             return self._availability_summary_of(game, asked)""")
 
 
+# ---------------------------------------------------------------------------
+# HOLE A — the raw two-sided store read, which has NO side argument for the
+# provenance detector to classify. This is the shape F1 and F3 shipped as,
+# and the shape the round-5 gate was blind to.
+# ---------------------------------------------------------------------------
+def case_raw_store_read_no_side(sources):
+    """A new facade read that goes STRAIGHT to the store and returns the whole
+    game's rows. No side argument, no home default, no client hint — nothing a
+    provenance check over producer arguments can see."""
+    return _append_method(sources, FACADE, '''
+    def get_game_roster_rows(self, game_id):
+        """A plausible-looking new read."""
+        self.roster._require_game(game_id)
+        return [_serialize(e) for e in self.store.roster_for_game(game_id)]
+''')
+
+
+def case_raw_store_read_outside_the_games_family(sources):
+    """THE SAME SHAPE IN A NEW MODULE. Rounds 4 and 5 both came from outside
+    the ``/api/games/{id}/…`` family, so a detector scoped to that family --
+    or to the facade -- would not have seen either."""
+    out = dict(sources)
+    out["services/side_digest.py"] = '''"""A plausible-looking new service."""
+
+
+class SideDigest:
+    def __init__(self, store):
+        self.store = store
+
+    def digest(self, game_id):
+        return {"subs": [s.player_id
+                         for s in self.store.substitutes_for_game(game_id)]}
+'''
+    return out
+
+
+def case_adjudicated_reader_stops_projecting(sources):
+    """A declared TWO_SIDED_BY_AUDIENCE_READER that stops consulting the
+    audience while still reading both sides — F1/F3 restored in place. The
+    class condition is a property of the BODY, not of a name in a table, so
+    it fires without any registry edit."""
+    return _replace(sources, FACADE, """        game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            return [_serialize(e) for e in self.store.roster_for_game(game_id)]
+        if audience == lineup_visibility.SUBMITTED_LINEUP:
+            return self._submitted_lineup_sides(game)
+        if audience == lineup_visibility.OWN_SIDE:
+            return [_serialize(e) for e in self.store.roster_for_game(game_id)
+                    if e.attribution is not None
+                    and e.attribution[0] == viewer_team_id]
+        raise NotAuthorizedError(_PRIVATE_SIDE_REFUSAL)""",
+                    """        self.roster._require_game(game_id)
+        return [_serialize(e) for e in self.store.roster_for_game(game_id)]""")
+
+
+# ---------------------------------------------------------------------------
+# HOLE B — a callable WEARING the trusted name. Round 5 compared the callee's
+# last name component to the string, so every one of these was trusted
+# unconditionally.
+# ---------------------------------------------------------------------------
+def case_nested_def_forges_the_resolver(sources):
+    """A nested ``def`` with the trusted name, shadowing it for one
+    function."""
+    return _append_method(sources, FACADE, '''
+    def get_forged_by_nested_def(self, game_id, query):
+        """A plausible-looking new read."""
+        def game_scoped_own_team_id(role, scope, game, store):
+            return query.get("team_id")
+        game = self.roster._require_game(game_id)
+        return self.roster.compute_roster_status(
+            game_id,
+            game_scoped_own_team_id(None, None, game, self.store)).to_dict()
+''')
+
+
+def case_method_forges_the_resolver(sources):
+    """A METHOD on the facade with the trusted name — ``self.`` in front of
+    it, and a last name component that matches exactly."""
+    return _append_method(sources, FACADE, '''
+    def game_scoped_own_team_id(self, role, scope, game, store):
+        """A plausible-looking helper."""
+        return (scope or {}).get("team_id")
+
+    def get_forged_by_method(self, game_id, scope):
+        """A plausible-looking new read."""
+        game = self.roster._require_game(game_id)
+        return self.roster.compute_roster_status(
+            game_id,
+            self.game_scoped_own_team_id(None, scope, game, self.store)
+        ).to_dict()
+''')
+
+
+def case_lambda_forges_the_resolver(sources):
+    """A local lambda bound to the trusted name."""
+    return _append_method(sources, FACADE, '''
+    def get_forged_by_lambda(self, game_id, query):
+        """A plausible-looking new read."""
+        game_scoped_own_team_id = lambda r, s, g, st: query.get("team_id")
+        game = self.roster._require_game(game_id)
+        return self.roster.compute_roster_status(
+            game_id,
+            game_scoped_own_team_id(None, None, game, self.store)).to_dict()
+''')
+
+
+def case_import_alias_forges_the_resolver(sources):
+    """THE SUBTLEST ONE: the facade keeps calling ``game_scoped_own_team_id``
+    exactly as it always did, and the IMPORT is redirected to a different
+    module. Every call site is byte-identical; only the binding moved."""
+    out = dict(sources)
+    out["services/forged_scope.py"] = '''"""A plausible-looking helper module."""
+
+
+def game_scoped_own_team_id(role, scope, game, store):
+    return (scope or {}).get("team_id")
+'''
+    return _replace(
+        out, FACADE,
+        "from ..services.game_side_scope import game_scoped_own_team_id",
+        "from ..services.forged_scope import game_scoped_own_team_id")
+
+
+# ---------------------------------------------------------------------------
+# THE REMOVED EXEMPTION — the fifth leak's own shape, which SUBJECT_OWN_SIDE
+# blessed.
+# ---------------------------------------------------------------------------
+def case_subject_side_from_the_permanent_pointer(sources):
+    """A ``/api/me/*``-shaped read that takes NO side parameter — so the old
+    SUBJECT_OWN_SIDE condition is satisfied — and derives the side from
+    ``Player.team_id``, the permanent pointer. This is ``get_player_home``
+    before round 6, and the round-5 gate passed it."""
+    return _append_method(sources, FACADE, '''
+    def get_my_next_game_status(self, player_id, game_id):
+        """A plausible-looking new subject-scoped read."""
+        player = self.store.get_player(player_id)
+        return self.roster.compute_roster_status(
+            game_id, player.team_id).to_dict()
+''')
+
+
 #: ``name -> (mutation, expected kind, expected function)``. Every entry is a
 #: regression this blocker actually saw, or a way of hiding one.
 ADVERSARIAL = {
@@ -258,6 +427,39 @@ ADVERSARIAL = {
     "alias_of_the_hint": (
         case_producer_reached_through_an_alias_of_the_hint, "untrusted_side",
         "get_availability_summary"),
+    # -- HOLE A -----------------------------------------------------------
+    "raw_store_read_no_side": (
+        case_raw_store_read_no_side, "undeclared_two_sided_read",
+        "get_game_roster_rows"),
+    "raw_store_read_outside_the_games_family": (
+        case_raw_store_read_outside_the_games_family,
+        "undeclared_two_sided_read", "digest"),
+    "adjudicated_reader_stops_projecting": (
+        case_adjudicated_reader_stops_projecting, "two_sided_class_broken",
+        "get_roster"),
+    # -- HOLE B -----------------------------------------------------------
+    "nested_def_forges_the_resolver": (
+        case_nested_def_forges_the_resolver, "untrusted_side",
+        "get_forged_by_nested_def"),
+    "nested_def_is_reported_at_its_definition": (
+        case_nested_def_forges_the_resolver, "forged_trusted_resolver",
+        "game_scoped_own_team_id"),
+    "method_forges_the_resolver": (
+        case_method_forges_the_resolver, "untrusted_side",
+        "get_forged_by_method"),
+    "lambda_forges_the_resolver": (
+        case_lambda_forges_the_resolver, "untrusted_side",
+        "get_forged_by_lambda"),
+    "import_alias_forges_the_resolver": (
+        case_import_alias_forges_the_resolver, "forged_trusted_resolver",
+        "<module>"),
+    "import_alias_poisons_every_call_site": (
+        case_import_alias_forges_the_resolver, "untrusted_side",
+        "get_player_home"),
+    # -- THE REMOVED EXEMPTION --------------------------------------------
+    "subject_side_from_the_permanent_pointer": (
+        case_subject_side_from_the_permanent_pointer, "untrusted_side",
+        "get_my_next_game_status"),
 }
 
 
@@ -310,6 +512,26 @@ class _GuardHarness:
                 yield
             finally:
                 sp.audit_dispatch = saved
+        elif what == "two_sided":
+            saved = sp.audit_two_sided_store_reads
+            sp.audit_two_sided_store_reads = lambda sources=None: ([], set())
+            try:
+                yield
+            finally:
+                sp.audit_two_sided_store_reads = saved
+        elif what == "trusted_binding":
+            # The Hole-B neutering a careless edit really produces: go back
+            # to comparing the callee's LAST NAME COMPONENT to the string.
+            saved = sp._ModuleContext.resolves_to_canonical
+            sp._ModuleContext.resolves_to_canonical = \
+                lambda self, func, scope: True
+            saved_binding = sp.audit_trusted_binding
+            sp.audit_trusted_binding = lambda sources=None: []
+            try:
+                yield
+            finally:
+                sp._ModuleContext.resolves_to_canonical = saved
+                sp.audit_trusted_binding = saved_binding
         elif what == "trusted_everything":
             # The subtlest neutering, and the one a careless edit really
             # produces: every origin declared trusted.
@@ -627,7 +849,17 @@ class TheGuardsOwnTestsCanFail(_GuardHarness, unittest.TestCase):
         "trusted_everything": ("untrusted_side", "mixed_disjunct",
                                "ternary_hides_the_hint",
                                "client_hint_into_a_producer",
-                               "side_omitted_entirely"),
+                               "side_omitted_entirely",
+                               "subject_side_from_the_permanent_pointer"),
+        "two_sided": ("raw_store_read_no_side",
+                      "raw_store_read_outside_the_games_family",
+                      "adjudicated_reader_stops_projecting"),
+        "trusted_binding": ("nested_def_forges_the_resolver",
+                            "nested_def_is_reported_at_its_definition",
+                            "method_forges_the_resolver",
+                            "lambda_forges_the_resolver",
+                            "import_alias_forges_the_resolver",
+                            "import_alias_poisons_every_call_site"),
     }
 
     def test_neutering_each_detector_makes_its_cases_go_green(self):
@@ -660,23 +892,30 @@ class TheGuardsOwnTestsCanFail(_GuardHarness, unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 6. THE FOUR LEAKS THIS BLOCKER ACTUALLY FIXED.
+# 6. EVERY LEAK THIS BLOCKER FIXED — INCLUDING THE TWO THE PREVIOUS COMMIT
+#    MESSAGE CLAIMED AND THIS CLASS DID NOT TEST.
 # ---------------------------------------------------------------------------
-class TheGuardCatchesTheFourLeaksThisBlockerFixed(_GuardHarness,
-                                                  unittest.TestCase):
-    """The claim the whole exercise rests on, made checkable.
+class TheGuardCatchesEveryLeakThisBlockerFixed(_GuardHarness,
+                                               unittest.TestCase):
+    """The claim the whole exercise rests on, made checkable — and CORRECTED.
 
-    Each round's real defect is RECONSTRUCTED in the live source and the gate
-    is required to report it. This is a stronger statement than the synthetic
+    THE OVERCLAIM THIS CLASS REPLACES. Its previous name said "the four leaks
+    this blocker fixed" and its previous body tested four shapes, none of
+    which was F1's ``get_roster`` or F3's ``get_substitutes``: both of those
+    shipped as a RAW STORE READ WITH NO SIDE ARGUMENT, which the round-5 gate
+    could not see at all. The commit message claimed all four were
+    reconstructed and required to be reported. They were not.
+
+    All FIVE are here now, each RECONSTRUCTED in the live source and required
+    to be reported. This is a stronger statement than the synthetic
     adversarial cases above: these are not shapes chosen to be catchable,
-    they are the four shapes that actually shipped and were actually found by
+    they are the shapes that actually shipped and were actually found by
     hand, one round at a time.
 
-    TWO of them are caught by the PROVENANCE detector and two by the
-    REGISTRY-LIVENESS check, which is the design working as intended rather
-    than a gap: deleting a reader's audience test does not change any call
-    site's provenance, so a gate that only looked at call sites would have
-    missed it. The declaration that reader carries is what notices."""
+    Reconstruction here is text surgery on TODAY's tree, with unique anchors
+    that fail loudly if they drift. The independent measurement against the
+    REAL historical sources — ``git archive`` at each vulnerable commit — is
+    :class:`TheGuardIsMeasuredAgainstTheRealVulnerableTrees`."""
 
     def test_round_1_get_board_hard_coding_home_for_everybody(self):
         """`get_board` read `game.home_team_id` unconditionally, so an AWAY
@@ -770,6 +1009,363 @@ class TheGuardCatchesTheFourLeaksThisBlockerFixed(_GuardHarness,
                          "_schedule_roster_status"),
             "THE DEFECT THIS ROUND FIXED was not reported by the guard "
             "built to stop the next one:\n" + sp.report(violations, []))
+
+    def test_round_1_get_roster_returning_the_whole_games_rows(self):
+        """F1's OTHER half, and the one the previous version of this class
+        never tested: ``get_roster`` returned ``roster_for_game`` — EVERY
+        seated row in the game, both sides — to any caller the participation
+        gate admitted. There is no side argument here for the provenance
+        detector to classify, which is exactly why detector 4 exists."""
+        leaked = case_adjudicated_reader_stops_projecting(_sources())
+        violations, _errors = self._audit(leaked)
+        self.assertTrue(
+            self._caught(violations, "two_sided_class_broken", "get_roster"),
+            "F1's raw two-sided store read was not reported:\n"
+            + sp.report(violations, []))
+
+    def test_round_1_get_substitutes_returning_the_whole_games_rows(self):
+        """F3, the same shape on the substitute pool."""
+        leaked = _replace(_sources(), FACADE, """        game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            return [_serialize(s)
+                    for s in self.store.substitutes_for_game(game_id)]
+        if audience == lineup_visibility.OWN_SIDE:
+            return [_serialize(s)
+                    for s in self.store.substitutes_for_game(game_id)
+                    if s.team_id is not None and s.team_id == viewer_team_id]
+        raise NotAuthorizedError(_SUBSTITUTE_REFUSAL)""",
+                          """        self.roster._require_game(game_id)
+        return [_serialize(s)
+                for s in self.store.substitutes_for_game(game_id)]""")
+        violations, _errors = self._audit(leaked)
+        self.assertTrue(
+            self._caught(violations, "two_sided_class_broken",
+                         "get_substitutes"),
+            "F3's raw two-sided store read was not reported:\n"
+            + sp.report(violations, []))
+
+    def test_round_6_player_home_taking_its_side_from_the_pointer(self):
+        """THE FIFTH LEAK, restored verbatim — and the one an earlier version
+        of this gate BLESSED, under the ``SUBJECT_OWN_SIDE`` exemption whose
+        only condition was "takes no caller-supplied side". It takes none;
+        it derived the OPPONENT's side from ``Player.team_id``."""
+        leaked = _replace(_sources(), FACADE, """            my_team_id = game_scoped_own_team_id(
+                Role.PLAYER, {"player_id": player_id}, next_game, self.store)""",
+                          """            my_team_id = player.team_id""")
+        violations, _errors = self._audit(leaked)
+        self.assertTrue(
+            self._caught(violations, "untrusted_side", "get_player_home"),
+            "THE DEFECT THE COMPANION COMMIT FIXES was not reported by the "
+            "guard rebuilt after it was missed:\n" + sp.report(violations, []))
+
+    def test_the_ship_date_counterfactual_is_recorded(self):
+        """WHAT THE ROUND-5 GATE WOULD HAVE DONE, stated as an assertion
+        rather than as a claim in a commit message: with detector 4 removed,
+        F1 and F3 stop being reported at all — which is the measurement that
+        justifies detector 4 existing."""
+        leaked = case_adjudicated_reader_stops_projecting(_sources())
+        with self._neutered("two_sided"):
+            violations, _errors = self._audit(leaked)
+        self.assertEqual(
+            [], [v for v in violations if v.function == "get_roster"],
+            "with the two-sided detector removed, F1's raw store read was "
+            "still reported — so the ship-date counterfactual this round "
+            "rests on is not what it says it is: " + sp.report(violations, []))
+
+
+# ---------------------------------------------------------------------------
+# 7. EVERY CLASS CONDITION IS ENFORCED, ONE DEDICATED TEST EACH.
+# ---------------------------------------------------------------------------
+class EveryClassConditionIsEnforced(_GuardHarness, unittest.TestCase):
+    """THE RULING'S "typed, documented design classifications with dedicated
+    tests -- not accumulating exemptions".
+
+    A class whose condition is never exercised is a rubber stamp, and a
+    rubber stamp is how ``SUBJECT_OWN_SIDE`` blessed the fifth leak. Each
+    test below breaks ONE class's condition and requires the gate to say so
+    BY NAME."""
+
+    def _condition_errors(self, klass, name, fn_source, path=FACADE,
+                          origins=(), route=None):
+        sources = _append_method(_sources(), path, fn_source)
+        fn = sp._find_function(sources, path, name)
+        self.assertIsNotNone(fn, f"the fixture method {name} did not parse")
+        return sp._class_condition(klass, name, fn, None, sources,
+                                   origins=set(origins), route=route)
+
+    def test_subject_membership_context_rejects_the_permanent_pointer(self):
+        """THE CHECK THE FIFTH LEAK NEEDED. The old class asked only whether
+        a caller could NAME a side. This one asks where the derived side came
+        from, and ``attr:player.team_id`` is not a resolved membership
+        context."""
+        errors = self._condition_errors(
+            sp.SUBJECT_MEMBERSHIP_CONTEXT, "pretend_subject_read", '''
+    def pretend_subject_read(self, player_id, game_id):
+        """Resolves a context, then ignores it."""
+        player = self.store.get_player(player_id)
+        game = self.roster._require_game(game_id)
+        self.roster.resolve_membership_context(game, player)
+        return self.roster.compute_roster_status(
+            game_id, player.team_id).to_dict()
+''', origins=("attr:player.team_id",))
+        self.assertTrue(
+            any("permanent pointer" in e for e in errors),
+            f"a side taken from the permanent pointer was accepted as a "
+            f"'subject's own membership context': {errors}")
+
+    def test_subject_membership_context_requires_a_real_resolution(self):
+        errors = self._condition_errors(
+            sp.SUBJECT_MEMBERSHIP_CONTEXT, "pretend_handed_context", '''
+    def pretend_handed_context(self, player_id, game_id, ctx):
+        """Never resolves anything: the context is handed in whole."""
+        return self.roster.compute_roster_status(
+            game_id, ctx.team_id).to_dict()
+''', origins=("attr:ctx.team_id",))
+        self.assertTrue(
+            any("never resolves a membership context" in e for e in errors),
+            errors)
+
+    def test_subject_membership_context_requires_a_subject(self):
+        errors = self._condition_errors(
+            sp.SUBJECT_MEMBERSHIP_CONTEXT, "pretend_subjectless", '''
+    def pretend_subjectless(self, game_id, ctx):
+        """No subject at all."""
+        self.roster.resolve_membership_context(None, None)
+        return self.roster.compute_roster_status(
+            game_id, ctx.team_id).to_dict()
+''', origins=("attr:ctx.team_id",))
+        self.assertTrue(any("names no SUBJECT" in e for e in errors), errors)
+
+    def test_authorized_write_needs_authorization_on_the_path(self):
+        errors = self._condition_errors(
+            sp.AUTHORIZED_WRITE, "pretend_write", '''
+    def pretend_write(self, game_id, team_id):
+        """A write that takes a side and authorizes nothing."""
+        return self.roster.compute_roster_status(game_id, team_id).to_dict()
+''')
+        self.assertTrue(any("AUTHORIZED_WRITE" in e for e in errors), errors)
+
+    def test_operator_default_needs_an_audience_consulting_function(self):
+        errors = self._condition_errors(
+            sp.OPERATOR_DEFAULT, "pretend_operator_default", '''
+    def pretend_operator_default(self, game_id, game):
+        """Never consults an audience."""
+        return self.roster.compute_roster_status(
+            game_id, game.home_team_id).to_dict()
+''')
+        self.assertTrue(any("OPERATOR_DEFAULT" in e for e in errors), errors)
+
+    def test_operator_only_route_is_tied_to_the_registrys_recorded_auth(self):
+        self.assertEqual([], sp._route_is_operator_only(
+            "get_scheduler_drafts", "x"))
+        self.assertTrue(sp._route_is_operator_only("get_api_health", "x"))
+        self.assertTrue(sp._route_is_operator_only("no_such_route", "x"))
+
+    def test_durable_row_side_rejects_a_non_durable_origin(self):
+        errors = self._condition_errors(
+            sp.DURABLE_ROW_SIDE, "pretend_durable", '''
+    def pretend_durable(self, game_id, player):
+        """Claims the row's own side, reads the permanent pointer."""
+        return self.roster.compute_roster_status(
+            game_id, player.team_id).to_dict()
+''', origins=("attr:player.team_id",))
+        self.assertTrue(any("DURABLE_ROW_SIDE" in e for e in errors), errors)
+
+    def test_live_membership_by_design_must_still_resolve_membership(self):
+        errors = self._condition_errors(
+            sp.LIVE_MEMBERSHIP_BY_DESIGN, "pretend_live", '''
+    def pretend_live(self, game_id, team_id):
+        """Claims to read live membership; reads nothing of the kind."""
+        return list(self.store.players_for_team(team_id))
+''')
+        self.assertTrue(
+            any("LIVE_MEMBERSHIP_BY_DESIGN" in e for e in errors), errors)
+
+    def test_narrows_by_trusted_side_needs_a_side_to_narrow_by(self):
+        """A declared producer that LOSES its side parameter narrows by
+        nothing — and the registry, which still names it, would say it is
+        fine."""
+        sources = _replace(
+            _sources(), "services/roster_service.py",
+            '    def lineup_population(self, game, team_id: str) -> '
+            'List["LineupRow"]:',
+            '    def lineup_population(self, game) -> List["LineupRow"]:')
+        fn = sp._find_function(sources, "services/roster_service.py",
+                               "lineup_population")
+        problems = sp._two_sided_condition(
+            sp.NARROWS_BY_TRUSTED_SIDE, "services/roster_service.py", fn,
+            sources)
+        self.assertTrue(
+            any("narrow BY" in p for p in problems),
+            f"a producer with no side parameter still claimed to narrow by "
+            f"one: {problems}")
+
+    def test_out_of_band_tooling_is_checked_against_the_import_graph(self):
+        """The demo seeder's class holds only while no serving module
+        imports it."""
+        sources = _sources()
+        problems = sp._two_sided_condition(
+            sp.OUT_OF_BAND_TOOLING, "demo.py",
+            sp._find_function(sources, "demo.py", "main"), sources)
+        self.assertEqual([], problems, problems)
+        poisoned = dict(sources)
+        poisoned[SERVER] = "from .. import demo\n" + sources[SERVER]
+        problems = sp._two_sided_condition(
+            sp.OUT_OF_BAND_TOOLING, "demo.py",
+            sp._find_function(poisoned, "demo.py", "main"), poisoned)
+        self.assertTrue(
+            any("import(s) it" in p for p in problems),
+            f"a seeding script a serving module imports still claimed to be "
+            f"out of band: {problems}")
+
+    def test_a_dormant_two_sided_entry_is_an_error(self):
+        saved = sp.TWO_SIDED_READERS
+        sp.TWO_SIDED_READERS = {
+            **saved, ("api/service.py", "get_lineups"): (
+                sp.NARROWS_BY_TRUSTED_SIDE, "stale")}
+        try:
+            sources = _sources()
+            _v, usage = sp.audit_side_provenance(sources)
+            _f, used_f = sp.audit_home_fallback(sources)
+            usage["home_fallbacks"] = used_f
+            _t, used_t = sp.audit_two_sided_store_reads(sources)
+            usage["two_sided"] = used_t
+            _d, leaves = sp.audit_dispatch(sources[SERVER])
+            errors = sp.verify_registry_liveness(sources, usage, leaves)
+        finally:
+            sp.TWO_SIDED_READERS = saved
+        self.assertTrue(
+            any("TWO_SIDED_READERS" in e and "DORMANT" in e for e in errors),
+            f"the two-sided registry can rot: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# 8. MEASURED AGAINST THE REAL VULNERABLE TREES.
+# ---------------------------------------------------------------------------
+#: ``{commit: [(kind, function), …]}`` — what the rebuilt gate reports when
+#: run over the REAL source at that commit, recovered with ``git archive``.
+#: Not a text mutation of today's tree: these are the bytes that shipped.
+#:
+#: Liveness is OFF for these runs, deliberately. The registries describe
+#: TODAY's package, so a liveness pass over a 2026-08 tree would report
+#: dozens of "declares X, which has no such function" errors that say nothing
+#: about whether the DEFECT is caught. What is asserted is only that the
+#: DETECTORS report the defect.
+VULNERABLE_TREES = {
+    # F1 + F3 live: `/board` hard-codes home, and `get_roster` /
+    # `get_substitutes` return the whole game's rows.
+    "337374a": [("untrusted_side", "get_board"),
+                ("two_sided_class_broken", "get_roster"),
+                ("two_sided_class_broken", "get_substitutes"),
+                ("untrusted_side", "get_player_home")],
+    "23935a1": [("untrusted_side", "get_board"),
+                ("two_sided_class_broken", "get_roster"),
+                ("two_sided_class_broken", "get_substitutes"),
+                ("untrusted_side", "get_player_home")],
+    # F2: the availability-summary leaf takes its side from the query string.
+    "2f8eb73": [("untrusted_side", "get_availability_summary"),
+                ("untrusted_side", "get_player_home")],
+    # F3's workflow leaves: `team_id or viewer_team_id or home`.
+    "ae21c40": [("home_team_fallback", "get_substitute_candidates"),
+                ("home_team_fallback", "get_addable_substitutes"),
+                ("untrusted_side", "get_player_home")],
+    # F4: `GET /api/demo/overview`, outside the family entirely.
+    "56aa5dd": [("untrusted_side", "get_demo_overview"),
+                ("untrusted_side", "get_player_home")],
+    # F5, alone, at the tip this round started from.
+    "b1cc02d": [("untrusted_side", "get_player_home")],
+}
+
+
+class TheGuardIsMeasuredAgainstTheRealVulnerableTrees(_GuardHarness,
+                                                      unittest.TestCase):
+    """RECONSTRUCTED FROM REAL SOURCES, not by text-mutating today's tree.
+
+    Every other class here edits the CURRENT source to look like a past
+    defect, which proves the detector fires on that SHAPE. This one runs the
+    detectors over the actual bytes of the vulnerable commits, which proves
+    it fires on what actually shipped — including the ship-date
+    counterfactual the previous commit message asserted without testing.
+
+    NOT SILENTLY SKIPPED. These are commits of this branch; if the history
+    has been rewritten or the checkout is shallow they cannot be recovered,
+    and this test SAYS SO LOUDLY rather than passing quietly. A skip is not a
+    pass."""
+
+    def _sources_at(self, sha):
+        import shutil
+        import subprocess
+        import tempfile
+        root = Path(__file__).resolve().parents[3]
+        probe = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "-e", f"{sha}^{{commit}}"],
+            capture_output=True)
+        if probe.returncode != 0:
+            return None, None
+        archive = subprocess.run(
+            ["git", "-C", str(root), "archive", sha,
+             "hockey-scheduler/backend/hockey_scheduler"],
+            capture_output=True)
+        if archive.returncode != 0:
+            return None, None
+        tmp = tempfile.mkdtemp()
+        subprocess.run(["tar", "-x", "-C", tmp], input=archive.stdout,
+                       check=True)
+        pkg = Path(tmp) / "hockey-scheduler/backend/hockey_scheduler"
+        return sp.package_sources(pkg), (lambda: shutil.rmtree(tmp))
+
+    def test_every_shipped_defect_is_reported_at_the_tree_that_shipped_it(self):
+        checked = []
+        for sha, expected in sorted(VULNERABLE_TREES.items()):
+            sources, cleanup = self._sources_at(sha)
+            if sources is None:
+                print(f"\n[SIDE PROVENANCE HISTORY] commit {sha} is not in "
+                      f"this checkout, so the guard was NOT measured against "
+                      f"the real source that shipped the defect. The recorded "
+                      f"measurement is in the [#205] guard commit message. "
+                      f"A SKIP IS NOT A PASS.")
+                continue
+            try:
+                violations, _errors = sp.audit(sources=sources,
+                                               verify_liveness=False)
+                found = {(v.kind, v.function) for v in violations}
+                for pair in expected:
+                    with self.subTest(commit=sha, defect=pair):
+                        self.assertIn(
+                            pair, found,
+                            f"{sha}: the guard did NOT report {pair} against "
+                            f"the real source that shipped it. Reported: "
+                            f"{sorted(found)}")
+                checked.append(sha)
+            finally:
+                cleanup()
+        if checked:
+            self.assertEqual(sorted(checked), sorted(VULNERABLE_TREES),
+                             "some vulnerable trees were not measured")
+
+    def test_the_fifth_leak_is_reported_at_every_tree_that_carried_it(self):
+        """F5 was live for the WHOLE blocker and no round noticed. The gate
+        that missed it now reports it at every one of these trees — which is
+        the sharpest available statement that this rebuild is not just a
+        patch over the last symptom."""
+        for sha in sorted(VULNERABLE_TREES):
+            sources, cleanup = self._sources_at(sha)
+            if sources is None:
+                continue
+            try:
+                violations, _errors = sp.audit(sources=sources,
+                                               verify_liveness=False)
+                with self.subTest(commit=sha):
+                    self.assertTrue(
+                        self._caught(violations, "untrusted_side",
+                                     "get_player_home"),
+                        f"{sha}: the fifth leak was live here and was not "
+                        f"reported")
+            finally:
+                cleanup()
+
 
 
 if __name__ == "__main__":
