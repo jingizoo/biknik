@@ -3647,48 +3647,84 @@ class RosterService:
     @staticmethod
     def _is_visible_game(g) -> bool:
         """Published, non-draft, non-cancelled, scheduled game — the
-        player-visible half of :meth:`_is_visible_team_game`, split out so
-        the membership-resolved offer scan (#205 cutover) can pair it with
-        :meth:`team_for_game` instead of the permanent-pointer team test."""
+        GAME-SHAPE half of "counts for the Player Home Page" (#107), with no
+        team in it at all.
+
+        Every Player Home scan pairs it with :meth:`team_for_game` (see
+        :meth:`_plays_in`), so WHICH GAMES a player sees and WHICH SIDE they
+        see them from are decided by the one membership authority instead of
+        by two tests that could disagree."""
         return (not g.cancelled and g.published and not g.is_draft
                 and g.start_time is not None)
 
-    @staticmethod
-    def _is_visible_team_game(g, team_id) -> bool:
-        """Published, non-draft, non-cancelled game involving ``team_id`` —
-        the shared "counts for the Player Home Page" predicate (#107), so
-        next-game, today-count, and substitute-opportunity scans can never
-        drift apart on what a player-visible game is."""
-        return (RosterService._is_visible_game(g)
-                and team_id in (g.home_team_id, g.away_team_id))
+    def _plays_in(self, g, player) -> bool:
+        """Is ``g`` a game ``player`` is IN, resolved by the game-scoped
+        membership authority (#205, round 6)?
+
+        THE SELECTION HALF OF THE SIDE RULE. This used to be
+        ``_is_visible_team_game(g, player.team_id)`` — the permanent pointer
+        — which is the same guessed side the private-game family spent five
+        rounds removing from its READS, one step earlier: it decides WHICH
+        GAME the Player Home Page is about. The pointer is stale for a Mover
+        in BOTH directions, and both were live at b1cc02d on Memory, SQLite
+        and PostgreSQL:
+
+        * the pointer names a team NOT in the game while the seasonal
+          membership names one that IS — a real Mover shown no next game at
+          all (measured: pointer ``team_3``, membership ``team_1``,
+          ``next_game: null``);
+        * the pointer names a team IN the game while the membership has moved
+          off it — a departed player shown a game they have no part in, and
+          (before the caller's own fix) shown that team's private per-side
+          state with it (measured: pointer ``team_1``, membership ``team_3``,
+          ``team_status: "sub_search"``).
+
+        Resolving SELECTION here rather than only at the read is deliberate:
+        a Mover handed the WRONG GAME cannot be rescued by resolving the side
+        correctly within it, and the availability POST the Player Home screen
+        offers is addressed to ``next_game.game_id``.
+
+        ``team_for_game`` falls back to the permanent pointer for a game with
+        NO LeagueSeason binding, so exhibitions and unbound legacy rows keep
+        pre-#205 behavior exactly — there the pointer is the only authority
+        there has ever been and it is correct by design.
+
+        Same predicate, same order and the same authority
+        :meth:`list_player_offers` has used since the cutover, so the Player
+        Home scans cannot drift on what a player-visible game is."""
+        return (self._is_visible_game(g)
+                and self.team_for_game(g, player) is not None)
 
     def find_next_game_for_player(self, player_id: str) -> Optional[Game]:
         """The player's next published, non-cancelled game in chronological
-        order — the Player Home Page's "next game" card (#107). A pure read
-        helper — must NOT be @_transactional."""
+        order — the Player Home Page's "next game" card (#107).
+        Membership-resolved: see :meth:`_plays_in`. A pure read helper — must
+        NOT be @_transactional."""
         player = self.store.get_player(player_id)
         if player is None or not player.is_active:
             return None
         now = self.clock()
         upcoming = [
             g for g in self.store.all_games()
-            if self._is_visible_team_game(g, player.team_id)
-            and g.start_time >= now
+            if g.start_time is not None and g.start_time >= now
+            and self._plays_in(g, player)
         ]
         upcoming.sort(key=lambda g: g.start_time)
         return upcoming[0] if upcoming else None
 
     def count_games_today_for_player(self, player_id: str) -> int:
-        """How many of the player's team's games fall on today's date — the
-        Player Home Page's "Tonight" summary card (#107). A pure read
-        helper — must NOT be @_transactional."""
+        """How many of THIS PLAYER's games fall on today's date — the Player
+        Home Page's "Tonight" summary card (#107). Membership-resolved: see
+        :meth:`_plays_in`. A pure read helper — must NOT be
+        @_transactional."""
         player = self.store.get_player(player_id)
         if player is None or not player.is_active:
             return 0
         today = self.clock().date()
         return sum(1 for g in self.store.all_games()
-                   if self._is_visible_team_game(g, player.team_id)
-                   and g.start_time.date() == today)
+                   if g.start_time is not None
+                   and g.start_time.date() == today
+                   and self._plays_in(g, player))
 
     def substitute_block_reason(self, player_id: str, game_id: str,
                                 rstatus=None, ctx=None) -> Optional[str]:

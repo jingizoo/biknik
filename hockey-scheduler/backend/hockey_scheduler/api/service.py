@@ -7102,40 +7102,114 @@ class ApiService:
     def get_player_home(self, player_id: str, user_id: Optional[str] = None) -> dict:
         """The signed-in player's home screen (#107): next game, attendance
         status, team roster status, substitute opportunities, and unread
-        notification count — all scoped to this player only."""
+        notification count — all scoped to this player only.
+
+        THE SIDE IS THE SERVER'S RESOLUTION, NOT THE POINTER (#205, round 6).
+        ``next_game.team_id``/``team_name``/``opponent_name``/``team_status``
+        were all derived from ``Player.team_id``, the permanent pointer.
+        ``team_status`` is the player-facing rendering of the SAME per-side
+        enum the private-game family spent five rounds binding to the trusted
+        resolution — ``_PLAYER_TEAM_STATUS`` maps ``needs_substitute`` to
+        ``"sub_search"`` and ``open_slot`` to ``"short"`` — so for a MOVER
+        (pointer and seasonal membership naming different teams) this served
+        the OPPONENT's private per-side state, and served it to the linked
+        guardian too, since :meth:`get_guardian_home` calls this method once
+        per verified junior.
+
+        MEASURED at b1cc02d on Memory, SQLite and real PostgreSQL, over real
+        authenticated sessions, with the two sides made to genuinely DIFFER
+        (HOME ``needs_substitute`` / AWAY ``open_slot``). Mover ``player_6``,
+        pointer ``team_1`` (HOME), membership and ``game_scoped_own_team_id``
+        both ``team_2`` (AWAY)::
+
+            /api/games/{id}/roster-status  ->  team_2  open_slot
+            /api/me/player-home            ->  team_1 "Home" vs "Away",
+                                               team_status "sub_search"
+
+        Identical on all three backends, and identical inside
+        ``/api/me/guardian/home`` for a guardian verified for that junior.
+
+        THE ENTITLEMENT RULE, and it is decided by MEMBERSHIP, never by the
+        pointer: the side is ``game_scoped_own_team_id`` against THIS game —
+        the one resolution ``web/scope.can_read_private_game_data``, the
+        private-game dispatch and the Dashboard schedule row all use, and the
+        one whose own module documents this pointer as stale "in either
+        direction". A pointer that has OUTLIVED the membership grants
+        nothing: the game is not selected (see
+        :meth:`RosterService._plays_in`), so there is no ``next_game`` and
+        neither side's private state is served. The subject is the
+        session-resolved player, never a request field, and there is no side
+        parameter for a caller to name.
+
+        IT IS A CORRECTNESS FIX AS WELL. The same pointer named the Mover's
+        OPPONENT as their team on their own Dashboard — ``app.js`` renders
+        ``${team_name} vs ${opponent_name}`` — and addressed their "I'm In" /
+        "Can't Play" POST to ``next_game.game_id``, the game the pointer
+        chose.
+
+        GAME SELECTION MOVED TO THE SAME AUTHORITY. ``next_game`` and
+        ``today_count`` now choose WHICH games this page is about through
+        :meth:`RosterService._plays_in` (``team_for_game``), because a Mover
+        handed the wrong game cannot be rescued by resolving the side
+        correctly within it. Both halves fall back to the permanent pointer
+        for a game with NO LeagueSeason binding, so exhibitions and unbound
+        legacy rows are byte-for-byte unchanged."""
         player = self.store.get_player(player_id)
         if player is None:
             raise NotFoundError("Player not found.")
-        team = self.store.get_team(player.team_id) if player.team_id else None
 
         next_game = self.roster.find_next_game_for_player(player_id)
         next_game_dto = None
+        # The SERVER's per-game resolution for the SIGNED-IN subject — the
+        # same function every other private per-side read of this game goes
+        # through. The subject comes from `player_id`, which `web/server.py`
+        # takes from the SESSION scope and never from a query parameter, so
+        # no caller can name a side here.
         if next_game is not None:
-            my_team_id = player.team_id
-            opponent_id = self._opponent_team_id(next_game, my_team_id)
-            opponent = self.store.get_team(opponent_id) if opponent_id else None
-            rstatus = self.roster.compute_roster_status(next_game.id, my_team_id)
-            # Only this player's own roster entry + availability are needed —
-            # single-player lookups, not a full _lineup_rows pass over the team.
-            entry = self.store.roster_entry_for_player(next_game.id, player_id)
-            avail = self.store.availability_for_player(next_game.id, player_id)
-            my_row = {
-                "backed_out": entry is not None and not entry.status.occupies_slot,
-                "availability": (avail.availability_status.value
-                                 if avail else "pending"),
-            }
-            next_game_dto = {
-                "game_id": next_game.id, "team_id": my_team_id,
-                "team_name": team.name if team else my_team_id,
-                "opponent_name": opponent.name if opponent else None,
-                "start_time": next_game.start_time.isoformat()
-                             if next_game.start_time else None,
-                "venue_name": self._venue_name_for_game(next_game),
-                "rink_name": next_game.rink,
-                "attendance_status": self._player_attendance_status(my_row),
-                "team_status": self._PLAYER_TEAM_STATUS.get(
-                    rstatus.status.value, "not_responded"),
-            }
+            my_team_id = game_scoped_own_team_id(
+                Role.PLAYER, {"player_id": player_id}, next_game, self.store)
+            # FAIL-CLOSED, and unreachable by construction rather than a new
+            # user-visible state: `find_next_game_for_player` selected this
+            # game through the SAME membership authority (`_plays_in` ->
+            # `team_for_game`), so a game it returned always resolves a side.
+            # The guard is what stops a future caller reintroducing the
+            # fallback — the same reasoning `position_for_game` gives for its
+            # own unreachable raise. It matters because an unresolved side
+            # here would reach `_opponent_team_id(g, None)` -> `home_team_id`
+            # and `compute_roster_status(gid, None)` -> the producer's home
+            # default: this very leak, by the back door.
+            if my_team_id is not None:
+                team = self.store.get_team(my_team_id)
+                opponent_id = self._opponent_team_id(next_game, my_team_id)
+                opponent = (self.store.get_team(opponent_id)
+                            if opponent_id else None)
+                rstatus = self.roster.compute_roster_status(
+                    next_game.id, my_team_id)
+                # Only this player's own roster entry + availability are
+                # needed — single-player lookups, not a full _lineup_rows
+                # pass over the team.
+                entry = self.store.roster_entry_for_player(
+                    next_game.id, player_id)
+                avail = self.store.availability_for_player(
+                    next_game.id, player_id)
+                my_row = {
+                    "backed_out": (entry is not None
+                                   and not entry.status.occupies_slot),
+                    "availability": (avail.availability_status.value
+                                     if avail else "pending"),
+                }
+                next_game_dto = {
+                    "game_id": next_game.id, "team_id": my_team_id,
+                    "team_name": team.name if team else my_team_id,
+                    "opponent_name": opponent.name if opponent else None,
+                    "start_time": next_game.start_time.isoformat()
+                                 if next_game.start_time else None,
+                    "venue_name": self._venue_name_for_game(next_game),
+                    "rink_name": next_game.rink,
+                    "attendance_status": self._player_attendance_status(my_row),
+                    "team_status": self._PLAYER_TEAM_STATUS.get(
+                        rstatus.status.value, "not_responded"),
+                }
 
         opportunities = [self._opportunity_base_dict(g, player)
                          for g in self.roster.list_substitute_opportunities(player_id)]

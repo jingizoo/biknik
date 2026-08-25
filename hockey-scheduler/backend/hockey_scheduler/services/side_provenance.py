@@ -445,11 +445,6 @@ EXEMPTIONS = {
         AUTHORIZED_WRITE, None,
         "`result['team_id']` — the side the write itself resolved and "
         "`authorized_team_id` gated, read back to report the outcome."),
-    ("get_player_home", "compute_roster_status",
-     "attr:player.team_id"): (
-        SUBJECT_OWN_SIDE, None,
-        "`player.team_id` for the SIGNED-IN player's own next game. The "
-        "method takes no side parameter, so no caller can name one."),
     ("get_substitute_opportunity", "compute_roster_status",
      "attr:ctx.team_id"): (
         SUBJECT_OWN_SIDE, None,
@@ -554,7 +549,6 @@ EXEMPTION_MODULES = {
     "list_addable_players": "services/roster_service.py",
     "_draft_review_row": "api/service.py",
     "auto_build_roster": "api/service.py",
-    "get_player_home": "api/service.py",
     "get_substitute_opportunity": "api/service.py",
     "substitute_block_reason": "services/roster_service.py",
     "_back_out_entry": "services/roster_service.py",

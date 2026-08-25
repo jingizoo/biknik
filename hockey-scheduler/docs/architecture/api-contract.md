@@ -161,11 +161,12 @@ withheld from **both** rather than guessed onto one.
 
 ### Per-side private state outside the `/games/{id}/…` family (#205)
 
-The boundary is the *state*, not the path. One route outside that dispatch
-carries a per-side private value:
+The boundary is the *state*, not the path. Two routes outside that dispatch
+carry a per-side private value:
 
 ```http
-GET /api/demo/overview  ->  schedule[].roster_status
+GET /api/demo/overview    ->  schedule[].roster_status
+GET /api/me/player-home   ->  next_game.team_status
 ```
 
 `roster_status` is the same per-side operational enum `roster-status`
@@ -207,6 +208,51 @@ were never assigned to — strictly *wider* than the family. There is also no
 honest single-side answer (one enum, a two-sided entitlement), and the value it
 would carry is `needs_substitute`, which `_submitted_lineup_status` neutralises
 by name one route away.
+
+#### `GET /api/me/player-home` — the subject's own *resolved* side
+
+`next_game.team_status` is that same per-side enum again, relabelled for the
+Player Home Page: `needs_substitute` renders as `"sub_search"` and `open_slot`
+as `"short"`. `GET /api/me/guardian/home` carries it too — that route returns
+each verified junior's Player Home payload — so every rule here applies to it
+unchanged.
+
+The subject is **always the signed-in caller** (or their verified junior),
+resolved from the session scope and never from a query parameter, so there is
+no audience to classify and no client hint to ignore. The only question is
+*which side of the game the subject is on*, and the answer is the same
+`game_scoped_own_team_id` resolution the family uses — **never**
+`Player.team_id`, the permanent pointer, which a mid-season transfer leaves
+stale for a particular game in either direction.
+
+Entitlement therefore comes from **authoritative game-scoped membership**, and
+a pointer that has outlived the membership grants nothing:
+
+| pointer / membership for this game | `next_game` |
+|---|---|
+| pointer HOME, membership AWAY | the **away** side |
+| pointer names a team in neither game, membership HOME | the **home** side |
+| pointer HOME, membership moved to another team | **no game, neither side** |
+| pointer HOME, membership ended or absent | **no game, neither side** |
+| pointer and membership agree | that side, unchanged |
+| no player binding on the session (including an unscoped operator) | the empty stub |
+
+**Game selection follows the same authority.** `next_game` and `today_count`
+choose *which games* the page is about through the game-scoped membership
+resolution as well, because a player handed the wrong game cannot be rescued
+by resolving the side correctly within it — and the availability POST the
+screen offers is addressed to `next_game.game_id`. For a **mover** this
+changed three things at once, and only the first is a privacy fix:
+
+| | before | now |
+|---|---|---|
+| `next_game.team_status` | the **pointer** team's private per-side enum | the subject's own side's |
+| `next_game.team_name` / `opponent_name` | inverted — the opponent named as their team | the resolved side, named correctly |
+| which games are listed | games the **pointer** team plays; a mover on a new team saw none, a departed player saw their old team's | games the subject's membership actually puts them in |
+
+A game with **no LeagueSeason binding** — an exhibition, or an unbound legacy
+row — has no membership authority, so the permanent pointer remains both the
+side *and* the selector there, unchanged.
 
 ### The side rule is machine-enforced (#205)
 
