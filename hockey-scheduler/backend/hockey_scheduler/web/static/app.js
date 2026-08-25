@@ -8157,7 +8157,12 @@ const AVAIL_PILL = { available: "available", unavailable: "blocked",
 const AVAIL_LABEL = { all: "All", available: "Available", unavailable: "Unavailable",
   maybe: "Maybe", no_response: "No response" };
 
-function renderAvailSummary() {
+function renderAvailSummary(side) {
+  // WITHHELD IS NOT ABSENT (#427 final blocker, round 2). A side this caller
+  // does not read in full has no availability rollup for them, and the fetch
+  // is skipped rather than fired at a route that refuses it -- so say that,
+  // instead of silently omitting the card.
+  if (side && !isFullSide(side)) return restrictedNote("availability");
   if (!availSummary) return "";
   const c = availSummary.counts;
   const chip = (key) => {
@@ -8242,6 +8247,27 @@ function rosterGamePicker(ov) {
 function isRestrictedSide(side) {
   return !!(side && side.restricted);
 }
+/* WHICH SIDES CARRY PRIVATE WORKFLOW STATE, asked of the SERVER'S OWN LABEL
+   rather than guessed from the signed-in role (#427 final blocker, round 2).
+
+   `isRestrictedSide` is not the same question and could not answer this one.
+   An assigned official's `/lineups` sides come back `projection:
+   "submitted_lineup"` with `restricted: false` -- correctly, they ARE being
+   shown that side's submitted lineup -- so every "not restricted" gate read
+   TRUE for them and the Roster tab fetched
+   `/availability-summary?team_id=<the side being shown>` on every render,
+   with the side toggle switching teams. That route now refuses an official,
+   as it should, and a gate that keeps firing it would turn the leak into a
+   guaranteed 403 on every render instead of closing the screen honestly.
+
+   `full` is the ONE projection that carries per-player availability,
+   candidates and substitute workflow, so it is the ONE that may ask for
+   them. Keying on the label rather than on `currentUser.role` means the
+   server decides, once, for every role that exists now or later -- the same
+   reason `isRestrictedSide` exists rather than a role test. */
+function isFullSide(side) {
+  return !!(side && side.projection === "full");
+}
 function restrictedNote(kind) {
   // `kind` only changes the WORDING; every one of them says the same thing --
   // WITHHELD, not absent. One function, so the redacted look cannot drift
@@ -8259,6 +8285,17 @@ function restrictedNote(kind) {
     // empty-operational-state mistake the redacted lineup already avoids.
     activity: ["Game activity not shown",
       "This game's notification and audit trail is private to the teams playing and the league office."],
+    // #427 final blocker round 2: an assigned official reads the SUBMITTED
+    // lineup, and per-player availability is not part of it. Saying so beats
+    // rendering nothing -- an absent card reads as "there is no availability
+    // data", the same empty-operational-state mistake as `players: []`.
+    availability: ["Availability not shown",
+      "Per-player availability is private to each team's coach and the league office. You are shown the submitted lineup."],
+    // The candidate pool and the substitute workflow, withheld together --
+    // they are one subject (who is NOT in the lineup and might be) and the
+    // submitted-lineup projection carries neither.
+    workflow: ["Candidate and substitute list not shown",
+      "Who else could play, and this team's substitute workflow, are private to their coach and the league office. You are shown the submitted lineup."],
   };
   const [title, detail] = COPY[kind] || COPY.roster;
   return `<div class="restricted-side" data-restricted>
@@ -8297,7 +8334,7 @@ function renderRoster(lineups, ov) {
       <button class="seg ${gameView === "coach" ? "active" : ""}" data-view="coach">Coach</button>
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
     </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side, ov) : playerBody(side)}</div>
-    ${renderAvailSummary()}`;
+    ${renderAvailSummary(side)}`;
   return `${rosterGamePicker(ov)}<div class="lineup-switch">${tab("home", "\u{1F3E0}", "Home")}${tab("away", "\u2708\uFE0F", "Away")}</div>
     ${body}`;
 }
@@ -10167,6 +10204,19 @@ function coachBody(board, ov) {
   const subs = board.players.filter((p) => p.group === "substitute");
 
   if (!board.players.length) {
+    // WHAT AN EMPTY `players` MEANS DEPENDS ON THE PROJECTION (#427 final
+    // blocker, round 2). On a `full` side it really is the whole population,
+    // so "this team has no players, add them in Setup" is a true and useful
+    // instruction. On a SUBMITTED_LINEUP side it is only the players
+    // SUBMITTED -- the candidate pool was never sent -- so the same sentence
+    // becomes a false claim about another team's roster, made to a reader who
+    // is simply not being shown it. The honest reading there is the Game
+    // Sheet's own: nothing has been submitted yet, and the rest is withheld.
+    if (!isFullSide(board)) {
+      return `<div class="banner neutral"><h2>No lineup submitted</h2>
+        <p>This team has not submitted a lineup for this game yet.</p></div>
+        ${restrictedNote("workflow")}`;
+    }
     return `<div class="banner neutral"><h2>No roster yet</h2>
       <p>The home team has no players. Add players in Setup first (team player
       management is a follow-up: #25).</p></div>`;
@@ -10272,13 +10322,29 @@ function coachBody(board, ov) {
   }
 
   const total = s.target_goalies + s.target_skaters;
+  // WHAT A NON-FULL SIDE MUST NOT CLAIM (#427 final blocker, round 2). The
+  // two sections below are built from the candidate and substitute
+  // populations, and the SUBMITTED_LINEUP projection carries NEITHER -- it
+  // sends the selected rows and nothing else. Rendered by a screen written
+  // for the full side they collapse to their FULL-shaped empty states:
+  // "Available players (0) / All eligible players are on the roster or in the
+  // sub pool." and "No substitutes enrolled." Both are operational claims
+  // about THIS TEAM's preparedness, both are false, and both are exactly the
+  // failure the ruling names -- restricted data represented as an empty
+  // operational state rather than as withheld. So a side this caller does
+  // not read in full gets the withheld note in their place, from the SAME
+  // one-place helper the redacted opponent and the withheld activity log
+  // already use. The submitted lineup itself is real and stays.
+  const workflow = isFullSide(board)
+    ? `${availableGroups(available, s, !canEdit)}
+    ${subCandidates ? outreachPanel(canEdit) + cleanupCard() : subPoolCard()}`
+    : restrictedNote("workflow");
   return `
     <div class="banner ${bannerClass(s.status)}"><h2>${prettyStatus(s.status)}</h2><p>${esc(s.message)}</p></div>
     ${summary}${warnHtml}${toolbar}
     <div class="section-title">Roster (${onRoster.length}/${total})</div>
     <div class="card">${rosterRows}</div>
-    ${availableGroups(available, s, !canEdit)}
-    ${subCandidates ? outreachPanel(canEdit) + cleanupCard() : subPoolCard()}
+    ${workflow}
     ${footer}
     ${renderReschedulePanel(canRoster, ov)}
     `;
@@ -10896,10 +10962,15 @@ async function render() {
     if (renderPass !== myRenderPass) return;  // superseded (#215)
     // Availability rollup for the roster screen's selected side (#89).
     availSummary = null;
-    // #427: a RESTRICTED side has no availability rollup this caller may
-    // read, and asking anyway would be a guaranteed 403 on every render.
-    if (view === "roster" && lineups && lineups[rosterSide] && !lineups.error
-        && !isRestrictedSide(lineups[rosterSide])) {
+    // #427: only a side this caller reads in FULL has an availability rollup
+    // they may read, and asking anyway would be a guaranteed 403 on every
+    // render. Round 2 tightened this from "not restricted" to "full": an
+    // assigned official's sides are `submitted_lineup`, not `restricted`, so
+    // the old test passed for them and this fetch was the live UI path by
+    // which they recovered both sides' candidate pool -- names, per-player
+    // availability and all -- with the side toggle switching teams.
+    if (view === "roster" && lineups && !lineups.error
+        && isFullSide(lineups[rosterSide])) {
       const tid = lineups[rosterSide].team_id;
       const s = await getJSON(
         `/api/games/${currentGame}/availability-summary?team_id=${tid}`);
@@ -10909,9 +10980,12 @@ async function render() {
     // Coach substitute outreach queue for the shown side (#112), operator-only.
     subCandidates = null;
     addableSubs = null;
+    // Same tightening, same reason: the outreach queue and the addable list
+    // are substitute WORKFLOW state, which only a `full` side carries. The
+    // `manage_roster` gate happens to exclude officials today, but this must
+    // not depend on a role check agreeing with the server's projection.
     if (view === "roster" && gameView === "coach" && hasPerm("manage_roster")
-        && lineups && lineups[rosterSide] && !lineups.error
-        && !isRestrictedSide(lineups[rosterSide])) {
+        && lineups && !lineups.error && isFullSide(lineups[rosterSide])) {
       const tid = lineups[rosterSide].team_id;
       const q = await getJSON(
         `/api/games/${currentGame}/substitute-candidates?team_id=${tid}`);

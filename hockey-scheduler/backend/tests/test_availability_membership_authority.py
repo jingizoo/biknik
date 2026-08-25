@@ -866,14 +866,31 @@ class TheCoachJourneyOverRealHttpUsesMembership(_CoachHttpHarness,
                         {"available": 0, "unavailable": 0, "maybe": 0,
                          "no_response": 1}, body)
 
-                    # 2. OPPONENT DENIAL at the transport.
-                    status, denied = self._req(
+                    # 2. THE OPPONENT IS UNREACHABLE at the transport.
+                    #
+                    # #427 final blocker, round 2: this used to assert 403.
+                    # The leaf now IGNORES a scoped caller's side hint rather
+                    # than refusing it, matching the four private-game
+                    # siblings that answer a hinted call byte-for-byte as an
+                    # un-hinted one. The requirement is unchanged and the
+                    # assertion is stronger: a 403 said only that this
+                    # request was turned away, while this says the response
+                    # IS the coach's own side and carries no AWAY identity --
+                    # checked against the AWAY population derived below in
+                    # step 3, not against a literal.
+                    status, hinted = self._req(
                         coach, "GET",
                         f"/api/games/{fx['gid']}/availability-summary"
                         f"?team_id={fx['away']}")
-                    self.assertEqual(status, 403, denied)
-                    self.assertEqual(denied["error"]["code"], "forbidden",
-                                     denied)
+                    self.assertEqual(status, 200, hinted)
+                    self.assertEqual(
+                        hinted, body,
+                        "?team_id=<opponent> changed the coach's response -- "
+                        "a client hint selected a side")
+                    self.assertEqual(hinted["team_id"], fx["home"], hinted)
+                    self.assertNotIn(
+                        away_side["id"],
+                        [p["player_id"] for p in hinted["players"]], hinted)
                     # THIRD is not in this game at all — refused as a
                     # non-participant even for an operator.
                     status, bad = self._req(

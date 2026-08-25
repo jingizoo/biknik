@@ -290,8 +290,12 @@ _VALID_AUTH_VALUES = frozenset({
     # #427 blocker: the private-game gate admits the caller, then the SERVER
     # resolves their own game-scoped side and the response is PROJECTED to
     # it -- own side in full for a Coach/Player with the opponent marked
-    # restricted, submitted-lineup only for an assigned official, both sides
-    # in full for an unscoped operator. A narrowing of the same shape as
+    # restricted, submitted-lineup only for an assigned official (or a 403
+    # where no official-shaped projection exists), both sides in full for an
+    # unscoped operator. Round 2 added the fifth and last leaf of the family,
+    # the availability rollup, which is also the only one that reads a side
+    # hint -- so this label now additionally means "a client-supplied side is
+    # adjudicated, never trusted". A narrowing of the same shape as
     # `session+player-scope`: nobody's 403 changes, what changes is which
     # subject's private data the 200 may contain.
     "session+own-side-projection",
@@ -316,7 +320,15 @@ _EXPECTED_CLASSIFICATION = {
     ("GET", '/api/context/options'): ('session', 'none'),  # get_context_options
     ("GET", '/api/demo/overview'): ('session', 'cross'),  # get_demo_overview
     ("GET", '/api/games/{}'): ('none', 'none'),  # get_games_id
-    ("GET", '/api/games/{}/availability-summary'): ('session', 'none'),  # get_games_id_availability_summary
+    # #427 final blocker round 2: was bare 'session' while this leaf's inline
+    # narrowing named only COACH and PLAYER, so an assigned OFFICIAL fell
+    # through it -- and this is the ONE private-game leaf that reads a side
+    # from the QUERY STRING, so `?team_id=` was the sole side selector for
+    # that role. It is now projected by the SAME route_audience as its four
+    # siblings: hint kept for an operator, IGNORED for a Coach/Player in
+    # favour of the trusted side, 403 for an official.
+    ("GET", '/api/games/{}/availability-summary'):
+        ('session+own-side-projection', 'none'),  # get_games_id_availability_summary
     # #427 blocker: both were bare 'session' while get_board hard-coded the
     # HOME side and get_lineups returned both sides' private state to either
     # Coach. The gate is unchanged; the response is now projected to the

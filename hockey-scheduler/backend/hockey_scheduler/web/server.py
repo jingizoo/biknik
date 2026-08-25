@@ -2946,39 +2946,49 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(
                     {"requests": api.list_reschedule_requests(gid)})
             if sub == "availability-summary":
-                # Availability rollup for a team (#89). The #73 gate above only
-                # proves the caller belongs to *a* team in this game — it does
-                # not bound *which* team's summary they may read. Add a
-                # team-level scope check (#89 review): a coach/player may read
-                # only their own team; operators (league admin / arena manager)
-                # any team in the game. The team defaults to the caller's own
-                # scope when not specified.
+                # THE FIFTH LEAF OF THE SAME FAMILY (#427 final blocker,
+                # round 2) — and the ONLY one that reads a side from the
+                # QUERY STRING, which is why it was the last one still open.
+                #
+                # Its narrowing used to be spelled inline here and named only
+                # COACH and PLAYER, so an assigned OFFICIAL fell straight
+                # through it: measured tri-store over a real session,
+                # `?team_id=<either side>` answered an official 200 with that
+                # side's whole candidate pool, NAMES and per-player
+                # availability included — precisely the two classes the
+                # `/lineups` projection strips for that exact role one path
+                # segment away. The shipped Roster tab fired it on every
+                # render, and its side toggle switched teams.
+                #
+                # So the decision moves to the facade, where the other four
+                # siblings already make it, keyed on the SAME trusted
+                # `own_team` resolved once above and the SAME
+                # `lineup_visibility.route_audience`: an unscoped operator
+                # keeps the hint unchanged, a Coach/Player has it IGNORED in
+                # favour of their trusted side (ignored, not refused — the
+                # siblings answer a hinted call identically to an un-hinted
+                # one), and an assigned official is refused 403 rather than
+                # handed an empty summary. A side is never trusted from the
+                # query string.
                 from urllib.parse import parse_qs, urlparse
                 qs = parse_qs(urlparse(self.path).query)
-                # The caller's own team, resolved authoritatively AGAINST THIS
-                # GAME (#160, refined by #205 blocker 1): a Coach's stored
-                # team_id (permanent — unchanged); a Player's team resolved
-                # through the SAME game-scoped membership resolver the
-                # substitute workflow uses, never the permanent player.team_id
-                # pointer, which a mid-season transfer can leave stale for
-                # this exact game — so the opponent-summary block holds for a
-                # Mover whose membership has moved, in either direction.
-                #
-                # #427: this resolution now happens ONCE above, for the whole
-                # private-game family, rather than only here — the lineup
-                # reads need the very same trusted side, and two copies of
-                # "which side is the caller's" is exactly the drift this
-                # blocker is about. The comparison below is byte-for-byte the
-                # one that stood here before the hoist.
+                # BYTE-FOR-BYTE the binding that stood here before, name
+                # included: this is the same client-supplied team the
+                # substitute-candidates and substitute-addable leaves bind
+                # from the identical expression in this same function, and
+                # `_dispatch_get`'s tracked-name set is flat, so spelling it
+                # differently here would say these are different kinds of
+                # value when they are one. What CHANGED is downstream — it is
+                # now a HINT handed to the facade to be adjudicated against
+                # the trusted side, never the side itself. The own-team
+                # default is retained because the facade's FULL branch would
+                # apply it anyway (`team_id or viewer_team_id`), so an
+                # unscoped operator's un-hinted call resolves exactly what it
+                # always has.
                 team_id = (qs.get("team_id") or [own_team])[0]
-                if role in (Role.COACH, Role.PLAYER) and own_team \
-                        and team_id != own_team:
-                    return self._send_json({"error": {
-                        "code": "forbidden",
-                        "message": "You can only view your own team's "
-                                   "availability."}}, 403)
-                return self._send_api(
-                    api.get_availability_summary(gid, team_id))
+                return self._send_api(api.get_availability_summary(
+                    gid, team_id,
+                    viewer_role=role, viewer_team_id=own_team))
             if sub == "substitute-candidates":
                 # Coach outreach queue (#112): manage_roster only — a player
                 # must not see the operator candidate list even for their own

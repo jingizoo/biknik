@@ -682,6 +682,15 @@ async function checkViewport(browser, viewport) {
       { team_id: playerTeam.body.id, name: `Priya Player ${suffix}`, position: "forward" });
     const official = await apiPost(page, "/api/v2/setup/official",
       { name: `Ozzy Official ${suffix}` });
+    // A SECOND official, ASSIGNED to this game (#427 final blocker, round 2).
+    // Distinct from Ozzy on purpose, and for this file's own stated reason --
+    // "every role gets its own distinctly-named user ... so no role's fixture
+    // can accidentally satisfy another role's assertion". Ozzy proves the
+    // UNASSIGNED official's Inbox empty state; assigning Ozzy would destroy
+    // it. Only an ASSIGNED official passes `can_read_private_game_data`, and
+    // that is the principal whose Roster tab this leg is about.
+    const assignedOfficial = await apiPost(page, "/api/v2/setup/official",
+      { name: `Avery Assigned ${suffix}` });
 
     // Seven distinct, role-scoped accounts (League Admin reuses the
     // existing seeded "admin"/"demo" login used to build this fixture).
@@ -695,6 +704,8 @@ async function checkViewport(browser, viewport) {
       guardian: { username: mk("guardian"), role: "guardian", scope: {} },
       official: { username: mk("official"), role: "official",
         scope: { official_id: official.body.id } },
+      assigned_official: { username: mk("assignedofficial"), role: "official",
+        scope: { official_id: assignedOfficial.body.id } },
       viewer: { username: mk("viewer"), role: "viewer", scope: {} },
     };
     for (const key of Object.keys(accounts)) {
@@ -705,6 +716,16 @@ async function checkViewport(browser, viewport) {
         fail(`account create failed for ${acct.username}: ${JSON.stringify(res)}`);
       }
       acct.id = res.body.id;
+    }
+    // Assign Avery to the fixture game, as the operator, so the account above
+    // is a genuinely ASSIGNED official -- the only shape
+    // `can_read_private_game_data` admits, and therefore the only one whose
+    // Roster tab reaches the private-game family at all.
+    const assign = await apiPost(page,
+      `/api/games/${game.body.id}/officials/assign`,
+      { official_id: assignedOfficial.body.id, role: "referee" });
+    if (assign.status !== 200 || assign.body.error) {
+      fail(`official assignment failed: ${JSON.stringify(assign)}`);
     }
     const link = await apiPost(page, "/api/guardians/links",
       { guardian_user_id: accounts.guardian.id, player_id: junior.body.id });
@@ -1649,6 +1670,138 @@ async function checkViewport(browser, viewport) {
     await assertForbiddenNoChange(page, reader, tracker, fail, "Official",
       "/api/setup/official", { name: "Should Not Exist (official)" },
       ["/api/v2/setup/overview", "/api/demo/overview"]);
+    await logout(page);
+
+    // ============================================================
+    // ASSIGNED Official -- the Roster tab degrades honestly (#427 final
+    // blocker, round 2).
+    //
+    // WHAT ONLY A BROWSER CAN PROVE HERE. The server side is pinned tri-store
+    // over real authenticated HTTP (backend/tests/
+    // test_private_game_sibling_routes.py). What that cannot show is that the
+    // SHIPPED SCREEN was the live path: `canReadAnyPrivateGame()` admits any
+    // official_id to the Roster tab, and an official's /lineups sides come
+    // back `projection: "submitted_lineup"` with `restricted: false` -- so
+    // every "not restricted" gate read TRUE for them and the tab fetched
+    // `/availability-summary?team_id=<the side being shown>` on every render,
+    // with the side toggle switching teams. Measured in exactly this browser
+    // before the fix: 200, both sides, names and per-player availability.
+    //
+    // Unlike the two injected legs elsewhere in this file, NOTHING is faked:
+    // this is a real assigned official's real session reading the real
+    // endpoint. Three things are required, and they are different claims --
+    // the request is not made, the withheld state is NAMED, and the two
+    // FULL-shaped empty states that would misdescribe it are gone.
+    // ============================================================
+    await loginAs(page, accounts.assigned_official.username, PW);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await waitForView(page, "inbox");
+    await waitForRealContent(page);
+    const officialGameCalls = [];
+    const collectGameCalls = (req) => {
+      const u = new URL(req.url());
+      if (/^\/api\/games\//.test(u.pathname)) {
+        officialGameCalls.push(`${req.method()} ${u.pathname}${u.search}`);
+      }
+    };
+    page.on("request", collectGameCalls);
+    await page.evaluate(() => switchTab("roster"));
+    await waitForView(page, "roster");
+    await waitForRealContent(page);
+    // The COACH sub-view explicitly: `gameView` is a module global that an
+    // earlier role's journey may have left on "player", and the candidate
+    // pool and substitute workflow this leg is about live only on the coach
+    // body. Clicked, not assigned -- this is the control a real reader uses.
+    await page.click('.seg[data-view="coach"]');
+    await waitForRealContent(page);
+    // The data-side toggle is the half a landing-only check would miss: it is
+    // what turned one side's rollup into both.
+    const sideTabs = await page.$$("[data-side]");
+    if (sideTabs.length !== 2) {
+      fail(`Assigned official [${L}]: expected both side tabs on the Roster `
+        + `tab, found ${sideTabs.length} -- the leg below cannot prove the `
+        + `toggle no longer fetches the other side's rollup`);
+    }
+    await page.click('[data-side="away"]');
+    await waitForRealContent(page);
+    page.off("request", collectGameCalls);
+    const leaked = officialGameCalls.filter((c) =>
+      /availability-summary|substitute-candidates|substitute-addable/.test(c));
+    if (leaked.length) {
+      fail(`Assigned official [${L}]: the Roster tab still fetches a route `
+        + `that carries private candidate/availability state -- and which now `
+        + `refuses this caller, so every render would 403: `
+        + `${JSON.stringify(leaked)}`);
+    }
+    if (!officialGameCalls.some((c) => /\/lineups$/.test(c))) {
+      fail(`Assigned official [${L}]: the Roster tab fetched no /lineups at `
+        + `all, so the check above passed vacuously: `
+        + `${JSON.stringify(officialGameCalls)}`);
+    }
+    const officialRoster = await page.evaluate(() => {
+      const text = (document.getElementById("content").textContent || "")
+        .replace(/\s+/g, " ");
+      return {
+        restricted: document.querySelectorAll("[data-restricted]").length,
+        saysAvailWithheld: /Availability not shown/.test(text),
+        saysWorkflowWithheld: /Candidate and substitute list not shown/.test(text),
+        saysAllOnRoster: /All eligible players are on the roster or in the sub pool\./.test(text),
+        saysNoSubs: /No substitutes enrolled\./.test(text),
+        // The submitted lineup this reader IS entitled to. In this fixture
+        // the Coach's own journey ends with nothing seated, so the honest
+        // answer is the Game Sheet's "No lineup submitted" -- a true claim
+        // about the SUBMITTED lineup, which is exactly what this projection
+        // sends.
+        saysNothingSubmitted: /No lineup submitted/.test(text),
+        // ...and NOT the full-side instruction, which asserts the team has
+        // no players AT ALL and tells the reader to go add some.
+        saysTeamHasNoPlayers: /The home team has no players/.test(text),
+      };
+    });
+    // WITHHELD IS NAMED...
+    if (!officialRoster.saysAvailWithheld || !officialRoster.saysWorkflowWithheld
+        || officialRoster.restricted < 2) {
+      fail(`Assigned official [${L}]: the Roster tab must say the availability `
+        + `rollup and the candidate/substitute list are WITHHELD, not render `
+        + `them as absent: ${JSON.stringify(officialRoster)}`);
+    }
+    // ...AND NOT RENDERED AS AN EMPTY OPERATIONAL STATE. Both sentences are
+    // claims about THIS TEAM's preparedness -- "everyone eligible is already
+    // on the roster", "this team has enrolled no substitutes" -- and both are
+    // false for a reader who is simply not being shown those populations.
+    if (officialRoster.saysAllOnRoster || officialRoster.saysNoSubs) {
+      fail(`Assigned official [${L}]: withheld candidate/substitute state was `
+        + `rendered as an EMPTY operational claim about the team rather than `
+        + `as withheld: ${JSON.stringify(officialRoster)}`);
+    }
+    // AND THE SAME RULE ONE LAYER UP. An empty `players` array means
+    // different things on the two projections: on a full side it is the whole
+    // population, on this one it is only what was SUBMITTED. The full-side
+    // sentence ("The home team has no players. Add players in Setup first")
+    // is a claim about another team's roster that this reader was never shown
+    // -- the same mistake as the two above, made by an earlier guard.
+    if (officialRoster.saysTeamHasNoPlayers || !officialRoster.saysNothingSubmitted) {
+      fail(`Assigned official [${L}]: an empty SUBMITTED lineup must read as `
+        + `"no lineup submitted", never as "this team has no players": `
+        + `${JSON.stringify(officialRoster)}`);
+    }
+    // AND THE ROUTE ITSELF REFUSES, probed directly the way a console user
+    // would -- so the UI gate is defence in depth, never the boundary.
+    for (const teamId of [coachTeam.body.id, rivalTeam.body.id]) {
+      const probePath = `/api/games/${game.body.id}/availability-summary`;
+      tracker.expect("GET", probePath, 403);
+      const probe = await apiGet(page, `${probePath}?team_id=${teamId}`);
+      if (probe.status !== 403 || !probe.body.error
+          || probe.body.error.code !== "forbidden") {
+        fail(`Assigned official [${L}]: ?team_id=${teamId} must be refused, `
+          + `got status=${probe.status} body=${JSON.stringify(probe.body)}`);
+      }
+      if ("players" in probe.body || "counts" in probe.body) {
+        fail(`Assigned official [${L}]: the refusal carried a rollup shape -- `
+          + `an empty summary is a claim about the team, not about the `
+          + `reader: ${JSON.stringify(probe.body)}`);
+      }
+    }
     await logout(page);
 
     // ============================================================

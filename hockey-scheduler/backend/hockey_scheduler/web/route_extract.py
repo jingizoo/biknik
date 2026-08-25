@@ -3658,15 +3658,24 @@ _AUDIT_WAIVERS = {
     # string omits it, and is read from `self.path`'s query component the
     # SAME way as every other entry in this block.
     ("_dispatch_get",
-     "role in (Role.COACH, Role.PLAYER) and own_team and (team_id != "
-     "own_team)", "if_test", "sub == 'availability-summary'"):
-        "get_games_id_availability_summary (#89): own-team scoping for a "
-        "coach/player, operators exempt -- see this sub-group's own "
-        "comment above",
-    ("_dispatch_get", "api.get_availability_summary(gid, team_id)",
+     "api.get_availability_summary(gid, team_id, viewer_role=role, "
+     "viewer_team_id=own_team)",
      "call_argument", "sub == 'availability-summary'"):
-        "the service call consuming the already-waived `team_id` scope "
-        "check immediately above -- not a routing decision",
+        "gid captured off the SAME match; `sub == 'availability-summary'` "
+        "already selects this exact leaf. #427 final blocker round 2 REPLACED "
+        "this leaf's inline own-team `if` (whose own waiver stood here, and "
+        "which named only COACH/PLAYER so an assigned OFFICIAL fell through "
+        "it) with the SAME facade projection its four siblings use: "
+        "`own_team` is the already-waived TRUSTED SIDE and `role` the "
+        "session-resolved caller, so `lineup_visibility.route_audience` can "
+        "keep the hint for an unscoped operator, IGNORE it for a "
+        "Coach/Player in favour of their trusted side, and refuse an "
+        "official. The remaining `qs.get('team_id')` is the CLIENT HINT "
+        "passed in to be adjudicated, never trusted -- and every value of "
+        "all three arguments returns through this one leaf, so they decide "
+        "what this caller may SEE of an already-selected route, not which "
+        "route was chosen. Identical shape and reasoning to the "
+        "`api.get_roster_status` / `api.get_substitutes` waivers below",
     ("_dispatch_get",
      "role == Role.COACH and own_team and (team_id != own_team)", "if_test",
      "sub == 'substitute-candidates'"):

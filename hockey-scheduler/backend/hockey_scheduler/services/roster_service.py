@@ -521,6 +521,61 @@ class RosterService:
                          "authorized_team_id": authorized_team_id,
                          "owning_team_id": owning_team_id})
 
+    def _require_attributed_enrollment(
+        self, sub, authorized_team_id: Optional[str],
+    ) -> None:
+        """A TEAM-SCOPED actor may not transition an enrollment whose
+        ADMITTING SIDE IS UNKNOWN (#427 final blocker, round 2).
+
+        WHY THIS IS SEPARATE FROM :meth:`_require_authorized_team` and not a
+        change to it. That gate compares the actor's team against a COMPARAND
+        each call site chooses, and the standing ruling (#205 blocker 3) sets
+        which comparand: "Row-removal/response commands compare against
+        durable row attribution; commands creating new state compare against
+        the locked live context." ``withdraw_substitute`` and
+        ``decline_substitute`` therefore pass ``sub.team_id`` and ALREADY
+        fail closed on a NULL. The three CREATE-STATE transitions —
+        ``offer_substitute``, ``accept_substitute``,
+        ``add_substitute_to_roster`` — correctly pass the LIVE context, and
+        that must stay live: it is what lets the coach a player has genuinely
+        transferred TO act, and what keeps the side authorized to offer
+        identical to the side the offer is recorded against.
+
+        THE HOLE THAT LEFT. For an enrollment with ``team_id IS NULL`` the
+        live comparand does not merely permit the action, it INVENTS the
+        answer the row could not give: ``offer_substitute`` writes
+        ``sub.team_id = team_id`` three lines on, so the transition MINTS an
+        admitting side out of today's membership. Reproduced over an
+        authenticated HTTP session at ae21c40 — the HOME Coach offered a
+        NULL-owner enrollment and the row came back ``"team_id": "team_1"``,
+        durably, and then appeared in that Coach's ``/substitutes``. If the
+        row was really the opponent's bench, it has just changed hands.
+        That is exactly the guess this blocker forbids, made permanent.
+
+        SO THE TWO QUESTIONS ARE ASKED SEPARATELY. This one runs FIRST and
+        asks only "does this row name a side at all?"; the live comparand
+        then asks, unchanged, "is that side yours?". Composing them this way
+        (rather than switching the create-state comparand to durable) keeps
+        the transfer case the standing ruling protects: a durably attributed
+        row whose occupant has moved is still resolved live.
+
+        ``authorized_team_id is None`` MEANS NO COACH CONSTRAINT, the same
+        convention :meth:`_require_authorized_team` uses and for the same
+        reason — player self-service and an unscoped League Admin claim no
+        side, so neither is guessing when they act, and an operator remains
+        the path by which a legacy row can be repaired at all. Same
+        ``attribution_missing`` reason and same message as the durable
+        comparand's own NULL refusal, because it is the same fact about the
+        same column observed by a different gate."""
+        if authorized_team_id is None:
+            return
+        if sub.team_id is None:
+            raise NotAuthorizedError(
+                _ATTRIBUTION_MISSING_DURABLE.format(
+                    what="substitute enrollment"),
+                details={"reason": ATTRIBUTION_MISSING,
+                         "authorized_team_id": authorized_team_id})
+
     def _audit(
         self,
         game_id: str,
@@ -1387,6 +1442,14 @@ class RosterService:
             raise InvalidTransitionError(
                 "Only an enrolled substitute can be offered a slot."
             )
+        # FIRST: does this row name a side AT ALL? Because the write below
+        # MINTS `sub.team_id` from the live context, a NULL-owner row would
+        # otherwise have an admitting side invented for it out of today's
+        # membership — durably. A team-scoped actor is refused; an operator
+        # (no constraint) can still repair the row. See
+        # `_require_attributed_enrollment` for why this is a separate
+        # question from the comparand check below and not a change to it.
+        self._require_attributed_enrollment(sub, authorized_team_id)
         team_id = self._require_membership_context(game, player).team_id
         # COMPARAND: THE LOCKED LIVE CONTEXT. Making an offer CREATES NEW
         # STATE — it is the transition that MINTS the offer-owner snapshot
@@ -1469,6 +1532,13 @@ class RosterService:
             # still durably record EXPIRED for them even when membership has
             # ended, which an unconditional resolution here would prevent.
             if authorized_team_id is not None:
+                # Same two questions, same order, same reason as
+                # `offer_substitute`: a row that names no side is not any
+                # side's to seat from, and accepting SEATS it. Inside the
+                # same `is not None` guard so the player/guardian paths --
+                # which must still durably record EXPIRED below -- resolve
+                # nothing extra, exactly as before.
+                self._require_attributed_enrollment(sub, authorized_team_id)
                 self._require_authorized_team(
                     authorized_team_id,
                     self._require_membership_context(game, player).team_id,
@@ -1644,6 +1714,10 @@ class RosterService:
             raise NotEnrolledError(
                 "Player must be an enrolled/offered substitute to be added."
             )
+        # Same two questions, same order, same reason as `offer_substitute`:
+        # this is the coach-override SEATING of an existing enrollment, and a
+        # row that names no side is not any side's to seat from.
+        self._require_attributed_enrollment(sub, authorized_team_id)
         # ONE resolution, held in a name, so the gate below and the durable
         # attribution written into the row are provably the same decision
         # (#205 blocker 5 round 2) rather than two independent lookups.
@@ -3774,10 +3848,36 @@ class RosterService:
         rows = []
         for sub in self.store.substitutes_for_game(game_id):
             player = self.store.get_player(sub.player_id)
-            # A deactivated player's enrollment stays as history but drops out
-            # of the live outreach queue (#270 review) — never offer-able. The
-            # same live-fail-closed rule applies to the #205 resolution: a
-            # membership ended after enrollment drops the row from the queue.
+            # ATTRIBUTION IS DURABLE; LIVENESS IS LIVE. Two different
+            # questions, and this loop used to answer BOTH with the live
+            # membership (#427 final blocker, round 2).
+            #
+            # THE DEFECT THAT FIXES. `/substitutes` correctly omits a pre-060
+            # NULL-owner enrollment from BOTH Coaches — it cannot name the
+            # side it was admitted on, and `durable_game_sides` refuses to
+            # guess one. This queue served the SAME ROW to whichever Coach
+            # the occupant happens to belong to TODAY, with `can_offer: True`.
+            # Measured tri-store over real authenticated sessions at ae21c40:
+            # the AWAY Coach's queue carried a NULL-owner row its own
+            # `/substitutes` had just withheld, and the HOME Coach's carried
+            # the mirrored one — two routes in one family, two authorities,
+            # contradicting this blocker's own "never guess" rule.
+            #
+            # So WHICH SIDE this row belongs to is `sub.team_id`, the side it
+            # was ADMITTED on (migration 060) — the same authority
+            # `lineup_population`'s (b) population and `get_substitutes`
+            # already key on, so all three cannot drift. A NULL owner names
+            # no side and appears in NEITHER queue.
+            if sub.team_id is None or sub.team_id != team_id:
+                continue
+            # WHETHER IT IS STILL LIVE stays a live question, unchanged: a
+            # deactivated player's enrollment remains as history but drops out
+            # of the outreach queue (#270 review) — never offer-able — and so
+            # does one whose membership ended after enrollment. The durably
+            # owned row is still visible to its owning Coach for cleanup on
+            # the lineup screen (2f8eb73's "Needs cleanup" block, labelled
+            # Ineligible and carrying only Withdraw); it simply cannot be
+            # OFFERED from here.
             if (player is None or not player.is_active
                     or self.team_for_game(game, player) != team_id):
                 continue
@@ -4065,6 +4165,34 @@ class RosterService:
         for sub in subs:
             player = self.store.get_player(sub.player_id)
             if player is None:
+                continue
+            # SIDE FROM THE ROW, LIVENESS FROM THE MEMBERSHIP (#427 final
+            # blocker, round 2). This charged an enrollment to whichever side
+            # its occupant's CURRENT membership named and consulted
+            # `sub.team_id` not at all, so a pre-060 NULL-owner row — one that
+            # `get_substitutes`, `lineup_population` and `durable_game_sides`
+            # all refuse to place on any side — was still COUNTED into one
+            # side's `substitutes_enrolled` and `substitutes_available`.
+            # Measured tri-store: `substitutes_enrolled` read 2 for HOME and 2
+            # for AWAY where only one durably owned ENROLLED row existed on
+            # each, and a Coach's own /roster-status therefore disagreed with
+            # their own /substitutes about how many enrollments they had.
+            #
+            # Both clauses are load-bearing and they are NOT the same test.
+            # `sub.team_id == team_id` answers "was this row admitted on this
+            # side" and is durable, so a transfer cannot move an existing row
+            # to the opponent's count. `ctx.team_id == team_id` answers "is
+            # this candidacy still real" and stays live, which is the
+            # deliberate choice this method's own docstring records
+            # ("SUBSTITUTE ENROLLMENTS STAY LIVE"): an enrollment is a
+            # CANDIDACY, not a seating, so a participation that has ended
+            # must drop out of the available count immediately — while the
+            # row itself stays visible to its owning Coach for cleanup.
+            #
+            # This can only ever REDUCE `substitutes_available`, so like the
+            # NULL-attribution seat rule above it can never reopen a slot and
+            # is incapable of admitting overfill.
+            if sub.team_id is None or sub.team_id != team_id:
                 continue
             ctx = context_of(sub.player_id, player)
             if ctx is not None and ctx.team_id == team_id:

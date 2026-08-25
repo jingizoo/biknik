@@ -702,8 +702,42 @@ class ParticipationEndingDoesNotFlipTheDurableSide(_LineupAuthority,
                 p, api = fx["people"], fx["api"]
                 with self.subTest(backend=label):
                     before = api.get_roster_status(fx["gid"])
-                    self.assertEqual(before["substitutes_enrolled"], 2,
-                                     before)
+                    # ONE, NOT TWO -- and the difference is the point (#427
+                    # final blocker, round 2). This baseline used to read 2:
+                    # HOME's own `enrolled` row PLUS `legacy_sub`, a pre-060
+                    # enrollment with `team_id IS NULL` that `_side_data`
+                    # charged to HOME because its occupant is a live HOME
+                    # member. That is attribution by live membership, the
+                    # authority `durable_game_sides` exists to refuse, and it
+                    # made this count disagree with `/substitutes` (which
+                    # withholds the same row from BOTH sides) about how many
+                    # enrollments HOME has. The number is asserted here
+                    # against the DURABLE authority rather than restated as a
+                    # literal, and the NULL row's exclusion is asserted BY
+                    # NAME below -- so this precondition now pins the rule
+                    # instead of merely recording a total.
+                    self.assertEqual(
+                        before["substitutes_enrolled"], 1,
+                        "`substitutes_enrolled` must count only enrollments "
+                        "this game DURABLY attributes to this side: "
+                        f"{before}")
+                    legacy = api.store.substitute_for_player(
+                        fx["gid"], p["legacy_sub"]["id"])
+                    self.assertIsNone(
+                        legacy.team_id,
+                        "fixture: legacy_sub is not the NULL-owner shape, so "
+                        "the count above could not distinguish the two "
+                        "authorities")
+                    self.assertTrue(
+                        legacy.status.is_active_enrollment, legacy)
+                    self.assertEqual(
+                        RosterService(api.store).team_for_game(
+                            api.store.get_game(fx["gid"]),
+                            api.store.get_player(p["legacy_sub"]["id"])),
+                        fx["home"],
+                        "fixture: legacy_sub is not a live HOME member, so a "
+                        "live-membership rule would not have counted it here "
+                        "and its absence proves nothing")
                     row = self._row_for(fx, fx["home"], p["enrolled"]["id"])
                     self.assertTrue(row["eligible"], row)
 
@@ -720,9 +754,11 @@ class ParticipationEndingDoesNotFlipTheDurableSide(_LineupAuthority,
                     # 2. THE LIVE ELIGIBLE COUNT DROPS.
                     after = api.get_roster_status(fx["gid"])
                     self.assertEqual(
-                        after["substitutes_enrolled"], 1,
+                        after["substitutes_enrolled"],
+                        before["substitutes_enrolled"] - 1,
                         "`substitutes_enrolled` still counts a candidate who "
                         "can no longer play")
+                    self.assertEqual(after["substitutes_enrolled"], 0, after)
                     # 3. THE ROW REMAINS VISIBLE FOR CLEANUP, on ITS side.
                     row = self._row_for(fx, fx["home"], p["enrolled"]["id"])
                     self.assertIsNotNone(

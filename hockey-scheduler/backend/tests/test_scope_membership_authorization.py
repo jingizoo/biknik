@@ -570,7 +570,16 @@ class ScopeAuthorizationOverHttp(unittest.TestCase):
         # #205 blocker 1 also covers the availability-summary sub-scope
         # (server.py, own_team resolved via game_scoped_own_team_id): a
         # Mover's default (no ?team_id=) summary must be their RESOLVED
-        # side, and the opponent side must stay refused.
+        # side, and naming the opponent must not reach it.
+        #
+        # #427 final blocker, round 2: the opponent probe used to assert 403.
+        # This leaf now IGNORES a scoped caller's side hint rather than
+        # refusing it, matching its four private-game siblings -- so the
+        # assertion is the STRONGER one that the hinted response IS the
+        # Mover's own resolved side, byte-for-byte the un-hinted answer. The
+        # property this test exists for (a Mover's side comes from their
+        # membership, and the opponent's summary is not reachable) is
+        # unchanged and now pinned on the body rather than on a status code.
         mover = self.f._pointer_only_player(
             self.api, self.teams["third"]["id"], "HTTP AvailMover")
         self.f._membership(self.api, mover["id"], self.ls_id,
@@ -583,10 +592,16 @@ class ScopeAuthorizationOverHttp(unittest.TestCase):
             c, f"/api/games/{self.game['id']}/availability-summary")
         self.assertEqual(status, 200, body)
         self.assertEqual(body.get("team_id"), self.teams["home"]["id"], body)
-        status, body = self._get(
+        status, hinted = self._get(
             c, f"/api/games/{self.game['id']}/availability-summary"
               f"?team_id={self.teams['away']['id']}")
-        self.assertEqual(status, 403, body)
+        self.assertEqual(status, 200, hinted)
+        self.assertEqual(
+            hinted, body,
+            "?team_id=<opponent> changed the response -- a client hint "
+            "selected a side")
+        self.assertEqual(hinted.get("team_id"), self.teams["home"]["id"],
+                         hinted)
 
 
 if __name__ == "__main__":  # pragma: no cover

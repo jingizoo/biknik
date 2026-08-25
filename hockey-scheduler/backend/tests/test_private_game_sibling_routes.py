@@ -33,12 +33,39 @@ F2 ``/roster-status`` called ``compute_roster_status(game_id)`` with NO team
 F3 ``/roster`` and ``/substitutes`` returned BOTH sides, unscoped, to either
    Coach AND to an assigned official.
 
+A SECOND independent review then measured two more, both closed here (round 2):
+
+F4 ``/availability-summary`` — the FIFTH leaf of the same ``re.match`` block,
+   behind the same gate, and THE ONLY ONE THAT READS A SIDE FROM THE QUERY
+   STRING. Its narrowing was spelled inline in ``web/server.py`` and named
+   only COACH and PLAYER, so an assigned OFFICIAL fell straight through it.
+   Measured tri-store over real sessions at ae21c40: the un-hinted call
+   answered that official ``400`` while ``?team_id=<either side>`` answered
+   ``200`` with that side's whole candidate pool — ``player_2``, ``player_3``,
+   ``player_4``, ``player_8``, ``player_9`` — carrying NAMES and per-player
+   availability, while the SAME official's ``/lineups`` one path segment away
+   carried only ``player_1`` with ``availability``/``sub_status``/``eligible``
+   stripped. The client hint was the SOLE side selector. The shipped UI fired
+   it too, confirmed in a real browser: an official is admitted to the Roster
+   tab, their ``/lineups`` sides are ``submitted_lineup`` rather than
+   ``restricted``, so the tab fetched ``?team_id=<the shown side>`` on every
+   render and the side toggle switched teams.
+
+F5 ``/substitute-candidates`` served a pre-060 NULL-owner enrollment —
+   attributed by LIVE MEMBERSHIP, the exact authority ``durable_game_sides``
+   refuses to use — to whichever Coach its occupant belongs to TODAY, with
+   ``can_offer: True``, while ``/substitutes`` correctly withheld that same
+   row from BOTH. ``substitutes_enrolled`` counted it the same way. And the
+   act was open, not only the read: an authenticated Coach's ``offer`` on such
+   a row returned 200 and MINTED ``team_id`` onto it from today's membership,
+   making the guess durable.
+
 WHAT IS PINNED HERE, one class per clause of the ruling:
 
 * a HOME scoped caller cannot pivot to AWAY private state through ANY of the
   four routes, and vice versa — driven as both Coaches AND as both Players;
-* an assigned official cannot recover candidate or substitute state through
-  ANY sibling;
+* an assigned official cannot recover candidate, availability or substitute
+  state through ANY sibling;
 * CLIENT HINTS cannot select the opponent — every route is driven with
   ``?team_id=`` and ``?side=`` naming the other side and required to answer
   identically to the un-hinted call;
@@ -84,8 +111,12 @@ from hockey_scheduler.api.service import ApiService as _ApiService
 from hockey_scheduler.services import lineup_visibility
 from hockey_scheduler.services.roster_service import RosterService
 
-#: The four routes the ruling names as one acceptance boundary.
-PRIVATE_SIBLINGS = ("board", "roster-status", "roster", "substitutes")
+#: The routes the ruling names as ONE acceptance boundary — "the caller's
+#: obtainable private game state". ``availability-summary`` joined the list in
+#: round 2: it is the fifth leaf of the same ``re.match`` block, behind the
+#: same gate, and it was the last one still answering around the projection.
+PRIVATE_SIBLINGS = ("board", "roster-status", "roster", "substitutes",
+                    "availability-summary")
 
 #: Query strings that NAME A SIDE. Every one of them is a client hint and
 #: every one must be ignored: `team_id` because that is the parameter the
@@ -118,6 +149,16 @@ class _SiblingHarness(_ProjectionHarness):
         p["away_sub"] = self._mover(fx, "Away Sub", fx["home"], fx["away"])
         assert "error" not in api.enroll_substitute(
             fx["gid"], p["away_sub"]["id"], actor_id=ADMIN)
+        # A pre-060 NULL-OWNER enrollment whose occupant is a LIVE AWAY
+        # member, mirroring the shared fixture's `legacy_sub` (live HOME).
+        # Both directions are needed: with only the HOME-side one, "attributed
+        # by live membership" and "attributed to HOME" are the same answer,
+        # and a test cannot tell which rule produced it.
+        p["away_legacy_sub"] = self._mover(fx, "Away Legacy Sub",
+                                           fx["home"], fx["away"])
+        assert "error" not in api.enroll_substitute(
+            fx["gid"], p["away_legacy_sub"]["id"], actor_id=ADMIN)
+        self._strip_sub_owner(api, fx["gid"], p["away_legacy_sub"]["id"])
         # The premise every assertion below rests on: the two sides' durable
         # populations are DISJOINT and neither is empty.
         home_side = self._durable(fx, fx["home"])
@@ -137,7 +178,7 @@ class _SiblingHarness(_ProjectionHarness):
         sides = RosterService(fx["api"].store).durable_game_sides(fx["gid"])
         return {v["id"] for k, v in fx["people"].items()
                 if k in ("legacy_seat", "legacy_sub", "orphan_seat",
-                         "orphan_sub")} - set(sides)
+                         "orphan_sub", "away_legacy_sub")} - set(sides)
 
     # -- readers -----------------------------------------------------------
     def _get(self, opener, fx, route, query=""):
@@ -255,6 +296,129 @@ class _SiblingHarness(_ProjectionHarness):
                            viewer_team_id=viewer_team_id)
                 return [] if isinstance(out, dict) and "error" in out else out
             target, attr, patch = api, "get_substitutes", get_substitutes
+        elif kind == "availability_official_served":
+            # F4: the leaf's inline narrowing, restored exactly as it stood --
+            # COACH and PLAYER only, so an OFFICIAL falls through it and the
+            # client hint selects the side.
+            real = api.get_availability_summary
+
+            def summary(self, game_id, team_id=None, viewer_role=None,
+                        viewer_team_id=None):
+                from hockey_scheduler.domain import Role
+                if viewer_role in (Role.COACH, Role.PLAYER):
+                    return real(self, game_id, team_id,
+                                viewer_role=viewer_role,
+                                viewer_team_id=viewer_team_id)
+                return self._availability_summary_of(
+                    self.roster._require_game(game_id),
+                    team_id or viewer_team_id or "")
+            target, attr, patch = (api, "get_availability_summary",
+                                   _catching(summary))
+        elif kind == "availability_hint_honoured":
+            # F4's other half, ALONE: the official refusal intact, but a
+            # Coach/Player's `?team_id=` selects the side again -- so a test
+            # that only drove the official cannot cover for it.
+            real = api.get_availability_summary
+
+            def summary(self, game_id, team_id=None, viewer_role=None,
+                        viewer_team_id=None):
+                return real(self, game_id, team_id,
+                            viewer_role=viewer_role,
+                            viewer_team_id=team_id or viewer_team_id)
+            target, attr, patch = api, "get_availability_summary", summary
+        elif kind == "availability_empty_instead_of_forbidden":
+            # THE RULING'S NAMED FAILURE MODE on this route: refuse by
+            # answering an empty summary with zero counts, which asserts
+            # "nobody on this team owes an answer".
+            real = api.get_availability_summary
+
+            def summary(self, game_id, team_id=None, viewer_role=None,
+                        viewer_team_id=None):
+                out = real(self, game_id, team_id, viewer_role=viewer_role,
+                           viewer_team_id=viewer_team_id)
+                if isinstance(out, dict) and "error" in out:
+                    return {"game_id": game_id, "team_id": team_id,
+                            "counts": {"available": 0, "unavailable": 0,
+                                       "maybe": 0, "no_response": 0},
+                            "players": []}
+                return out
+            target, attr, patch = api, "get_availability_summary", summary
+        elif kind == "availability_operator_narrowed":
+            # THE OTHER DIRECTION, and its own falsifier because narrowing the
+            # UNSCOPED OPERATOR is its own regression rather than a milder
+            # version of the same fix. The shape restored is the historical
+            # one this whole blocker began with -- `get_board`'s hard-coded
+            # HOME -- applied here: the operator's hint is dropped and every
+            # answer is the home side's.
+            real = api.get_availability_summary
+
+            def summary(self, game_id, team_id=None, viewer_role=None,
+                        viewer_team_id=None):
+                game = self.roster._require_game(game_id)
+                if lineup_visibility.route_audience(
+                        viewer_role, viewer_team_id, game.home_team_id,
+                        game.away_team_id) == lineup_visibility.FULL:
+                    return self._availability_summary_of(
+                        game, game.home_team_id)
+                return real(self, game_id, team_id, viewer_role=viewer_role,
+                            viewer_team_id=viewer_team_id)
+            target, attr, patch = (api, "get_availability_summary",
+                                   _catching(summary))
+        elif kind == "candidates_by_live_membership":
+            # F5, the read half: the outreach queue attributed by LIVE
+            # membership, which is what served a NULL-owner row to whichever
+            # Coach its occupant belongs to today.
+            real = RosterService.list_substitute_candidates
+
+            def candidates(self, game_id, team_id=None, rstatus=None):
+                rows = real(self, game_id, team_id=team_id, rstatus=rstatus)
+                game = self._require_game(game_id)
+                team_id = team_id or game.home_team_id
+                seen = {r["player_id"] for r in rows}
+                for sub in self.store.substitutes_for_game(game_id):
+                    if sub.team_id is not None or sub.player_id in seen:
+                        continue
+                    player = self.store.get_player(sub.player_id)
+                    if (player is None or not player.is_active
+                            or self.team_for_game(game, player) != team_id):
+                        continue
+                    rows.append({
+                        "player_id": sub.player_id, "name": player.name,
+                        "position": sub.position.value,
+                        "slot_type": sub.slot_type.value,
+                        "status": sub.status.value,
+                        "priority_rank": sub.priority_rank,
+                        "can_offer": True})
+                return rows
+            target, attr, patch = (RosterService, "list_substitute_candidates",
+                                   candidates)
+        elif kind == "subs_counted_by_live_membership":
+            # F5, the COUNT half: `_side_data` charging an enrollment to
+            # whichever side its occupant's CURRENT membership names, so a
+            # NULL-owner row is counted into one side's substitutes_enrolled.
+            real = RosterService._side_data
+
+            def side_data(self, game_id, team_id):
+                summaries, entries, subs = real(self, game_id, team_id)
+                game = self._require_game(game_id)
+                owned = {s.player_id for s in subs}
+                for sub in self.store.substitutes_for_game(game_id):
+                    if sub.team_id is not None or sub.player_id in owned:
+                        continue
+                    player = self.store.get_player(sub.player_id)
+                    if (player is not None
+                            and self.team_for_game(game, player) == team_id):
+                        subs.append(sub)
+                return summaries, entries, subs
+            target, attr, patch = RosterService, "_side_data", side_data
+        elif kind == "null_owner_actionable":
+            # F5, the ACT half: the guard that stops a team-scoped Coach
+            # transitioning a row whose admitting side is unknown, removed --
+            # so `offer` mints an admitting side out of today's membership.
+            def allow(self, sub, authorized_team_id):
+                return None
+            target, attr, patch = (RosterService,
+                                   "_require_attributed_enrollment", allow)
         elif kind == "attribution_by_live_membership":
             # NEVER GUESS A SIDE: attribution re-derived from the player's
             # CURRENT membership, which hands a legacy NULL row a side it
@@ -293,6 +457,14 @@ class _SiblingHarness(_ProjectionHarness):
 def _dump(obj):
     from hockey_scheduler.api.service import _serialize
     return _serialize(obj)
+
+
+def _catching(fn):
+    """Wrap a falsifier that may raise a domain error so it matches the real
+    method's ``@catch``-wrapped contract (a structured error dict, never an
+    exception across the facade boundary)."""
+    from hockey_scheduler.api.service import catch
+    return catch(fn)
 
 
 def _serializing(fn):
@@ -495,7 +667,8 @@ class SubstitutesAreOwnSideOnlyAndRefusedToOfficials(_SiblingHarness,
                 fx = self._fixture(store)
                 who = self._serve(fx)
                 nameless = {fx["people"][k]["id"]
-                            for k in ("legacy_sub", "orphan_sub")}
+                            for k in ("legacy_sub", "orphan_sub",
+                                      "away_legacy_sub")}
 
                 def check():
                     for user, team in (("homecoach", fx["home"]),
@@ -739,7 +912,8 @@ class TheOpponentIsUnreachableThroughEverySibling(_SiblingHarness,
                     # them is the same recovery by another name.
                     unselected = {fx["people"][k]["id"]
                                   for k in ("candidate", "enrolled",
-                                            "offered", "away_sub")}
+                                            "offered", "away_sub",
+                                            "legacy_sub", "away_legacy_sub")}
                     for route in PRIVATE_SIBLINGS:
                         for query in [""] + [f"?{h}={fx['away']}"
                                              for h in SIDE_HINTS]:
@@ -822,6 +996,354 @@ class AnUnscopedOperatorKeepsFullGameAccess(_SiblingHarness,
             finally:
                 self._close(label, store)
         self._assert_matrix_ran(ran, ["operator_unchanged"])
+
+
+# ---------------------------------------------------------------------------
+# 7. F4 — /availability-summary is projected like its four siblings.
+# ---------------------------------------------------------------------------
+class TheAvailabilityRollupIsProjectedLikeItsSiblings(_SiblingHarness,
+                                                      unittest.TestCase):
+    """The FIFTH leaf, and the only one that reads a side from the query
+    string — so it is the only place the ruling's "Ignore client side hints"
+    could actually be defeated, and it was.
+
+    THREE SEPARATE PROPERTIES, three falsifiers, because they are three
+    independent defects and a test that proved one could cover for another:
+
+    * an assigned OFFICIAL is REFUSED — the old narrowing named only COACH and
+      PLAYER, and this rollup IS per-player availability, the thing
+      ``_submitted_lineup_rows`` exists to strip;
+    * a Coach/Player's hint is IGNORED, not honoured and not merely refused —
+      the four siblings answer a hinted call identically to an un-hinted one,
+      and this must too or the family answers "what does ``?team_id=`` do"
+      two different ways;
+    * the UNSCOPED OPERATOR is byte-for-byte unchanged, proven against the
+      facade's own un-projected read rather than a literal.
+    """
+
+    def _summary(self, opener, fx, query=""):
+        return self._get(opener, fx, "availability-summary", query)
+
+    def test_only_a_full_or_own_side_caller_reads_the_rollup(self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                # The premise: each side really does owe answers, and the two
+                # sides name DIFFERENT people -- otherwise "own side only"
+                # could pass on an empty or an identical rollup.
+                api = fx["api"]
+                home_pool = {r["player_id"] for r in api
+                             .get_availability_summary(fx["gid"],
+                                                       fx["home"])["players"]}
+                away_pool = {r["player_id"] for r in api
+                             .get_availability_summary(fx["gid"],
+                                                       fx["away"])["players"]}
+                self.assertTrue(home_pool and away_pool, (home_pool, away_pool))
+                self.assertFalse(home_pool & away_pool,
+                                 "fixture: the two pools overlap")
+
+                def check_hint_ignored():
+                    for user, team in (("homecoach", fx["home"]),
+                                       ("homeplayer", fx["home"]),
+                                       ("awaycoach", fx["away"]),
+                                       ("awayplayer", fx["away"])):
+                        other = (fx["away"] if team == fx["home"]
+                                 else fx["home"])
+                        status, plain = self._summary(who[user], fx)
+                        self.assertEqual(status, 200, (user, plain))
+                        self.assertEqual(
+                            plain["team_id"], team,
+                            f"[{label}] {user} received the OTHER side's "
+                            "availability rollup")
+                        for hint in SIDE_HINTS:
+                            status, hinted = self._summary(
+                                who[user], fx, f"?{hint}={other}")
+                            self.assertEqual(
+                                status, 200,
+                                f"[{label}] {user}: ?{hint}= naming the "
+                                "opponent must be IGNORED, not refused -- "
+                                "every sibling answers a hinted call exactly "
+                                f"as an un-hinted one: {hinted!r}")
+                            self.assertEqual(
+                                hinted, plain,
+                                f"[{label}] {user}: ?{hint}= changed the "
+                                "availability rollup -- a client hint "
+                                "selected a side")
+                        # And nothing of the opponent's pool is in it.
+                        self._assert_absent(
+                            plain, away_pool if team == fx["home"]
+                            else home_pool, f"{label}/{user}",
+                            "/availability-summary")
+
+                def check_official():
+                    for query in [""] + [f"?{h}={side}"
+                                         for h in SIDE_HINTS
+                                         for side in (fx["home"], fx["away"])]:
+                        status, body = self._summary(who["official"], fx,
+                                                     query)
+                        self.assertNotEqual(
+                            status, 200,
+                            f"[{label}] an assigned official read the "
+                            f"availability rollup with {query!r}: {body!r}")
+                        self.assertEqual(status, 403, (query, body))
+                        self.assertEqual(body["error"]["code"], "forbidden",
+                                         body)
+                        # NEVER AN EMPTY OPERATIONAL STATE. The refusal must
+                        # not carry a rollup shape at all -- `players: []`
+                        # with zero counts asserts "nobody on this team owes
+                        # an answer", a claim about the GAME rather than
+                        # about this reader.
+                        self.assertNotIn("players", body, body)
+                        self.assertNotIn("counts", body, body)
+
+                # CAPTURED BEFORE ANY FALSIFIER RUNS. The expectation is the
+                # facade's OWN un-projected read rather than a literal, so it
+                # cannot drift into agreeing with a narrowed operator -- but
+                # that same call goes through the very method the operator
+                # falsifier replaces, so recomputing it inside `check_operator`
+                # would rewrite the ANSWER KEY along with the code and the
+                # falsifier would pass. This is the identical trap
+                # `attribution_by_live_membership` fell into.
+                unprojected = {team: fx["api"].get_availability_summary(
+                    fx["gid"], team) for team in (fx["home"], fx["away"])}
+
+                def check_operator():
+                    for team in (fx["home"], fx["away"]):
+                        status, served = self._summary(
+                            who["operator"], fx, f"?team_id={team}")
+                        self.assertEqual(status, 200, served)
+                        self.assertEqual(
+                            served, unprojected[team],
+                            f"[{label}] the operator's rollup was narrowed")
+
+                with self.subTest(backend=label):
+                    check_hint_ignored()
+                    check_official()
+                    check_operator()
+                self._require_falsifier_breaks(
+                    "availability_official_served", check_official,
+                    f"[{label}] the official's availability refusal")
+                self._require_falsifier_breaks(
+                    "availability_empty_instead_of_forbidden", check_official,
+                    f"[{label}] refusal-not-empty on /availability-summary")
+                self._require_falsifier_breaks(
+                    "availability_hint_honoured", check_hint_ignored,
+                    f"[{label}] the ignored side hint")
+                self._require_falsifier_breaks(
+                    "availability_operator_narrowed", check_operator,
+                    f"[{label}] the unchanged operator rollup")
+                ran.append((label, "availability_projected"))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, ["availability_projected"])
+
+
+# ---------------------------------------------------------------------------
+# 8. F5 — a NULL-attribution enrollment: not served, not counted, not
+#    actionable, by EITHER Coach.
+# ---------------------------------------------------------------------------
+class ANullOwnerEnrollmentIsServedCountedAndActedOnByNobody(
+        _SiblingHarness, unittest.TestCase):
+    """"Legacy NULL attribution is omitted, never guessed" — applied to the
+    THREE surfaces that were still guessing, in the two directions that make
+    the guess visible.
+
+    THE CONTRADICTION THIS CLOSES, stated as the assertion it becomes:
+    ``/substitutes`` and ``/substitute-candidates`` are two views of ONE
+    resource, so they must name the SAME rows. They did not — the flat list
+    keyed on ``enrollment.team_id`` (durable) and the queue on
+    ``team_for_game`` (live), so a NULL-owner row was withheld by one and
+    served by the other WITH ``can_offer: True``.
+
+    BOTH DIRECTIONS ARE FIXTURED. ``legacy_sub`` is a NULL-owner row whose
+    occupant is a live HOME member and ``away_legacy_sub`` one whose occupant
+    is a live AWAY member. With only the first, "attributed by live
+    membership" and "attributed to HOME" are indistinguishable answers.
+
+    AND THE ACT, NOT ONLY THE READ. ``offer_substitute`` re-resolves the side
+    LIVE and then WRITES it into ``sub.team_id`` — so on a row that named no
+    side, the transition invented one and made it durable. The refusal is
+    asserted together with the row being UNCHANGED in the store, because a
+    403 returned after a write would be worse than the 200."""
+
+    def _null_owned(self, fx):
+        rows = {s.player_id for s in
+                fx["api"].store.substitutes_for_game(fx["gid"])
+                if s.team_id is None}
+        self.assertTrue(rows, "fixture: no NULL-owner enrollments")
+        return rows
+
+    def _queue(self, opener, fx):
+        status, body = self._get(opener, fx, "substitute-candidates")
+        self.assertEqual(status, 200, body)
+        return body["candidates"]
+
+    def _durable_enrolled(self, fx, team_id) -> int:
+        """The ENROLLED rows this game DURABLY attributes to ``team_id`` whose
+        occupant is still a live member of it — the number
+        ``substitutes_enrolled`` must report, derived from the two authorities
+        rather than from a literal."""
+        api = fx["api"]
+        game = api.store.get_game(fx["gid"])
+        roster = RosterService(api.store)
+        n = 0
+        for sub in api.store.substitutes_for_game(fx["gid"]):
+            if sub.team_id is None or sub.team_id != team_id:
+                continue
+            if sub.status.value != "enrolled":
+                continue
+            player = api.store.get_player(sub.player_id)
+            if player is None:
+                continue
+            if roster.team_for_game(game, player) == team_id:
+                n += 1
+        return n
+
+    def test_neither_coach_reads_counts_or_acts_on_an_unattributed_row(self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                nameless = self._null_owned(fx)
+                # The premise the whole class rests on: at least one
+                # NULL-owner row's occupant IS a live member of each side, so
+                # a live-membership rule really would serve it to that Coach.
+                api, roster = fx["api"], RosterService(store)
+                game = store.get_game(fx["gid"])
+                live_sides = {
+                    roster.team_for_game(game, store.get_player(pid))
+                    for pid in nameless}
+                self.assertIn(fx["home"], live_sides, live_sides)
+                self.assertIn(fx["away"], live_sides, live_sides)
+
+                def check_reads():
+                    for user, team in (("homecoach", fx["home"]),
+                                       ("awaycoach", fx["away"])):
+                        queue = {c["player_id"] for c in
+                                 self._queue(who[user], fx)}
+                        self.assertFalse(
+                            queue & nameless,
+                            f"[{label}] {user}'s outreach queue carries a "
+                            "NULL-owner enrollment on a GUESSED side: "
+                            f"{sorted(queue & nameless)}")
+                        # ONE RESOURCE, ONE ANSWER: the queue and the flat
+                        # list must name the same rows.
+                        flat = {r["player_id"] for r in
+                                self._ok(who[user], fx, "substitutes")}
+                        self.assertEqual(
+                            queue, flat,
+                            f"[{label}] {user}: /substitute-candidates and "
+                            "/substitutes disagree about which enrollments "
+                            "are this side's -- two authorities, one "
+                            "resource")
+
+                def check_counts():
+                    for user, team in (("homecoach", fx["home"]),
+                                       ("awaycoach", fx["away"])):
+                        body = self._ok(who[user], fx, "roster-status")
+                        self.assertEqual(body["team_id"], team, body)
+                        self.assertEqual(
+                            body["substitutes_enrolled"],
+                            self._durable_enrolled(fx, team),
+                            f"[{label}] {user}'s substitutes_enrolled counts "
+                            "a row this game cannot durably attribute to "
+                            "their side")
+
+                def check_acts():
+                    for user, team in (("homecoach", fx["home"]),
+                                       ("awaycoach", fx["away"])):
+                        for pid in sorted(nameless):
+                            before = _enrollment(fx, pid)
+                            for path, body in (
+                                    (f"substitutes/{pid}/offer", {}),
+                                    (f"substitutes/{pid}/add-to-roster", {}),
+                                    ("substitutes/withdraw",
+                                     {"player_id": pid})):
+                                status, out = self._req(
+                                    who[user], "POST",
+                                    f"/api/games/{fx['gid']}/{path}", body)
+                                self.assertEqual(
+                                    status, 403,
+                                    f"[{label}] {user} acted on an "
+                                    f"enrollment whose admitting side is "
+                                    f"unknown via {path}: {out!r}")
+                            after = _enrollment(fx, pid)
+                            self.assertEqual(
+                                (before.status, before.team_id),
+                                (after.status, after.team_id),
+                                f"[{label}] {user}'s refused action still "
+                                f"wrote to {pid}'s enrollment -- a 403 after "
+                                "a write is worse than the 200")
+                            self.assertIsNone(
+                                after.team_id,
+                                f"[{label}] {pid}'s admitting side was MINTED "
+                                "from live membership by a refused action")
+
+                with self.subTest(backend=label):
+                    check_reads()
+                    check_counts()
+                    check_acts()
+                    # THE NARROWINGS ARE NARROWINGS, not blanket breakage: a
+                    # DURABLY OWNED row is still served, still counted, and
+                    # still actionable by its own Coach.
+                    owned = {c["player_id"]
+                             for c in self._queue(who["homecoach"], fx)}
+                    self.assertTrue(
+                        owned, f"[{label}] HOME's outreach queue is empty, so "
+                        "the omission of the NULL row proves nothing")
+                    self.assertGreater(
+                        self._durable_enrolled(fx, fx["home"]), 0,
+                        f"[{label}] fixture: HOME owns no ENROLLED row")
+                    target = sorted(
+                        c["player_id"] for c in self._queue(who["homecoach"],
+                                                            fx)
+                        if c["status"] == "enrolled")[0]
+                    status, out = self._req(
+                        who["homecoach"], "POST",
+                        f"/api/games/{fx['gid']}/substitutes/{target}/offer",
+                        {})
+                    self.assertEqual(
+                        status, 200,
+                        f"[{label}] the HOME Coach can no longer offer a row "
+                        f"their own side durably owns: {out!r}")
+                    # AND THE OPERATOR KEEPS THE REPAIR PATH. An unscoped
+                    # caller claims no side, so they are not guessing -- and
+                    # they are the only route by which a legacy row can be
+                    # resolved at all.
+                    victim = sorted(nameless)[0]
+                    status, out = self._req(
+                        who["operator"], "POST",
+                        f"/api/games/{fx['gid']}/substitutes/withdraw",
+                        {"player_id": victim})
+                    self.assertEqual(
+                        status, 200,
+                        f"[{label}] the unscoped operator lost the only path "
+                        f"by which a legacy row can be cleared: {out!r}")
+
+                self._require_falsifier_breaks(
+                    "candidates_by_live_membership", check_reads,
+                    f"[{label}] durable attribution on the outreach queue")
+                self._require_falsifier_breaks(
+                    "subs_counted_by_live_membership", check_counts,
+                    f"[{label}] durable attribution in substitutes_enrolled")
+                self._require_falsifier_breaks(
+                    "null_owner_actionable", check_acts,
+                    f"[{label}] the unattributed-enrollment act refusal")
+                ran.append((label, "null_owner_nowhere"))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, ["null_owner_nowhere"])
+
+
+def _enrollment(fx, player_id):
+    return fx["api"].store.substitute_for_player(fx["gid"], player_id)
 
 
 if __name__ == "__main__":  # pragma: no cover

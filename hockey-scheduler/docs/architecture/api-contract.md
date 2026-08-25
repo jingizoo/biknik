@@ -110,19 +110,23 @@ The facade supports the three required screen states:
 
 ## Private game visibility (#427)
 
-`board`, `lineups`, `roster-status`, `roster` and `substitutes` all expose one
-game's **private** state. Passing the session + participation gate proves the
-caller belongs to *a* team in the game; it does **not** decide *which side*
-they may read. The server resolves the caller's own side once
+`board`, `lineups`, `roster-status`, `roster`, `substitutes`,
+`availability-summary` and `substitute-candidates` all expose one game's
+**private** state. Passing the session + participation gate proves the caller
+belongs to *a* team in the game; it does **not** decide *which side* they may
+read. The server resolves the caller's own side once
 (`game_scoped_own_team_id`) and every one of these routes is projected on it.
-**A side is never read from the query string or the body** — a `?team_id=` or
-`?side=` naming the opponent is ignored, not honoured and not rejected.
+**A side is never trusted from the query string or the body** — a `?team_id=`
+or `?side=` naming the opponent is *ignored* for a scoped caller, so a hinted
+request returns exactly what the un-hinted one returns. It is deliberately not
+rejected: a 403 raised only for the opponent's id is itself an oracle for
+which team is playing, while an unchanged own-side answer discloses nothing.
 
-| Caller | board / lineups | roster-status | roster | substitutes |
-|---|---|---|---|---|
-| League Admin, Arena Manager | both sides, full | full | full | full |
-| Coach, Player | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows |
-| Assigned official | both sides' submitted lineup | **403** | both sides' submitted lineup | **403** |
+| Caller | board / lineups | roster-status | roster | substitutes | availability-summary |
+|---|---|---|---|---|---|
+| League Admin, Arena Manager | both sides, full | full | full | full | any side (hint honoured) |
+| Coach, Player | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows | own side only (hint ignored) |
+| Assigned official | both sides' submitted lineup | **403** | both sides' submitted lineup | **403** | **403** |
 
 Two rules govern how withheld data is represented, and both exist because an
 empty collection is an *operational claim about the game* rather than a
@@ -142,6 +146,28 @@ Attribution comes from the stored `GameRosterEntry.team_side` and
 `SubstituteEnrollment.team_id` — never live membership and never
 `Player.team_id`. A legacy row with NULL attribution names no side, so it is
 withheld from **both** rather than guessed onto one.
+
+### Which side a substitute enrollment belongs to
+
+`SubstituteEnrollment.team_id` — the side the row was **admitted** on — and
+nothing else. This is one rule with three consequences, because attribution
+and liveness are different questions asked of the same row:
+
+- **Served** — `substitutes` and `substitute-candidates` are two views of one
+  resource and name the **same** rows. A NULL-owner row appears in neither.
+- **Counted** — `substitutes_enrolled` and `substitutes_available` count only
+  rows this game durably attributes to the side *and* whose occupant is still
+  a live member of it. Attribution is durable so a transfer cannot move an
+  existing row into the opponent's count; liveness is live so a candidacy that
+  has ended drops out of the count immediately, while the row itself stays
+  visible to its owning coach for cleanup.
+- **Actionable** — a **team-scoped** actor cannot transition a row whose
+  admitting side is unknown: `offer`, `accept` and `add-to-roster` answer
+  **403** with `reason: "attribution_missing"`, alongside `withdraw` and
+  `decline`, which already did. This matters because `offer` *writes*
+  `team_id`, so permitting it would mint an admitting side out of today's
+  membership and make the guess durable. An unscoped operator claims no side
+  and is unaffected — they remain the path by which a legacy row is repaired.
 
 ## Named schedule scenarios (#378)
 

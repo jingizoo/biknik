@@ -250,9 +250,9 @@ class _SetupMutationRefused(Exception):
         self.payload = payload
 
 
-#: THE THREE FLAT-LIST REFUSALS (#427 final blocker). Each says WHO may read
-#: the resource, so the answer is "you are not entitled to this", never the
-#: operational claim "there is none" an empty list would make. All three are
+#: THE FLAT-LIST / ROLLUP REFUSALS (#427 final blocker). Each says WHO may
+#: read the resource, so the answer is "you are not entitled to this", never
+#: the operational claim "there is none" an empty list would make. All are
 #: `NotAuthorizedError` -> code "forbidden" -> HTTP 403.
 _PRIVATE_SIDE_REFUSAL = (
     "You can only view your own team's roster for this game.")
@@ -262,6 +262,9 @@ _SUBSTITUTE_REFUSAL = (
 _ROSTER_STATUS_REFUSAL = (
     "Roster status is private to each team's coach and the league office — "
     "an assigned official reads the submitted lineup instead.")
+_AVAILABILITY_REFUSAL = (
+    "Per-player availability is private to each team's coach and the league "
+    "office — an assigned official reads the submitted lineup instead.")
 
 #: Key-name suffixes that mark a value as a PLAYER identity in an audit
 #: entry's free-form ``detail`` payload. Every player-bearing key the service
@@ -4221,12 +4224,87 @@ class ApiService:
         return [_serialize(a) for a in self.store.availability_for_game(game_id)]
 
     @catch
-    def get_availability_summary(self, game_id: str, team_id: str) -> dict:
+    def get_availability_summary(self, game_id: str,
+                                 team_id: Optional[str] = None,
+                                 viewer_role=None,
+                                 viewer_team_id: Optional[str] = None) -> dict:
         """Per-player availability for a team in a game (#89), bucketed into
-        available / unavailable / maybe / no_response, with counts. Private
-        (player names) — callers are gated by the same #73 access check."""
-        return self._availability_summary_of(
-            self.roster._require_game(game_id), team_id)
+        available / unavailable / maybe / no_response, with counts — projected
+        onto the audience this caller belongs to (#427 final blocker, round 2).
+
+        THE DEFECT THIS CLOSES, and why it is the same defect as the four
+        siblings'. This is the FIFTH leaf of the private-game family and the
+        ONLY one that reads a side from the QUERY STRING. Its narrowing was
+        spelled inline in ``web/server.py`` and named only COACH and PLAYER::
+
+            team_id = (qs.get("team_id") or [own_team])[0]
+            if role in (Role.COACH, Role.PLAYER) and own_team \\
+                    and team_id != own_team:
+
+        so an assigned OFFICIAL fell straight through it. Measured at ae21c40
+        over a real authenticated session, identically on Memory, SQLite and
+        PostgreSQL: ``GET /availability-summary`` answered an official 400
+        ("That team is not playing in this game.") while
+        ``?team_id=<home>`` answered **200** with the whole HOME candidate
+        pool — ``player_2``, ``player_3``, ``player_4``, ``player_8``,
+        ``player_9`` — carrying NAMES and per-player availability, and
+        ``?team_id=<away>`` did the same for AWAY. One path segment away, that
+        same official's ``/lineups`` carried only the submitted rows with
+        ``availability``/``sub_status``/``eligible`` stripped and
+        ``substitutes_enrolled: null``. So the projection removed exactly the
+        two classes this route handed back.
+
+        THE CLIENT HINT WAS THE SOLE SIDE SELECTOR — 400 without it, 200 with
+        it — which is the standing ruling's "Ignore client side hints"
+        defeated on the one family route that actually reads one. And the
+        SHIPPED UI fired it: ``canReadAnyPrivateGame()`` admits any
+        ``official_id`` to the Roster tab, an official's ``/lineups`` sides
+        are ``submitted_lineup`` rather than ``restricted``, so
+        ``isRestrictedSide`` was false and the tab fetched
+        ``?team_id=<the shown side>`` on every render — with the side toggle
+        switching teams. Confirmed in a real browser, not only by curl.
+
+        SO THE AUDIENCE DECIDES, exactly as it does for ``/roster``,
+        ``/roster-status``, ``/substitutes`` and ``/board``
+        (:func:`services.lineup_visibility.route_audience`):
+
+        ``FULL``
+            Unscoped operator — the hint is kept, byte-for-byte the existing
+            #89 behaviour including the "no hint, no own team" case that
+            resolves ``""`` and raises the ordinary participation
+            ``ValidationError``. Narrowing the operator would be its own
+            regression.
+        ``OWN_SIDE``
+            Coach / Player — the hint is IGNORED ENTIRELY and the TRUSTED
+            server-resolved side is used. Ignored, not refused: the four
+            siblings answer a hinted request identically to an un-hinted one,
+            and a fifth leaf that refused instead would leave "what does a
+            side hint do here" answered two different ways inside one family.
+            It is also strictly less informative — a 403 that appears only
+            for the opponent's id is itself a probe oracle for which team is
+            playing, while an unchanged own-side answer tells the caller
+            nothing they did not already have.
+        ``SUBMITTED_LINEUP`` / ``RESTRICTED``
+            Assigned official, and any caller whose own side did not resolve
+            to one of this game's two teams — **403**, never ``players: []``
+            with zero counts. This rollup IS per-player availability, the
+            thing ``_submitted_lineup_rows`` exists to remove, so there is no
+            official-shaped projection of it; and an empty summary would
+            assert "nobody on this team owes an answer", an operational claim
+            about the game rather than a fact about the reader.
+
+        ``viewer_role`` of ``None`` is the in-process default and resolves
+        ``FULL``, so every non-HTTP caller is unchanged.
+        """
+        game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.OWN_SIDE:
+            return self._availability_summary_of(game, viewer_team_id)
+        if audience == lineup_visibility.FULL:
+            return self._availability_summary_of(
+                game, team_id or viewer_team_id or "")
+        raise NotAuthorizedError(_AVAILABILITY_REFUSAL)
 
     def _availability_candidates(self, game, team_id: str) -> List["Player"]:
         """WHO owes ``team_id`` an availability answer for ``game`` — the ONE

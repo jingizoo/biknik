@@ -285,14 +285,33 @@ REGISTRY = (
     RouteSpec("GET", r"^/api/games/[^/]+/availability-summary$",
               "/api/games/{}/availability-summary",
               "get_games_id_availability_summary", "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: _resolve_role (server.py:2070) then "
-                    "can_read_private_game_data (scope.py:122-152 -- "
+              auth="session+own-side-projection", scope_axis="none",
+              note=("#202: _resolve_role (server.py:2851) then "
+                    "can_read_private_game_data (scope.py:230-259 -- "
                     "operators any, coach/player only their own team via "
-                    "the game, official only if assigned; server.py:2078) "
-                    "gates every sub-branch, then this leaf's own extra "
-                    "narrowing (server.py:2116-2123): a coach/player's "
-                    "team_id query param must match their own team. "
+                    "the game, official only if assigned; server.py:2859) "
+                    "gates every sub-branch. "
+                    "#427 final blocker round 2: this leaf's own extra "
+                    "narrowing used to be spelled inline here and named "
+                    "only COACH and PLAYER, so an assigned OFFICIAL fell "
+                    "straight through it -- and this is the ONLY leaf of "
+                    "the private-game family that reads a side from the "
+                    "QUERY STRING, so the client hint was the sole side "
+                    "selector: measured tri-store over a real session, an "
+                    "official's un-hinted call was 400 while "
+                    "?team_id=<either side> was 200 with that side's whole "
+                    "candidate pool, NAMES and per-player availability "
+                    "included -- the two classes the /lineups projection "
+                    "strips for that same role. It is now projected by the "
+                    "SAME lineup_visibility.route_audience (server.py:2948-"
+                    "2991 -> service.py:4227-4307) its four siblings use, "
+                    "on the SAME trusted server-resolved own side: an "
+                    "unscoped operator keeps the hint (unchanged), a "
+                    "Coach/Player has the hint IGNORED in favour of their "
+                    "trusted side (ignored, not refused -- the siblings "
+                    "answer a hinted call identically to an un-hinted one), "
+                    "and an assigned official is REFUSED 403 rather than "
+                    "handed players: [] with zero counts. "
                     "get_availability_summary is keyed by (game_id, "
                     "team_id) -- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/board$", "/api/games/{}/board",

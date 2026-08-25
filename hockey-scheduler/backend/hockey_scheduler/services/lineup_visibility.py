@@ -110,13 +110,14 @@ def side_projections(role, viewer_team_id, home_team_id, away_team_id) -> dict:
 
 
 def route_audience(role, viewer_team_id, home_team_id, away_team_id):
-    """WHICH AUDIENCE this caller belongs to on a FLAT-LIST private-game
-    sibling — ``/roster-status``, ``/roster``, ``/substitutes`` (#427 final
-    blocker, owner ruling: "the acceptance boundary is the caller's obtainable
-    private game state, not only `/board` and `/lineups`; leaving F2/F3 would
-    make the fix bypassable through sibling routes").
+    """WHICH AUDIENCE this caller belongs to on a SINGLE-ANSWER private-game
+    sibling — ``/roster-status``, ``/roster``, ``/substitutes`` and
+    ``/availability-summary`` (#427 final blocker, owner ruling: "the
+    acceptance boundary is the caller's obtainable private game state, not
+    only `/board` and `/lineups`; leaving F2/F3 would make the fix bypassable
+    through sibling routes").
 
-    THE DEFECT THIS EXISTS TO CLOSE. All three siblings sat behind the SAME
+    THE DEFECT THIS EXISTS TO CLOSE. All of them sat behind the SAME
     single ``can_read_private_game_data`` gate as ``/board`` and ``/lineups``,
     and like them carried no team-level narrowing at all — so once the two
     lineup reads were projected, an identical pivot remained one path segment
@@ -124,6 +125,28 @@ def route_audience(role, viewer_team_id, home_team_id, away_team_id):
     ``/substitutes`` handed either Coach *and* an assigned official the
     opponent's substitute workflow rows, and ``/roster-status`` hard-coded HOME
     for everybody exactly as ``get_board`` used to.
+
+    THE FIFTH LEAF, and why it was last (round 2).
+    ``/availability-summary`` is the ONLY route in this family that reads a
+    side FROM THE QUERY STRING, and its narrowing was spelled inline in
+    ``web/server.py`` naming only COACH and PLAYER — so an assigned OFFICIAL
+    fell straight through it. Measured tri-store over a real session at
+    ae21c40: the un-hinted call answered that official 400 while
+    ``?team_id=<either side>`` answered **200** with that side's whole
+    candidate pool, carrying NAMES and per-player availability — the two
+    classes ``_submitted_lineup_rows``/``_submitted_lineup_status`` exist to
+    remove, recovered one path segment from where they are removed. The
+    client hint was the SOLE side selector, which is the ruling's "ignore
+    client side hints" defeated on the one route that reads one.
+
+    A HINT IS ADJUDICATED HERE, NEVER TRUSTED. ``FULL`` keeps it (an unscoped
+    operator may read either side anyway, and narrowing them would be its own
+    regression); ``OWN_SIDE`` IGNORES it and answers for the trusted side, so
+    a hinted call is byte-identical to an un-hinted one exactly as it is on
+    the other four; ``SUBMITTED_LINEUP``/``RESTRICTED`` refuse. Ignoring
+    rather than refusing is deliberate: a 403 raised only for the opponent's
+    id is itself an oracle for which team is playing, while an unchanged
+    own-side answer discloses nothing the caller did not already hold.
 
     Returns one of the SAME four labels :func:`side_projections` uses, so the
     two-sided and flat-list reads cannot describe one caller differently:
@@ -136,10 +159,10 @@ def route_audience(role, viewer_team_id, home_team_id, away_team_id):
     ``SUBMITTED_LINEUP``
         Assigned official. Servable only where the submitted lineup is
         genuinely what the route is for (``/roster``); the routes whose whole
-        subject is candidate or substitute workflow state refuse it instead,
-        because an official referees the game and does not manage anyone's
-        roster. Each route names its own choice — that is a per-route
-        decision, not a property of the role.
+        subject is candidate, availability or substitute workflow state
+        refuse it instead, because an official referees the game and does not
+        manage anyone's roster. Each route names its own choice — that is a
+        per-route decision, not a property of the role.
     ``RESTRICTED``
         Nothing on this route. A flat list has no per-side envelope to carry a
         ``restricted: true`` marker the way ``/lineups`` does, so the honest
