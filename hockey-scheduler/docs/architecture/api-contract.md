@@ -154,6 +154,17 @@ which team is playing, while an unchanged own-side answer discloses nothing.
 | Player | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows | own side only (hint ignored) | **403** (no `MANAGE_ROSTER`) |
 | Assigned official | both sides' submitted lineup | **403** | both sides' submitted lineup | **403** | **403** | **403** |
 
+**"Submitted lineup" means the rows that OCCUPY a slot**, not the rows a
+screen happens to group under *selected*. `_lineup_rows` keeps a seated
+player in that group after they have gone unavailable or been removed, marked
+`backed_out: true`, so their own coach can still see the row for cleanup —
+that is the side's roster *history*, not its current sheet, and an official
+receives none of it. Occupancy is `RosterEntryStatus.occupies_slot`
+(`selected` / `confirmed` / `offered` / `accepted`), the same predicate slot
+accounting already uses; `backed_out` is invariantly `false` in an official's
+rows. The rule is applied in one place, `_submitted_lineup_rows`, which
+`/board`, `/lineups` and `/roster` all share.
+
 The last two carry a second, independent gate that the other five do not:
 `MANAGE_ROSTER`, a **role capability** ("may this kind of caller manage a
 roster at all"), checked before the side question is asked. That is why a

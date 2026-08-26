@@ -73,6 +73,7 @@ from test_lineup_population_authority import (PERM_POSITION, SEASON_POSITION,
                                               _LineupAuthority)
 from test_substitute_membership_cutover import ADMIN
 
+from hockey_scheduler.api.service import ApiService as _ApiService
 from hockey_scheduler.services import lineup_visibility
 from hockey_scheduler.web import server as srv
 from hockey_scheduler.web.auth import DEMO_PASSWORD, DEMO_USERS
@@ -482,6 +483,166 @@ class AnAssignedOfficialGetsTheSubmittedLineupOnly(_ProjectionHarness,
             finally:
                 self._close(label, store)
         self._assert_matrix_ran(ran, ["official_projection"])
+
+
+# ---------------------------------------------------------------------------
+# 4b. THE OFFICIAL'S ROWS ARE THE ONES THAT OCCUPY A SLOT — on all three
+#     routes that share the projection.
+# ---------------------------------------------------------------------------
+class TheOfficialSheetHoldsOnlyOccupyingRows(_ProjectionHarness,
+                                             unittest.TestCase):
+    """"``_submitted_lineup_rows`` filters only ``group == 'selected'``,
+    while ``_lineup_rows`` keeps an unavailable/removed roster entry in that
+    group and marks ``backed_out=true`` … This exceeds the accepted
+    submitted/occupying projection and exposes historical team workflow
+    rather than the current sheet." (#427 round 2, blocker 3.)
+
+    REPRODUCED at head 42d4f4d on Memory, SQLite and real PostgreSQL: mark
+    the selected player unavailable, and ``get_lineups(...,
+    viewer_role=Role.OFFICIAL)`` still returned them with
+    ``roster_status: "unavailable", backed_out: true`` — and so did
+    ``/board`` and ``/roster``, because all three read the same helper.
+
+    THE PREDICATE IS THE EXISTING ONE. ``RosterEntryStatus.occupies_slot``
+    is what ``RosterService._side_data`` already counts slots with, and
+    ``_lineup_rows`` has already applied it per row — ``backed_out`` IS
+    ``not entry.status.occupies_slot``. Nothing here derives a second
+    answer.
+
+    ALL THREE OCCUPYING STATES A SERVICE CALL CAN REACH are exercised as
+    separate people: SELECTED (seated), CONFIRMED (the seated player answers
+    available) and ACCEPTED (a substitute accepts an offer). The fourth
+    member of ``occupies_slot``, OFFERED, is deliberately absent: no code
+    path in this repository writes it to a roster row — the evidence is
+    recorded at ``services/roster_service.py``'s own "OFFERED — NOT
+    REACHABLE" note, and inventing a store write to produce one would test
+    a state the product cannot be in.
+
+    BOTH NON-OCCUPYING STATES are exercised too — UNAVAILABLE and REMOVED,
+    the two ``_back_out_entry`` writes — and both must be ABSENT.
+
+    THE FALSIFIER is the shipped filter: restore ``group == "selected"``
+    alone and every assertion below must break."""
+
+    #: ``key -> (occupying?, how the state is reached)``. Named so a failure
+    #: says which state, and so the two halves cannot drift apart.
+    OCCUPYING = ("sheet_selected", "sheet_confirmed", "sheet_accepted")
+    BACKED_OUT = ("sheet_unavailable", "sheet_removed")
+
+    def _sheet_fixture(self, store):
+        """The shared fixture plus one HOME person per roster-entry state."""
+        fx = self._fixture(store)
+        api, p = fx["api"], fx["people"]
+        for key in self.OCCUPYING + self.BACKED_OUT:
+            person = self._mover(fx, f"Sheet {key}", fx["third"], fx["home"])
+            p[key] = person
+            if key == "sheet_accepted":
+                # ACCEPTED is written by `_add_to_roster_entry` on the
+                # substitute path, which refuses a player the coach has
+                # already selected — so this one is never seated first.
+                continue
+            out = api.select_roster(fx["gid"], [person["id"]], actor_id=ADMIN)
+            assert "error" not in out, out
+        # SELECTED stays as select_roster left it.
+        out = api.set_availability(fx["gid"], p["sheet_confirmed"]["id"],
+                                   "available", actor_id=ADMIN)
+        assert "error" not in out, out
+        out = api.set_availability(fx["gid"], p["sheet_unavailable"]["id"],
+                                   "unavailable", actor_id=ADMIN)
+        assert "error" not in out, out
+        out = api.remove_player(fx["gid"], p["sheet_removed"]["id"],
+                                actor_id=ADMIN)
+        assert "error" not in out, out
+        # ACCEPTED is only reachable through the substitute workflow.
+        for step in (api.enroll_substitute, api.offer_substitute,
+                     api.accept_substitute):
+            out = step(fx["gid"], p["sheet_accepted"]["id"], actor_id=ADMIN)
+            assert "error" not in out, out
+        # THE PREMISE, asserted rather than assumed: every one of the five
+        # rows really is in the state this test says it is, and the two
+        # groups really do differ on `occupies_slot`.
+        expected = {"sheet_selected": "selected",
+                    "sheet_confirmed": "confirmed",
+                    "sheet_accepted": "accepted",
+                    "sheet_unavailable": "unavailable",
+                    "sheet_removed": "removed"}
+        for key, want in expected.items():
+            entry = api.store.roster_entry_for_player(fx["gid"], p[key]["id"])
+            assert entry is not None and entry.status.value == want, (
+                key, None if entry is None else entry.status.value)
+            assert entry.status.occupies_slot == (key in self.OCCUPYING), key
+        return fx
+
+    def _official_rows(self, who, fx, route):
+        """The official's rows on ONE of the three routes, over real HTTP."""
+        status, body = self._req(
+            who["official"], "GET", f"/api/games/{fx['gid']}/{route}")
+        self.assertEqual(status, 200, (route, body))
+        if route == "roster":
+            return [r for r in body if r["team_id"] == fx["home"]]
+        if route == "lineups":
+            return body["home"]["players"]
+        self.assertEqual(body["team_id"], fx["home"], body)
+        return body["players"]
+
+    def _assert_sheet(self, who, fx, label):
+        p = fx["people"]
+        for route in ("board", "lineups", "roster"):
+            rows = self._official_rows(who, fx, route)
+            ids = [row["id"] for row in rows]
+            for key in self.OCCUPYING:
+                self.assertIn(
+                    p[key]["id"], ids,
+                    f"[{label}] /{route}: the official's sheet LOST the "
+                    f"{key} row, which does occupy a slot")
+            for key in self.BACKED_OUT:
+                self.assertNotIn(
+                    p[key]["id"], ids,
+                    f"[{label}] /{route}: the official's sheet carried the "
+                    f"{key} row — a player who no longer occupies a slot, "
+                    f"which is that side's roster HISTORY and not the "
+                    f"current sheet")
+            for row in rows:
+                self.assertFalse(
+                    row["backed_out"],
+                    f"[{label}] /{route}: a backed-out row survived into the "
+                    f"official's sheet: {row}")
+
+    def test_only_occupying_rows_reach_the_official_on_all_three_routes(self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._sheet_fixture(store)
+                who = self._serve(fx)
+                with self.subTest(backend=label):
+                    self._assert_sheet(who, fx, label)
+                    # THE FALSIFIER: the shipped group-only filter, restored
+                    # into the LIVE code. Every assertion above must break.
+                    real = _ApiService.__dict__["_submitted_lineup_rows"]
+
+                    @classmethod
+                    def group_only(cls, rows):
+                        return [{k: row[k] for k in cls._SHEET_PLAYER_FIELDS}
+                                for row in rows if row["group"] == "selected"]
+
+                    _ApiService._submitted_lineup_rows = group_only
+                    try:
+                        with self.assertRaises(
+                                AssertionError,
+                                msg=f"[{label}] restoring the group-only "
+                                    f"filter left every assertion green, so "
+                                    f"they do not pin the occupancy rule"):
+                            self._assert_sheet(who, fx, f"{label}/falsified")
+                    finally:
+                        _ApiService._submitted_lineup_rows = real
+                    # …and the property holds again once it is removed.
+                    self._assert_sheet(who, fx, f"{label}/restored")
+                ran.append((label, "occupying_rows_only"))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, ["occupying_rows_only"])
 
 
 # ---------------------------------------------------------------------------

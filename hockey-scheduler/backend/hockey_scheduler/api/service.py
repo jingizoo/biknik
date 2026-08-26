@@ -5031,21 +5031,54 @@ class ApiService:
     #: an ALLOW-list, not a deny-list: a future private field added to
     #: `_lineup_rows` is withheld from officials until someone deliberately
     #: names it here, rather than leaking the day it ships.
+    #:
+    #: ``backed_out`` is kept in the list although :meth:`_submitted_lineup_rows`
+    #: now makes it INVARIANTLY ``false`` for an official (#427 round 2,
+    #: blocker 3): the field is part of the row shape every other caller
+    #: receives, and dropping it for one audience would make the two shapes
+    #: differ in a second way for no gain. That the value can only be
+    #: ``false`` is asserted, not assumed.
     _SHEET_PLAYER_FIELDS = ("id", "name", "position", "slot_type",
                             "jersey_number", "group", "roster_status",
                             "backed_out")
 
     @classmethod
     def _submitted_lineup_rows(cls, rows: list) -> list:
-        """The rows a side actually SUBMITTED, stripped of workflow state.
+        """The rows that actually OCCUPY A SLOT on a side's sheet, stripped of
+        workflow state.
 
-        Selected rows only — an official has no business in either side's
-        unselected candidate pool — and, of those, only the fields the Game
-        Sheet renders. ``availability`` (a private per-player answer),
-        ``sub_status`` (substitute workflow state) and ``eligible`` (live
-        membership state) are all dropped."""
+        THE DEFECT THIS CLOSES (#427 round 2, blocker 3). This filtered on
+        ``group == "selected"`` alone — the DISPLAY GROUP — and
+        :meth:`_lineup_rows` keeps a seated row in that group after its
+        occupant has gone unavailable or been removed, flagging it
+        ``backed_out: true`` so a coach's own screen can still show it for
+        cleanup. So an official's Game Sheet carried players who are not on
+        it. Exact-head repro: mark the selected player unavailable, then
+        ``get_lineups(..., viewer_role=Role.OFFICIAL)`` still returned that
+        player with ``roster_status: "unavailable", backed_out: true`` — on
+        ``/board``, ``/lineups`` AND ``/roster``, because all three share this
+        one helper. That exceeds the accepted submitted/occupying projection:
+        it is the side's historical roster workflow, not the current sheet.
+
+        OCCUPANCY IS THE EXISTING PREDICATE, NOT A NEW ONE.
+        ``RosterEntryStatus.occupies_slot`` (SELECTED / CONFIRMED / OFFERED /
+        ACCEPTED) is what ``RosterService._side_data`` already counts slots
+        with, and ``_lineup_rows`` has already applied it per row: ``backed_out``
+        IS ``not entry.status.occupies_slot``. Filtering on that field reuses
+        the one answer rather than deriving a second one here that could drift
+        from it. ``group == "selected"`` is retained as well and is exactly
+        equivalent to "this row came from a roster ENTRY" (``_GROUP_OF_SOURCE``
+        maps the seated population and only it to that label), so the two
+        clauses read as what they are: a seated row, still holding its slot.
+
+        Of the surviving rows, only the fields the Game Sheet renders.
+        ``availability`` (a private per-player answer), ``sub_status``
+        (substitute workflow state) and ``eligible`` (live membership state)
+        are all dropped.
+        """
         return [{k: row[k] for k in cls._SHEET_PLAYER_FIELDS}
-                for row in rows if row["group"] == "selected"]
+                for row in rows
+                if row["group"] == "selected" and not row["backed_out"]]
 
     @staticmethod
     def _submitted_lineup_status(status: dict) -> dict:

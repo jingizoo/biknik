@@ -357,8 +357,14 @@ REGISTRY = (
                     "official reads both sides' submitted lineup but "
                     "neither side's unselected candidates, availability or "
                     "substitute state (services/lineup_visibility.py). "
-                    "Still game-keyed -- no P/S/L concept, not "
-                    "applicable.")),
+                    "#427 round 2 blocker 3: 'submitted' means the rows "
+                    "that OCCUPY a slot (RosterEntryStatus.occupies_slot), "
+                    "not the display group -- a seated row whose occupant "
+                    "went unavailable/removed stays in the `selected` group "
+                    "flagged backed_out and is that side's roster HISTORY, "
+                    "which an official does not receive. Same rule on "
+                    "/board and /roster, one helper. Still game-keyed -- no "
+                    "P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/officials$",
               "/api/games/{}/officials", "get_games_id_officials",
               "_dispatch_get",

@@ -1875,6 +1875,81 @@ async function checkViewport(browser, viewport) {
     }
 
     // ------------------------------------------------------------
+    // THE GAME SHEET HOLDS ONLY ROWS THAT OCCUPY A SLOT (#427 round 2,
+    // blocker 3), probed from the assigned official's own real session.
+    //
+    // `_lineup_rows` keeps a seated player in the `selected` GROUP after they
+    // have gone unavailable, flagged `backed_out: true`, so their own coach
+    // can still see the row for cleanup. The official's projection filtered
+    // on that group alone, so a referee's Game Sheet listed a player who is
+    // not playing -- that side's roster HISTORY rather than its current
+    // sheet. All three routes share one helper, so all three are probed.
+    //
+    // The fixture is built through the OPERATOR reader (the same authorized
+    // boundary this file already uses to snapshot state), and read back
+    // through the OFFICIAL's session. Nothing is faked, and nothing is
+    // asserted about a row this reader is not entitled to at all.
+    // ------------------------------------------------------------
+    const sheetOn = await apiPost(reader, "/api/v2/setup/player",
+      { team_id: coachTeam.body.id, name: `Sheet Playing ${suffix}`, position: "forward" });
+    const sheetOff = await apiPost(reader, "/api/v2/setup/player",
+      { team_id: coachTeam.body.id, name: `Sheet Backed Out ${suffix}`, position: "defense" });
+    const seatSheet = await apiPost(reader,
+      `/api/games/${game.body.id}/roster/select`,
+      { player_ids: [sheetOn.body.id, sheetOff.body.id] });
+    if (seatSheet.status !== 200 || seatSheet.body.error) {
+      fail(`sheet seat failed: ${JSON.stringify(seatSheet)}`);
+    }
+    const backOut = await apiPost(reader,
+      `/api/games/${game.body.id}/availability`,
+      { player_id: sheetOff.body.id, availability_status: "unavailable" });
+    if (backOut.status !== 200 || backOut.body.error) {
+      fail(`sheet back-out failed: ${JSON.stringify(backOut)}`);
+    }
+    // The PREMISE, read through the operator: one row occupies its slot and
+    // the other does not, and BOTH are still in the `selected` display group.
+    // Without this the probes below could pass because the row was never
+    // created at all.
+    const fullSide = await apiGet(reader, `/api/games/${game.body.id}/lineups`);
+    const fullRows = (fullSide.body.home.players || [])
+      .filter((pl) => pl.id === sheetOn.body.id || pl.id === sheetOff.body.id);
+    if (fullRows.length !== 2
+        || !fullRows.every((pl) => pl.group === "selected")
+        || fullRows.filter((pl) => pl.backed_out === true).length !== 1) {
+      fail(`Assigned official [${L}]: the sheet fixture is not the shape this `
+        + `leg is about (two 'selected' rows, exactly one backed out): `
+        + `${JSON.stringify(fullRows)}`);
+    }
+    const sheetProbes = {
+      board: (b) => b.players || [],
+      lineups: (b) => (b.home.players || []),
+      roster: (b) => (b || []).filter((r) => r.team_id === coachTeam.body.id),
+    };
+    for (const route of Object.keys(sheetProbes)) {
+      const res = await apiGet(page, `/api/games/${game.body.id}/${route}`);
+      if (res.status !== 200) {
+        fail(`Assigned official [${L}]: /${route} answered ${res.status}: `
+          + `${JSON.stringify(res.body)}`);
+      }
+      const rows = sheetProbes[route](res.body);
+      const ids = rows.map((r) => r.id);
+      if (!ids.includes(sheetOn.body.id)) {
+        fail(`Assigned official [${L}]: /${route} dropped a row that DOES `
+          + `occupy a slot: ${JSON.stringify(rows)}`);
+      }
+      if (ids.includes(sheetOff.body.id)) {
+        fail(`Assigned official [${L}]: /${route} carried a backed-out row `
+          + `into the Game Sheet -- a player who no longer occupies a slot, `
+          + `which is that side's roster history and not the current sheet: `
+          + `${JSON.stringify(rows)}`);
+      }
+      if (rows.some((r) => r.backed_out !== false)) {
+        fail(`Assigned official [${L}]: /${route} returned a row whose `
+          + `backed_out is not false: ${JSON.stringify(rows)}`);
+      }
+    }
+
+    // ------------------------------------------------------------
     // THE GAMES LIST RENDERS THE WITHHELD ROSTER STATUS AS WITHHELD
     // (#205, round 4).
     //
