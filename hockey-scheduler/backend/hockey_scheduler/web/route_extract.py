@@ -5170,6 +5170,165 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
     return found
 
 
+# --------------------------------------------------------------------------
+# 3. The query-parameter inventory
+# --------------------------------------------------------------------------
+#
+# WHY THIS LIVES HERE (#205 / #427 round 9, D7). The route inventory above is
+# what makes "a new route cannot be a silent gap" true for the behavioural
+# side-sweep: the sweep takes its routes from ``route_registry.REGISTRY``
+# rather than from a hand-written list, so a route the product gains and the
+# sweep does not drive is an ERROR NAMING IT.
+#
+# The QUERY-STRING axis had no such property. The sweep's hint variants were a
+# hand-written 4-tuple, and one of them named ``side`` -- a parameter
+# ``server.py`` does not read at all -- so the variant that was supposed to
+# prove "client input cannot select a side" was probing a name the server
+# ignores. MEASURED: injecting four lines that make the private-game family
+# honour ``?side=away`` hands a HOME Coach and a HOME Player the AWAY side's
+# five private identities with ``restricted: false``, and the primary sweep
+# stayed green, because the only spelling it sent was ``?side=<a team id>``.
+#
+# This function is the authority the hint axis is now closed against, the way
+# the route axis is closed against the registry: every query parameter the
+# server READS is enumerated from the source, so a parameter the product
+# begins reading and the sweep has no probe for fails a named test.
+#
+# FAIL-CLOSED ON A SPELLING THIS DOES NOT UNDERSTAND. A silently skipped call
+# site would reintroduce exactly the blind spot this closes, so every
+# ``parse_qs`` result must be consumed in one of the two shapes below and
+# anything else raises :class:`ExtractionError` naming the line. That is not
+# hypothetical: the falsifier that reproduced the defect spells its read
+# ``parse_qs(urlparse(self.path).query).get("side")`` with ALIASED imports and
+# no intermediate ``qs`` name, so a matcher that keyed on the literal text
+# ``qs.get(`` would have missed the very leak this exists to catch. Both
+# shapes are covered, and a third raises.
+
+#: The stdlib function whose result IS the parsed query string. Tracked
+#: through ``from urllib.parse import parse_qs [as alias]`` so a renamed
+#: import cannot hide a call site.
+_QUERY_PARSE_FUNC = "parse_qs"
+
+
+def _query_parse_aliases(tree: ast.AST) -> set:
+    """Every local name that refers to :data:`_QUERY_PARSE_FUNC`."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == _QUERY_PARSE_FUNC:
+                    names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.endswith("." + _QUERY_PARSE_FUNC):
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+def _is_query_parse_call(node, aliases: set) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in aliases
+    # ``urllib.parse.parse_qs(...)`` -- an attribute call is understood too,
+    # so importing the MODULE rather than the function is not a way past this.
+    return isinstance(func, ast.Attribute) and func.attr == _QUERY_PARSE_FUNC
+
+
+def _literal_get_key(receiver, parents: dict) -> Optional[str]:
+    """``receiver`` is the expression holding a parsed query string. Returns
+    the literal name it is being asked for, i.e. the ``"name"`` in
+    ``<receiver>.get("name")``, or ``None`` when ``receiver`` is not the
+    subject of a ``.get`` call at all.
+
+    A NON-LITERAL key (``qs.get(name)``) raises rather than returning
+    ``None``: a computed parameter name is a set this cannot enumerate, and
+    quietly returning nothing would be the silent gap this exists to close.
+    """
+    attr = parents.get(id(receiver))
+    if not (isinstance(attr, ast.Attribute) and attr.attr == "get"
+            and attr.value is receiver):
+        return None
+    call = parents.get(id(attr))
+    if not (isinstance(call, ast.Call) and call.func is attr and call.args):
+        return None
+    key = call.args[0]
+    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+        return key.value
+    raise ExtractionError(
+        f"line {call.lineno}: a query parameter is read under a NON-LITERAL "
+        f"name ({ast.unparse(key)}), so the set of parameters this server "
+        f"reads cannot be enumerated from the source")
+
+
+def query_parameter_names(source: Optional[str] = None) -> tuple:
+    """Every query-string parameter ``server.py`` (or ``source``) READS.
+
+    Returned sorted, so the value is a stable inventory rather than a
+    walk order. Raises :class:`ExtractionError` on any ``parse_qs`` result
+    this cannot resolve to literal ``.get("name")`` reads -- see the section
+    comment above for why a skip is not an option here.
+    """
+    text = source if source is not None else SERVER_PATH.read_text()
+    tree = ast.parse(text)
+    aliases = _query_parse_aliases(tree)
+    if not aliases:
+        raise ExtractionError(
+            "no `parse_qs` import found, so either this server no longer "
+            "reads the query string at all or it reads it by a spelling "
+            "this inventory does not understand")
+    found, parents = set(), _build_parent_map(tree)
+    for node in ast.walk(tree):
+        if not _is_query_parse_call(node, aliases):
+            continue
+        parent = parents.get(id(node))
+        # SHAPE A: `qs = parse_qs(...)` -- a plain single-Name binding, then
+        # every use of that name in the SAME function must be a literal
+        # `.get("...")`.
+        if isinstance(parent, ast.Assign) and len(parent.targets) == 1 \
+                and isinstance(parent.targets[0], ast.Name):
+            name = parent.targets[0].id
+            fn = _enclosing_function(node, parents)
+            if fn is None:
+                raise ExtractionError(
+                    f"line {node.lineno}: a query string is parsed outside "
+                    f"any function, which this inventory cannot scope")
+            for use in ast.walk(fn):
+                if not (isinstance(use, ast.Name) and use.id == name
+                        and isinstance(use.ctx, ast.Load)):
+                    continue
+                key = _literal_get_key(use, parents)
+                if key is None:
+                    raise ExtractionError(
+                        f"line {use.lineno}: the parsed query string {name!r} "
+                        f"is used in a shape other than `{name}.get"
+                        f"(\"<literal>\")`, so the parameters read through it "
+                        f"cannot be enumerated")
+                found.add(key)
+            continue
+        # SHAPE B: `parse_qs(...).get("name")` -- consumed directly, with no
+        # intermediate name at all.
+        key = _literal_get_key(node, parents)
+        if key is not None:
+            found.add(key)
+            continue
+        raise ExtractionError(
+            f"line {node.lineno}: a parsed query string is consumed in a "
+            f"shape this inventory does not understand "
+            f"({ast.unparse(parent) if parent is not None else '?'})")
+    return tuple(sorted(found))
+
+
+def _enclosing_function(node, parents: dict):
+    cur = parents.get(id(node))
+    while cur is not None:
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return cur
+        cur = parents.get(id(cur))
+    return None
+
+
 ENTRY_POINTS = {"GET": "do_GET", "POST": "do_POST"}
 
 
