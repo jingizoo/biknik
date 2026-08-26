@@ -386,10 +386,15 @@ REGISTRY = (
     RouteSpec("GET", r"^/api/games/[^/]+/roster$", "/api/games/{}/roster",
               "get_games_id_roster", "_dispatch_get",
               auth="session+own-side-projection", scope_axis="none",
-              note=("#202: same _resolve_role + can_read_private_game_data "
-                    "gate as get_games_id_board (server.py:2070-2078, "
-                    "2091-2092; scope.py:122-152). "
-                    "#427 final blocker: that gate proves membership of *a* "
+              note=("#202: same _resolve_role + admission boundary as "
+                    "get_games_id_board (server.py:2070-2078, 2091-2092; "
+                    "scope.py:122-152). #427 round 2 blocker 1: that "
+                    "boundary is resolve_private_game_read "
+                    "(services/game_side_scope.py), ONE decision taken "
+                    "against a single fetch and carried into this leaf; "
+                    "can_read_private_game_data is a fast-denial preflight "
+                    "only, not the gate. "
+                    "#427 final blocker: admission proves membership of *a* "
                     "team and carries no team-level narrowing, so this leaf "
                     "returned BOTH sides' seated rows -- measured, an AWAY "
                     "Coach reading HOME's seat, side and seated position. "
@@ -399,15 +404,25 @@ REGISTRY = (
                     "rows this game DURABLY attributes to their own side, an "
                     "assigned official the two-side submitted-lineup "
                     "projection, an unscoped operator the unchanged full "
-                    "read. get_roster is still game-keyed -- no P/S/L "
-                    "concept, not applicable.")),
+                    "read. #427 round 2 blocker 3, the SAME occupancy "
+                    "refinement /lineups states: 'submitted' means the rows "
+                    "that OCCUPY a slot (RosterEntryStatus.occupies_slot), "
+                    "not the display group -- a seated row whose occupant "
+                    "went unavailable/removed stays in the `selected` group "
+                    "flagged backed_out and is that side's roster HISTORY, "
+                    "which an official does not receive. One helper serves "
+                    "/board, /lineups and this leaf. get_roster is still "
+                    "game-keyed -- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/roster-status$",
               "/api/games/{}/roster-status", "get_games_id_roster_status",
               "_dispatch_get",
               auth="session+own-side-projection", scope_axis="none",
-              note=("#202: same _resolve_role + can_read_private_game_data "
-                    "gate as get_games_id_board (server.py:2070-2078, "
-                    "2089-2090; scope.py:122-152). "
+              note=("#202: same _resolve_role + admission boundary as "
+                    "get_games_id_board (server.py:2070-2078, 2089-2090; "
+                    "scope.py:122-152) -- resolve_private_game_read "
+                    "(services/game_side_scope.py) since #427 round 2 "
+                    "blocker 1, with can_read_private_game_data a "
+                    "fast-denial preflight only, not the gate. "
                     "#427 final blocker: this leaf called "
                     "compute_roster_status(game_id) with NO team and so "
                     "hard-coded HOME for every caller -- the same defect "

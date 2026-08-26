@@ -79,6 +79,19 @@ guardian is now confined to :data:`GUARDIAN_JUNIOR_ROUTES` by the same
 mechanism, narrowed by ROUTE ONLY because the measurement says the data-class
 rule does not apply to them; see :class:`TheGuardianGrantIsRouteSpecific`.
 
+EVERY ASSERTION IN HERE CAN FAIL, AND A NAMED TEST PROVES IT
+============================================================
+Round 7 also found that neutering :meth:`_assert_non_interference` reddened
+three tests while neutering :meth:`_assert_no_foreign_ids` or
+:meth:`_assert_hints_are_inert` reddened NOTHING — the two of them could have
+silently stopped biting and this suite would not have noticed. That is the
+same shape as the defect above, sitting in the protection itself, and on this
+PR an earlier round deleted two real authorization gates outright with the
+whole suite staying green. Each of the three assertions now has at least one
+test that injects a defect ONLY THAT ASSERTION can see, so neutering it
+reddens a named test: :class:`TheSweepCatchesTheLeakItFound` for oracle 2,
+and :class:`EveryOracleGoesRedOnADefectOnlyItCanSee` for the other two.
+
 RUNTIME, MEASURED AND STATED. Eight worlds — a fresh base and a perturbed
 world for each of the two sides x each of the two perturbation kinds in
 :data:`PERTURBATIONS` — x every authenticated GET route x 8 principals x 4
@@ -341,6 +354,14 @@ class _SweepHarness(_OverviewHarness):
     #: normalisation is reviewable and cannot quietly grow to cover a real
     #: difference. `test_the_sweep_is_stable` is what proves the list is
     #: COMPLETE: two consecutive sweeps of the same world must agree exactly.
+    #:
+    #: THE STRIPPING IS BY NAME AND DEPTH-INDEPENDENT: :meth:`_canonical`
+    #: recurses, so a key called ``now`` or ``issued_at`` is removed wherever
+    #: it appears, at ANY nesting level, in EVERY response — and it is removed
+    #: before BOTH oracles read the body, not only before the diff. A private
+    #: per-side field that happened to be given one of these names would
+    #: therefore be invisible to this sweep. The list is short and generic on
+    #: purpose; adding a name to it is widening a blind spot, not tidying.
     VOLATILE_KEYS = ("expires_at", "generated_at", "server_time", "now",
                      "last_seen_at", "issued_at")
 
@@ -1173,6 +1194,16 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
 
                 # OPERATOR_UNSCOPED_BY_DESIGN: the operator session really
                 # carries no team/player binding.
+                #
+                # THIS ONE IS DEFENSIVE, NOT FALSIFIABLE, AND THAT IS NOT A
+                # DEFECT — recorded here so a later reader does not mistake
+                # it for a proven property. The precondition is refused
+                # UPSTREAM: `AccountService._ALLOWED_SCOPE_KEYS` does not
+                # accept `team_id` for a league_admin, and a row planted
+                # directly into the store is normalised away at login, so
+                # three attempts to make this assertion fail could not. It
+                # stands as a tripwire for a future change that loosens
+                # either of those, not as evidence about today's code.
                 status, body = self._req(who["operator"], "GET",
                                          "/api/auth/me")
                 self.assertEqual(status, 200, body)
@@ -1929,6 +1960,315 @@ class TheSweepCatchesTheLeakItFound(_SweepHarness, unittest.TestCase):
                     # itself is asserted on all three above
 
 
+
+
+# ---------------------------------------------------------------------------
+# 5. EVERY ORACLE GOES RED ON A DEFECT ONLY IT CAN SEE.
+#
+# THE DEFECT THIS SECTION EXISTS FOR (#427 round 3). The sweep makes three
+# assertions. Neutering `_assert_non_interference` reddened three tests;
+# neutering `_assert_no_foreign_ids` or `_assert_hints_are_inert` reddened
+# NOTHING. Two thirds of the primary protection could have silently stopped
+# biting with the whole suite green — and on this PR an earlier round deleted
+# two real authorization gates outright without the suite noticing, so this is
+# not a hypothetical failure mode.
+#
+# `TheSweepCatchesTheLeakItFound` covers oracle 2 by reintroducing the fifth
+# leak into live code. The two tests here do the same job for the other two,
+# each injecting a defect the OTHER assertions are structurally incapable of
+# seeing — so each test reddens if and only if its own assertion stops
+# biting. Both injections are registered routes, the same mechanism the
+# guardian and official probes use.
+# ---------------------------------------------------------------------------
+
+_STATIC_LEAK_NAME = "get_sweep_probe_roster_roll_id"
+_STATIC_LEAK_SPEC = route_registry.RouteSpec(
+    "GET", r"^/api/sweep-probe-roll/[^/]+$", "/api/sweep-probe-roll/{}",
+    _STATIC_LEAK_NAME, "_dispatch_get", kind="route", auth="session",
+    scope_axis="none",
+    note="injected by test_authenticated_side_noninterference; never shipped")
+
+_HINT_LEAK_NAME = "get_sweep_probe_hinted_status_id"
+_HINT_LEAK_SPEC = route_registry.RouteSpec(
+    "GET", r"^/api/sweep-probe-hinted/[^/]+$", "/api/sweep-probe-hinted/{}",
+    _HINT_LEAK_NAME, "_dispatch_get", kind="route", auth="session",
+    scope_axis="none",
+    note="injected by test_authenticated_side_noninterference; never shipped")
+
+
+@contextlib.contextmanager
+def _a_route_returning_a_snapshotted_two_side_roll():
+    """A registered route that answers EVERY caller a frozen roll of BOTH
+    sides' durably-attributed player ids.
+
+    WHY IT IS INVISIBLE TO THE OTHER TWO ASSERTIONS, by construction:
+
+    * SNAPSHOTTED. The roll is computed once, on first request, and cached
+      forever. It is therefore PERTURBATION-INVARIANT — the two worlds return
+      byte-identical bodies — so ``_assert_non_interference`` sees no diff and
+      cannot report it. This is the property that makes the test a statement
+      about oracle 1 alone.
+    * HINT-INDEPENDENT. The query string is never read, so
+      ``_assert_hints_are_inert`` sees nothing either.
+
+    A real leak of exactly this shape is not exotic: any endpoint that
+    caches, precomputes or denormalises a roster roll has it.
+    """
+    real_registry = route_registry.REGISTRY
+    real_dispatch = srv.Handler._dispatch_get
+    snapshot = {}
+
+    def dispatch(self):
+        path = self.path.split("?", 1)[0]
+        match = re.match(r"^/api/sweep-probe-roll/([^/]+)$", path)
+        if match is None:
+            return real_dispatch(self)
+        _role, _scope, _user_id, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            return self._send_json(payload, code)
+        gid = match.group(1)
+        if gid not in snapshot:
+            api = srv.STATE.api
+            snapshot[gid] = sorted(
+                RosterService(api.store).durable_game_sides(gid))
+        return self._send_json({"roll": snapshot[gid]})
+
+    route_registry.REGISTRY = real_registry + (_STATIC_LEAK_SPEC,)
+    srv.Handler._dispatch_get = dispatch
+    try:
+        yield
+    finally:
+        route_registry.REGISTRY = real_registry
+        srv.Handler._dispatch_get = real_dispatch
+
+
+@contextlib.contextmanager
+def _a_route_whose_hint_selects_a_side_for_a_scoped_caller():
+    """A registered route where ``?team_id=`` chooses WHICH side's private
+    roster-status enum the caller reads — for every caller, scoped ones
+    included.
+
+    WHY IT IS INVISIBLE TO THE OTHER TWO ASSERTIONS, by construction:
+
+    * NO IDENTITIES. It returns one enum string and never a player id, so
+      ``_assert_no_foreign_ids`` has nothing to match.
+    * SNAPSHOTTED, per ``(game, side)``, so it is perturbation-invariant and
+      ``_assert_non_interference`` sees no diff between the two worlds.
+
+    What is left is precisely the property hint-inertness exists to defend:
+    a query parameter selecting what a caller reads. This is the shape of the
+    real thing — ``_workflow_side``'s FULL branch already answers whatever
+    ``?team_id`` names, and the whole claim of this sweep is that no scoped
+    caller can reach that branch."""
+    real_registry = route_registry.REGISTRY
+    real_dispatch = srv.Handler._dispatch_get
+    snapshot = {}
+
+    def dispatch(self):
+        raw = self.path
+        path = raw.split("?", 1)[0]
+        match = re.match(r"^/api/sweep-probe-hinted/([^/]+)$", path)
+        if match is None:
+            return real_dispatch(self)
+        _role, _scope, _user_id, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            return self._send_json(payload, code)
+        gid = match.group(1)
+        query = raw.split("?", 1)[1] if "?" in raw else ""
+        hinted = None
+        for part in query.split("&"):
+            if part.startswith("team_id="):
+                hinted = part.split("=", 1)[1]
+        api = srv.STATE.api
+        game = api.store.get_game(gid)
+        if game is None:
+            return self._send_json({"status": None})
+        side = hinted or game.home_team_id
+        if (gid, side) not in snapshot:
+            try:
+                snapshot[(gid, side)] = api.roster.compute_roster_status(
+                    gid, side).status.value
+            except Exception:
+                snapshot[(gid, side)] = None
+        return self._send_json({"status": snapshot[(gid, side)]})
+
+    route_registry.REGISTRY = real_registry + (_HINT_LEAK_SPEC,)
+    srv.Handler._dispatch_get = dispatch
+    try:
+        yield
+    finally:
+        route_registry.REGISTRY = real_registry
+        srv.Handler._dispatch_get = real_dispatch
+
+
+class EveryOracleGoesRedOnADefectOnlyItCanSee(_SweepHarness,
+                                              unittest.TestCase):
+    """One injected defect per otherwise-silent assertion.
+
+    Each test asserts BOTH halves, and the second half is the one that makes
+    it a falsifiability test rather than just another leak test: the
+    assertion under test must REPORT the defect, and the other two must be
+    measured GREEN on the same world. Without that, a test could go red for
+    the wrong reason and the assertion it is meant to pin could still be
+    dead."""
+
+    probe = None
+
+    def _route_subjects(self, fx):
+        subjects = super()._route_subjects(fx)
+        if self.probe:
+            subjects[self.probe] = [(fx["gid"],)]
+        return subjects
+
+    def _reported(self, fn, *args):
+        """The assertion's failure text, or ``None`` when it passed."""
+        try:
+            fn(*args)
+        except AssertionError as exc:
+            return str(exc)
+        return None
+
+    def test_a_static_two_side_identity_roll_reddens_only_the_id_oracle(self):
+        """NEUTERING ``_assert_no_foreign_ids`` MUST REDDEN THIS TEST.
+
+        A registered route hands every caller a frozen roll of both sides'
+        durably-attributed player ids. It is perturbation-invariant and
+        hint-independent by construction, so oracle 2 and hint-inertness are
+        structurally blind to it — measured here, not assumed — and oracle 1
+        is the only thing standing between this and a shipped leak."""
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                with _a_route_returning_a_snapshotted_two_side_roll():
+                    self.probe = _STATIC_LEAK_NAME
+                    try:
+                        specs, subjects = self._assert_inventory_is_closed(fx)
+                        self.assertIn(
+                            _STATIC_LEAK_NAME, {s.name for s in specs},
+                            "the injected route is not in the sweep's own "
+                            "inventory, so nothing below is a statement "
+                            "about the sweep")
+                        base = self._sweep(who, fx, specs, subjects)
+                        # THE ASSERTION UNDER TEST must report it, and must
+                        # name a caller who should not have received an id.
+                        ids = self._reported(
+                            self._assert_no_foreign_ids, base, fx,
+                            f"{label}/static-roll")
+                        self.assertIsNotNone(
+                            ids,
+                            "ORACLE 1 DID NOT REPORT A ROUTE HANDING EVERY "
+                            "CALLER BOTH SIDES' DURABLE PLAYER IDS. This is "
+                            "the assertion's only proof of life: the other "
+                            "two oracles cannot see a snapshotted leak, so "
+                            "if this one stops biting the sweep is silently "
+                            "two thirds of a protection.")
+                        self.assertIn(_STATIC_LEAK_NAME, ids)
+                        # …and it names a caller who genuinely may not read
+                        # that id. WHICH one it names is iteration order, not
+                        # a property worth pinning; that it is a caller
+                        # entitled to at most one side IS.
+                        self.assertTrue(
+                            any(p in ids for p in (
+                                "homecoach", "awaycoach", "homeplayer",
+                                "awayplayer", "thirdcoach", "guardian")),
+                            f"oracle 1 reported the injected roll but named "
+                            f"no caller who is short of both sides, so it is "
+                            f"not reporting the leak this test injected: "
+                            f"{ids}")
+                        # THE OTHER TWO MUST BE BLIND, so this test can only
+                        # go red for the reason it claims.
+                        self.assertIsNone(
+                            self._reported(self._assert_hints_are_inert, base,
+                                           fx, f"{label}/static-roll"),
+                            "the static roll moved under a client hint, so "
+                            "hint-inertness could carry this test and it "
+                            "would no longer pin oracle 1")
+                        with self._perturbed(fx, fx["home"], fx["gid"],
+                                             "substitute_enrolment"):
+                            world = self._sweep(who, fx, specs, subjects)
+                            moved = [k for k in base.diff(world)
+                                     if k[1] == _STATIC_LEAK_NAME]
+                            self.assertEqual(
+                                [], moved,
+                                "the injected roll CHANGED between the two "
+                                "worlds, so it is not the snapshotted leak "
+                                "this test is about and oracle 2 could "
+                                "carry it")
+                    finally:
+                        self.probe = None
+            finally:
+                self._close(label, store)
+            return   # the oracle's own behaviour, not a per-backend property
+
+    def test_a_hint_selected_side_reddens_only_the_hint_assertion(self):
+        """NEUTERING ``_assert_hints_are_inert`` MUST REDDEN THIS TEST.
+
+        A registered route lets ``?team_id=`` choose which side's private
+        roster-status enum the caller reads. It carries no identities and is
+        perturbation-invariant, so both oracles are structurally blind to it
+        — measured here — and hint-inertness is the only assertion that can
+        see a query parameter selecting a side.
+
+        A HINT-ONLY LEAK IS GENUINELY CONSTRUCTIBLE, which is worth stating
+        because it was an open question: the assertion is not merely
+        defensive, it defends a reachable shape. The FULL branch of
+        ``_workflow_side`` really does answer whatever ``?team_id`` names,
+        and this sweep's claim is that no scoped caller reaches it."""
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                with _a_route_whose_hint_selects_a_side_for_a_scoped_caller():
+                    self.probe = _HINT_LEAK_NAME
+                    try:
+                        specs, subjects = self._assert_inventory_is_closed(fx)
+                        self.assertIn(
+                            _HINT_LEAK_NAME, {s.name for s in specs},
+                            "the injected route is not in the sweep's own "
+                            "inventory, so nothing below is a statement "
+                            "about the sweep")
+                        base = self._sweep(who, fx, specs, subjects)
+                        # THE ASSERTION UNDER TEST must report it.
+                        hints = self._reported(
+                            self._assert_hints_are_inert, base, fx,
+                            f"{label}/hinted-side")
+                        self.assertIsNotNone(
+                            hints,
+                            "HINT-INERTNESS DID NOT REPORT A ROUTE WHERE "
+                            "?team_id SELECTS WHICH SIDE A SCOPED CALLER "
+                            "READS. This is the assertion's only proof of "
+                            "life: neither oracle can see a hint-selected, "
+                            "identity-free, perturbation-invariant answer.")
+                        self.assertIn(_HINT_LEAK_NAME, hints)
+                        # THE OTHER TWO MUST BE BLIND.
+                        self.assertIsNone(
+                            self._reported(self._assert_no_foreign_ids, base,
+                                           fx, f"{label}/hinted-side"),
+                            "the hinted route leaked an identity, so oracle "
+                            "1 could carry this test and it would no longer "
+                            "pin hint-inertness")
+                        with self._perturbed(fx, fx["home"], fx["gid"],
+                                             "substitute_enrolment"):
+                            world = self._sweep(who, fx, specs, subjects)
+                            moved = [k for k in base.diff(world)
+                                     if k[1] == _HINT_LEAK_NAME]
+                            self.assertEqual(
+                                [], moved,
+                                "the injected route CHANGED between the two "
+                                "worlds, so oracle 2 could carry this test "
+                                "and it would no longer pin hint-inertness")
+                    finally:
+                        self.probe = None
+            finally:
+                self._close(label, store)
+            return   # the assertion's own behaviour, not a per-backend one
 
 
 if __name__ == "__main__":
