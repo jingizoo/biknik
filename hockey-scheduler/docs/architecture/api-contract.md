@@ -149,10 +149,12 @@ which team is playing, while an unchanged own-side answer discloses nothing.
 
 | Caller | board / lineups | roster-status | roster | substitutes | availability-summary | substitute-candidates / -addable |
 |---|---|---|---|---|---|---|
-| League Admin, Arena Manager | both sides, full | full | full | full | any side (hint honoured) | any side (hint honoured) |
+| League Admin | both sides, full | full | full | full | any side (hint honoured) | any side (hint honoured) |
+| Arena Manager | both sides, full | full | full | full | any side (hint honoured) | **403** (no `MANAGE_ROSTER`) |
 | Coach | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows | own side only (hint ignored) | own side only (hint ignored) |
 | Player | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows | own side only (hint ignored) | **403** (no `MANAGE_ROSTER`) |
 | Assigned official | both sides' submitted lineup | **403** | both sides' submitted lineup | **403** | **403** | **403** |
+| Viewer | **403** | **403** | **403** | **403** | **403** | **403** |
 
 **"Submitted lineup" means the rows that OCCUPY a slot**, not the rows a
 screen happens to group under *selected*. `_lineup_rows` keeps a seated
@@ -168,8 +170,17 @@ rows. The rule is applied in one place, `_submitted_lineup_rows`, which
 The last two carry a second, independent gate that the other five do not:
 `MANAGE_ROSTER`, a **role capability** ("may this kind of caller manage a
 roster at all"), checked before the side question is asked. That is why a
-Player is refused there but served their own side everywhere else. The two
-gates are deliberately not folded together — the side rule must not be
+Player is refused there but served their own side everywhere else — and, for
+the same reason, why an **Arena Manager is refused there too** although it is
+an unscoped operator admitted to both sides everywhere else in this family.
+`Role.ARENA_MANAGER` holds `MANAGE_ARENA`, `MANAGE_SCHEDULE` and `VIEW`, not
+`MANAGE_ROSTER`, so the two operator roles are NOT interchangeable on these
+two leaves; the row above said they were until the measurement in
+`test_authenticated_side_noninterference
+.TheArenaManagerIsAnOperatorWithoutRosterAuthority` was taken. That test now
+pins the whole ten-leaf matrix for both roles, so this table and the product
+cannot drift apart again silently. The two gates are deliberately not folded
+together — the side rule must not be
 contingent on a permission table that can change without it, so the facade
 refuses an audience with no claim on a private candidate pool even though the
 capability gate makes that unreachable over today's HTTP dispatch.
