@@ -60,7 +60,7 @@ from ..services import lineup_visibility
 from .rate_limit import LoginThrottle, RateLimiter
 from .route_registry import REGISTRY
 from .scope import (
-    can_read_private_game_data, game_scoped_own_team_id, scope_violation)
+    can_read_private_game_data, resolve_private_game_read, scope_violation)
 from .validation import BodyError, check_body, parse_json_object
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
@@ -2861,40 +2861,42 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "forbidden",
                     "message": "You cannot view private data for this game.",
                     "details": {"role": role.value}}}, 403)
-            # THE CALLER'S OWN SIDE, RESOLVED ONCE FOR THE WHOLE PRIVATE-GAME
-            # FAMILY (#427 blocker, owner ruling comment 5394947899).
+            # ADMISSION AND PROJECTION SHARE ONE BOUNDARY (#427 round 2,
+            # blocker 1). The preflight above is kept for fast denial and is
+            # NOT the authoritative gate: it answers a boolean and discards
+            # both the game it fetched and the side it resolved, so this
+            # dispatch used to fetch and resolve them a SECOND time, and the
+            # gap between the two was a disclosure window. A membership
+            # transferred, ended or deactivated in that gap left `own_team`
+            # empty, which collapsed through `own_side() -> None` into
+            # `get_board`'s HOME default — a caller who had just lost their
+            # authority received HOME's private pool, status block,
+            # notifications and audit stream with `restricted: false`.
+            # Reproduced over a real authenticated session parked between the
+            # two reads (200, `team_id` naming HOME) on Memory, SQLite and
+            # two-connection PostgreSQL.
             #
-            # The gate above proves the caller belongs to *a* team in this
-            # game. It does NOT bound WHICH side's private data they may read,
-            # and the route registry records that honestly for every leaf
-            # below (`scope_axis="none"`). `/board` then hard-coded
-            # `game.home_team_id` for everybody, so an AWAY Coach was handed
-            # HOME's private pool and a `status` block naming HOME; `/lineups`
-            # returned BOTH sides' private candidates, availability and
-            # substitute state to either Coach. Reproduced tri-store over a
-            # real authenticated session.
-            #
-            # So the SERVER resolves the side — never the client. This was
-            # already the availability-summary leaf's own private resolution
-            # (#160/#205 blocker 1); hoisting it here makes it ONE resolution
-            # shared by all three consumers, so the side that bounds an
-            # availability rollup and the side that bounds a lineup read
-            # cannot drift apart. `sub_game` is a re-fetch of the SAME
-            # already-selected game; `None` (deleted mid-request) leaves the
-            # caller with no own side, which every consumer treats as
-            # fail-closed.
-            sub_game = api.store.get_game(gid)
-            # An if/else statement rather than a ternary on purpose:
-            # route_extract does not model ternaries that test a dispatch
-            # subject, and this is the same statement shape the
-            # availability-summary leaf used before the hoist.
-            if sub_game is not None:
-                own_team = game_scoped_own_team_id(
-                    role, scope, sub_game, api.store) or ""
-                side_ids = (sub_game.home_team_id, sub_game.away_team_id)
-            else:
-                own_team = ""
-                side_ids = (None, None)
+            # So there is ONE resolution now, and everything below reads
+            # admission, the game and the TRUSTED SIDE off that single
+            # record rather than asking the store again. This is the
+            # read-path twin of the write path's rule: a preflight may deny
+            # fast, but the authoritative answer is resolved once and
+            # carried. Nothing here ever consults a client-supplied side.
+            private_read = resolve_private_game_read(
+                role, scope, gid, api.store)
+            if not private_read.admitted:
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": "You cannot view private data for this game.",
+                    "details": {"role": role.value}}}, 403)
+            # `own_team` keeps its `""`-for-absent spelling so every leaf
+            # below is byte-for-byte unchanged; it is empty ONLY for the
+            # audiences that have no side of their own by design (an
+            # unscoped operator, an assigned official) — an admitted
+            # Coach/Player always carries a real, participating side, because
+            # that is precisely what admission now proves.
+            own_team = private_read.own_team or ""
+            side_ids = private_read.side_ids
             if sub == "board":
                 # A single-sided read: answer for the caller's OWN side.
                 # `own_side` returns None for a caller who has no side of

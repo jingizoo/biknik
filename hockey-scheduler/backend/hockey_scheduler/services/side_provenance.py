@@ -235,6 +235,25 @@ PRODUCER_MODULES = {
 TRUSTED_RESOLVER = "game_scoped_own_team_id"
 TRUSTED_RESOLVER_MODULE = "services/game_side_scope.py"
 
+#: THE CARRIER: the one function that takes the private-game family's
+#: admission AND its trusted side together, against a single fetch of the
+#: game (#427 round 2, blocker 1). The dispatch used to call
+#: :data:`TRUSTED_RESOLVER` itself, INDEPENDENTLY of the admission gate that
+#: had already resolved the same thing — and the window between those two
+#: resolutions was a disclosure window: an authority lost inside it left the
+#: dispatch's own answer empty, which fell through to a full HOME read. So
+#: the dispatch now reads the side off ONE carrier record instead.
+#:
+#: The carrier is trusted ONLY because it traces back to the same one
+#: function this whole gate is built on: it must live in
+#: :data:`TRUSTED_RESOLVER_MODULE` and its own body must call
+#: :data:`TRUSTED_RESOLVER`, which :func:`audit_trusted_binding` verifies. A
+#: carrier that stopped doing that would be a second, unchecked answer to
+#: "which side is this caller's" — exactly what this module exists to refuse.
+TRUSTED_CARRIER = "resolve_private_game_read"
+#: The attribute of a carrier record that holds the trusted side.
+TRUSTED_CARRIER_SIDE_FIELD = "own_team"
+
 #: Functions that may LAUNDER a client-supplied side: they take the hint AND
 #: the trusted side, consult the audience, and return the trusted side or
 #: raise. VERIFIED: each body must call `lineup_visibility.route_audience`.
@@ -453,17 +472,24 @@ EXEMPTIONS = {
         "FULL branch's `side = game.home_team_id`, the unchanged "
         "unscoped-operator answer."),
     ("get_board", "compute_roster_status",
-     "attr:game.home_team_id|param:get_board.team_id"): (
+     "attr:game.home_team_id|const:None|param:get_board.team_id"): (
         OPERATOR_DEFAULT, None,
-        "`team_id or game.home_team_id`. The parameter IS the trusted side "
-        "(`lineup_visibility.own_side`); the fallback is reached only by an "
-        "unscoped operator, an assigned official or an in-process caller, "
-        "all of whom may read either side."),
+        "the parameter IS the trusted side (`lineup_visibility.own_side`, "
+        "off the ONE `resolve_private_game_read`). The `game.home_team_id` "
+        "fallback is now AUDIENCE-BOUND (#427 round 2, blocker 1): it is "
+        "applied only when `lineup_visibility.default_side_permitted(role)` "
+        "— an unscoped operator, an assigned official or an in-process "
+        "caller, all of whom may read either side. `const:None` is the new "
+        "REFUSAL binding a Coach/Player with no resolved side takes, and it "
+        "reaches no producer at all: that branch sets `status`/`rows` to "
+        "None without calling one. This scanner is flow-INSENSITIVE, so it "
+        "unions every binding of the name; the third origin appearing here "
+        "is that union, not a third read."),
     ("get_board", "_lineup_rows",
-     "attr:game.home_team_id|param:get_board.team_id"): (
+     "attr:game.home_team_id|const:None|param:get_board.team_id"): (
         OPERATOR_DEFAULT, None, "same binding, same fallback as above."),
     ("get_board", "_activity_projection",
-     "attr:game.home_team_id|param:get_board.team_id"): (
+     "attr:game.home_team_id|const:None|param:get_board.team_id"): (
         OPERATOR_DEFAULT, None, "same binding, same fallback as above."),
     ("get_roster_status", "compute_roster_status",
      "absent"): (
@@ -1545,9 +1571,39 @@ def audit_trusted_binding(sources=None):
     sources = package_sources() if sources is None else sources
     violations = []
     canonical = []
+    carriers = []
     for path, text in sorted(sources.items()):
         tree = parse(text)
         ctx = _ModuleContext(path, tree)
+        # THE CARRIER IS TRUSTED ONLY BECAUSE IT CALLS THE RESOLVER. Checked
+        # here, beside the canonical-definition rule, because it is the same
+        # claim: everything downstream calls trusted traces back to ONE
+        # function. A carrier defined elsewhere, or one that stopped calling
+        # the resolver, is a second answer to "which side is this caller's".
+        for fn, parent in functions_in(text):
+            if fn.name != TRUSTED_CARRIER or parent is not None:
+                continue
+            if path != TRUSTED_RESOLVER_MODULE:
+                violations.append(Violation(
+                    "forged_trusted_carrier", path, fn.lineno, fn.name,
+                    f"{TRUSTED_CARRIER} is defined outside "
+                    f"{TRUSTED_RESOLVER_MODULE}",
+                    f"the carrier the dispatch reads its trusted side off "
+                    f"must live beside {TRUSTED_RESOLVER}, so the two "
+                    f"cannot be maintained apart"))
+                continue
+            calls = {_final_name(node.func) for node in ast.walk(fn)
+                     if isinstance(node, ast.Call)}
+            if TRUSTED_RESOLVER not in calls:
+                violations.append(Violation(
+                    "forged_trusted_carrier", path, fn.lineno, fn.name,
+                    f"{TRUSTED_CARRIER} does not call {TRUSTED_RESOLVER}",
+                    f"the dispatch trusts `{TRUSTED_CARRIER_SIDE_FIELD}` off "
+                    f"this record BECAUSE the record is built by calling "
+                    f"{TRUSTED_RESOLVER}. A carrier that resolves the side "
+                    f"some other way is an unchecked second answer"))
+                continue
+            carriers.append((path, fn.lineno))
         for lineno, what in ctx.forgeries:
             violations.append(Violation(
                 "forged_trusted_resolver", path, lineno, "<module>",
@@ -1608,6 +1664,14 @@ def audit_trusted_binding(sources=None):
             f"(expected exactly 1): {canonical}",
             "everything this gate calls TRUSTED is trusted because it traces "
             "back to ONE function"))
+    if len(carriers) != 1:
+        violations.append(Violation(
+            "forged_trusted_carrier", TRUSTED_RESOLVER_MODULE, 0,
+            "<module>",
+            f"{len(carriers)} definitions of {TRUSTED_CARRIER} "
+            f"(expected exactly 1): {carriers}",
+            f"the private-game dispatch reads admission AND its side off "
+            f"ONE carrier record; two carriers are two boundaries again"))
     return violations
 
 
@@ -1651,7 +1715,36 @@ def audit_dispatch(source=None):
             f"the private-game family's side must be resolved ONCE into "
             f"{DISPATCH_TRUSTED_NAME!r} from {TRUSTED_RESOLVER}(…)")], set()
 
-    # (a) `own_team` is assigned from NOTHING but the trusted resolver.
+    # (a0) THE CARRIER IS TAKEN, ONCE. `own_team` may be read off a record
+    # produced by `TRUSTED_CARRIER` — the ONE resolution that decides
+    # admission and the side together (#427 round 2, blocker 1) — so the
+    # names bound from that call are collected first, and only THOSE
+    # attributes are accepted as trusted below.
+    scope = _Scope(fn)
+    carrier_names = set()
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Assign) \
+                or not isinstance(node.value, ast.Call):
+            continue
+        if _final_name(node.value.func) != TRUSTED_CARRIER:
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                carrier_names.add(target.id)
+    if not carrier_names:
+        violations.append(Violation(
+            "dispatch_carrier_missing", path, fn.lineno, "_dispatch_get",
+            f"no assignment from {TRUSTED_CARRIER}(…) in the dispatch",
+            f"the private-game family's admission and its trusted side must "
+            f"be resolved ONCE, together, into a {TRUSTED_CARRIER} record — "
+            f"resolving them separately is the disclosure window #427 round "
+            f"2 closed"))
+    trusted_carrier_origins = {
+        f"attr:{name}.{TRUSTED_CARRIER_SIDE_FIELD}" for name in carrier_names}
+
+    # (a) `own_team` is assigned from NOTHING but the trusted resolution —
+    # either the resolver itself, or the side field of a carrier record taken
+    # from it.
     for node in ast.walk(fn):
         if not isinstance(node, ast.Assign):
             continue
@@ -1662,6 +1755,7 @@ def audit_dispatch(source=None):
         origins = _origins(node.value, scope, node.lineno + 1, ctx=ctx)
         bad = sorted(o for o in origins
                      if o != f"call:{TRUSTED_RESOLVER}"
+                     and o not in trusted_carrier_origins
                      and not o.startswith("const:"))
         if bad:
             violations.append(Violation(
@@ -1669,7 +1763,9 @@ def audit_dispatch(source=None):
                 f"{DISPATCH_TRUSTED_NAME} assigned from {', '.join(bad)}",
                 f"{DISPATCH_TRUSTED_NAME} is the ONE trusted side the whole "
                 f"private-game family reads; it must come from "
-                f"{TRUSTED_RESOLVER}(…) and nothing else — every "
+                f"{TRUSTED_RESOLVER}(…), or from the "
+                f"`{TRUSTED_CARRIER_SIDE_FIELD}` field of a "
+                f"{TRUSTED_CARRIER}(…) record, and nothing else — every "
                 f"`viewer_team_id` the facade trusts is filled from it"))
 
     # (b) every leaf of the block is declared.

@@ -25,6 +25,9 @@ never reach this resolution, which is the whole property the private-game
 family rests on.
 """
 
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
 from ..domain import Role
 from .roster_service import RosterService
 
@@ -91,3 +94,118 @@ def game_scoped_own_team_id(role, scope, game, store):
     if role == Role.PLAYER:
         return _player_team_for_game(scope, game, store)
     return None
+
+
+@dataclass(frozen=True)
+class PrivateGameRead:
+    """THE ONE resolution a private-game read is decided by — admission AND
+    projection — carried, not recomputed (#427 round 2, blocker 1).
+
+    WHY THIS TYPE EXISTS. ``web/server.py``'s private-game family used to
+    take that decision TWICE. First ``can_read_private_game_data`` fetched
+    the game and resolved the caller's game-scoped team to decide whether to
+    admit them at all; then, independently, the dispatch fetched the SAME
+    game again and resolved the SAME team again to decide which side to
+    answer for. Nothing held the two together, and the gap between them was
+    a disclosure window: a membership transferred, ended or invalidated
+    after the first resolution and before the second left ``own_team`` empty,
+    which collapsed to ``own_side() -> None`` and then to ``get_board``'s
+    HOME default — so a caller who had just LOST their authority received
+    the HOME side's private pool, status block, notifications and audit
+    stream with ``restricted: false``. Reproduced over a real authenticated
+    session, parked between the two reads, on Memory and SQLite (200,
+    ``team_id`` naming HOME, six HOME identities, three HOME notifications,
+    four HOME audit rows) and on two-connection PostgreSQL.
+
+    Loss of authority must produce a REFUSAL, never a fallback. The fix is
+    structural rather than a third check: there is now ONE resolution, taken
+    once, and everything downstream reads it off this record instead of
+    asking the store again. This is the READ-PATH TWIN of the pattern the
+    coach-authorization work established on the WRITE path — a preflight may
+    remain for fast denial, but it cannot be the authoritative gate, and the
+    authoritative answer is resolved once and carried.
+
+    ``game`` is ``None`` only when the game does not exist; the caller is
+    still ADMITTED so the facade can return its normal ``not_found`` payload
+    rather than a 403 that would confirm the id's absence differently from
+    every other route.
+
+    ``own_team`` is the TRUSTED side and is ``None`` for every caller who has
+    no side of their own — an unscoped operator, an assigned official, an
+    in-process caller. It is never ``None`` for an ADMITTED team-scoped
+    caller: that combination is exactly what admission refuses.
+    """
+
+    role: object
+    game: object
+    own_team: Optional[str]
+    admitted: bool
+
+    @property
+    def side_ids(self) -> Tuple[Optional[str], Optional[str]]:
+        """``(home, away)`` of the game THIS decision was taken against —
+        the same fetch, so a side id can never come from a different read of
+        the row than the one that admitted the caller."""
+        if self.game is None:
+            return (None, None)
+        return (self.game.home_team_id, self.game.away_team_id)
+
+
+def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
+    """Resolve, ONCE, everything a private-game read is decided by.
+
+    This is the whole of the #73 admission rule and the whole of the #205
+    trusted-side resolution, taken together against ONE fetch of the game:
+
+    * an UNSCOPED OPERATOR is admitted with no side of their own;
+    * a COACH/PLAYER is admitted only when ``game_scoped_own_team_id``
+      resolves a side that is actually one of this game's two — a missing,
+      ended, deactivated or nonparticipant side is a REFUSAL, never a
+      default;
+    * an assigned OFFICIAL is admitted with no side of their own;
+    * everyone else (a viewer, an unrecognised role) is refused.
+
+    Nothing here reads a request. The inputs are a session-resolved ``role``,
+    the session's own ``scope``, an already-selected ``game_id`` and the
+    store — so a query string, a body field or a header can never reach this
+    resolution, which is the property the whole private-game family rests on.
+    """
+    # The role tests below are spelled EXACTLY as the two functions this one
+    # merges already spelled them — `can_read_private_game_data`'s operator
+    # short-circuit and `game_scoped_own_team_id`'s COACH/PLAYER branches —
+    # rather than introducing role tuples here. A second list of "which roles
+    # are team-scoped" is the drift shape this whole boundary exists to
+    # remove; `services/lineup_visibility.py` holds the one that classifies
+    # PROJECTIONS, and nothing here needs a copy of it.
+    scope = scope or {}
+    if role in (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER):
+        # Admitted before the game matters, exactly as
+        # `can_read_private_game_data` short-circuited: an operator's
+        # admission does not depend on the game existing. The game is still
+        # fetched so `side_ids` is usable.
+        return PrivateGameRead(role=role, game=store.get_game(game_id),
+                               own_team=None, admitted=True)
+    game = store.get_game(game_id)
+    if game is None:
+        # Let the facade answer its normal not_found. Byte-for-byte the
+        # pre-existing `can_read_private_game_data` behaviour.
+        return PrivateGameRead(role=role, game=None, own_team=None,
+                               admitted=True)
+    if role in (Role.COACH, Role.PLAYER):
+        own_team = game_scoped_own_team_id(role, scope, game, store)
+        admitted = own_team is not None and own_team in (
+            game.home_team_id, game.away_team_id)
+        # `own_team` is deliberately dropped on refusal: a refused read must
+        # not carry a side any downstream code could still answer for.
+        return PrivateGameRead(role=role, game=game,
+                               own_team=own_team if admitted else None,
+                               admitted=admitted)
+    if role == Role.OFFICIAL:
+        official_id = scope.get("official_id")
+        admitted = official_id is not None and any(
+            a.official_id == official_id
+            for a in store.assignments_for_game(game_id))
+        return PrivateGameRead(role=role, game=game, own_team=None,
+                               admitted=admitted)
+    return PrivateGameRead(role=role, game=game, own_team=None,
+                           admitted=False)

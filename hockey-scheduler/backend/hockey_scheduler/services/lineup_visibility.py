@@ -187,6 +187,34 @@ def route_audience(role, viewer_team_id, home_team_id, away_team_id):
     return RESTRICTED
 
 
+def default_side_permitted(role) -> bool:
+    """May a caller who resolved NO side of their own fall back to the game's
+    DEFAULT (home) side? (#427 round 2, blocker 1.)
+
+    ``get_board`` answers for ONE side, and applied ``team_id or
+    game.home_team_id`` BEFORE choosing a projection — so a caller whose
+    trusted side was missing was silently promoted to a full HOME read
+    instead of being refused. Measured on this exact head: a direct
+    ``Role.COACH`` call with ``team_id=None`` returned ``team_id=team_1,
+    projection=full, restricted=false`` and HOME's player identities.
+
+    The default is not wrong; it is wrong for the WRONG AUDIENCE. It exists
+    for callers who have no side of their own BY DESIGN and may read either
+    side anyway — an unscoped operator, an assigned official (whose default
+    side is answered through the submitted-lineup projection, so nothing
+    widens), and an in-process caller with no role at all. For a COACH or a
+    PLAYER, "no side resolved" is not "no side needed": it is a failure to
+    establish authority, and the only sound answer is RESTRICTED.
+
+    Reads :data:`_TEAM_SCOPED` — the SAME tuple :func:`side_projections` and
+    :func:`route_audience` narrow on — so "which roles act for one team" is
+    answered in exactly one place. ``services/game_side_scope.py`` keeps no
+    copy of it: the admission boundary spells its two role tests the way the
+    functions it merged already spelled them.
+    """
+    return role not in _TEAM_SCOPED
+
+
 def own_side(role, viewer_team_id, home_team_id, away_team_id):
     """THE ONE side a single-sided read (``/board``) must answer for, or
     ``None`` to mean "this caller has no own side, use the caller-supplied or

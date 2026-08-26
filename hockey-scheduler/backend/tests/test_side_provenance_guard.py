@@ -89,6 +89,7 @@ from hockey_scheduler.services import side_provenance as sp
 #: A whole-source mutation: ``sources -> sources``.
 SERVER = "web/server.py"
 FACADE = "api/service.py"
+GAME_SIDE_SCOPE = "services/game_side_scope.py"
 
 
 def _sources():
@@ -230,10 +231,44 @@ def case_dispatch_untrusted_viewer_team(sources):
 
 def case_dispatch_hoist_replaced(sources):
     """The hoisted resolution itself replaced by a SECOND answer to "which
-    side is the caller's" — the drift the hoist exists to end."""
-    return _replace(sources, SERVER, """                own_team = game_scoped_own_team_id(
-                    role, scope, sub_game, api.store) or \"\"""",
-                    """                own_team = (scope or {}).get("team_id") or \"\"""")
+    side is the caller's" — the drift the hoist exists to end.
+
+    RE-ANCHORED for #427 round 2, blocker 1: the dispatch no longer calls
+    ``game_scoped_own_team_id`` itself, it reads ``own_team`` off the ONE
+    ``resolve_private_game_read`` record that also decided admission. The
+    adversarial edit is the same one — replace it with a session-scope
+    lookup — spelled against the shape that is actually there now."""
+    return _replace(sources, SERVER,
+                    """            own_team = private_read.own_team or \"\"""",
+                    """            own_team = (scope or {}).get("team_id") or \"\"""")
+
+
+def case_dispatch_resolves_the_side_a_second_time(sources):
+    """THE EXACT SHAPE BLOCKER 1 WAS: the dispatch stops reading the carrier
+    and resolves the side AGAIN, independently of the admission that already
+    resolved it. Both resolutions call the canonical resolver, so nothing is
+    "forged" — what is wrong is that there are TWO of them, and a membership
+    that changes between them turns a lost authority into a HOME fallback.
+
+    The carrier detector is what catches this: no assignment from
+    ``resolve_private_game_read`` remains, so the family's admission and its
+    projection are no longer one decision."""
+    return _replace(
+        sources, SERVER,
+        """            private_read = resolve_private_game_read(
+                role, scope, gid, api.store)""",
+        """            sub_game = api.store.get_game(gid)
+            private_read = None""")
+
+
+def case_carrier_stops_calling_the_resolver(sources):
+    """The carrier survives by NAME but stops deriving the side from the one
+    canonical resolver — an unchecked second answer wearing the trusted
+    record's shape."""
+    return _replace(
+        sources, GAME_SIDE_SCOPE,
+        """        own_team = game_scoped_own_team_id(role, scope, game, store)""",
+        """        own_team = (scope or {}).get("team_id")""")
 
 
 def case_producer_reached_through_an_alias_of_the_hint(sources):
@@ -424,6 +459,12 @@ ADVERSARIAL = {
     "dispatch_hoist_replaced": (
         case_dispatch_hoist_replaced, "dispatch_hoist_untrusted",
         "_dispatch_get"),
+    "dispatch_resolves_the_side_a_second_time": (
+        case_dispatch_resolves_the_side_a_second_time,
+        "dispatch_carrier_missing", "_dispatch_get"),
+    "carrier_stops_calling_the_resolver": (
+        case_carrier_stops_calling_the_resolver, "forged_trusted_carrier",
+        "resolve_private_game_read"),
     "alias_of_the_hint": (
         case_producer_reached_through_an_alias_of_the_hint, "untrusted_side",
         "get_availability_summary"),
@@ -845,7 +886,8 @@ class TheGuardsOwnTestsCanFail(_GuardHarness, unittest.TestCase):
                       "alias_of_the_hint"),
         "home_fallbacks": ("home_default_in_a_new_function",),
         "dispatch": ("new_dispatch_leaf", "dispatch_untrusted_viewer_team",
-                     "dispatch_hoist_replaced"),
+                     "dispatch_hoist_replaced",
+                     "dispatch_resolves_the_side_a_second_time"),
         "trusted_everything": ("untrusted_side", "mixed_disjunct",
                                "ternary_hides_the_hint",
                                "client_hint_into_a_producer",
@@ -920,9 +962,27 @@ class TheGuardCatchesEveryLeakThisBlockerFixed(_GuardHarness,
     def test_round_1_get_board_hard_coding_home_for_everybody(self):
         """`get_board` read `game.home_team_id` unconditionally, so an AWAY
         Coach was handed the HOME side's private pool."""
-        leaked = _replace(_sources(), FACADE,
-                          "        team_id = team_id or game.home_team_id",
-                          "        team_id = game.home_team_id")
+        # RE-ANCHORED for #427 round 2, blocker 1: the home default is now
+        # inside an audience-bound else-branch, so the reconstruction has to
+        # remove that guard as well — which is precisely what round 1 was.
+        leaked = _replace(_sources(), FACADE, """        if team_id is None and not lineup_visibility.default_side_permitted(
+                viewer_role):
+            # A TEAM-SCOPED caller with no resolved side. Refused, never
+            # defaulted — see this method's docstring. Over HTTP the shared
+            # `resolve_private_game_read` boundary has already answered 403,
+            # so this is the facade's own fence for a direct caller.
+            projection = lineup_visibility.RESTRICTED
+        else:
+            team_id = team_id or game.home_team_id
+            projection = lineup_visibility.side_projections(
+                viewer_role, team_id, game.home_team_id, game.away_team_id)
+            projection = (projection["home"] if team_id == game.home_team_id
+                          else projection["away"])""",
+                          """        team_id = game.home_team_id
+        projection = lineup_visibility.side_projections(
+            viewer_role, team_id, game.home_team_id, game.away_team_id)
+        projection = (projection["home"] if team_id == game.home_team_id
+                      else projection["away"])""")
         violations, _errors = self._audit(leaked)
         self.assertTrue(
             self._caught(violations, "untrusted_side", "get_board"),

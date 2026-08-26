@@ -29,7 +29,8 @@ from ..services.subject_scope import own_team_id, player_team_id  # noqa: F401
 # `from .scope import game_scoped_own_team_id` caller are byte-for-byte
 # unchanged.
 from ..services.game_side_scope import (  # noqa: F401
-    _player_team_for_game, game_scoped_own_team_id)
+    _player_team_for_game, game_scoped_own_team_id,
+    resolve_private_game_read)
 # `RosterService.team_for_game` is THE #205 game-scoped eligibility resolver
 # (`services/roster_service.py`) — the same one substitute enroll/offer/
 # accept already resolve through. No import-cycle risk: roster_service.py
@@ -189,25 +190,22 @@ def can_read_private_game_data(role, scope, game_id, store) -> bool:
     availability, substitutes, or staff assignments. Operators see everything;
     a coach/player only their own team's games; an official only the games they
     are assigned to; a plain viewer, none.
+
+    A FAST-DENIAL PREFLIGHT, NOT THE AUTHORITATIVE GATE (#427 round 2,
+    blocker 1). This function answers only the boolean; it throws away the
+    game it fetched and the side it resolved, so every caller that needed
+    either had to go and resolve them AGAIN — and the window between the two
+    resolutions was a disclosure window (see
+    :class:`services.game_side_scope.PrivateGameRead`). The private-game
+    dispatch therefore no longer treats this as its gate: it takes ONE
+    :func:`services.game_side_scope.resolve_private_game_read` and reads
+    admission, the game and the trusted side off that single record. This
+    stays as the cheap early refusal, and as the unchanged answer for the
+    callers that genuinely want only the boolean.
+
+    THE RULE IS NOT RESTATED HERE. It is ``resolve_private_game_read``'s
+    ``admitted`` field, so the preflight and the authoritative gate cannot
+    answer differently — which is the drift the fast-denial/authoritative
+    split would otherwise reintroduce.
     """
-    scope = scope or {}
-    if role in (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER):
-        return True
-    game = store.get_game(game_id)
-    if game is None:
-        return True  # let the facade return its normal not_found payload
-    if role in (Role.COACH, Role.PLAYER):
-        # #205 blocker 1: resolved against THIS game — see
-        # `game_scoped_own_team_id`. Coach behavior is byte-for-byte
-        # unchanged (still `scope["team_id"]`); Player behavior now resolves
-        # through the game-scoped membership resolver instead of the
-        # permanent pointer.
-        team_id = game_scoped_own_team_id(role, scope, game, store)
-        return team_id is not None and team_id in (
-            game.home_team_id, game.away_team_id)
-    if role == Role.OFFICIAL:
-        official_id = scope.get("official_id")
-        return official_id is not None and any(
-            a.official_id == official_id
-            for a in store.assignments_for_game(game_id))
-    return False  # viewer / anything else
+    return resolve_private_game_read(role, scope, game_id, store).admitted

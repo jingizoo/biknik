@@ -118,6 +118,29 @@ participation gate proves the caller belongs to *a* team in the game; it does
 **not** decide *which side* they may read. The server resolves the caller's
 own side once (`game_scoped_own_team_id`) and every one of these routes is
 projected on it.
+
+**Admission and projection are one decision, taken once.**
+`services.game_side_scope.resolve_private_game_read` decides whether the
+caller is admitted *and* resolves their trusted side, against a **single**
+fetch of the game, and the dispatch carries that one record into every leaf.
+`can_read_private_game_data` remains only as a fast-denial preflight — it is
+literally `resolve_private_game_read(...).admitted`, so the two cannot answer
+differently — and it is no longer the authoritative gate. Previously the
+handler authorised, then independently re-fetched the game and re-resolved
+membership; a membership transferred, ended or deactivated **between** those
+two reads left the second one with no side, which fell through to `/board`'s
+home default and answered the caller **HOME's** private pool, status,
+notifications and audit stream. Losing an authority now produces a refusal,
+not a fallback.
+
+**The home default is audience-bound.** `/board` answers one side and still
+defaults to home — but only for an audience with no side of its own *by
+design*: an unscoped operator, an assigned official (whose default side is
+served through the submitted-lineup projection, so nothing widens), or an
+in-process caller with no role. A Coach or Player who arrives with a missing
+or nonparticipant side is `restricted: true` with `team_id: null` — the
+response does not name the side it declined to answer for.
+
 **A side is never trusted from the query string or the body** — a `?team_id=`
 or `?side=` naming the opponent is *ignored* for a scoped caller, so a hinted
 request returns exactly what the un-hinted one returns. It is deliberately not

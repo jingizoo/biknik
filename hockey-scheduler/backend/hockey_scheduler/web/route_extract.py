@@ -3216,47 +3216,35 @@ _AUDIT_WAIVERS = {
         "sub-resource (board/roster/etc, all already enumerated as "
         "separate leaves under the SAME `m` match), not which route was "
         "chosen",
-    ("_dispatch_get", "api.store.get_game(gid)", "assign_rhs", "m"):
-        "#205 blocker 1, hoisted to the whole private-game family by #427: "
-        "re-fetches the SAME already-selected game (`gid`, captured by "
-        "`m`'s own regex match one waiver above) so the family can resolve "
-        "the caller's OWN team against THIS game "
-        "(`game_scoped_own_team_id`) instead of the permanent "
-        "player.team_id pointer -- a data lookup that feeds the "
-        "availability-summary team-level scope check AND the board/lineups "
-        "trusted-side projection below, the same 'produces a RESULT, not a "
-        "routing decision' shape as the `can_read_private_game_data` waiver "
-        "immediately above: the route (this sub-resource, this game) was "
-        "already fully decided upstream by `m` and `sub`. It moved OUT of "
-        "the `sub == 'availability-summary'` branch and into `m`'s own body "
-        "in #427, which is why this key's enclosing-if fingerprint changed "
-        "-- exactly the relocation the four-part key is designed to make "
-        "visible in the diff rather than silently re-match",
-    ("_dispatch_get", "sub_game is not None", "if_test", "m"):
-        "#205 blocker 1, hoisted by #427: guards whether the re-fetched "
-        "game (waived immediately above) still existed to resolve the "
-        "caller's own team against -- a facade not_found case, not a "
-        "routing decision; the route (this sub-resource, this game) was "
-        "already fully decided upstream by `m` and `sub`. Same guard as "
-        "before, moved out of the `sub == 'availability-summary'` branch "
-        "into `m`'s own body, which is why the enclosing-if fingerprint "
-        "changed",
     ("_dispatch_get",
-     "game_scoped_own_team_id(role, scope, sub_game, api.store)",
-     "boolop", "sub_game is not None"):
-        "#205 blocker 1, hoisted by #427 to serve the whole private-game "
-        "family: the SAME re-fetched game (waived immediately above) feeds "
-        "`game_scoped_own_team_id` to resolve the caller's own team ONCE -- "
-        "the team-level availability-summary scope check AND the "
-        "board/lineups trusted-side projection both read this one answer, "
-        "instead of each resolving its own. A RESULT the waiver above's own "
-        "docstring notes keeps propagating ('a waiver silences the call, "
-        "not the result'), not a second routing decision; the `if sub_game "
-        "is not None:` guard only decides between resolving the caller's "
-        "team or leaving it empty when the already-selected game vanished "
-        "mid-request (a facade not_found case), never which route was "
-        "chosen. This key is UNCHANGED by the hoist -- the expression, its "
-        "`or \"\"` boolop parent and its immediate guard all moved together",
+     "resolve_private_game_read(role, scope, gid, api.store)",
+     "assign_rhs", "m"):
+        "#427 round 2, blocker 1 -- THE ONE resolution the private-game "
+        "family's admission AND projection now share (see "
+        "services/game_side_scope.PrivateGameRead). `gid` is captured by "
+        "`m`'s own regex match one waiver above; this resolves, against a "
+        "single fetch of that already-selected game, whether the "
+        "SIGNED-IN caller is admitted at all and WHICH SIDE is theirs. It "
+        "REPLACES three waivers this dict used to carry -- the second "
+        "`api.store.get_game(gid)` re-fetch, its `sub_game is not None` "
+        "guard, and the `game_scoped_own_team_id(...)` call that hung off "
+        "it -- which existed because the dispatch resolved independently "
+        "of the gate; the gap between those two resolutions was the "
+        "disclosure window this round closes. Same 'produces a RESULT, "
+        "not a routing decision' shape as the `can_read_private_game_data` "
+        "waiver immediately above, and for the same reason: the route "
+        "(this sub-resource, this game) was already fully decided upstream "
+        "by `m` and `sub`, and every leaf below returns through its own "
+        "already-enumerated branch whatever this resolves",
+    ("_dispatch_get", "not private_read.admitted", "if_test", "m"):
+        "#427 round 2, blocker 1 -- the AUTHORITATIVE half of the "
+        "private-data gate, read off the single resolution waived "
+        "immediately above rather than recomputed. Structurally identical "
+        "to the `not can_read_private_game_data(...)` preflight two "
+        "waivers up (same 403, same message, same already-selected "
+        "game/sub-resource): it decides whether the signed-in caller may "
+        "view this game's private sub-resource, never which route was "
+        "chosen",
     ("_dispatch_get", "lineup_visibility.own_side(role, own_team, *side_ids)",
      "assign_rhs", "sub == 'board'"):
         "#427 blocker: picks WHICH SIDE of the already-selected game the "

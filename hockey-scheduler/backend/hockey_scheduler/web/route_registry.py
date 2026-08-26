@@ -329,11 +329,19 @@ REGISTRY = (
                     "(game_scoped_own_team_id, hoisted to serve this whole "
                     "sub-family) and passes that TRUSTED side plus the "
                     "session role into the read; a Coach/Player is "
-                    "answered for their own side only, an unscoped "
-                    "operator keeps the home default, an assigned official "
+                    "answered for their own side only, an assigned official "
                     "gets the submitted-lineup projection "
-                    "(services/lineup_visibility.py). Still game-keyed -- "
-                    "no P/S/L concept, not applicable.")),
+                    "(services/lineup_visibility.py). #427 round 2 blocker "
+                    "1: admission and projection are now ONE decision "
+                    "(services/game_side_scope.resolve_private_game_read) "
+                    "taken against a single fetch, carried into this leaf; "
+                    "can_read_private_game_data is a fast-denial preflight "
+                    "only. The HOME default survives for an unscoped "
+                    "operator/official/in-process caller and NOT for a "
+                    "Coach/Player, who are restricted instead -- losing an "
+                    "authority mid-request is a refusal, not a fallback. "
+                    "Still game-keyed -- no P/S/L concept, not "
+                    "applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/lineups$", "/api/games/{}/lineups",
               "get_games_id_lineups", "_dispatch_get",
               auth="session+own-side-projection", scope_axis="none",

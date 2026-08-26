@@ -4784,12 +4784,26 @@ class ApiService:
         boundary.
 
         ``team_id`` is the TRUSTED side ``web/server.py`` resolves through
-        ``game_scoped_own_team_id`` — never a client-supplied value. It stays
-        optional and still defaults to the home side, because that default is
-        now reached only by an unscoped operator or an in-process caller, both
-        of whom may read either side anyway. ``RosterService.lineup_population``
-        rejects a team that is not playing in this game, so a bad value fails
-        closed rather than silently answering for a stranger.
+        ``resolve_private_game_read`` — never a client-supplied value.
+
+        THE HOME DEFAULT IS AUDIENCE-BOUND (#427 round 2, blocker 1). It used
+        to be applied to EVERY caller, and applied BEFORE the projection was
+        chosen, so ``team_id=None`` from a team-scoped caller became a full
+        HOME read rather than a refusal. Measured on the head this corrects: a
+        direct ``Role.COACH`` call with ``team_id=None`` answered
+        ``team_id=team_1, projection=full, restricted=false`` with HOME's
+        identities, and the same shape was reachable over HTTP whenever a
+        Coach/Player lost their side between admission and projection. The
+        default now survives ONLY for an audience with no side of its own BY
+        DESIGN — an unscoped operator, an assigned official, an in-process
+        caller (:func:`services.lineup_visibility.default_side_permitted`).
+        A COACH or PLAYER who arrives with no side, or with a side that is not
+        one of this game's two, is RESTRICTED: no ``status``, no ``players``,
+        no notifications, no audit, and ``team_id: null`` — the response never
+        names a side it is not answering for.
+
+        ``RosterService.lineup_population`` still rejects a team that is not
+        playing in this game, so a bad value fails closed there too.
 
         ``viewer_role`` selects the projection for a caller with no side of
         their own: an assigned OFFICIAL gets the submitted-lineup projection
@@ -4797,15 +4811,25 @@ class ApiService:
         the full private side. See :mod:`services.lineup_visibility`.
         """
         game = self.roster._require_game(game_id)
-        team_id = team_id or game.home_team_id
-        projection = lineup_visibility.side_projections(
-            viewer_role, team_id, game.home_team_id, game.away_team_id)
-        projection = (projection["home"] if team_id == game.home_team_id
-                      else projection["away"])
+        if team_id is None and not lineup_visibility.default_side_permitted(
+                viewer_role):
+            # A TEAM-SCOPED caller with no resolved side. Refused, never
+            # defaulted — see this method's docstring. Over HTTP the shared
+            # `resolve_private_game_read` boundary has already answered 403,
+            # so this is the facade's own fence for a direct caller.
+            projection = lineup_visibility.RESTRICTED
+        else:
+            team_id = team_id or game.home_team_id
+            projection = lineup_visibility.side_projections(
+                viewer_role, team_id, game.home_team_id, game.away_team_id)
+            projection = (projection["home"] if team_id == game.home_team_id
+                          else projection["away"])
         if projection == lineup_visibility.RESTRICTED:
-            # Unreachable from `web/server.py`, which always passes the
-            # caller's OWN side — kept because a single-sided read must not
-            # depend on its one caller having got that right.
+            # A team-scoped caller with a missing or nonparticipant side.
+            # `team_id` is cleared as well: a restricted board must not name
+            # the side it declined to answer for, which is exactly what the
+            # HOME default used to do.
+            team_id = None
             status, rows = None, None
         else:
             status = self.roster.compute_roster_status(
