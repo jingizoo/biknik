@@ -154,7 +154,9 @@ route                  CLOSED      ``route_registry.REGISTRY``
 principal (role)       CLOSED      ``domain.Role``
 session scope          CLOSED      ``AccountService._ALLOWED_SCOPE_KEYS``
 query parameter        CLOSED      ``route_extract.query_parameter_names``
-subject (which game)   CLOSED      the store's own relationship rows
+subject (which game)   **LIMIT**   entitlement recomputed from the store's
+                                   own rows; the REVOCATION KINDS are a test
+                                   construction (see ``relationship kind``)
 backend                CLOSED      ``_assert_matrix_ran``: a skip is not a pass
 HTTP method            **LIMIT**   GET only; the VOCABULARY is closed
 =====================  ==========  ==================================
@@ -164,7 +166,7 @@ WHAT THE ORACLES INTERPRET
 =====================  ==========  ==================================
 axis                   status      authority / disclosed limit
 =====================  ==========  ==================================
-identity alphabet      CLOSED      the ``Player`` record's own fields
+identity alphabet      **LIMIT**   ``Player``'s own fields, STRING-VALUED ONLY
 entitlement class      CLOSED      each principal BOUND by an assertion
 data class             **LIMIT**   no product enum exists; non-vacuity asserted
 perturbation kind      **LIMIT**   test constructions; PREMISES asserted
@@ -176,15 +178,21 @@ Each CLOSED row means the same thing the route row has always meant: the
 product gaining one more of that thing, without this sweep gaining a probe
 for it, is an ERROR NAMING IT rather than a silent gap. Each **LIMIT** row is
 a disclosed limit with a measurement, in the numbered section at the bottom of
-this docstring — not a claim of closure. The three closures round 9 added
-(query parameter, subject, identity alphabet) each replaced a hand-written
-list that a reproduced falsifier had just walked through.
+this docstring — not a claim of closure. Round 9 replaced three hand-written
+lists that a reproduced falsifier had just walked through; only ONE of the
+three — query parameter — came out CLOSED. Subject and identity alphabet are
+better than the lists they replaced and are still LIMIT rows, because a
+closure needs an authority in the PRODUCT and neither has one yet: there is
+no enum of relationship kinds, and ``Player``'s fields are authoritative
+about that record, not about every way a person can be named.
 
 RUNTIME, MEASURED AND STATED, AND IT IS NOT CHEAP ANY MORE. TWENTY worlds —
 a fresh base and a changed world for each of the two sides x each kind in
 :data:`PERTURBATIONS` in each game of :data:`PERTURBED_GAMES` (sixteen), plus
 one for each kind in :data:`RELATIONSHIP_REVOCATIONS` (four) — x every
-authenticated GET route x 10 principals x 10 hint variants.
+authenticated GET route x 10 principals x the FOUR per-world variants in
+:data:`HINTS`. The other six live in :data:`FULL_HINTS` and are swept once
+per backend, for the reason measured at :data:`HINTS` itself.
 
 The sentence this replaces said "Eight worlds … two perturbation kinds … 8
 principals … 1,984 requests per world … 6.1 s Memory". Every one of those
@@ -1437,12 +1445,33 @@ class _SweepHarness(_OverviewHarness):
     NON_IDENTITY_PLAYER_FIELDS = ("team_id",)
 
     def _identity_tokens(self, player):
-        """EVERY WAY THE PRODUCT CAN NAME THIS ONE PERSON, derived from the
-        ``Player`` record's own fields rather than hand-listed.
+        """Every way the product can name this one person WITH A STRING,
+        derived from the ``Player`` record's own fields rather than
+        hand-listed.
+
+        THE LIMIT, STATED BECAUSE IT IS NOT CLOSED (#427 round 9 review).
+        The FIELD SET is derived; the VALUE SPACE is not. ``type(v) is str``
+        admits nine string-valued fields and excludes every numeric one, so
+        a NUMERIC identity is outside this alphabet. ``jersey_number`` is
+        not hypothetical: it is served on ``_lineup_rows`` and allow-listed
+        in ``_SHEET_PLAYER_FIELDS``, and MEASURED over this sweep it names a
+        person uniquely on 779 of 2,480 rows, on ``/board``, ``/lineups``
+        and ``/roster``. A route handing ``thirdcoach`` the away side's five
+        jersey numbers passes oracle 1 green.
+
+        WHAT BOUNDS IT, ALSO MEASURED: all 779 of those 779 nodes carry the
+        player ``id`` as well, so a realistic ``_lineup_rows`` disclosure is
+        still caught through the id; the jersey is the sole carrier only in
+        a payload that deliberately omits the id. And no live leak exists
+        today — only callers entitled to both sides, plus each side's own
+        coach and player, receive their own side's jerseys; zero cross-side.
+        CLOSING THIS NEEDS A PRODUCT-SIDE AUTHORITY OVER IDENTITIES rather
+        than over ``Player``'s fields, which does not exist yet. Until it
+        does, this is a disclosed limit with a measurement, not a closure.
 
         THE BLIND SPOT THIS CLOSES (#427 round 9, D8). Oracle 1's alphabet
         was the ``id`` FIELD ALONE. A name is an identity too, and so is a
-        registration number, and the record carries eight string-valued
+        registration number, and the record carries nine string-valued
         identity fields today. MEASURED on the head this corrects: a
         registered authenticated route handing ``thirdcoach`` — typed
         :data:`IN_NEITHER_SIDE`, entitled to nothing of either side — the
@@ -2196,9 +2225,16 @@ class TheSweepCoversEveryAuthenticatedRoute(_SweepHarness, unittest.TestCase):
 # 2. THE TWO ORACLES, OVER THE WHOLE SURFACE, ON EVERY BACKEND.
 # ---------------------------------------------------------------------------
 class NoAuthenticatedRouteLeaksTheOtherSide(_SweepHarness, unittest.TestCase):
-    """THE ASSET. Three worlds, both oracles, both perturbation directions,
-    every authenticated GET route, eight principals, four hint variants,
-    three backends."""
+    """THE ASSET. Twenty worlds, all three oracles, both perturbation
+    directions, every authenticated GET route, ten principals, four hint
+    variants, three backends.
+
+    THESE NUMBERS ARE MEASURED, AND THAT IS NOT A FORMALITY. The sentence
+    this replaces read "Three worlds ... eight principals" and survived the
+    round whose own docstring narrates correcting the SAME defect one screen
+    above (:data:`_SweepHarness` RUNTIME). A count here that drifts from the
+    matrix is the file's own thesis failing on the file itself, so re-measure
+    rather than reason when either constant moves."""
 
     @staticmethod
     def _phases():
