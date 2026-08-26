@@ -142,10 +142,22 @@ or nonparticipant side is `restricted: true` with `team_id: null` — the
 response does not name the side it declined to answer for.
 
 **A side is never trusted from the query string or the body** — a `?team_id=`
-or `?side=` naming the opponent is *ignored* for a scoped caller, so a hinted
-request returns exactly what the un-hinted one returns. It is deliberately not
+naming the opponent is *ignored* for a scoped caller, so a hinted request
+returns exactly what the un-hinted one returns. It is deliberately not
 rejected: a 403 raised only for the opponent's id is itself an oracle for
 which team is playing, while an unchanged own-side answer discloses nothing.
+
+**And `?side=` is not a parameter this server has at all**, which is a
+different and stronger fact than "it is ignored" — stated separately because
+the two were run together here, and the sentence that ran them together was
+what a round of verification walked through. Measured from the source rather
+than asserted: `web/server.py` reads exactly SEVEN query-string parameters
+(`team_id`, `season_id`, `scope_type`, `scope_id`, `recipient_ref`,
+`actor_type`, `actor_ref`), enumerated from its own `parse_qs` call sites by
+`web/route_extract.query_parameter_names`. `side` is not among them, so
+`?side=away` reaches no branch — and the behavioural sweep now derives its
+hint variants from that inventory, so a parameter this server BEGINS reading
+enters the sweep instead of being tested under a name nothing consumes.
 
 | Caller | board / lineups | roster-status | roster | substitutes | availability-summary | substitute-candidates / -addable |
 |---|---|---|---|---|---|---|
