@@ -11,18 +11,36 @@ Every OTHER test in this module returns after the first backend, or builds an
 reason on the line that does it: they pin the behaviour of an ORACLE, of the
 fixture, or of a gate, none of which is a per-backend property. MEASURED off
 the module's own AST rather than eyeballed, so the sentence is a count and
-not an impression: exactly FIVE test methods in this file loop every
+not an impression: exactly SIX test methods in this file loop every
 configured backend and call ``_assert_matrix_ran``. The first is the
 whole-surface property above. The second is
 :meth:`TheHintAxisIsClosedAgainstWhatTheServerReads
 .test_no_parameter_the_server_reads_selects_a_side`, added in round 9, which
 carries the FULL query-parameter matrix on one fresh world per backend
-because carrying it in all twenty worlds is not affordable — see
-:data:`HINTS`. The other three are the whole of
+because carrying it in all twenty-four worlds is not affordable — see
+:data:`HINTS`. Three more are the whole of
 :class:`AGameKeyedGrantDoesNotSpanASecondGame`, added in round 10, which the
-owner required on all three backends by name. (It said ONE until round 9 and
-TWO until round 10. The count is stated because the headline sentence is easy
-to read as a claim about every test in the file.)
+owner required on all three backends by name. The sixth is
+:meth:`ThePlayerGrantIsTheEligibleMembershipRow
+.test_the_ex_member_is_refused_and_a_blind_gate_reddens_the_sweep`, added in
+round 12, which LB1's close condition 4 required on all three backends by
+name. (It said ONE until round 9, TWO until round 10 and FIVE until round 12.
+The count is stated because the headline sentence is easy to read as a claim
+about every test in the file, and it is MEASURED off this module's own AST:
+six methods contain both ``_stores()`` and ``_assert_matrix_ran``.)
+
+WHERE THE ENUMERATION KEEPS MOVING TO, AND WHY THIS ROUND IS ONE LEVEL UP
+AGAIN (#427 round 12, LB1). Round 11 derived every grant DIMENSION from the
+product row and left the SET OF GRANT ROWS hand-written in
+:data:`GRANT_ROWS`, audited by nothing — so the enumeration moved up one
+level and the hole moved with it. ``SeasonRosterMembership``, the row the
+whole of #205 exists to make authoritative, was simply absent from it: Coach
+and Player were ONE entitlement class whose comment said "there is no
+per-game row to key on", which is true of a Coach and false of a Player. The
+answer is not a third entry in that map — it is that the ADMISSION BRANCHES
+are now derived from the GATE (:func:`admission_branches`), so a
+non-operator branch with no authority behind it fails by name. See the
+``admission branch`` row of the axis table below.
 
 WHY THIS IS THE PRIMARY PROTECTION AND THE STATIC SCANNER IS SUPPLEMENTAL.
 Five rounds of this blocker found five leaks, each by a human enumerating
@@ -231,6 +249,22 @@ path names)                        own rows, matched on EVERY DIMENSION the
                                    construction (see ``relationship kind``)
 backend                CLOSED      ``_assert_matrix_ran``: a skip is not a pass
 HTTP method            **LIMIT**   GET only; the VOCABULARY is closed
+admission branch       CLOSED      ``admission_branches()`` — the GATE'S OWN
+                                   SOURCE. #427 round 12, LB1: the set of
+                                   branches that admit a caller to a private
+                                   game is DERIVED from
+                                   ``services/game_side_scope.py`` the way
+                                   ``query_parameter_names`` derives the
+                                   query axis from ``server.py``, and every
+                                   non-operator branch must carry an entry
+                                   in ``ADMISSION_AUTHORITIES``. Proved by
+                                   INJECTION, in ten spellings
+membership status      CLOSED      ``MembershipStatus`` x
+                                   ``RosterService
+                                   ._ELIGIBLE_MEMBERSHIP_STATUSES``, pinned
+                                   per member in
+                                   ``MEMBERSHIP_STATUS_GRANTS`` and MEASURED
+                                   over real HTTP on every backend
 =====================  ==========  ==================================
 
 WHAT THE ORACLES INTERPRET
@@ -239,7 +273,9 @@ WHAT THE ORACLES INTERPRET
 axis                   status      authority / disclosed limit
 =====================  ==========  ==================================
 identity alphabet      **LIMIT**   ``Player``'s own fields, STRING-VALUED ONLY
-entitlement class      CLOSED      each principal BOUND by an assertion
+entitlement class      CLOSED      each principal BOUND by an assertion, and
+                                   each ADMISSION BRANCH the gate takes bound
+                                   to the class that models it
 data class             **LIMIT**   no product enum exists; non-vacuity asserted
 perturbation kind      **LIMIT**   test constructions; PREMISES asserted
 relationship kind      **LIMIT**   test constructions; PREMISES asserted
@@ -258,11 +294,12 @@ closure needs an authority in the PRODUCT and neither has one yet: there is
 no enum of relationship kinds, and ``Player``'s fields are authoritative
 about that record, not about every way a person can be named.
 
-RUNTIME, MEASURED AND STATED, AND IT IS NOT CHEAP ANY MORE. TWENTY-TWO
+RUNTIME, MEASURED AND STATED, AND IT IS NOT CHEAP ANY MORE. TWENTY-FOUR
 worlds — a fresh base and a changed world for each of the two sides x each
 kind in :data:`PERTURBATIONS` in each game of :data:`PERTURBED_GAMES`
-(sixteen), plus one for each kind in :data:`RELATIONSHIP_REVOCATIONS` (SIX,
-since round 11 drives DECLINED as well as unassigned) — x every
+(sixteen), plus one for each kind in :data:`RELATIONSHIP_REVOCATIONS` (EIGHT,
+since round 11 drives DECLINED as well as unassigned and round 12 adds the
+ex-member's ``season_roster_membership``) — x every
 authenticated GET route x 10 principals x the FOUR per-world variants in
 :data:`HINTS`. The other six live in :data:`FULL_HINTS` and are swept once
 per backend, for the reason measured at :data:`HINTS` itself.
@@ -276,21 +313,21 @@ exists to prevent, in the file whose whole thesis is MEASURED RATHER THAN
 IMPLIED, so the numbers below are re-measured on the current tree rather than
 adjusted:
 
-* **2,560 real HTTP requests per world, 56,320 per backend** for the main
+* **2,560 real HTTP requests per world, 61,440 per backend** for the main
   property — 64 concrete paths x 10 principals x the 4 per-world variants in
-  :data:`HINTS`. Round 11 adds two concrete paths and one world-pair: the
-  guardian route is now bound to a junior the guardian is NOT linked to (see
+  :data:`HINTS`. Round 11 added two concrete paths and one world-pair: the
+  guardian route is bound to a junior the guardian is NOT linked to (see
   :class:`TheSweptBindingsExerciseTheUnentitledDirection`),
   ``get_officials_id_availability`` to a second official, and
-  ``official_assignment_declined`` is a third revocation kind;
+  ``official_assignment_declined`` is a third revocation kind. Round 12 adds
+  NO path and ONE world-pair — ``season_roster_membership``, the EX-MEMBER,
+  which is the state no world in this matrix contained;
 * measured on this machine, for the whole-surface property alone:
-  **36.6 s Memory, 21.3 s SQLite, 68.9 s real PostgreSQL** — one recorded
-  run, and it moves a few percent between runs with the machine's load (the
-  same property measured 34.6/20.1/68.2 two runs earlier on the same tree);
-* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 59 tests in 260.1 s ...
-  OK** — 273.4 s on a second run of the same tree, which is the "few
-  percent" above made concrete — against the **49 tests / 225.6 s** at the
-  head this round started from, re-measured on that head rather than
+  **44.3 s Memory, 24.0 s SQLite, 79.5 s real PostgreSQL** — one recorded
+  run, and it moves a few percent between runs with the machine's load;
+* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 71 tests in 299.3 s ...
+  OK** — against the **59 tests / 285.2 s** at the head this round started
+  from (63db78f), re-measured on that head on this machine rather than
   carried forward;
 * round 10 adds THREE more requests of a full sweep per backend —
   :class:`AGameKeyedGrantDoesNotSpanASecondGame` sweeps once for the
@@ -301,9 +338,13 @@ adjusted:
   and the control without the second official's row), ONCE for
   ``guardian_user_id``, and FOUR times for ``player_id`` — two sweeps on
   each of two fixtures, because ``_perturbed`` cannot be entered twice on
-  one. Its three AUDIT tests, and both of
+  one. Its three AUDIT tests, and all three of
   :class:`TheSweptBindingsExerciseTheUnentitledDirection`'s, sweep NOTHING:
-  they read the oracles directly;
+  they read the oracles directly. Round 12 adds ONE more full sweep per
+  backend — :class:`ThePlayerGrantIsTheEligibleMembershipRow` sweeps once
+  inside the widened window, to require oracle 1 to REPORT the ex-member —
+  and :class:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority` sweeps
+  nothing at all: it reads the GATE'S OWN SOURCE;
 * and the full derived parameter matrix — :data:`FULL_HINTS`, ten variants,
   6,400 requests — once per backend on a fresh world, which is the shape
   that made closing the query-string axis affordable at all.
@@ -378,26 +419,32 @@ rather than left in prose by
 .test_two_family_leaves_are_beyond_the_non_interference_oracle`.
 """
 
+import ast
 import contextlib
 import dataclasses
 import datetime as _datetime
 import enum
+import inspect
 import json
 import re
 import time
 import typing
 import unittest
+from pathlib import Path
 
-from helpers import BACKEND  # noqa: F401
+from helpers import BACKEND, end_membership_directly  # noqa: F401
 from test_lineup_side_projection import _ProjectionHarness
 from test_overview_schedule_side import _OverviewHarness
 from test_substitute_membership_cutover import ADMIN
 
 from hockey_scheduler.api.service import ApiService as _ApiService
-from hockey_scheduler.domain import GuardianLink, OfficialAssignment, Role
+from hockey_scheduler.domain import (Game, GuardianLink, MembershipStatus,
+                                     OfficialAssignment, Role,
+                                     ROLE_PERMISSIONS, Permission,
+                                     SeasonRosterMembership)
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.services import (game_side_scope, guardian_service,
-                                        lineup_visibility)
+                                        lineup_visibility, side_provenance)
 from hockey_scheduler.services.account_service import AccountService
 from hockey_scheduler.services.roster_service import RosterService
 from hockey_scheduler.web import route_extract
@@ -528,12 +575,12 @@ FULL_HINTS = ("none",) + tuple(
                                  **UNREAD_PARAMETER_CONTROL}.items())
     for label in labels)
 
-#: The variants swept in EVERY ONE OF THE TWENTY WORLDS, as against
+#: The variants swept in EVERY ONE OF THE TWENTY-FOUR WORLDS, as against
 #: :data:`FULL_HINTS`, which is swept once per backend by
 #: :class:`TheHintAxisIsClosedAgainstWhatTheServerReads`.
 #:
 #: WHY THE AXIS IS SPLIT ACROSS TWO PLACES, WITH THE MEASUREMENT THAT FORCED
-#: IT (#427 round 9). Sweeping all ten variants in all twenty worlds is a
+#: IT (#427 round 9). Sweeping all ten variants in all twenty-four worlds is a
 #: correct design and an unaffordable one. This sweep RE-MEASURES A FRESH
 #: BASE FOR EVERY PHASE — it has to, because a perturbation is not
 #: byte-reversible and ``/board`` serves an append-only audit stream — so the
@@ -555,7 +602,8 @@ FULL_HINTS = ("none",) + tuple(
 #:   product begins reading still enters the sweep automatically; it is the
 #:   number of WORLDS it enters that is bounded, not whether it enters.
 #: * "does a side's private STATE change what a hint does?" — the
-#:   side-bearing variants below, in all twenty worlds, exactly as before.
+#:   side-bearing variants below, in all twenty-four worlds, exactly as
+#:   before.
 #:
 #: WHAT THAT COSTS, STATED RATHER THAN ABSORBED: a parameter that selects a
 #: side ONLY while some side's private state holds a particular value would
@@ -574,9 +622,59 @@ HINTS = ("none", "team_id=home_team", "team_id=away_team", "side=away_word")
 # principal whose entitlement stops matching its class fails that test rather
 # than quietly widening this sweep.
 # ---------------------------------------------------------------------------
-SCOPED_TO_ONE_SIDE = "scoped_to_one_side"
-#: A Coach bound to a team, or a Player whose game-scoped membership resolves
-#: one. Entitled to exactly that side and to nothing of the other.
+COACH_SCOPED_TO_ONE_SIDE = "coach_scoped_to_one_side"
+#: A COACH bound to a team by their ACCOUNT SCOPE. Entitled to exactly that
+#: side and to nothing of the other.
+#:
+#: THE GRANT IS THE SCOPE, AND THERE IS NO ROW (#427 round 12, LB1). This is
+#: the half of the old merged ``scoped_to_one_side`` class that the sentence
+#: describing it was actually TRUE of: ``game_side_scope
+#: .game_scoped_own_team_id`` answers a Coach with ``scope.get("team_id")``
+#: and reads no store at all, and that function's own docstring records why —
+#: "There is no ``CoachSeasonMembership`` (or any season-scoped Coach model)
+#: anywhere in this codebase — a Coach's team assignment genuinely IS
+#: permanent". A Coach really does manage a team's roster across every game
+#: it plays, so there is no per-game row to key on.
+
+PLAYER_SCOPED_BY_MEMBERSHIP = "player_scoped_by_membership"
+#: A PLAYER whose side in THIS game is resolved from an ELIGIBLE
+#: :class:`SeasonRosterMembership`. Entitled to exactly the side that row
+#: names, in exactly the games that row's LeagueSeason covers, and to nothing
+#: anywhere once the row stops granting participation.
+#:
+#: THE BLIND SPOT THIS REPLACES (#427 round 12, LB1). Coach and Player were
+#: ONE class, and the comment above :data:`GRANT_RECORD_FIELDS` stated
+#: affirmatively that its grant is "the ACCOUNT SCOPE… there is no per-game
+#: row to key on". That is true of a Coach and FALSE of a Player: a Player's
+#: scope is canonicalized to ``player_id`` ALONE (#160), and the side is
+#: resolved live by ``game_side_scope._player_team_for_game`` ->
+#: ``RosterService.team_for_game`` -> ``resolve_membership_context``, which
+#: gates on ``SeasonRosterMembership.status`` against
+#: ``RosterService._ELIGIBLE_MEMBERSHIP_STATUSES`` and on the
+#: ``SeasonTeamRegistration`` spine. There IS a per-game row, and it is the
+#: row #205 exists to make authoritative.
+#:
+#: Because the class was merged, ``SeasonRosterMembership`` was in neither
+#: :data:`GRANT_ROWS` nor :data:`GRANT_DIMENSIONS`, every one of its eleven
+#: fields was keyed on by NOTHING, and no perturbation or revocation in the
+#: matrix ever moved a membership — so no world in this sweep contained the
+#: state at all.
+#:
+#: MEASURED at the head this corrects, driven through the product's own
+#: ``SetupService.set_season_roster_membership_status`` write path: the
+#: PRODUCT narrowed ``homeplayer``'s ``GET /api/games/{gid}/board`` from 200
+#: to 403 while the ORACLE'S ``_entitled_teams`` stayed ``[team_1]``. And the
+#: falsifier that turns that blindness into a leak is d62473a's byte for byte
+#: on the row nobody modelled — widen the gate by ONE enum member
+#: (``_ELIGIBLE_MEMBERSHIP_STATUSES += (MembershipStatus.INACTIVE,)``, the
+#: same omission that let a DECLINED official keep 200) and a real
+#: authenticated EX-MEMBER session receives 200 with EIGHT private HOME
+#: identities, while this file stayed green on all three backends: ``Ran 59
+#: tests in 275.541s … OK``, 22 worlds x 2,560 requests per backend.
+#:
+#: :class:`ThePlayerGrantIsTheEligibleMembershipRow` is the falsifier that
+#: closes it, and :class:`ThePlayerGrantIsTheEligibleMembershipRow` pins
+#: each status by name.
 
 IN_NEITHER_SIDE = "in_neither_side"
 #: A Coach of a team that plays in NEITHER game. Entitled to NO side of
@@ -776,10 +874,21 @@ PERTURBED_GAMES = {
 #: official's own softer state — the row survives, still names this official
 #: and this game, and ``OfficialAssignmentStatus.is_active`` says it holds
 #: nothing — so it is the sharper subject the guardian half already had.
+#: ``season_roster_membership`` is #427 round 12's addition (LB1), and it is
+#: the world whose ABSENCE was the finding. No perturbation and no revocation
+#: kind here ever moved a ``SeasonRosterMembership``, so no world in this
+#: matrix contained the state at all — and the state is condition 4's
+#: "ex-member": a membership the PRODUCT ITSELF made ineligible, through
+#: ``SetupService.set_season_roster_membership_status``. Like the guardian's
+#: unverified link and the official's DECLINED assignment it is the SOFT
+#: revocation, not a deletion: the row survives, still names this player,
+#: this team and this LeagueSeason, and only ``status`` moves — which is the
+#: product's own statement that the stint no longer participates.
 RELATIONSHIP_REVOCATIONS = {
     "official_assignment": "official",
     "official_assignment_declined": "official",
     "guardian_link": "guardian",
+    "season_roster_membership": "homeplayer",
 }
 
 OPERATOR_UNSCOPED_BY_DESIGN = "operator_unscoped_by_design"
@@ -963,6 +1072,51 @@ def _subject_fields(record):
                      if f.name.endswith("_id") and f.name != "id")
 
 
+#: ``{activation enum: (the object that owns the product's partition of it,
+#: the ELIGIBLE attribute, the INELIGIBLE attribute)}`` — for an enum whose
+#: "does this value grant anything" answer lives OUTSIDE the enum.
+#:
+#: WHY THIS IS NOT A SECOND WAY OF SPELLING THE SAME THING (#427 round 12,
+#: LB1). :func:`_activation_fields` recognised exactly two shapes: a ``bool``
+#: column, and an ``Enum`` exposing an ``is_active`` PROPERTY. Both read the
+#: answer off the type itself, which is why they need nothing declared here.
+#: ``MembershipStatus`` declares ``is_terminal`` and NOT ``is_active``: the
+#: product keeps its participation answer in ``RosterService``, as the pair
+#: of tuples ``_ELIGIBLE_MEMBERSHIP_STATUSES`` /
+#: ``_INELIGIBLE_MEMBERSHIP_STATUSES`` whose own comment says they "must
+#: partition ``MembershipStatus`` exactly". So the answer is still the
+#: PRODUCT'S — it is only kept somewhere the TYPE cannot point at, and this
+#: is the pointer.
+#:
+#: BOTH HALVES, NOT JUST THE ELIGIBLE ONE, and that is what makes it
+#: fail-closed: :meth:`ThePlayerGrantIsTheEligibleMembershipRow
+#: .test_the_products_two_tuples_still_partition_the_enum` requires the two
+#: to partition the enum, so a status the product has not classified cannot
+#: reach :func:`_row_is_active` at all.
+ELIGIBILITY_AUTHORITIES = {
+    MembershipStatus: (RosterService, "_ELIGIBLE_MEMBERSHIP_STATUSES",
+                       "_INELIGIBLE_MEMBERSHIP_STATUSES"),
+}
+
+
+def _eligibility_partition(declared):
+    """``(eligible, ineligible)`` frozensets for an activation enum whose
+    partition the PRODUCT keeps outside the type — read live off the owner
+    named in :data:`ELIGIBILITY_AUTHORITIES`, never copied here."""
+    owner, yes, no = ELIGIBILITY_AUTHORITIES[declared]
+    return (frozenset(getattr(owner, yes)), frozenset(getattr(owner, no)))
+
+
+def _is_activation_enum(declared):
+    """Does ``declared`` carry the product's own "does this value grant
+    anything" answer — by its OWN property, or by a partition the product
+    keeps beside it?"""
+    if not (isinstance(declared, type) and issubclass(declared, enum.Enum)):
+        return False
+    return (isinstance(getattr(declared, "is_active", None), property)
+            or declared in ELIGIBILITY_AUTHORITIES)
+
+
 def _activation_fields(record):
     """The field names whose DECLARED TYPE carries the product's own answer
     to "does this row grant anything at all".
@@ -977,7 +1131,15 @@ def _activation_fields(record):
     * ``bool`` — a flag the row carries about itself;
     * an ``Enum`` exposing an ``is_active`` PROPERTY — the product's own
       predicate, which :func:`_row_is_active` then calls rather than
-      re-deriving.
+      re-deriving;
+    * an ``Enum`` the product PARTITIONS beside the type rather than on it —
+      :data:`ELIGIBILITY_AUTHORITIES` (#427 round 12, LB1).
+      ``SeasonRosterMembership.status`` is the case that matters, and it is
+      the reason the third shape exists: ``MembershipStatus`` declares
+      ``is_terminal`` and no ``is_active`` at all, so a rule that recognised
+      only the first two shapes would have called the ONE column #205 makes
+      authoritative "not activation state" and let it fall into
+      :data:`GRANT_FIELDS_THAT_KEY_NOTHING` with a reason that was false.
 
     ``OfficialRole`` is an Enum and declares no ``is_active``, so it is not
     activation state and does not land here — which the measured audit in
@@ -987,10 +1149,7 @@ def _activation_fields(record):
     out = set()
     for field in dataclasses.fields(record):
         declared = _base_type(hints.get(field.name))
-        if declared is bool:
-            out.add(field.name)
-        elif isinstance(declared, type) and issubclass(declared, enum.Enum) \
-                and isinstance(getattr(declared, "is_active", None), property):
+        if declared is bool or _is_activation_enum(declared):
             out.add(field.name)
     return frozenset(out)
 
@@ -1008,16 +1167,30 @@ def _row_is_active(record, row):
     That distinction is the whole of F2 and of the claim
     :meth:`_SweepHarness._subject_narrowed` makes above it. ``bool`` fields
     must be true; an activation Enum is coerced back through its own class
-    (the SQL backends hydrate it as a plain string) and asked ``is_active``.
-    So deleting a status check from ``game_side_scope`` does NOT move this
-    answer, which is what makes that deletion a RED sweep instead of a
-    silent widening of the expectation."""
+    (the SQL backends hydrate it as a plain string) and asked ``is_active``,
+    or — where the product keeps the partition beside the type rather than on
+    it — tested against the ELIGIBLE half of
+    :data:`ELIGIBILITY_AUTHORITIES` (#427 round 12, LB1). So deleting a
+    status check from ``game_side_scope``, or WIDENING
+    ``_ELIGIBLE_MEMBERSHIP_STATUSES`` by one enum member, does NOT move this
+    answer in the direction the gate moved: the eligible half is read live,
+    so a widening makes the gate and this predicate agree — which is exactly
+    why the eligible SET is additionally pinned by name in
+    :data:`MEMBERSHIP_STATUS_GRANTS` and measured against real HTTP by
+    :class:`ThePlayerGrantIsTheEligibleMembershipRow`. Deleting the check
+    outright is what this predicate catches on its own, and it is what makes
+    that deletion a RED sweep instead of a silent widening of the
+    expectation."""
     hints = _record_types(record)
     for name in sorted(_activation_fields(record)):
         value = getattr(row, name)
         declared = _base_type(hints[name])
         if declared is bool:
             if not value:
+                return False
+        elif declared in ELIGIBILITY_AUTHORITIES:
+            eligible, _ineligible = _eligibility_partition(declared)
+            if declared(value) not in eligible:
                 return False
         elif not declared(value).is_active:
             return False
@@ -1054,13 +1227,25 @@ def _row_is_active(record, row):
 #:   ``player_id`` and no game. A verified link is a standing authority over
 #:   one junior in every game, so narrowing it by game would report the real
 #:   product grant as a leak.
-#: * ``SCOPED_TO_ONE_SIDE`` / ``IN_NEITHER_SIDE`` — the ACCOUNT SCOPE, whose
-#:   accepted keys are ``team_id``/``player_id``. A coach manages a team's
-#:   roster across every game it plays; there is no per-game row to key on.
+#: * ``COACH_SCOPED_TO_ONE_SIDE`` / ``IN_NEITHER_SIDE`` — the ACCOUNT SCOPE,
+#:   whose accepted key is ``team_id``. A coach manages a team's roster across
+#:   every game it plays, and ``game_scoped_own_team_id`` answers a Coach out
+#:   of the scope without reading the store at all; there is no per-game row
+#:   to key on.
+#: * ``PLAYER_SCOPED_BY_MEMBERSHIP`` — ``SeasonRosterMembership``, which
+#:   carries ``league_season_id``, ``team_id``, ``player_id`` and ``status``.
+#:   THERE IS A PER-GAME ROW (#427 round 12, LB1). Until this round Coach and
+#:   Player were one class and the three lines above claimed the sentence
+#:   they now carry alone: "there is no per-game row to key on". That is a
+#:   true statement about a COACH and a false one about a PLAYER, and merging
+#:   the two put ``SeasonRosterMembership`` — the row #205 exists to make
+#:   authoritative — outside :data:`GRANT_ROWS`, outside
+#:   :data:`GRANT_DIMENSIONS`, and outside every world in the matrix.
 #: * the three unscoped classes — no grant row at all: their authority is the
 #:   role's permissions, which name nothing.
 GRANT_RECORD_FIELDS = {
-    SCOPED_TO_ONE_SIDE: _scope_keys(Role.COACH, Role.PLAYER),
+    COACH_SCOPED_TO_ONE_SIDE: _scope_keys(Role.COACH),
+    PLAYER_SCOPED_BY_MEMBERSHIP: _record_fields(SeasonRosterMembership),
     IN_NEITHER_SIDE: _scope_keys(Role.COACH),
     GUARDIAN_OF_A_JUNIOR: _record_fields(GuardianLink),
     OFFICIAL_SUBMITTED_LINEUP_ONLY: _record_fields(OfficialAssignment),
@@ -1082,9 +1267,22 @@ GRANT_RECORD_FIELDS = {
 #: on it — was keyed on by neither the gate nor this file. So the record
 #: itself is carried, not just its field names, and every dimension it
 #: carries keys the grant.
+#:
+#: STILL HAND-WRITTEN, AND THAT IS NOW AUDITED FROM ONE LEVEL UP (#427 round
+#: 12, LB1). Round 11 derived the grant DIMENSIONS from the product row and
+#: left the SET OF ROWS listed here, checked by nothing — so the enumeration
+#: moved up one level and the hole moved with it: a class whose grant IS a
+#: row could simply be absent, which is exactly what
+#: ``PLAYER_SCOPED_BY_MEMBERSHIP`` was. Adding a third entry does not fix
+#: that shape; what fixes it is that the ADMISSION BRANCHES are now DERIVED
+#: FROM THE GATE'S OWN SOURCE (:func:`admission_branches`) and every
+#: non-operator branch must name an authority here —
+#: :class:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority` fails BY NAME
+#: on a branch that does not, and the derivation is proved by injecting one.
 GRANT_ROWS = {
     GUARDIAN_OF_A_JUNIOR: GuardianLink,
     OFFICIAL_SUBMITTED_LINEUP_ONLY: OfficialAssignment,
+    PLAYER_SCOPED_BY_MEMBERSHIP: SeasonRosterMembership,
 }
 
 #: ``{domain row: the store method that reads EVERY row of that kind}``.
@@ -1099,6 +1297,33 @@ GRANT_ROWS = {
 GRANT_ROW_READERS = {
     GuardianLink: "all_guardian_links",
     OfficialAssignment: "all_official_assignments",
+    # `memberships_for_player` pre-keys on the player, which is the same
+    # shape `guardian_links_for_player` had when it hid F3.
+    SeasonRosterMembership: "all_season_roster_memberships",
+}
+
+#: ``{domain row: the store method that writes one row of that kind}`` — used
+#: ONLY by the measured dimension audit, which moves a field, re-asks the
+#: ORACLES, and puts the row back.
+#:
+#: A STORE WRITE HERE IS NOT A PRODUCT STATE CHANGE, and the distinction is
+#: the reason this map may exist at all. That audit asks a question about the
+#: ORACLES — "does this file's own answer depend on this column?" — and never
+#: asks the product anything, so what it needs is the ability to move a
+#: column, not a workflow. Every place this file makes a claim about the
+#: PRODUCT drives the product's own write path instead: `_perturbed`,
+#: `_revoked` and :class:`ThePlayerGrantIsTheEligibleMembershipRow` all go
+#: through `ApiService`/`SetupService`.
+#:
+#: It is DERIVED-SHAPED rather than derived: a store's writer cannot be read
+#: off a dataclass. :meth:`TheGrantIsKeyedByEveryDimensionOfItsRow
+#: .test_every_field_of_every_grant_row_is_declared_one_way_or_the_other`
+#: requires one entry per grant row, so a row added to :data:`GRANT_ROWS`
+#: without one is an error naming it rather than a silently unmeasured row.
+GRANT_ROW_WRITERS = {
+    GuardianLink: "save_guardian_link",
+    OfficialAssignment: "save_official_assignment",
+    SeasonRosterMembership: "save_season_roster_membership",
 }
 
 #: ``{entitlement class: the field names of its grant row that KEY the
@@ -1136,6 +1361,27 @@ GRANT_FIELDS_THAT_KEY_NOTHING = {
                        "an authority the official holds",
         "note": "operator free text",
     },
+    SeasonRosterMembership: {
+        "id": "the row's OWN primary key — see above",
+        "position": "which position this stint plays (#269, season-scoped). "
+                    "A sheet field, not an authority: it changes what the "
+                    "roster SAYS about the player, never which game or side "
+                    "the membership admits them to — measured, not assumed",
+        "jersey_number": "the season-Team jersey (#269). Unique within a "
+                         "season Team and therefore a real dimension of the "
+                         "ROSTER; it keys no read, and the measured audit "
+                         "below confirms perturbing it moves no oracle",
+        "shoots": "left/right — a scouting attribute of the stint",
+        "effective_from": "when the stint opened; NULL on a backfilled row, "
+                          "first-class 'predates membership tracking'. "
+                          "`resolve_membership_context` reads neither bound: "
+                          "participation is answered by `status` against "
+                          "`_ELIGIBLE_MEMBERSHIP_STATUSES` and by the "
+                          "LeagueSeason/registration spine, never by a date "
+                          "window — measured here, not read off the docstring",
+        "effective_to": "when it closed — stamped by a terminal transition, "
+                        "and the terminal STATUS is the dimension; see above",
+    },
     GuardianLink: {
         "id": "the row's OWN primary key — see above",
         "created_at": "when the link was made — bookkeeping",
@@ -1156,6 +1402,33 @@ GRANT_FIELDS_THAT_KEY_NOTHING = {
 #: skips is exactly this one, so "not measurable" cannot quietly grow.
 GRANT_FIELDS_NOT_PERTURBABLE = frozenset({"id"})
 
+#: The dimension a PATH names when it names a game, and nothing else does.
+GAME_SUBJECT = "game_id"
+
+#: Every subject dimension any grant row declares, across all of them.
+GRANT_SUBJECT_FIELDS = frozenset().union(
+    *(_subject_fields(record) for record in GRANT_ROWS.values()))
+
+#: The dimensions a read INHERITS FROM THE GAME ROW ITSELF — derived as the
+#: fields ``Game`` declares that a grant row is keyed on BY THE SAME NAME.
+#:
+#: WHY A SUBJECT ROW CONTRIBUTES MORE THAN ITS OWN ID (#427 round 12, LB1).
+#: ``SeasonRosterMembership`` is keyed on ``league_season_id``, and NO path in
+#: this product names a LeagueSeason: what a private-game path names is a
+#: GAME, and the game row is what fixes which competition the read belongs
+#: to. Without this the Player's grant would match a membership in ANY
+#: LeagueSeason, which is the "exact game-season" half of the #205 rule
+#: dropped on the floor.
+#:
+#: THE GAME AND ONLY THE GAME, DELIBERATELY. The same trick applied to a
+#: PLAYER subject row would inherit ``Player.team_id`` — the PERMANENT
+#: POINTER — as a ``team_id`` dimension, and re-admitting the stale pointer
+#: into this sweep's own reasoning is the exact defect #205 exists to remove.
+#: A subject row may contribute a dimension only where the product's own
+#: resolution does, and ``resolve_membership_context`` matches on
+#: ``game.league_season_id`` directly.
+SUBJECT_ROW_INHERITED = frozenset(_subject_fields(Game)) & GRANT_SUBJECT_FIELDS
+
 #: The classes whose grant row NAMES A GAME, DERIVED from the dimensions.
 #:
 #: For these, and only these, state of a game OTHER than the response's own
@@ -1167,6 +1440,384 @@ GRANT_FIELDS_NOT_PERTURBABLE = frozenset({"id"})
 GAME_KEYED_CLASSES = frozenset(
     klass for klass, fields in GRANT_DIMENSIONS.items()
     if "game_id" in fields)
+
+
+# ---------------------------------------------------------------------------
+# THE ADMISSION AXIS — DERIVED FROM THE GATE, NOT LISTED BESIDE IT.
+#
+# WHAT THIS REPLACES, AND WHY ONE MORE LIST WOULD HAVE BEEN THE SAME DEFECT
+# (#427 round 12, LB1). Round 11 derived the grant DIMENSIONS from the product
+# row — :func:`_subject_fields`, :func:`_activation_fields`,
+# :func:`_keying_fields` — and left the SET OF ROWS hand-written in
+# :data:`GRANT_ROWS`, audited by nothing. The enumeration moved up one level
+# and the hole moved with it: an entitlement class whose grant IS a row could
+# simply be ABSENT from that map, which is exactly what
+# :data:`PLAYER_SCOPED_BY_MEMBERSHIP` was. Adding a third entry to
+# ``GRANT_ROWS`` and calling LB1 closed would repeat the defect one round
+# later, one level up.
+#
+# SO THE RULE IS ONE LEVEL UP AGAIN, and this repo has a working precedent
+# for it. ``route_extract.query_parameter_names`` holds no list of the query
+# parameters the server reads: it DERIVES that axis from the server's own
+# ``parse_qs`` call sites and raises ``ExtractionError`` on any shape it
+# cannot resolve, because a skip is not an option there. That axis is the one
+# that came out genuinely CLOSED. The analogue for admission is to
+#
+#     ASK THE GATE WHICH ROLES IT ADMITS.
+#
+# :func:`admission_branches` parses ``services/game_side_scope.py`` and walks
+# the two functions that TOGETHER decide a private-game read: the carrier
+# ``resolve_private_game_read`` and the resolver ``game_scoped_own_team_id``
+# it delegates the side to. Both names are taken from
+# ``services/side_provenance.py``'s own constants rather than spelled again
+# here, so renaming the gate breaks one place loudly instead of leaving this
+# axis pointed at a function that no longer exists.
+#
+# WHAT MAKES IT FAIL-CLOSED, in three rules:
+#
+# * every ``return`` in the carrier must be a ``PrivateGameRead(...)`` naming
+#   every field of the record — anything else is an
+#   :class:`AdmissionExtractionError` at that line, because an admission
+#   decided somewhere this cannot see is an admission nothing audits;
+# * a role test that NAMES a ``Role`` and is not ``role == Role.X`` /
+#   ``role in (Role.X, …)`` is refused outright, rather than guessed at;
+# * a test that names no ``Role`` at all leaves the branch UNCONSTRAINED, and
+#   an unconstrained branch is attributed to EVERY role. That is the safe
+#   direction: a nested helper, ``role.value == "coach"`` or
+#   ``getattr(Role, name)`` makes a branch look like one that admits
+#   everybody, and every non-operator role in it then demands an authority.
+#
+# THE COACH/PLAYER SPLIT IS PART OF THE DERIVATION, not an editorial choice.
+# The carrier tests ``role in (Role.COACH, Role.PLAYER)`` as ONE branch; the
+# resolver it delegates to splits them, answering a Coach from
+# ``scope.get("team_id")`` and a Player from ``_player_team_for_game(scope,
+# game, store)``. Following that one delegation is what turns one merged
+# branch into the two separate authorization branches LB1's close condition 1
+# asks for — and it is the GATE'S OWN STRUCTURE that says where the seam is.
+# ---------------------------------------------------------------------------
+class AdmissionExtractionError(AssertionError):
+    """A shape in the gate this inventory will not guess at.
+
+    An ``AssertionError`` deliberately: an unresolvable admission branch is a
+    TEST FAILURE, not an infrastructure error to be caught and skipped — the
+    same posture ``route_extract.ExtractionError`` takes towards a query
+    string it cannot enumerate."""
+
+
+#: The two functions that TOGETHER decide a private-game read, named from the
+#: SUPPLEMENTAL scanner's own constants rather than spelled again here.
+GATE_CARRIER = side_provenance.TRUSTED_CARRIER
+GATE_RESOLVER = side_provenance.TRUSTED_RESOLVER
+
+#: The decision record's own field names — so a field renamed in the product
+#: makes the extraction fail rather than silently read the wrong keyword.
+ADMISSION_FIELDS = _record_fields(game_side_scope.PrivateGameRead)
+
+
+@dataclasses.dataclass(frozen=True)
+class AdmissionBranch:
+    """ONE decision the gate takes, for ONE role, read off the gate's own
+    source."""
+
+    role: str            #: a ``domain.Role`` MEMBER NAME
+    lineno: int          #: where the decision is returned
+    admits: bool         #: ``admitted=`` is not literally ``False``
+    carries_game: bool   #: ``game=`` is not literally ``None``
+    authority: str       #: normalized source of what decides it; ``"True"``
+    #: means an UNCONDITIONAL admission
+
+    @property
+    def needs_authority(self):
+        """Does this branch let somebody read a REAL game's private state?
+
+        Derived from the branch's own keywords, never listed. A refusal
+        grants nothing; and an admission carrying ``game=None`` grants
+        nothing either — that is the carrier's documented not-found
+        passthrough, which admits every role precisely so the facade can
+        answer its normal ``not_found`` rather than a 403 that would confirm
+        the id's absence differently from every other route."""
+        return self.admits and self.carries_game
+
+
+def _role_aliases(tree):
+    """Every name ``domain.Role`` is bound to in this module.
+
+    ALIAS-AWARE ON PURPOSE: a text matcher for ``Role.`` is defeated by one
+    ``as`` clause, and the query-parameter closure this is modelled on had to
+    resolve ``parse_qs`` aliases for exactly the same reason."""
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "Role":
+                    out.add(alias.asname or alias.name)
+                elif alias.name.endswith("domain"):
+                    out.add(f"{alias.asname or alias.name}.Role")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.endswith("domain"):
+                    out.add(f"{alias.asname or alias.name}.Role")
+    return frozenset(out)
+
+
+def _role_member(node, aliases):
+    """The ``Role`` MEMBER NAME ``node`` names, or ``None``."""
+    if not (isinstance(node, ast.Attribute)
+            and node.attr in Role.__members__):
+        return None
+    return node.attr if ast.unparse(node.value) in aliases else None
+
+
+def _names_a_role(node, aliases):
+    return any(_role_member(sub, aliases) for sub in ast.walk(node))
+
+
+def _module_constants(tree):
+    """``{name: the module-level literal container bound to it}`` — so the
+    ``_UNSCOPED_OPERATORS = (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER)`` spelling
+    the product already uses in ``services/lineup_visibility.py`` resolves,
+    instead of degrading into "this branch admits everybody"."""
+    return {node.targets[0].id: node.value for node in tree.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, (ast.Tuple, ast.List, ast.Set))}
+
+
+def _resolve_roles(test, aliases, constants):
+    """The ``Role`` members ``test`` is true for, or ``None`` for a test that
+    constrains no role — see the section comment for why ``None`` is the
+    fail-closed answer and not a permissive one."""
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        left, op, right = test.left, test.ops[0], test.comparators[0]
+        if isinstance(left, ast.Name):
+            if isinstance(op, (ast.Eq, ast.Is)):
+                member = _role_member(right, aliases)
+                if member:
+                    return frozenset({member})
+            if isinstance(op, ast.In):
+                container = right
+                if isinstance(container, ast.Name):
+                    container = constants.get(container.id, container)
+                if isinstance(container, (ast.Tuple, ast.List, ast.Set)):
+                    members = set()
+                    for elt in container.elts:
+                        member = _role_member(elt, aliases)
+                        if member is None:
+                            raise AdmissionExtractionError(
+                                f"line {test.lineno}: the role membership "
+                                f"test includes {ast.unparse(elt)!r}, which "
+                                f"is not a literal Role member, so the roles "
+                                f"this branch admits cannot be enumerated")
+                        members.add(member)
+                    return frozenset(members)
+    if _names_a_role(test, aliases):
+        raise AdmissionExtractionError(
+            f"line {test.lineno}: the role test {ast.unparse(test)!r} names "
+            f"a Role in a shape this inventory does not resolve. Spell it "
+            f"`role == Role.X` or `role in (Role.X, ...)`, or the roles this "
+            f"branch admits cannot be enumerated")
+    return None
+
+
+def _calls(node, name):
+    return any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+               and sub.func.id == name for sub in ast.walk(node))
+
+
+def _unfold(node, bindings, depth=4):
+    """A bare local name replaced by the expression last assigned to it, so
+    ``admitted = <predicate>`` … ``admitted=admitted`` reports the PREDICATE
+    and not the word ``admitted``."""
+    while isinstance(node, ast.Name) and node.id in bindings and depth:
+        node, depth = bindings[node.id], depth - 1
+    return node
+
+
+def _decisions(fn, aliases, constants, resolver_name=None):
+    """``[(Return, roles|None, delegates, bindings), …]`` for every return in
+    ``fn``, carrying the role constraint of the enclosing branches.
+
+    ROLES ARE OVER-APPROXIMATED, WHICH IS THE SAFE DIRECTION: an earlier
+    branch's early return is not subtracted from a later one, so a role may
+    be attributed to a branch it can never actually reach. That can only ADD
+    branches demanding an authority; it can never hide one."""
+    out = []
+
+    def walk(body, roles, delegates, bindings):
+        bindings = dict(bindings)
+        for stmt in body:
+            if isinstance(stmt, ast.Assign):
+                if resolver_name and _calls(stmt.value, resolver_name):
+                    delegates = True
+                if len(stmt.targets) == 1 \
+                        and isinstance(stmt.targets[0], ast.Name):
+                    bindings[stmt.targets[0].id] = stmt.value
+            elif isinstance(stmt, ast.If):
+                narrowed = _resolve_roles(stmt.test, aliases, constants)
+                inner = roles if narrowed is None else (
+                    narrowed if roles is None else roles & narrowed)
+                walk(stmt.body, inner, delegates, bindings)
+                walk(stmt.orelse, roles, delegates, bindings)
+            elif isinstance(stmt, ast.Return):
+                out.append((stmt, roles, delegates, bindings))
+            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While,
+                                   ast.With, ast.AsyncWith, ast.Try)):
+                raise AdmissionExtractionError(
+                    f"line {stmt.lineno}: {type(stmt).__name__} control flow "
+                    f"in {fn.name}, which this inventory cannot attribute to "
+                    f"a set of roles")
+    walk(fn.body, None, False, {})
+    return out
+
+
+def _gate_function(tree, name, where):
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AdmissionExtractionError(
+        f"{where}: no module-level function named {name!r}, so the gate this "
+        f"axis is derived from is not where side_provenance says it is")
+
+
+def _resolver_authorities(tree, aliases, constants, where):
+    """``{role: the normalized expression the RESOLVER answers it with}`` —
+    how the carrier's single ``role in (Role.COACH, Role.PLAYER)`` branch
+    becomes TWO authorization branches.
+
+    A role the resolver answers with a literal ``None`` resolves no side and
+    therefore reaches no admission, so it does not appear."""
+    fn = _gate_function(tree, GATE_RESOLVER, where)
+    out = {}
+    for node, roles, _delegates, bindings in _decisions(fn, aliases,
+                                                        constants):
+        value = _unfold(node.value, bindings) if node.value else None
+        if value is None or (isinstance(value, ast.Constant)
+                             and value.value is None):
+            continue
+        if roles is None:
+            raise AdmissionExtractionError(
+                f"line {node.lineno}: {GATE_RESOLVER} resolves a side for "
+                f"EVERY role — no role test governs this return — so no "
+                f"caller's side can be attributed to an authority")
+        for role in roles:
+            out[role] = ast.unparse(value)
+    return out
+
+
+def admission_branches(source=None):
+    """``{role name: (every AdmissionBranch the gate takes for it, …)}``,
+    DERIVED from the gate's own source.
+
+    ``source`` follows ``route_extract``'s convention: ``None`` means "the
+    real module", and a string is a mutated copy — which is what
+    :class:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority` injects new
+    branches into to prove the derivation is real rather than decorative."""
+    where = Path(inspect.getsourcefile(game_side_scope))
+    tree = ast.parse(source if source is not None else where.read_text())
+    aliases = _role_aliases(tree)
+    if not aliases:
+        raise AdmissionExtractionError(
+            f"{where}: `Role` is not imported under any name this inventory "
+            f"recognises, so either this gate no longer decides admission by "
+            f"role or it spells the roles in a way this cannot read")
+    constants = _module_constants(tree)
+    resolver = _resolver_authorities(tree, aliases, constants, where)
+    carrier = _gate_function(tree, GATE_CARRIER, where)
+    record = game_side_scope.PrivateGameRead.__name__
+    out = {}
+    for node, roles, delegates, bindings in _decisions(
+            carrier, aliases, constants, GATE_RESOLVER):
+        call = node.value
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                and call.func.id == record):
+            raise AdmissionExtractionError(
+                f"line {node.lineno}: {GATE_CARRIER} returns "
+                f"{(ast.unparse(call) if call else 'None')!r}, which is not "
+                f"a `{record}(...)` this inventory can classify. An "
+                f"admission decided somewhere this cannot see is an "
+                f"admission nothing audits")
+        keywords = {kw.arg: kw.value for kw in call.keywords}
+        if frozenset(keywords) != ADMISSION_FIELDS:
+            raise AdmissionExtractionError(
+                f"line {node.lineno}: the decision names {sorted(keywords)} "
+                f"and `{record}` declares {sorted(ADMISSION_FIELDS)}; a "
+                f"positional or defaulted field is a decision this inventory "
+                f"would read wrong")
+        admitted = _unfold(keywords["admitted"], bindings)
+        game = _unfold(keywords["game"], bindings)
+        admits = not (isinstance(admitted, ast.Constant)
+                      and admitted.value is False)
+        carries_game = not (isinstance(game, ast.Constant)
+                            and game.value is None)
+        for role in sorted(roles if roles is not None else Role.__members__):
+            if delegates:
+                if role not in resolver:
+                    # The carrier hands this role to the resolver and the
+                    # resolver answers it with nothing: no side, so nothing
+                    # this branch can admit them to.
+                    continue
+                authority = resolver[role]
+            else:
+                authority = ast.unparse(admitted)
+            out.setdefault(role, []).append(AdmissionBranch(
+                role=role, lineno=node.lineno, admits=admits,
+                carries_game=carries_game, authority=authority))
+    return {role: tuple(branches) for role, branches in sorted(out.items())}
+
+#: The roles whose authority over a game is LEAGUE-WIDE rather than earned by
+#: participating in it — the only branches of the gate that may be admitted
+#: with no authority row behind them, and DERIVED from the product's own
+#: permission table.
+#:
+#: ``MANAGE_SCHEDULE`` IS THE DISCRIMINATOR, and it is the product's own
+#: sentence: "create / move / publish games; assign officials". A role that
+#: may CREATE and MOVE the game is an operator OF the competition; every role
+#: that merely takes part in one — Coach, Player, Guardian, Official, Viewer —
+#: holds none of it. Measured on this tree that is exactly
+#: ``LEAGUE_ADMIN`` and ``ARENA_MANAGER``, which is also exactly the tuple
+#: the product's own ``lineup_visibility._UNSCOPED_OPERATORS`` names and
+#: exactly the tuple the gate short-circuits — three independent product
+#: statements, and
+#: :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+#: .test_the_operator_exemption_is_the_products_own_answer_three_times`
+#: requires all three to agree, so this exemption cannot be widened in one
+#: place.
+OPERATOR_PERMISSION = Permission.MANAGE_SCHEDULE
+OPERATOR_ROLES = frozenset(
+    role.name for role in Role
+    if OPERATOR_PERMISSION in ROLE_PERMISSIONS.get(role, frozenset()))
+
+#: ``{Role member name: (the entitlement class that models its grant, the
+#: normalized source of the gate expression that was classified)}`` — the
+#: AUTHORITY MAPPING every non-operator admission branch must have.
+#:
+#: THIS IS NOT THE ENUMERATION; :func:`admission_branches` IS. The set of
+#: branches is derived from the gate, and this map only has to ANSWER for the
+#: ones the derivation finds. A branch the gate gains and this map does not
+#: name is an error naming the role and the line — which is the property
+#: :data:`GRANT_ROWS` did not have, and the whole of LB1.
+#:
+#: THE SECOND ELEMENT IS PINNED ON EXACT NORMALIZED AST TEXT, the rule
+#: ``route_extract._AUDIT_WAIVERS`` already carries: the classification is a
+#: judgement about a SPECIFIC expression, so a branch that starts resolving
+#: its side some other way has to be RE-DECIDED rather than silently
+#: inheriting a mapping made for the old one.
+ADMISSION_AUTHORITIES = {
+    # A Coach's side is the account scope, read without touching the store —
+    # so the grant is the SCOPE, and the class is scope-backed.
+    "COACH": (COACH_SCOPED_TO_ONE_SIDE, "scope.get('team_id')"),
+    # A Player's side is resolved live, through the membership spine, which
+    # is why this class is ROW-backed and the Coach's is not. This one line
+    # is the whole of LB1: the gate has always split here, and this file
+    # modelled the two halves as one class.
+    "PLAYER": (PLAYER_SCOPED_BY_MEMBERSHIP,
+               "_player_team_for_game(scope, game, store)"),
+    # An assignment the product still records as ACTIVE (d62473a).
+    "OFFICIAL": (OFFICIAL_SUBMITTED_LINEUP_ONLY,
+                 "official_id is not None and any((a.official_id == "
+                 "official_id and a.status.is_active for a in "
+                 "store.assignments_for_game(game_id)))"),
+}
 
 
 class _Sweep:
@@ -1375,11 +2026,30 @@ class _SweepHarness(_OverviewHarness):
         # dimension is keyed on at all. Every entry names a row this fixture
         # really holds, because an id naming nothing would collapse the
         # oracles for the wrong reason.
+        # THE SECOND LEAGUESEASON, and the reason it has to exist (#427
+        # round 12, LB1). `SeasonRosterMembership` is keyed on
+        # `league_season_id` — that is the "exact game-season" half of the
+        # #205 rule — and with ONE LeagueSeason in the world there is no
+        # second value to move the row to, so the dimension would be
+        # UNFALSIFIABLE in exactly the way `gid2`'s missing assignment row
+        # made `official_id` unfalsifiable until round 11. It is bound to the
+        # SIBLING Season the fixture already carries, holds no team
+        # registration and no game, and exists only to be the OTHER
+        # LeagueSeason.
+        other_ls = api.setup.create_league_season(fx["league"]["id"],
+                                                  fx["s2"]["id"])
+        fx["other_league_season_id"] = other_ls.id
+        assert other_ls.id != fx["ls_id"], other_ls
         fx["other_subjects"] = {
             "game_id": fx["gid2"],
             "official_id": fx["official2_id"],
             "player_id": fx["unlinked_junior_id"],
             "guardian_user_id": fx["guardian2_account_id"],
+            # A team that plays in NEITHER game, so a membership moved onto
+            # it grants nothing anywhere.
+            "team_id": fx["third"],
+            "league_season_id": other_ls.id,
+            "season_id": fx["s2"]["id"],
         }
         # Every session selects the Program/Season/League explicitly: the
         # context-scoped reads fail CLOSED to an empty payload otherwise, and
@@ -1396,12 +2066,18 @@ class _SweepHarness(_OverviewHarness):
     def _entitlement(self, fx):
         """``{principal: (class, frozenset of team ids they may read)}``."""
         return {
-            "homecoach": (SCOPED_TO_ONE_SIDE, frozenset({fx["home"]})),
-            "awaycoach": (SCOPED_TO_ONE_SIDE, frozenset({fx["away"]})),
+            "homecoach": (COACH_SCOPED_TO_ONE_SIDE, frozenset({fx["home"]})),
+            "awaycoach": (COACH_SCOPED_TO_ONE_SIDE, frozenset({fx["away"]})),
             # Both Players are MOVERS: their entitled side is the one their
-            # game-scoped MEMBERSHIP names, never their permanent pointer.
-            "homeplayer": (SCOPED_TO_ONE_SIDE, frozenset({fx["home"]})),
-            "awayplayer": (SCOPED_TO_ONE_SIDE, frozenset({fx["away"]})),
+            # game-scoped MEMBERSHIP names, never their permanent pointer —
+            # and since #427 round 12 that is a ROW-BACKED class, so this
+            # constant is the WIDEST the class may reach and
+            # `_subject_narrowed` reads the actual side off
+            # `SeasonRosterMembership.team_id`.
+            "homeplayer": (PLAYER_SCOPED_BY_MEMBERSHIP,
+                           frozenset({fx["home"]})),
+            "awayplayer": (PLAYER_SCOPED_BY_MEMBERSHIP,
+                           frozenset({fx["away"]})),
             "thirdcoach": (IN_NEITHER_SIDE, frozenset()),
             "guardian": (GUARDIAN_OF_A_JUNIOR, frozenset({fx["away"]})),
             "official": (OFFICIAL_SUBMITTED_LINEUP_ONLY,
@@ -1516,7 +2192,41 @@ class _SweepHarness(_OverviewHarness):
            the dict this fixture passed in — an Official's ``official_id``
            is the case that matters;
         3. anything else is what the PATH NAMES — the subject axis, in the
-           same vocabulary, from :meth:`_path_subjects`.
+           same vocabulary, from :meth:`_path_subjects` (which includes the
+           dimensions the SUBJECT GAME ROW itself carries; see
+           :data:`SUBJECT_ROW_INHERITED`).
+
+        SCOPE BEFORE PATH, AND FROM THIS ROUND IT IS LOAD-BEARING (#427 round
+        12, LB1). The precedence was harmless while the only row-backed
+        classes were the official's and the guardian's, because neither
+        principal's scope binds a dimension its own routes also name. It
+        stops being harmless the moment ``SeasonRosterMembership`` is
+        modelled: ``player_id`` is then BOTH a scope key (a Player's stored
+        scope is canonicalized to ``player_id`` alone, #160) AND a path
+        argument (``/api/me/guardian/{player_id}/substitute-opportunities/
+        {game_id}``).
+
+        THE SESSION WINS, and the reason is the product's, not a
+        convenience. ``game_side_scope._player_team_for_game`` reads
+        ``scope.get("player_id")`` and nothing else, and the module's own
+        docstring states the property the whole private-game family rests on:
+        "NOTHING HERE READS A REQUEST… a query string, a body field or a
+        header can never reach this resolution". A Player's grant is
+        therefore a fact about WHO IS ASKING, and modelling it off a
+        path-supplied ``player_id`` would make this oracle's answer a
+        function of a value the CLIENT chose — the precise property every
+        other axis of this file exists to deny. Symmetrically, for a
+        principal whose scope does NOT bind the dimension — the guardian,
+        whose ``player_id`` names the JUNIOR being read — the path is the
+        only source and supplies it, unchanged.
+
+        SO THE RULE IS: a dimension the READING PRINCIPAL'S OWN SCOPE binds
+        is a fact about the caller and can never be overridden by the
+        request; every other dimension is a fact about what is being read.
+        :meth:`_session_fixed` classifies by exactly those two sources, and
+        :meth:`TheSweptBindingsExerciseTheUnentitledDirection
+        .test_a_path_cannot_override_a_dimension_the_session_binds` measures
+        the precedence rather than trusting this paragraph.
 
         ``None`` FOR AN UNSUPPLIED DIMENSION IS DELIBERATE AND IS NOT THE
         HOLE F1 WAS. A route that names no junior (``get_me_guardian_home``)
@@ -1628,16 +2338,32 @@ class _SweepHarness(_OverviewHarness):
         one, F3) and ``player_id`` (so the junior in the path never reached
         the oracle at all, F1). :meth:`_grant_rows` asks the single question
         both were approximations of."""
-        subject = subjects.get("game_id")
-        if klass in GRANT_ROWS \
-                and not self._grant_rows(fx, klass, principal, subjects):
-            # No stored row grants this principal this read: an official
-            # refereeing a DIFFERENT game, an official whose assignment the
-            # product records as DECLINED, a guardian of a DIFFERENT junior,
-            # a guardian whose own link is unverified. Each is a stranger to
-            # this read — the same standing this sweep gives a coach of
-            # neither team.
-            return frozenset()
+        subject = subjects.get(GAME_SUBJECT)
+        if klass in GRANT_ROWS:
+            rows = self._grant_rows(fx, klass, principal, subjects)
+            if not rows:
+                # No stored row grants this principal this read: an official
+                # refereeing a DIFFERENT game, an official whose assignment
+                # the product records as DECLINED, a guardian of a DIFFERENT
+                # junior, a guardian whose own link is unverified, a PLAYER
+                # whose membership for this game-season the product no
+                # longer treats as participating. Each is a stranger to this
+                # read — the same standing this sweep gives a coach of
+                # neither team.
+                return frozenset()
+            record = GRANT_ROWS[klass]
+            if "team_id" in _subject_fields(record):
+                # …AND WHERE THE GRANT ROW ITSELF NAMES THE SIDE, THE SIDE IS
+                # READ OFF THE ROW (#427 round 12, LB1) — the exact analogue
+                # of `_permitted_ids` reading the guardian's junior off
+                # `row.player_id` rather than off a constant. A Player's side
+                # IS `SeasonRosterMembership.team_id`, so a membership that
+                # moves, ends or stops participating collapses the
+                # entitlement instead of leaving `_entitlement`'s constant
+                # standing. Intersected rather than substituted: this may
+                # only ever NARROW the class's widest entitlement.
+                teams = frozenset(teams) & frozenset(
+                    row.team_id for row in rows)
         if subject is None:
             return teams
         # …and nobody is entitled to a side that is not one of THIS game's
@@ -1906,6 +2632,16 @@ class _SweepHarness(_OverviewHarness):
         param, label = hint.split("=", 1)
         return f"?{param}={self._probe_value(fx, label)}"
 
+    @staticmethod
+    def _path_of(spec, args):
+        """The concrete path a route spec + its bound arguments name — ONE
+        definition, so a test that drives a leaf by hand cannot address a
+        path the sweep itself never produces."""
+        path = spec.template
+        for arg in args:
+            path = path.replace("{}", arg, 1)
+        return path
+
     def _sweep(self, who, fx, specs, subjects, hints=None):
         """One world: every principal x every route x every hint.
 
@@ -1919,9 +2655,7 @@ class _SweepHarness(_OverviewHarness):
             if spec.name not in subjects:
                 continue
             for args in subjects[spec.name]:
-                path = spec.template
-                for arg in args:
-                    path = path.replace("{}", arg, 1)
+                path = self._path_of(spec, args)
                 subject_of[(spec.name, path)] = self._path_subjects(fx, args)
                 for principal in PRINCIPALS:
                     for hint in hints:
@@ -1951,6 +2685,15 @@ class _SweepHarness(_OverviewHarness):
         "player_id": "get_player",
         "official_id": "get_official",
         "team_id": "get_team",
+        # `SeasonRosterMembership`'s competition keys (#427 round 12, LB1).
+        # No path in this product names either directly; both arrive by
+        # INHERITANCE from the subject game (:data:`SUBJECT_ROW_INHERITED`),
+        # and they are listed here because
+        # `test_every_subject_dimension_is_resolvable_from_a_path` requires
+        # every subject dimension of every grant row to be recognisable —
+        # a dimension the sweep cannot RESOLVE is F1 one layer earlier.
+        "league_season_id": "get_league_season",
+        "season_id": "get_season",
     }
 
     def _path_subjects(self, fx, args):
@@ -1962,16 +2705,33 @@ class _SweepHarness(_OverviewHarness):
         binding in :meth:`_route_subjects`, with nothing to keep in step.
         An argument that names none of them (a Season, a League, a Program,
         an account, :data:`ABSENT`) contributes nothing, which is correct:
-        no grant row in this product is keyed on one."""
+        no grant row in this product is keyed on one.
+
+        AND A GAME ARGUMENT CONTRIBUTES THE GAME ROW'S OWN DIMENSIONS TOO
+        (#427 round 12, LB1) — :data:`SUBJECT_ROW_INHERITED`, derived as the
+        fields ``Game`` declares that a grant row is keyed on by the same
+        name. ``SeasonRosterMembership.league_season_id`` is why: no path
+        anywhere in this product names a LeagueSeason, so without this the
+        Player's grant would match a membership in ANY competition and the
+        "exact game-season" half of the #205 rule would never reach an
+        oracle. Only the GAME row contributes — see the constant for the
+        ``Player.team_id`` pointer this deliberately does not re-admit."""
         store = fx["api"].store
         out = {}
         for arg in args:
             for field, reader in self.SUBJECT_READERS.items():
                 if field in out:
                     continue
-                if getattr(store, reader)(arg) is not None:
-                    out[field] = arg
-                    break
+                row = getattr(store, reader)(arg)
+                if row is None:
+                    continue
+                out[field] = arg
+                if field == GAME_SUBJECT:
+                    for name in sorted(SUBJECT_ROW_INHERITED):
+                        value = getattr(row, name, None)
+                        if value is not None:
+                            out.setdefault(name, value)
+                break
         return out
 
     def _subject_of(self, fx, *args):
@@ -2123,14 +2883,17 @@ class _SweepHarness(_OverviewHarness):
           ``get_games_id_board`` (316), ``get_players`` (41) and
           ``get_games_id_roster`` (8). ``get_players`` is a flat roster list
           outside the private-game family and was missing from the list;
-        * across the matrix's TWENTY-TWO worlds the node count runs **789 to
-          1,080** and the request count **100 to 112** — it is never 779 in
-          any of them. (The floor is the first base world; the ceiling is a
-          late world, because each ``seated_lineup_row`` perturbation adds a
-          player and the store grows monotonically across a run.)
-          RE-MEASURED ON THE ROUND-11 TREE: the two paths round 11 adds
-          carry no jersey and the world it adds seats nobody, so both
-          ranges are unchanged — but the DENOMINATOR is not;
+        * across the matrix's TWENTY-FOUR worlds the node count runs **789
+          to 1,080** and the request count **96 to 112** — it is never 779
+          in any of them. (The node floor is the first base world; the
+          ceiling is a late world, because each ``seated_lineup_row``
+          perturbation adds a player and the store grows monotonically
+          across a run.) RE-MEASURED ON THE ROUND-12 TREE, all 24 worlds:
+          the node range is unchanged and the REQUEST FLOOR drops from 100
+          to **96**, in exactly one world — ``revoked/season_roster_
+          membership``, where the ex-member is refused the whole
+          private-game family and therefore carries four fewer
+          jersey-bearing responses than any other world;
 
         WHAT BOUNDS IT, ALSO MEASURED: **all 789 of the 789 nodes carry the
         player ``id`` as well**, so a realistic ``_lineup_rows`` disclosure
@@ -2748,6 +3511,20 @@ class _SweepHarness(_OverviewHarness):
             the product's softer state, so the one state where the two
             halves could disagree was never entered.
 
+        ``season_roster_membership``
+            THE ROW #205 EXISTS TO MAKE AUTHORITATIVE (#427 round 12, LB1).
+            The swept HOME Player's ``SeasonRosterMembership`` is driven to
+            ``inactive`` through ``SetupService
+            .set_season_roster_membership_status`` — the product's own write
+            path, so what the sweep observes afterwards is a real state of
+            the system. The row SURVIVES and still names this player, this
+            team and this LeagueSeason; only ``status`` moves, and the
+            product's own ``_ELIGIBLE_MEMBERSHIP_STATUSES`` says it now
+            grants nothing. That is the guardian's ``verified=False`` and
+            the official's ``DECLINED``, on the third row — and until this
+            round NOTHING in this matrix ever moved a membership at all, so
+            the state the whole of #205 turns on appeared in no world.
+
         ``guardian_link``
             The SWEPT GUARDIAN'S OWN ``GuardianLink`` loses ``verified``. The
             link row survives — an UNVERIFIED link is the product's own
@@ -2766,6 +3543,42 @@ class _SweepHarness(_OverviewHarness):
         api = fx["api"]
         assert kind in RELATIONSHIP_REVOCATIONS, kind
         gid = self._subject_of(fx, fx["gid"])
+        if kind == "season_roster_membership":
+            principal = RELATIONSHIP_REVOCATIONS[kind]
+            player = api.store.get_player(fx["scopes"][principal]["player_id"])
+            context = RosterService(api.store).resolve_membership_context(
+                api.store.get_game(fx["gid"]), player)
+            assert context is not None, (
+                f"{principal} holds no membership context for the first "
+                f"game, so there is no participation to withdraw")
+            row = context.membership
+            assert self._grant_rows(fx, PLAYER_SCOPED_BY_MEMBERSHIP,
+                                    principal, gid)
+            # THE PRODUCT'S OWN WRITE PATH, never a field write: condition 4
+            # says "ex-member", which means a membership the product itself
+            # made ineligible.
+            after = api.setup.set_season_roster_membership_status(
+                row.id, MembershipStatus.INACTIVE.value, actor_id=ADMIN)
+            # THE PREMISE, in the guardian's shape: the row is still there,
+            # still names this player, this team and this LeagueSeason, and
+            # the PRODUCT says it participates in nothing.
+            assert after.id == row.id and after.player_id == row.player_id
+            assert after.team_id == row.team_id
+            assert after.league_season_id == row.league_season_id
+            assert after.status not in \
+                RosterService._ELIGIBLE_MEMBERSHIP_STATUSES, after.status
+            assert not self._grant_rows(fx, PLAYER_SCOPED_BY_MEMBERSHIP,
+                                        principal, gid), (
+                "revoking the membership left the ex-member a grant row")
+            try:
+                yield
+            finally:
+                back = api.setup.set_season_roster_membership_status(
+                    row.id, MembershipStatus.ACTIVE.value, actor_id=ADMIN)
+                assert back.status == MembershipStatus.ACTIVE, back
+                assert self._grant_rows(fx, PLAYER_SCOPED_BY_MEMBERSHIP,
+                                        principal, gid)
+            return
         if kind in ("official_assignment", "official_assignment_declined"):
             rows = [a for a in api.store.assignments_for_game(fx["gid"])
                     if a.official_id == fx["official_id"]
@@ -3021,7 +3834,7 @@ class TheSweepCoversEveryAuthenticatedRoute(_SweepHarness, unittest.TestCase):
 # 2. THE TWO ORACLES, OVER THE WHOLE SURFACE, ON EVERY BACKEND.
 # ---------------------------------------------------------------------------
 class NoAuthenticatedRouteLeaksTheOtherSide(_SweepHarness, unittest.TestCase):
-    """THE ASSET. Twenty-two worlds, all three oracles, both perturbation
+    """THE ASSET. Twenty-four worlds, all three oracles, both perturbation
     directions, every authenticated GET route, ten principals, four hint
     variants, three backends.
 
@@ -3291,10 +4104,15 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
                         ("operator", OPERATOR_UNSCOPED_BY_DESIGN),
                         ("viewer", VIEWER_ENTITLED_TO_NOTHING),
                         ("thirdcoach", IN_NEITHER_SIDE),
-                        ("homecoach", SCOPED_TO_ONE_SIDE),
-                        ("awaycoach", SCOPED_TO_ONE_SIDE),
-                        ("homeplayer", SCOPED_TO_ONE_SIDE),
-                        ("awayplayer", SCOPED_TO_ONE_SIDE)):
+                        ("homecoach", COACH_SCOPED_TO_ONE_SIDE),
+                        ("awaycoach", COACH_SCOPED_TO_ONE_SIDE),
+                        # SEPARATE AUTHORIZATION BRANCHES (#427 round 12,
+                        # LB1). A Coach's side is their account scope and a
+                        # Player's is an eligible SeasonRosterMembership;
+                        # one class for both is what left that row outside
+                        # every grant map in this file.
+                        ("homeplayer", PLAYER_SCOPED_BY_MEMBERSHIP),
+                        ("awayplayer", PLAYER_SCOPED_BY_MEMBERSHIP)):
                     self.assertEqual(
                         entitlement[principal][0], expected,
                         f"[{label}] {principal} is typed "
@@ -3308,7 +4126,8 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
                 # somebody, so a class cannot rot into a dead constant whose
                 # dedicated test proves nothing about the sweep.
                 self.assertEqual(
-                    {SCOPED_TO_ONE_SIDE, IN_NEITHER_SIDE,
+                    {COACH_SCOPED_TO_ONE_SIDE, PLAYER_SCOPED_BY_MEMBERSHIP,
+                     IN_NEITHER_SIDE,
                      GUARDIAN_OF_A_JUNIOR, OFFICIAL_SUBMITTED_LINEUP_ONLY,
                      OPERATOR_UNSCOPED_BY_DESIGN,
                      UNSCOPED_OPERATOR_WITHOUT_ROSTER_AUTHORITY,
@@ -3321,13 +4140,15 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
                 for principal, (klass, teams) in entitlement.items():
                     with self.subTest(principal=principal):
                         self.assertIn(klass, (
-                            SCOPED_TO_ONE_SIDE, IN_NEITHER_SIDE,
+                            COACH_SCOPED_TO_ONE_SIDE,
+                            PLAYER_SCOPED_BY_MEMBERSHIP, IN_NEITHER_SIDE,
                             GUARDIAN_OF_A_JUNIOR,
                             OFFICIAL_SUBMITTED_LINEUP_ONLY,
                             OPERATOR_UNSCOPED_BY_DESIGN,
                             UNSCOPED_OPERATOR_WITHOUT_ROSTER_AUTHORITY,
                             VIEWER_ENTITLED_TO_NOTHING))
-                        if klass == SCOPED_TO_ONE_SIDE:
+                        if klass in (COACH_SCOPED_TO_ONE_SIDE,
+                                     PLAYER_SCOPED_BY_MEMBERSHIP):
                             self.assertEqual(len(teams), 1, principal)
                         if klass == IN_NEITHER_SIDE:
                             self.assertEqual(teams, frozenset(), principal)
@@ -3585,7 +4406,8 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
                 "is not safe")
             for principal, (klass, teams) in sorted(
                     self._entitlement(fx).items()):
-                if klass != SCOPED_TO_ONE_SIDE:
+                if klass not in (COACH_SCOPED_TO_ONE_SIDE,
+                                 PLAYER_SCOPED_BY_MEMBERSHIP):
                     continue
                 scope = fx["scopes"][principal]
                 with self.subTest(principal=principal):
@@ -5561,7 +6383,8 @@ class TheHintAxisIsClosedAgainstWhatTheServerReads(_SweepHarness,
         parameter can carry one, plus the ``?side=away`` control — against
         every authenticated GET route and every principal. This is where a
         NEW parameter is actually exercised; :data:`HINTS` carries only the
-        side-bearing subset into the twenty worlds, for the measured reason
+        side-bearing subset into the twenty-four worlds, for the measured
+        reason
         recorded on that constant.
 
         ONE FRESH WORLD PER BACKEND, which is what makes it affordable: the
@@ -6656,10 +7479,23 @@ def _alternative_value(fx, record, field, current):
     if field in _activation_fields(record):
         if declared is bool:
             return not current
+        if declared in ELIGIBILITY_AUTHORITIES:
+            # The product keeps the partition beside the type, so "a value
+            # whose ACTIVATION differs" is read off that partition — and off
+            # the INELIGIBLE half specifically, never off `set(enum) -
+            # eligible`, so a member the product has classified in neither
+            # tuple can never be picked up here as though it had been.
+            eligible, ineligible = _eligibility_partition(declared)
+            pool = ineligible if declared(current) in eligible else eligible
+            return next(m for m in declared if m in pool)
         return next(m for m in declared
                     if m.is_active != declared(current).is_active)
     if isinstance(declared, type) and issubclass(declared, enum.Enum):
         return next(m for m in declared if m != declared(current))
+    if declared is int:
+        # A season-Team jersey is unique within the season Team, so the
+        # substitute must be one nothing else holds.
+        return (current or 0) + 900
     if declared is _datetime.datetime:
         base = current or _datetime.datetime(
             2031, 1, 1, tzinfo=_datetime.timezone.utc)
@@ -6857,6 +7693,15 @@ class TheGrantIsKeyedByEveryDimensionOfItsRow(_SweepHarness,
                     f"this section exists for — name it, then MEASURE it.")
                 self.assertTrue(
                     dims, f"{record.__name__} declares no dimensions at all")
+                self.assertIn(
+                    record, GRANT_ROW_WRITERS,
+                    f"{record.__name__} has no entry in GRANT_ROW_WRITERS, "
+                    f"so the measured audit below cannot move a single one "
+                    f"of its fields and every dimension it declares is "
+                    f"unfalsifiable")
+                self.assertIn(
+                    record, GRANT_ROW_READERS,
+                    f"{record.__name__} has no unfiltered reader")
                 for field, why in GRANT_FIELDS_THAT_KEY_NOTHING[record].items():
                     self.assertTrue(
                         why.strip(),
@@ -6899,9 +7744,23 @@ class TheGrantIsKeyedByEveryDimensionOfItsRow(_SweepHarness,
             for field, value in sorted(fx["other_subjects"].items()):
                 if field.endswith("_user_id"):
                     continue
+                resolved = self._path_subjects(fx, (value,))
                 self.assertEqual(
-                    {field: value}, self._path_subjects(fx, (value,)),
-                    f"{field}={value} does not resolve back to {field}")
+                    value, resolved.get(field),
+                    f"{field}={value} does not resolve back to {field}: "
+                    f"{resolved}")
+                # A subject may contribute MORE than its own id — a game
+                # carries the competition keys a membership is keyed on
+                # (:data:`SUBJECT_ROW_INHERITED`) — but only those, and only
+                # a game. Anything else appearing here is a dimension this
+                # sweep is silently reading off a row nobody declared it on.
+                extra = frozenset(resolved) - {field}
+                allowed = (SUBJECT_ROW_INHERITED if field == GAME_SUBJECT
+                           else frozenset())
+                self.assertEqual(
+                    frozenset(), extra - allowed,
+                    f"{field}={value} contributed the undeclared dimensions "
+                    f"{sorted(extra - allowed)}")
         finally:
             store.clear_all_data()
 
@@ -6943,9 +7802,7 @@ class TheGrantIsKeyedByEveryDimensionOfItsRow(_SweepHarness,
                     f"[{record.__name__}] {principal} holds {len(rows)} "
                     f"grant rows, so 'move THE row' is ambiguous")
                 row = rows[0]
-                save = getattr(api.store,
-                               "save_guardian_link" if record is GuardianLink
-                               else "save_official_assignment")
+                save = getattr(api.store, GRANT_ROW_WRITERS[record])
                 base = self._oracle_answer(fx, principal, subjects, private,
                                            submitted)
                 self.assertTrue(
@@ -7316,6 +8173,43 @@ DIMENSIONS_WITH_NO_PATH_DIRECTION = {
 }
 
 
+#: ``{dimension: why the sweep binds exactly ONE direction of it, and where
+#: the other direction is measured instead}`` — a limitation of the FIXTURE,
+#: stated rather than absorbed, and machine-checked in BOTH halves.
+#:
+#: DISTINCT FROM :data:`DIMENSIONS_WITH_NO_PATH_DIRECTION`, which is for a
+#: dimension no path supplies AT ALL. These two ARE supplied by a path — by
+#: INHERITANCE from the subject game (:data:`SUBJECT_ROW_INHERITED`) — and
+#: every path that supplies them supplies the SAME value, because both games
+#: in this fixture hang off one LeagueSeason. That is a property
+#: :meth:`TheDesignClassificationsAreStillTrue
+#: .test_each_scoped_principals_side_is_the_same_in_both_games` depends on:
+#: moving the second game to another LeagueSeason would leave both Players
+#: with NO side in it and change what every world in the matrix means, which
+#: is far past what LB1 asks for.
+#:
+#: SO THE UNENTITLED DIRECTION IS MEASURED ON THE REQUEST SIDE INSTEAD, and
+#: the audit below re-runs that measurement here rather than pointing at it:
+#: a request naming ``fx["other_subjects"][field]`` — a REAL second
+#: LeagueSeason / Season this fixture holds — must be granted NOTHING, while
+#: the value a swept path really binds must be granted the row. Both halves
+#: run, so this entry cannot become a way to skip the dimension.
+DIMENSIONS_THE_FIXTURE_BINDS_IN_ONE_DIRECTION = {
+    "league_season_id":
+        "no authenticated GET route names a LeagueSeason; the only paths "
+        "that supply one supply it from the subject GAME's own row, and "
+        "both swept games hang off `fx[\"ls_id\"]`. The unentitled "
+        "direction is the second LeagueSeason the fixture holds for exactly "
+        "this purpose (`fx[\"other_league_season_id\"]`), measured below "
+        "and again by TheGrantIsKeyedByEveryDimensionOfItsRow.",
+    "season_id":
+        "the denormalized half of the same key — service-enforced equal to "
+        "the LeagueSeason's own `season_id` — so it is bound in one "
+        "direction for the same reason, and its unentitled direction is the "
+        "sibling Season `fx[\"s2\"]`.",
+}
+
+
 class TheSweptBindingsExerciseTheUnentitledDirection(_SweepHarness,
                                                      unittest.TestCase):
     """Every grant dimension is either fixed by the SESSION — a path cannot
@@ -7391,6 +8285,37 @@ class TheSweptBindingsExerciseTheUnentitledDirection(_SweepHarness,
                                 f"{sorted(values)} for it — delete the "
                                 f"reason rather than keeping a false one")
                             continue
+                        one_way = \
+                            DIMENSIONS_THE_FIXTURE_BINDS_IN_ONE_DIRECTION
+                        if field in one_way:
+                            # THE ENTRY'S OWN PREMISE, re-measured: the sweep
+                            # really does bind this dimension, and really
+                            # does bind only the granting direction.
+                            self.assertTrue(
+                                values,
+                                f"{field} is typed as bound in ONE "
+                                f"direction and the sweep binds NO value "
+                                f"for it at all — it belongs in "
+                                f"DIMENSIONS_WITH_NO_PATH_DIRECTION")
+                            self.assertEqual(
+                                values, granting,
+                                f"{field} is typed as bound in ONE "
+                                f"direction and the sweep now binds "
+                                f"{sorted(values - granting)} that grants "
+                                f"nothing — the fixture gained the other "
+                                f"direction, so delete the entry")
+                            # …AND THE OTHER DIRECTION, on the request side,
+                            # against a REAL second row. This is the whole
+                            # substance of the excuse, so it runs here.
+                            self.assertFalse(
+                                self._grant_rows(fx, klass, principal,
+                                                 {field: elsewhere}),
+                                f"{field}: a request naming {elsewhere} — a "
+                                f"real row this principal's grant is NOT "
+                                f"keyed to — is granted the read anyway, so "
+                                f"the dimension keys nothing and the typed "
+                                f"reason is false")
+                            continue
                         self.assertTrue(
                             granting,
                             f"{field}: the sweep binds no value that GRANTS "
@@ -7409,6 +8334,24 @@ class TheSweptBindingsExerciseTheUnentitledDirection(_SweepHarness,
                             f"DIMENSIONS_WITH_NO_PATH_DIRECTION.")
             # …and every typed excuse names a real dimension, measured
             # against the registry rather than remembered.
+            self.assertEqual(
+                frozenset(),
+                frozenset(DIMENSIONS_WITH_NO_PATH_DIRECTION)
+                & frozenset(DIMENSIONS_THE_FIXTURE_BINDS_IN_ONE_DIRECTION),
+                "a dimension is typed BOTH as having no path direction and "
+                "as being bound in one — the two excuses say opposite "
+                "things about the same fixture")
+            for field, why in sorted(
+                    DIMENSIONS_THE_FIXTURE_BINDS_IN_ONE_DIRECTION.items()):
+                self.assertTrue(why.strip(), field)
+                self.assertIn(
+                    field, frozenset().union(*GRANT_DIMENSIONS.values()),
+                    f"{field} is typed as bound in one direction but is not "
+                    f"a grant dimension at all")
+                self.assertIn(
+                    field, audited,
+                    f"{field} is typed as bound in one direction but this "
+                    f"audit never reached it, so the excuse is dead")
             for field in DIMENSIONS_WITH_NO_PATH_DIRECTION:
                 self.assertIn(
                     field,
@@ -7421,6 +8364,60 @@ class TheSweptBindingsExerciseTheUnentitledDirection(_SweepHarness,
                 - frozenset().union(*(_subject_fields(r)
                                       for r in GRANT_ROWS.values())),
                 "a typed excuse names a dimension this audit already covers")
+        finally:
+            store.clear_all_data()
+
+    def test_a_path_cannot_override_a_dimension_the_session_binds(self):
+        """THE PRECEDENCE DECISION, MEASURED (#427 round 12, LB1).
+
+        ``_dimension_value`` resolves the session BEFORE the path, and that
+        became load-bearing the moment ``SeasonRosterMembership`` was
+        modelled: ``player_id`` is now BOTH a key of a Player's account scope
+        and a path argument of the guardian route. The rule is that a
+        dimension the READING PRINCIPAL'S OWN SCOPE binds is a fact about the
+        caller and can never be overridden by the request; every other
+        dimension is a fact about what is being read.
+
+        BOTH DIRECTIONS ARE MEASURED HERE, on the same dimension, because a
+        rule that only ever ran one way would be indistinguishable from
+        "the scope always wins" or from "the path always wins"."""
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            self._serve(fx)
+            stranger = fx["other_subjects"]["player_id"]
+            mine = fx["scopes"]["homeplayer"]["player_id"]
+            self.assertNotEqual(stranger, mine)
+            # THE PLAYER: the scope binds `player_id`, so the path loses.
+            self.assertEqual(
+                mine,
+                self._dimension_value(fx, "homeplayer", "player_id",
+                                      {"player_id": stranger}),
+                "a path naming another player moved the PLAYER's own grant "
+                "dimension, so this oracle's answer is a function of a value "
+                "the CLIENT chose — the property every other axis of this "
+                "file exists to deny")
+            self.assertTrue(self._session_fixed(fx, "homeplayer", "player_id"))
+            # THE GUARDIAN: the scope binds no `player_id`, so the path wins
+            # — the junior being READ is what the request names.
+            self.assertEqual(
+                stranger,
+                self._dimension_value(fx, "guardian", "player_id",
+                                      {"player_id": stranger}),
+                "the guardian's `player_id` names the JUNIOR being read and "
+                "the path is its only source; discarding it is F1")
+            self.assertFalse(self._session_fixed(fx, "guardian", "player_id"))
+            # THE PRODUCT'S HALF, which is why the session wins for a Player:
+            # the resolver takes no request of any kind. Its parameters are
+            # a session-resolved role, the session's own scope, the game the
+            # server already selected, and the store.
+            self.assertEqual(
+                ["role", "scope", "game", "store"],
+                list(inspect.signature(
+                    game_side_scope.game_scoped_own_team_id).parameters),
+                "the trusted resolver's inputs changed; if a request can now "
+                "reach it, `_dimension_value`'s scope-before-path rule is "
+                "modelling an authority the product no longer has")
         finally:
             store.clear_all_data()
 
@@ -7585,6 +8582,704 @@ class TheSessionScopeAxisIsClosedAgainstWhatAccountsAccept(
 # in the docstring with hand-counted numbers beside it, and prose with
 # numbers in it is exactly what this round found to be wrong three times.
 # ---------------------------------------------------------------------------
+
+#: ``{MembershipStatus: (does a membership in this state admit its Player to
+#: the private-game family, why)}`` — EVERY member of the product's own enum,
+#: pinned by name.
+#:
+#: WHY A PIN EXISTS AT ALL WHEN THE PRODUCT ALREADY DECLARES THE PARTITION
+#: (#427 round 12, LB1, close condition 3). The ORACLES read the product:
+#: :func:`_row_is_active` asks :data:`ELIGIBILITY_AUTHORITIES`, which resolves
+#: ``RosterService._ELIGIBLE_MEMBERSHIP_STATUSES`` LIVE. That is the right
+#: authority for the oracle — a test-side copy driving the oracle is the
+#: "predicate copied from the gate" failure round 11 records — and it has one
+#: consequence that has to be answered rather than absorbed: a widening of
+#: that tuple moves the gate AND the oracle together, so the oracle alone can
+#: never report a status that becomes newly eligible.
+#:
+#: So this map is the SECOND, INDEPENDENT statement, and it is what makes a
+#: newly-eligible status fail BY NAME:
+#:
+#: * a status the product GAINS is absent here — :meth:`
+#:   ThePlayerGrantIsTheEligibleMembershipRow
+#:   .test_every_membership_status_is_pinned_by_name` fails naming it,
+#:   because the keys are checked against ``MembershipStatus`` itself;
+#: * a status that becomes newly ELIGIBLE disagrees with this pin —
+#:   :meth:`ThePlayerGrantIsTheEligibleMembershipRow
+#:   .test_the_pin_and_the_products_own_declaration_agree` fails naming it;
+#: * and neither is trusted: :meth:`ThePlayerGrantIsTheEligibleMembershipRow
+#:   .test_the_ex_member_is_refused_and_a_blind_gate_reddens_the_sweep`
+#:   DRIVES the swept Player's membership into every state the product will
+#:   accept and MEASURES the admission over real authenticated HTTP, on all
+#:   three backends.
+#:
+#: ELIGIBLE IS THE NARROW HALF, AND THAT IS THE PRODUCT'S OWN SENTENCE.
+#: ``RosterService``'s comment: "An ACTIVE membership is the authoritative
+#: stint; AFFILIATE is the governed call-up exception the #205 model defines
+#: … applicant/inactive/injured hold no current participation, and terminal
+#: rows are immutable history — none of them grants eligibility."
+MEMBERSHIP_STATUS_GRANTS = {
+    MembershipStatus.ACTIVE: (
+        True, "the AUTHORITATIVE stint: at most one per (player, Season), "
+              "enforced by migration 059's partial unique index"),
+    MembershipStatus.AFFILIATE: (
+        True, "the governed call-up exception the #205 epic names — "
+              "secondary participation with exactly that Team, deliberately "
+              "outside the authoritative-uniqueness rule"),
+    MembershipStatus.APPLICANT: (
+        False, "a pending request that occupies no roster place yet"),
+    MembershipStatus.INACTIVE: (
+        False, "PARKED — the membership-scoped successor of #270's "
+               "`Player.is_active`. THE STATE LB1 IS ABOUT: this is the "
+               "'ex-member' condition 4 names, and adding it to "
+               "`_ELIGIBLE_MEMBERSHIP_STATUSES` is the one-enum widening "
+               "that serves a departed player eight private HOME identities"),
+    MembershipStatus.INJURED: (
+        False, "temporarily unavailable; the stint stays open without being "
+               "authoritative-active"),
+    MembershipStatus.RELEASED: (
+        False, "TERMINAL: the stint ended and the row is immutable history. "
+               "Unreachable through `set_season_roster_membership_status`, "
+               "which refuses every terminal transition unconditionally "
+               "(#205 review round 2 owner ruling) — so the measurement "
+               "below plants it at the store layer, exactly as the rest of "
+               "this suite does"),
+    MembershipStatus.TRANSFERRED: (
+        False, "TERMINAL, as above — a later stint is a NEW row"),
+}
+
+
+@contextlib.contextmanager
+def _a_player_admitted_on_an_ineligible_membership():
+    """The #205 membership resolver WITHOUT its status test — d62473a's
+    defect, on the row nobody had modelled.
+
+    THE SHAPE IS THE OFFICIAL'S, ONE ROW OVER.
+    ``_an_official_admitted_on_a_dead_assignment`` restores the gate's old
+    predicate, which omitted ``OfficialAssignmentStatus.is_active``; this
+    restores a membership resolution that omits
+    ``_ELIGIBLE_MEMBERSHIP_STATUSES``. In both cases the PRODUCT'S DECLARED
+    partition is untouched, so :func:`_row_is_active` — and therefore every
+    oracle in this file — does NOT move with the widening, and the sweep is
+    free to report it. That is why the check is deleted here rather than the
+    declared tuple widened: widening the tuple moves the gate and the oracle
+    in lockstep, which is the circularity this whole file is built to avoid,
+    and it is instead caught by :data:`MEMBERSHIP_STATUS_GRANTS` by name.
+
+    The widened window lives strictly INSIDE one resolver call and is
+    restored before it returns, so nothing that reads the tuple from outside
+    — the oracles included — can observe it."""
+    real = RosterService.resolve_membership_context
+
+    def widened(self, game, player):
+        context = real(self, game, player)
+        if context is not None:
+            return context
+        keep = RosterService._ELIGIBLE_MEMBERSHIP_STATUSES
+        RosterService._ELIGIBLE_MEMBERSHIP_STATUSES = tuple(MembershipStatus)
+        try:
+            return real(self, game, player)
+        finally:
+            RosterService._ELIGIBLE_MEMBERSHIP_STATUSES = keep
+
+    RosterService.resolve_membership_context = widened
+    try:
+        yield
+    finally:
+        RosterService.resolve_membership_context = real
+
+
+class ThePlayerGrantIsTheEligibleMembershipRow(_SweepHarness,
+                                               unittest.TestCase):
+    """LB1's close conditions 2, 3 and 4, in one tri-store fixture.
+
+    A Player's side is an ELIGIBLE :class:`SeasonRosterMembership` at the
+    exact game-season — and this is where that stops being a sentence: the
+    ex-member is driven into being one through the product's own write path,
+    the refusal is measured over real authenticated HTTP on Memory, SQLite
+    and real PostgreSQL, and the PRIMARY ORACLE is required to go RED when
+    the gate stops reading the status."""
+
+    #: The whole private-game family, from the registry rather than listed —
+    #: an ex-member must be refused EVERY leaf, not the three that carry a
+    #: sheet.
+    def _family(self):
+        return sorted(spec.name for spec in self._authenticated_get_specs()
+                      if spec.name.startswith("get_games_id_"))
+
+    CASES = ["an_ex_member_is_refused_the_whole_family",
+             "every_status_admits_where_the_product_pins_it",
+             "a_gate_blind_to_membership_status_reddens_oracle_one"]
+
+    # -- the pin, checked against the product ------------------------------
+    def test_every_membership_status_is_pinned_by_name(self):
+        """FAIL-CLOSED ON THE PRODUCT GAINING A STATUS. The keys are checked
+        against ``MembershipStatus`` itself, so a new member is an error
+        NAMING IT rather than a state nobody decided about."""
+        self.assertEqual(
+            frozenset(MembershipStatus), frozenset(MEMBERSHIP_STATUS_GRANTS),
+            "MembershipStatus and this file's pin disagree about which "
+            "states exist; a state nobody has classified is a state that "
+            "can be silently seated or silently refused")
+        for status, (_grants, why) in MEMBERSHIP_STATUS_GRANTS.items():
+            self.assertTrue(why.strip(), f"{status.value} carries no reason")
+
+    def test_the_products_two_tuples_still_partition_the_enum(self):
+        """The PRODUCT's own half. ``RosterService``'s two tuples must
+        partition ``MembershipStatus``, which is the property
+        :data:`ELIGIBILITY_AUTHORITIES` relies on to read the ELIGIBLE half
+        as an answer rather than as a guess: a status in neither tuple would
+        be silently ineligible to :func:`_row_is_active` while the product
+        had decided nothing about it."""
+        eligible = frozenset(RosterService._ELIGIBLE_MEMBERSHIP_STATUSES)
+        ineligible = frozenset(RosterService._INELIGIBLE_MEMBERSHIP_STATUSES)
+        self.assertEqual(frozenset(), eligible & ineligible)
+        self.assertEqual(frozenset(MembershipStatus), eligible | ineligible)
+        self.assertEqual((eligible, ineligible),
+                         _eligibility_partition(MembershipStatus))
+
+    def test_the_pin_and_the_products_own_declaration_agree(self):
+        """THE BY-NAME FAILURE FOR A NEWLY ELIGIBLE STATUS.
+
+        Two independent statements about the same question: this file's pin,
+        and ``_ELIGIBLE_MEMBERSHIP_STATUSES``. Widening the product tuple by
+        one enum member — the one-enum widening that reproduced LB1 — makes
+        them disagree, and the message names the status."""
+        pinned = frozenset(s for s, (grants, _why)
+                           in MEMBERSHIP_STATUS_GRANTS.items() if grants)
+        declared = frozenset(RosterService._ELIGIBLE_MEMBERSHIP_STATUSES)
+        self.assertEqual(
+            pinned, declared,
+            f"newly ELIGIBLE: {sorted(s.value for s in declared - pinned)}; "
+            f"newly INELIGIBLE: {sorted(s.value for s in pinned - declared)}."
+            f" A status that changes side changes WHO MAY READ A GAME'S "
+            f"PRIVATE STATE — decide it here, with a reason, rather than "
+            f"letting the oracles follow the gate wherever it goes.")
+
+    # -- the measured half, tri-store --------------------------------------
+    def _membership_of(self, fx, principal):
+        """The swept Player's membership for the FIRST game, resolved by the
+        product's own context resolver — never picked out of the store by
+        hand, so this is the exact row the gate reads."""
+        api = fx["api"]
+        player = api.store.get_player(fx["scopes"][principal]["player_id"])
+        context = RosterService(api.store).resolve_membership_context(
+            api.store.get_game(fx["gid"]), player)
+        self.assertIsNotNone(
+            context, f"{principal} holds no membership context for the "
+                     f"first game, so there is no ex-member to make")
+        return context.membership
+
+    def _set_status(self, fx, membership_id, status):
+        """Drive the membership through the PRODUCT'S OWN write path.
+
+        A terminal status has no write path at all — ``set_season_roster_
+        membership_status`` refuses every terminal transition
+        unconditionally — so the product's REFUSAL is asserted and the row is
+        then planted at the store layer by the same helper the rest of this
+        suite uses. That refusal is itself part of the measurement: a state
+        the product will not let a membership reach is a stronger statement
+        than a 403."""
+        api = fx["api"]
+        if status.is_terminal:
+            with self.assertRaises(Exception) as caught:
+                api.setup.set_season_roster_membership_status(
+                    membership_id, status.value, actor_id=ADMIN)
+            self.assertIn("NotAuthorized", type(caught.exception).__name__,
+                          f"the product now ALLOWS a terminal transition to "
+                          f"{status.value} through its own write path")
+            return end_membership_directly(api.store, membership_id,
+                                           status.value)
+        return api.setup.set_season_roster_membership_status(
+            membership_id, status.value, actor_id=ADMIN)
+
+    def _restore_active(self, fx, membership_id):
+        api = fx["api"]
+        row = api.store.get_season_roster_membership(membership_id)
+        if row.status.is_terminal:
+            # An immutable row cannot be revived through the service either,
+            # so the store puts it back exactly as it planted it.
+            end_membership_directly(api.store, membership_id,
+                                    MembershipStatus.ACTIVE.value)
+        elif row.status is not MembershipStatus.ACTIVE:
+            api.setup.set_season_roster_membership_status(
+                membership_id, MembershipStatus.ACTIVE.value, actor_id=ADMIN)
+        self.assertEqual(
+            MembershipStatus.ACTIVE,
+            api.store.get_season_roster_membership(membership_id).status)
+
+    def _foreign_ids_in(self, fx, body, permitted):
+        """Every identity PRIVATE TO EITHER SIDE that this body names and
+        this caller is not permitted — oracle 1's own question, asked of one
+        response."""
+        private, _ambiguous = self._private_side_ids(fx)
+        blob = json.dumps(body, sort_keys=True, default=str)
+        forbidden = (private[fx["home"]] | private[fx["away"]]) - permitted
+        return sorted(pid for pid in forbidden
+                      if re.search(rf"\b{re.escape(pid)}\b", blob))
+
+    def test_the_ex_member_is_refused_and_a_blind_gate_reddens_the_sweep(
+            self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                specs, subjects = self._assert_inventory_is_closed(fx)
+                membership = self._membership_of(fx, "homeplayer")
+                family = self._family()
+                self.assertGreaterEqual(len(family), 10, family)
+                gid = self._subject_of(fx, fx["gid"])
+                with self.subTest(backend=label):
+                    # THE PREMISE: while the membership is ACTIVE the Player
+                    # really does read their own side, so a 403 below is the
+                    # membership being withdrawn and not a broken fixture.
+                    status, body = self._req(
+                        who["homeplayer"], "GET",
+                        f"/api/games/{fx['gid']}/board")
+                    self.assertEqual(status, 200, (label, body))
+                    self.assertTrue(
+                        self._entitled_teams(
+                            fx, "homeplayer", "get_games_id_board", gid,
+                            SUBMITTED_LINEUP_DATA),
+                        f"[{label}] the ORACLE grants an ACTIVE member no "
+                        f"side, so its collapse below would prove nothing")
+
+                    # ---- CONDITION 4: the ex-member, through the product's
+                    # own write path, refused the WHOLE family with no
+                    # private identity anywhere.
+                    self._set_status(fx, membership.id,
+                                     MembershipStatus.INACTIVE)
+                    self.assertEqual(
+                        frozenset(),
+                        self._entitled_teams(
+                            fx, "homeplayer", "get_games_id_board", gid,
+                            SUBMITTED_LINEUP_DATA),
+                        f"[{label}] the PRIMARY ORACLE still grants an "
+                        f"ex-member their old side. That is LB1 exactly: the "
+                        f"product narrows 200 -> 403 and the oracle does not "
+                        f"move, so a gate that stopped narrowing would be "
+                        f"invisible.")
+                    for leaf_name in family:
+                        spec = next(s for s in specs if s.name == leaf_name)
+                        for args in subjects[leaf_name]:
+                            path = self._path_of(spec, args)
+                            status, body = self._req(
+                                who["homeplayer"], "GET", path)
+                            self.assertEqual(
+                                status, 403,
+                                f"[{label}] an EX-MEMBER — a membership the "
+                                f"product itself made ineligible — was "
+                                f"admitted to {path}: {body}")
+                            self.assertEqual(
+                                [], self._foreign_ids_in(fx, body,
+                                                         frozenset()),
+                                f"[{label}] {path} handed an ex-member a "
+                                f"side-private identity")
+                    ran.append((label, self.CASES[0]))
+
+                    # ---- CONDITION 3: every status, measured where the
+                    # product pins it.
+                    for status_value in sorted(MembershipStatus,
+                                               key=lambda m: m.value):
+                        with self.subTest(backend=label,
+                                          status=status_value.value):
+                            self._restore_active(fx, membership.id)
+                            if status_value is not MembershipStatus.ACTIVE:
+                                self._set_status(fx, membership.id,
+                                                 status_value)
+                            code, body = self._req(
+                                who["homeplayer"], "GET",
+                                f"/api/games/{fx['gid']}/board")
+                            grants, why = MEMBERSHIP_STATUS_GRANTS[
+                                status_value]
+                            self.assertEqual(
+                                200 if grants else 403, code,
+                                f"[{label}] a membership the product records "
+                                f"as {status_value.value!r} answered "
+                                f"{code} on /board, and this file pins that "
+                                f"state as "
+                                f"{'ELIGIBLE' if grants else 'INELIGIBLE'} "
+                                f"({why}). One of the two is wrong, and "
+                                f"which one is a product decision.")
+                            self.assertEqual(
+                                grants,
+                                bool(self._entitled_teams(
+                                    fx, "homeplayer", "get_games_id_board",
+                                    gid, SUBMITTED_LINEUP_DATA)),
+                                f"[{label}] the ORACLE and the PRODUCT "
+                                f"disagree about {status_value.value!r}")
+                    self._restore_active(fx, membership.id)
+                    ran.append((label, self.CASES[1]))
+
+                    # ---- THE RED FALSIFIER: a gate that stops reading the
+                    # membership status, on an ex-member, must be reported by
+                    # the PRIMARY oracle.
+                    self._set_status(fx, membership.id,
+                                     MembershipStatus.INACTIVE)
+                    try:
+                        with _a_player_admitted_on_an_ineligible_membership():
+                            code, body = self._req(
+                                who["homeplayer"], "GET",
+                                f"/api/games/{fx['gid']}/board")
+                            self.assertEqual(
+                                200, code,
+                                f"[{label}] the injected widening did not "
+                                f"re-admit the ex-member, so nothing below "
+                                f"measures a leak: {body}")
+                            served = self._foreign_ids_in(fx, body,
+                                                          frozenset())
+                            self.assertTrue(
+                                served,
+                                f"[{label}] the re-admitted ex-member "
+                                f"received NO side-private identity, so the "
+                                f"falsifier carries no disclosure")
+                            sweep = self._sweep(who, fx, specs, subjects)
+                            reported = None
+                            try:
+                                self._assert_no_foreign_ids(
+                                    sweep, fx, f"{label}/ex-member")
+                            except AssertionError as exc:
+                                reported = str(exc)
+                            self.assertIsNotNone(
+                                reported,
+                                f"[{label}] THE PRIMARY SWEEP DID NOT CATCH "
+                                f"AN EX-MEMBER SERVED {len(served)} PRIVATE "
+                                f"IDENTITIES OF A SIDE THEY LEFT: "
+                                f"{served}. This is d62473a's failure on the "
+                                f"row nobody modelled, and closing LB1 means "
+                                f"exactly this going RED.")
+                            self.assertIn("homeplayer", reported)
+                    finally:
+                        self._restore_active(fx, membership.id)
+                    ran.append((label, self.CASES[2]))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, self.CASES)
+
+
+# ---------------------------------------------------------------------------
+# 12. EVERY ADMISSION BRANCH IS DERIVED FROM THE GATE AND CARRIES AN
+#     AUTHORITY — AND THE DERIVATION IS PROVED BY INJECTING ONE.
+#
+# LB1's close condition 5: "Make a new non-admin admission branch fail unless
+# it has an authority mapping — without relying on another unaudited
+# GRANT_ROWS list."
+#
+# The audit below never reads `GRANT_ROWS`' keys to decide WHICH branches
+# exist. It asks `admission_branches()`, which reads the GATE. `GRANT_ROWS`
+# is then only an ANSWER to the branches the gate was found to take, and a
+# branch with no answer fails naming the role and the line.
+# ---------------------------------------------------------------------------
+class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
+                                                        unittest.TestCase):
+    """The set of admission branches is DERIVED; the authority behind each is
+    DECLARED; and a branch the gate gains fails by name until somebody
+    decides what admits it.
+
+    Pure source analysis plus one in-memory fixture, so no backend loop: the
+    gate's text is not a per-backend property, and every claim this makes
+    about BEHAVIOUR is made by the sweep itself elsewhere."""
+
+    #: Where an injected branch is spliced in — the first role test in the
+    #: carrier that a non-operator role actually reaches, so an injected
+    #: branch is genuinely live rather than shadowed by an earlier return.
+    ANCHOR = "    if role in (Role.COACH, Role.PLAYER):"
+
+    #: A branch that admits its caller to a REAL game with a REAL side. The
+    #: injected branches all end here, so what differs between them is only
+    #: HOW THE ROLE IS SPELLED, which is the thing under test.
+    ADMITTING_BODY = (
+        "        return PrivateGameRead(role=role, game=game,\n"
+        "                               own_team=game.home_team_id,\n"
+        "                               admitted=True)\n")
+
+    def _gate_source(self):
+        return Path(inspect.getsourcefile(game_side_scope)).read_text()
+
+    def _audit(self, source=None):
+        """The rule, in one place, applied to the real gate or to a mutated
+        copy — so the injections below are checked by the SAME code that
+        guards the real one, never by a re-statement of it.
+
+        Returns a list of NAMED failures; empty means the axis is closed."""
+        try:
+            branches = admission_branches(source=source)
+        except AdmissionExtractionError as exc:
+            return [f"unresolvable admission shape — {exc}"]
+        failures = []
+        for role, decisions in branches.items():
+            for branch in decisions:
+                if not branch.needs_authority:
+                    continue
+                if branch.authority == "True":
+                    # ADMITTED BEFORE ANY AUTHORITY IS CONSULTED. Legitimate
+                    # for an operator of the competition; for anybody else it
+                    # is a branch with nothing behind it at all, which no
+                    # mapping could answer for.
+                    if role in OPERATOR_ROLES:
+                        continue
+                    failures.append(
+                        f"{role} is ADMITTED UNCONDITIONALLY at line "
+                        f"{branch.lineno} of {GATE_CARRIER} and holds no "
+                        f"{OPERATOR_PERMISSION.value} permission, so nothing "
+                        f"decides whether this caller may read the game")
+                    continue
+                declared = ADMISSION_AUTHORITIES.get(role)
+                if declared is None:
+                    failures.append(
+                        f"{role} is admitted at line {branch.lineno} of "
+                        f"{GATE_CARRIER} by {branch.authority!r} and has no "
+                        f"entry in ADMISSION_AUTHORITIES, so this sweep "
+                        f"models no grant behind it — every oracle in this "
+                        f"file would answer for it out of a class that "
+                        f"describes somebody else")
+                    continue
+                klass, pinned = declared
+                if branch.authority != pinned:
+                    failures.append(
+                        f"{role} is now admitted by {branch.authority!r}, "
+                        f"and its authority was classified against "
+                        f"{pinned!r}. The classification is a judgement "
+                        f"about a specific expression; re-decide it rather "
+                        f"than inheriting it")
+        return failures
+
+    # -- the real gate -----------------------------------------------------
+    def test_every_admission_branch_the_gate_takes_carries_an_authority(self):
+        """THE AXIS ITSELF, against the real
+        ``services/game_side_scope.py``."""
+        self.assertEqual([], self._audit(),
+                         "\n".join(self._audit()))
+
+    def test_the_derivation_finds_the_branches_the_gate_actually_has(self):
+        """The premise: the extraction is not vacuously green.
+
+        Every ROLE the product declares is accounted for — a role the gate
+        never mentions still appears, because the catch-all refusal is
+        attributed to every role — and the branches that need an authority
+        are exactly the five the gate takes."""
+        branches = admission_branches()
+        self.assertEqual(frozenset(Role.__members__), frozenset(branches),
+                         "a domain Role reaches no decision in the gate at "
+                         "all, so nothing says what happens to it")
+        needing = {role for role, decisions in branches.items()
+                   for b in decisions if b.needs_authority}
+        answered = frozenset(OPERATOR_ROLES) | frozenset(
+            ADMISSION_AUTHORITIES)
+        self.assertEqual(
+            answered, needing,
+            f"the gate admits {sorted(needing)} to a real game, and the "
+            f"operator exemption plus ADMISSION_AUTHORITIES answer for "
+            f"{sorted(answered)}")
+        # …and the two roles the gate REFUSES outright really are refused,
+        # so "no authority needed" is not hiding an admission.
+        for role in ("GUARDIAN", "VIEWER"):
+            self.assertTrue(
+                all(not b.needs_authority for b in branches[role]),
+                f"{role} reaches an admission carrying a real game, which is "
+                f"a grant this file types as entitled to nothing")
+
+    def test_every_declared_authority_is_a_class_this_sweep_models(self):
+        """A mapping may not answer with a class the sweep does not drive, or
+        with one whose grant names nothing — either would be an authority in
+        name only."""
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            entitlement = self._entitlement(fx)
+            classes = {klass for klass, _teams in entitlement.values()}
+            for role, (klass, _pinned) in sorted(
+                    ADMISSION_AUTHORITIES.items()):
+                with self.subTest(role=role):
+                    self.assertIn(
+                        klass, classes,
+                        f"{role}'s admission is answered by a class no swept "
+                        f"principal carries")
+                    self.assertTrue(
+                        GRANT_DIMENSIONS[klass],
+                        f"{role}'s admission is answered by {klass}, whose "
+                        f"grant is keyed on NOTHING")
+                    self.assertEqual(
+                        PRINCIPAL_ROLES[next(
+                            p for p in PRINCIPALS
+                            if entitlement[p][0] == klass)].name,
+                        role,
+                        f"{role}'s admission is answered by {klass}, which "
+                        f"the sweep drives under a DIFFERENT role")
+        finally:
+            store.clear_all_data()
+
+    def test_the_operator_exemption_is_the_products_own_answer_three_times(
+            self):
+        """The one exemption this axis has, cross-checked against three
+        independent product statements so it cannot be widened in one place:
+        the PERMISSION table, ``lineup_visibility._UNSCOPED_OPERATORS``, and
+        the gate's own unconditional branch."""
+        self.assertEqual(
+            OPERATOR_ROLES,
+            frozenset(r.name for r in lineup_visibility._UNSCOPED_OPERATORS),
+            "the roles holding MANAGE_SCHEDULE and the roles the projection "
+            "module calls unscoped operators have diverged, so 'operator' "
+            "means two different things in the product")
+        unconditional = {role for role, decisions in
+                         admission_branches().items() for b in decisions
+                         if b.needs_authority and b.authority == "True"}
+        self.assertEqual(
+            OPERATOR_ROLES, unconditional,
+            "the gate admits a different set of roles before consulting any "
+            "authority than the product calls operators")
+        for role in Role:
+            if role.name in OPERATOR_ROLES:
+                continue
+            self.assertNotIn(
+                OPERATOR_PERMISSION, ROLE_PERMISSIONS.get(role, frozenset()),
+                f"{role.name} gained {OPERATOR_PERMISSION.value} and is "
+                f"therefore now exempt from carrying an authority — decide "
+                f"that deliberately")
+
+    # -- THE INJECTION: the derivation is real, in ten spellings -----------
+    def _injected(self, *, anchor=None, replacement, prelude=None):
+        source = self._gate_source()
+        if prelude is not None:
+            before, after = prelude
+            self.assertIn(before, source)
+            source = source.replace(before, after, 1)
+        anchor = anchor or self.ANCHOR
+        self.assertIn(anchor, source)
+        return source.replace(anchor, replacement, 1)
+
+    def _spellings(self):
+        """A new NON-ADMIN admission branch, spelled ten ways — chosen to
+        defeat a text matcher, which is what the query-parameter closure was
+        tested against and what this axis has to survive too."""
+        body, anchor = self.ADMITTING_BODY, self.ANCHOR
+        resolver_player = ("    if role == Role.PLAYER:\n"
+                           "        return _player_team_for_game("
+                           "scope, game, store)")
+        return {
+            "plain_equality":
+                dict(replacement=f"    if role == Role.GUARDIAN:\n"
+                                 f"{body}{anchor}"),
+            "aliased_import":
+                dict(replacement=f"    if role in (_R.GUARDIAN,):\n"
+                                 f"{body}{anchor}",
+                     prelude=("from ..domain import Role\n",
+                              "from ..domain import Role\n"
+                              "from ..domain import Role as _R\n")),
+            "nested_helper":
+                dict(replacement=f"    if _is_guardian(role):\n{body}{anchor}",
+                     prelude=("def _player_team_for_game(",
+                              "def _is_guardian(r):\n"
+                              "    return r == Role.GUARDIAN\n\n\n"
+                              "def _player_team_for_game(")),
+            "identity_test":
+                dict(replacement=f"    if role is Role.GUARDIAN:\n"
+                                 f"{body}{anchor}"),
+            "role_value_string":
+                dict(replacement=f"    if role.value == 'guardian':\n"
+                                 f"{body}{anchor}"),
+            "module_level_tuple":
+                dict(replacement=f"    if role in _EXTRA_ADMITTED:\n"
+                                 f"{body}{anchor}",
+                     prelude=("def _player_team_for_game(",
+                              "_EXTRA_ADMITTED = (Role.GUARDIAN,)\n\n\n"
+                              "def _player_team_for_game(")),
+            "getattr_member":
+                dict(replacement=f"    if role == getattr(Role, 'GUARDIAN'):"
+                                 f"\n{body}{anchor}"),
+            "else_branch":
+                dict(replacement=f"    if role == Role.OFFICIAL:\n"
+                                 f"        pass\n    else:\n{body}{anchor}"),
+            "returned_from_a_helper":
+                dict(replacement="    if role == Role.GUARDIAN:\n"
+                                 "        return _guardian_read(role, game)\n"
+                                 + anchor,
+                     prelude=("def _player_team_for_game(",
+                              "def _guardian_read(role, game):\n"
+                              "    return PrivateGameRead(role=role, "
+                              "game=game, own_team=game.home_team_id, "
+                              "admitted=True)\n\n\n"
+                              "def _player_team_for_game(")),
+            # BOTH HALVES OF THE REAL SEAM, which is the sharpest one: widen
+            # the carrier's role tuple AND teach the resolver to answer the
+            # new role a side. This is the shape that would actually ship.
+            "carrier_and_resolver":
+                dict(anchor=anchor,
+                     replacement="    if role in (Role.COACH, Role.PLAYER, "
+                                 "Role.GUARDIAN):",
+                     prelude=(resolver_player,
+                              resolver_player
+                              + "\n    if role == Role.GUARDIAN:\n"
+                                "        return scope.get('team_id')")),
+        }
+
+    def test_a_new_non_admin_admission_branch_fails_by_name(self):
+        """THE PROOF THAT CONDITION 5 IS DERIVED AND NOT DECORATIVE.
+
+        Ten spellings of "admit the GUARDIAN", each injected into a COPY of
+        the gate's source, each required to produce a NAMED failure from the
+        same audit that guards the real gate. Aliased imports, a nested
+        helper, a module-level tuple, ``role.value``, ``getattr``, an
+        ``else`` branch, a decision returned from a second function, and the
+        two-place widening that touches both the carrier and the resolver.
+
+        A spelling this cannot READ fails as an unresolvable shape naming the
+        line, which is the same fail-closed answer
+        ``route_extract.query_parameter_names`` gives a query string it
+        cannot enumerate; a spelling it CAN read fails naming the role."""
+        for name, injection in sorted(self._spellings().items()):
+            with self.subTest(spelling=name):
+                failures = self._audit(self._injected(**injection))
+                self.assertTrue(
+                    failures,
+                    f"a new non-admin admission branch spelled {name!r} was "
+                    f"NOT reported. Condition 5 is closed only if the "
+                    f"BRANCHES are derived from the gate; a spelling that "
+                    f"slips past this is a role admitted with no authority "
+                    f"and no oracle in this file modelling it.")
+                self.assertTrue(
+                    any("GUARDIAN" in f or "unresolvable" in f
+                        for f in failures),
+                    f"{name!r} was reported, but not in a way that NAMES the "
+                    f"new branch: {failures}")
+
+    def test_a_mutation_that_admits_nobody_is_not_reported(self):
+        """THE CONTROL, without which the test above proves only that this
+        audit is noisy.
+
+        Widening the carrier's role tuple ALONE admits nobody new: the
+        resolver still answers a Guardian ``None``, so ``own_team`` is
+        ``None`` and the branch's own ``admitted`` is False. The audit must
+        stay silent — and it is the same mutation whose SECOND half
+        (teaching the resolver to answer that role) the injection above
+        requires it to catch, so the two together show the audit is reading
+        the admission and not merely the diff."""
+        self.assertEqual([], self._audit(self._injected(
+            replacement="    if role in (Role.COACH, Role.PLAYER, "
+                        "Role.GUARDIAN):")))
+
+    def test_the_gate_this_axis_reads_is_the_gate_the_server_calls(self):
+        """THE PREMISE OF THE WHOLE SECTION. Deriving the branches from a
+        module nothing calls would be a closed axis over dead code, so the
+        names come from ``side_provenance``'s own constants and the objects
+        are resolved live."""
+        self.assertEqual(GATE_CARRIER, "resolve_private_game_read")
+        self.assertEqual(GATE_RESOLVER, "game_scoped_own_team_id")
+        for name in (GATE_CARRIER, GATE_RESOLVER):
+            self.assertTrue(callable(getattr(game_side_scope, name)), name)
+        self.assertIs(web_scope.game_scoped_own_team_id,
+                      game_side_scope.game_scoped_own_team_id,
+                      "web/scope.py no longer re-exports the one canonical "
+                      "resolver, so the gate this axis reads and the one the "
+                      "server calls may be different functions")
+        self.assertEqual(
+            side_provenance.TRUSTED_RESOLVER_MODULE,
+            "services/game_side_scope.py",
+            "the scanner and this axis disagree about where the gate lives")
+
 class TheMethodAxisIsADisclosedLimitWithLiveNumbers(unittest.TestCase):
     """The GET-only limit, re-measured rather than remembered."""
 
