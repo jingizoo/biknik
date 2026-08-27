@@ -712,6 +712,105 @@ class RosterService:
                 authorized_team_id, ctx.team_id if ctx else None, "player",
                 comparand="live")
 
+        # CLASSIFY EVERY EXISTING ROW BEFORE SEATING ANY OF THEM (#205, the
+        # cross-team idempotency blocker).
+        #
+        # THE DEFECT THIS CLOSES, measured tri-store and over authenticated
+        # HTTP at head 63db78f. The loop above authorizes each target against
+        # the LIVE membership context, which is the right comparand for the
+        # half of this method that CREATES state. But the write loop below
+        # then treated ANY occupying row as idempotent and returned it
+        # without ever consulting the row's own durable `team_side`. So: a
+        # HOME Coach seats a player (entry_1, team_side=HOME); the player's
+        # membership transfers to AWAY; the AWAY Coach calls select_roster
+        # with authorized_team_id=AWAY. The live gate PASSES — the player
+        # really is theirs now — and the method returned entry_1 itself, HOME
+        # attribution, HOME `selected_by` and all, with 200 over
+        # `POST /api/games/{id}/roster/select`. Storage stayed HOME-occupied
+        # and AWAY open, and a second `roster_selected` audit was appended
+        # although no roster state had changed. An opposing Coach received
+        # another side's durable row plus a false success while their own
+        # side stayed unfilled.
+        #
+        # THE RULE, and why it takes a comparand the loop above cannot.
+        # Durable attribution answers WHICH slot or side a row holds; the
+        # live context authorizes WHO may act on it. Idempotency is a claim
+        # about an EXISTING row, so it must be judged against that row's
+        # durable side — the same `entry.team_side` (migration 061)
+        # `remove_player` and `set_availability` already compare against, and
+        # for the same reason. Judging it live is what made idempotency
+        # CROSS-TEAM instead of side-owned.
+        #
+        # WHY IT IS A WHOLE-BATCH PREFLIGHT AND NOT A CHECK IN THE WRITE
+        # LOOP. Selection is a batch and the loop below seats each player as
+        # it goes, so a check made there would let player 1 be written before
+        # player 2's foreign row was noticed. `@_transactional` would roll
+        # that write back, but "zero write ATTEMPTS on refusal" is an
+        # ORDERING property no rollback can satisfy — the same argument that
+        # put the live gate above the write loop in the first place. So both
+        # gates are preflights and the write loop is reached only once every
+        # target has cleared both.
+        #
+        # THE THREE OUTCOMES, all delegated to the ONE existing gate rather
+        # than to a second reason vocabulary invented here:
+        #
+        #   FOREIGN occupying row -> `team_scope_violation`, raised by
+        #   `_require_authorized_team` with the same structured details every
+        #   other surface raises. Nothing about the row is returned: no id,
+        #   no `selected_by`, no `seated_position`, no status, and no serialized
+        #   entry — the refusal happens before the write loop can append it to
+        #   `entries`.
+        #
+        #   NULL attribution -> fails CLOSED under that same gate's existing
+        #   typed rule (`attribution_missing`, `comparand="durable"`). The row
+        #   was FOUND and cannot name its side, which is reachable only for a
+        #   pre-060/061 row, so the DURABLE wording is the literally true one
+        #   here — unlike the live loop above, which found no row at all.
+        #
+        #   OWN occupying row -> falls through to the write loop, where the
+        #   pre-existing idempotent return is now correct BY CONSTRUCTION:
+        #   every occupying row that reaches it has already been proven to
+        #   carry `team_side == authorized_team_id`.
+        #
+        # UNSCOPED OPERATORS ARE PRESERVED EXPLICITLY. With
+        # `authorized_team_id=None` — League Admin, Arena Manager, and the
+        # in-process/self-service call paths whose authority never came from a
+        # team — `_require_authorized_team` returns on its first line, so this
+        # whole pass is a pure read and the previous unconditional
+        # `occupies_slot` behaviour is byte-for-byte unchanged.
+        #
+        # THIS PASS IS PURELY CLASSIFICATORY AND THE WRITE LOOP STILL DOES ITS
+        # OWN READ. Caching the row here and reusing it below looks like a free
+        # halving of the lookups, and it is wrong: `player_ids` MAY CONTAIN THE
+        # SAME PLAYER TWICE (``test_lifecycle_concurrency``'s
+        # ``RosterSelectionOrderParityTest`` passes ``[p3, p1, p2, p1]`` for
+        # exactly this reason, and the output is required to echo the caller's
+        # order duplicates included). The write loop relies on re-reading to see
+        # the row IT JUST INSERTED for an earlier occurrence of the same id and
+        # take the idempotent branch; served from a snapshot taken before any
+        # write, the second occurrence would insert a second row and violate the
+        # one-row-per-(game, player) unique index (migration 023). Measured: the
+        # cached version failed that test on Memory (2 rows) and SQLite
+        # (IntegrityError).
+        for player_id in player_ids:
+            existing = self.store.roster_entry_for_player(game_id, player_id)
+            if existing is None or not existing.status.occupies_slot:
+                # Missing or non-occupying: this is a CREATE or a REVIVE, the
+                # live context authorized it above, and it is that context
+                # which (re-)attributes the row below. Nothing durable is
+                # being claimed, so there is nothing to classify.
+                continue
+            self._require_authorized_team(
+                authorized_team_id, existing.team_side, "roster row",
+                comparand="durable")
+
+        # Whether this call actually CHANGED any roster state. A selection in
+        # which every requested row was already seated on this side is a true
+        # no-op, and the audit must not claim a second selection that never
+        # happened (#205: the duplicate `roster_selected` the blocker
+        # measured). Set by the revive and insert branches only.
+        changed = False
+
         entries: List[GameRosterEntry] = []
         for player_id in player_ids:
             player = locked_players[player_id]
@@ -726,6 +825,9 @@ class RosterService:
                 raise NotEligibleError(f"{player.name} is not an active player.")
 
             now = self.clock()
+            # Re-read, deliberately: a repeated player id in this same batch
+            # must see the row an earlier iteration wrote. See the
+            # classification pass above for why this is not cached.
             existing = self.store.roster_entry_for_player(game_id, player_id)
             if existing is not None:
                 if existing.status.occupies_slot:
@@ -734,6 +836,14 @@ class RosterService:
                     # row is a no-op, not a re-seat, so it must not silently
                     # re-attribute a row (including a pre-061 row, whose
                     # NULL attribution stays NULL and stays fail-closed).
+                    #
+                    # FOR A COACH this row has already been PROVEN to be
+                    # theirs by the durable preflight above — a foreign or
+                    # unattributed row never reaches this line. For an
+                    # unscoped operator the preflight abstained and this
+                    # stays the unconditional pre-existing behaviour.
+                    # Either way nothing is written, so `changed` is not set
+                    # and this player alone cannot justify an audit row.
                     entries.append(existing)
                     continue
                 # Revive a removed/unavailable row instead of inserting a
@@ -750,6 +860,7 @@ class RosterService:
                 existing.seated_position = ctx.position
                 self.store.save_roster_entry(existing)
                 entries.append(existing)
+                changed = True
                 continue
 
             entry = GameRosterEntry(
@@ -767,13 +878,26 @@ class RosterService:
             )
             self.store.add_roster_entry(entry)
             entries.append(entry)
+            changed = True
 
-        self._audit(
-            game_id,
-            AuditAction.ROSTER_SELECTED,
-            actor_id=actor_id,
-            detail={"player_ids": player_ids},
-        )
+        # NOTHING CHANGED MEANS NOTHING TO AUDIT (#205). Every requested row
+        # was already seated on this side, so no roster state moved and an
+        # audit row here would assert a selection that did not occur — the
+        # duplicate `roster_selected` the blocker measured when the AWAY
+        # Coach's call "succeeded" against a HOME row. `_audit` also mints an
+        # id, so suppressing the row also removes the `next_id` write attempt
+        # a true no-op has no business making.
+        #
+        # This is deliberately about CHANGE, not about refusal: a batch that
+        # revives or inserts even one row still audits once, with the full
+        # requested `player_ids` as the detail, exactly as before.
+        if changed:
+            self._audit(
+                game_id,
+                AuditAction.ROSTER_SELECTED,
+                actor_id=actor_id,
+                detail={"player_ids": player_ids},
+            )
         return entries
 
     # ====================================================================

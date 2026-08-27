@@ -369,6 +369,40 @@ and liveness are different questions asked of the same row:
   membership and make the guess durable. An unscoped operator claims no side
   and is unaffected — they remain the path by which a legacy row is repaired.
 
+### Which side a roster selection may act on
+
+`POST /games/{gameId}/roster/select` is a **batch**, and it answers two
+different questions with two different comparands:
+
+- **May this coach seat this player at all?** The **live** membership context,
+  resolved under the Season lock — selection *creates* state, and the context
+  that authorizes the seat is the one written into the row's durable
+  `team_side`.
+- **Is this an idempotent retry?** The **durable** `team_side` of the row that
+  already exists, and nothing else. Idempotency is a claim about an existing
+  row, so it is **side-owned**: a retry is a no-op only when the occupying
+  row's `team_side` equals the caller's authorized side.
+
+The whole batch is classified **before any write**, so one foreign row cannot
+follow earlier writes:
+
+- an occupying row on **another** side answers **403** with
+  `reason: "team_scope_violation"` and discloses nothing about the row — no
+  id, no `selected_by`, no seated position, no serialized entry;
+- an occupying row with **NULL** attribution (pre-migration-061) fails closed
+  with the existing `reason: "attribution_missing"`;
+- a **missing or non-occupying** row is the only shape the live context may
+  create, revive and **re-attribute** — so a released seat can legitimately be
+  re-taken by the side the player now plays for, with `team_side` rewritten;
+- refusal is **atomic**: zero writes are attempted, not merely rolled back.
+
+`ROSTER_SELECTED` is appended **only when roster state actually changed**. A
+selection in which every requested row was already seated on the caller's own
+side is a true no-op and audits nothing, so the trail cannot claim a selection
+that did not occur. An unscoped operator (`authorized_team_id` unset) keeps the
+prior unconditional behaviour and receives the occupying row whatever side it
+names.
+
 ## Named schedule scenarios (#378)
 
 All four routes require a **signed-in session** plus server-side
