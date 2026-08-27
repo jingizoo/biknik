@@ -524,8 +524,11 @@ GUARDIAN_OF_A_JUNIOR = "guardian_of_a_junior"
 #: OFFICIAL and left the GUARDIAN one seat over in exactly the shape the owner
 #: had just ruled on: :meth:`_entitled_teams` returned the junior's whole side
 #: for every route and every data class, so all three oracles read that one
-#: number for the guardian on all 48 route names. MEASURED on the head this
-#: corrects: a REGISTERED authenticated route returning to
+#: number for the guardian on all 50 swept route names. (It said 48 until
+#: round 10: the count was written when the surface had 48, never re-counted,
+#: and `TheMethodAxisIsADisclosedLimitWithLiveNumbers` has been asserting
+#: `assertEqual(50, count("GET", True))` beside it.) MEASURED on the head
+#: this corrects: a REGISTERED authenticated route returning to
 #: ``Role.GUARDIAN`` alone the entire AWAY side's private workflow state —
 #: per-player availability answers, substitute status, roster statuses and
 #: candidate-pool cardinality, deliberately carrying NO identities so only the
@@ -1258,9 +1261,10 @@ class _SweepHarness(_OverviewHarness):
             return frozenset()
         if klass == GUARDIAN_OF_A_JUNIOR:
             # The junior's own SIDE, on the junior's own two routes — not a
-            # standing grant over the junior's whole team on all 48, and not
-            # the junior's own ROW either: the row-level narrowing is
-            # oracle 1's, in `_permitted_ids`. What is returned here is the
+            # standing grant over the junior's whole team on all 50 swept
+            # route names, and not the junior's own ROW either: the
+            # row-level narrowing is oracle 1's, in `_permitted_ids`. What
+            # is returned here is the
             # SIDE whose private state may legitimately move these two
             # routes, which is what oracle 2 needs.
             if route not in GUARDIAN_JUNIOR_ROUTES:
@@ -1587,20 +1591,46 @@ class _SweepHarness(_OverviewHarness):
         admits nine string-valued fields and excludes every numeric one, so
         a NUMERIC identity is outside this alphabet. ``jersey_number`` is
         not hypothetical: it is served on ``_lineup_rows`` and allow-listed
-        in ``_SHEET_PLAYER_FIELDS``, and MEASURED over this sweep it names a
-        person uniquely on 779 of 2,480 rows, on ``/board``, ``/lineups``
-        and ``/roster``. A route handing ``thirdcoach`` the away side's five
-        jersey numbers passes oracle 1 green.
+        in ``_SHEET_PLAYER_FIELDS``. A route handing ``thirdcoach`` the away
+        side's five jersey numbers passes oracle 1 green.
 
-        WHAT BOUNDS IT, ALSO MEASURED: all 779 of those 779 nodes carry the
-        player ``id`` as well, so a realistic ``_lineup_rows`` disclosure is
-        still caught through the id; the jersey is the sole carrier only in
-        a payload that deliberately omits the id. And no live leak exists
-        today — only callers entitled to both sides, plus each side's own
-        coach and player, receive their own side's jerseys; zero cross-side.
-        CLOSING THIS NEEDS A PRODUCT-SIDE AUTHORITY OVER IDENTITIES rather
-        than over ``Player``'s fields, which does not exist yet. Until it
-        does, this is a disclosed limit with a measurement, not a closure.
+        HOW MUCH OF THE SWEPT SURFACE THAT IS, RE-MEASURED (#427 round 10).
+        The sentence that stood here said "it names a person uniquely on 779
+        of 2,480 rows, on ``/board``, ``/lineups`` and ``/roster``". Three
+        things in it were wrong, and this file exists to catch exactly that:
+        779 is not a number this fixture produces at all, the denominator
+        framed NODES as if they were REQUESTS, and the route list was short
+        by one. Counted by walking every swept body for a dict carrying a
+        non-null ``jersey_number``:
+
+        * **789 jersey-bearing NODES**, on **112 of the 2,480 requests** of
+          the base world — a node is one player on one response, so the two
+          are different units and 779-of-2,480 read as neither;
+        * on **FOUR** routes, not three: ``get_games_id_lineups`` (424),
+          ``get_games_id_board`` (316), ``get_players`` (41) and
+          ``get_games_id_roster`` (8). ``get_players`` is a flat roster list
+          outside the private-game family and was missing from the list;
+        * across the matrix's TWENTY worlds the node count runs **789 to
+          1,080** and the request count **100 to 112** — it is never 779 in
+          any of them. (The floor is the first base world; the ceiling is a
+          late world, because each ``seated_lineup_row`` perturbation adds a
+          player and the store grows monotonically across a run.)
+
+        WHAT BOUNDS IT, ALSO MEASURED: **all 789 of the 789 nodes carry the
+        player ``id`` as well**, so a realistic ``_lineup_rows`` disclosure
+        is still caught through the id; the jersey is the sole carrier only
+        in a payload that deliberately omits the id. Of the 30 distinct
+        jersey values served, none names more than one person, so the
+        "uniquely" in the old sentence was the one part of it that held. And
+        no live leak exists today — only callers entitled to both sides, plus
+        each side's own coach and player, receive their own side's jerseys;
+        zero cross-side. CLOSING THIS NEEDS A PRODUCT-SIDE AUTHORITY OVER
+        IDENTITIES rather than over ``Player``'s fields, which does not exist
+        yet. Until it does, this is a disclosed limit with a measurement, not
+        a closure — and the base-world numbers above are re-measured every
+        run by :meth:`TheDisclosedLimitsAreMeasuredNotRemembered
+        .test_the_numeric_identity_blind_spot_is_still_the_measured_one`, so
+        this paragraph cannot become another set of stale numbers.
 
         THE BLIND SPOT THIS CLOSES (#427 round 9, D8). Oracle 1's alphabet
         was the ``id`` FIELD ALONE. A name is an identity too, and so is a
@@ -2829,7 +2859,7 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
                 # round 3). Asserting only "the guardian's side equals the
                 # junior's resolved side" says nothing about the SURFACE that
                 # side is readable on, and it was precisely that gap that let
-                # the class hand out a whole side on all 48 routes. The
+                # the class hand out a whole side on all 50 swept routes. The
                 # official got a per-leaf 403/200 matrix; so does this one.
                 #
                 # The guardian differs from the official in the direction
@@ -6164,3 +6194,94 @@ class TheDisclosedLimitsAreMeasuredNotRemembered(_SweepHarness,
             "limit-1 paragraph's measurement is stale, and the blind spot is "
             "now being paid for rather than merely declared: "
             + str(first.diff(second)[:6]))
+
+    #: The NUMERIC-identity blind spot, MEASURED on the base world (#427
+    #: round 10). ``{route name: jersey-bearing nodes it serves}`` — see
+    #: :meth:`_SweepHarness._identity_tokens`, whose paragraph these numbers
+    #: are. The paragraph they replace stated a count this fixture never
+    #: produces, on a denominator that was a different unit, over a route
+    #: list that was short by one; it stood for a round because nothing
+    #: re-ran it.
+    JERSEY_NODES_BY_ROUTE = {
+        "get_games_id_lineups": 424,
+        "get_games_id_board": 316,
+        "get_players": 41,
+        "get_games_id_roster": 8,
+    }
+
+    #: Requests of the base world's 2,480 that carry at least one such node.
+    JERSEY_BEARING_REQUESTS = 112
+
+    @staticmethod
+    def _jersey_nodes(node, out):
+        """Every dict node carrying a non-null ``jersey_number``, at any
+        depth — the same depth-independent walk the volatile-key measurement
+        above uses, asking a different question of the same bodies."""
+        if isinstance(node, dict):
+            if node.get("jersey_number") not in (None, ""):
+                out.append(node)
+            for value in node.values():
+                TheDisclosedLimitsAreMeasuredNotRemembered._jersey_nodes(
+                    value, out)
+        elif isinstance(node, list):
+            for value in node:
+                TheDisclosedLimitsAreMeasuredNotRemembered._jersey_nodes(
+                    value, out)
+        return out
+
+    def test_the_numeric_identity_blind_spot_is_still_the_measured_one(self):
+        """``jersey_number`` is outside oracle 1's alphabet, and HOW MUCH of
+        the surface that leaves uncovered is a measurement, not a memory.
+
+        Three separate facts, because each fails differently: WHERE the
+        jerseys are (a fifth route would widen the spot), HOW MANY there are
+        (a shrinking count can make the limit read worse than it is), and
+        whether every one of them still carries the player ``id`` — which is
+        the whole reason the spot is bounded rather than open."""
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            who = self._serve(fx)
+            specs, subjects = self._assert_inventory_is_closed(fx)
+            sweep = self._sweep(who, fx, specs, subjects)
+            per_route, requests, nodes, with_id = {}, 0, 0, 0
+            owners = {}
+            for (_p, route, _path, _h), (_st, body) in sweep.rows.items():
+                found = self._jersey_nodes(body, [])
+                if not found:
+                    continue
+                requests += 1
+                nodes += len(found)
+                per_route[route] = per_route.get(route, 0) + len(found)
+                for row in found:
+                    if row.get("id"):
+                        with_id += 1
+                        owners.setdefault(
+                            str(row["jersey_number"]), set()).add(row["id"])
+            self.assertEqual(
+                self.JERSEY_NODES_BY_ROUTE, per_route,
+                "the routes that serve a jersey_number, or how many each "
+                "serves, moved. A route appearing here that is not in the "
+                "declared map is a WIDER numeric blind spot than the "
+                "`_identity_tokens` paragraph discloses; re-measure it and "
+                "rewrite the paragraph rather than this line.")
+            self.assertEqual(
+                sum(self.JERSEY_NODES_BY_ROUTE.values()), nodes,
+                "the jersey-bearing NODE count moved")
+            self.assertEqual(
+                self.JERSEY_BEARING_REQUESTS, requests,
+                f"jersey-bearing REQUESTS moved; the paragraph states "
+                f"{self.JERSEY_BEARING_REQUESTS} of {sweep.requests}")
+            self.assertEqual(
+                nodes, with_id,
+                "a jersey_number is served on a node that carries NO player "
+                "id, so the jersey is the SOLE carrier of that identity — "
+                "which is exactly the payload the disclosed limit says does "
+                "not exist today, and the bound on the blind spot is gone.")
+            self.assertEqual(
+                {}, {j: sorted(ids) for j, ids in owners.items()
+                     if len(ids) > 1},
+                "a served jersey_number names more than one person, so it is "
+                "not the unique identity the paragraph calls it")
+        finally:
+            store.clear_all_data()
