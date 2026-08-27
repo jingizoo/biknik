@@ -278,7 +278,27 @@ admission branch       CLOSED      ``admission_branches()`` — the GATE'S OWN
                                    only where it RESTS ON that answer; and
                                    the carrier must have exactly ONE
                                    module-level definition, because Python
-                                   binds the last and this read the first
+                                   binds the last and this read the first.
+                                   #427 round 15: the pin FOLLOWS the call
+                                   a decision rests on (``_inlined``) into
+                                   the product predicate that takes it, so
+                                   what is pinned is what is DECIDED and
+                                   never a function name — following is an
+                                   allow-list too, refusing by name a callee
+                                   outside the product package, bound twice,
+                                   containing a statement the fold cannot
+                                   read, able to fall through, deciding on
+                                   its own globals, or called other than
+                                   plain-positionally
+official assignment    CLOSED      ``OfficialAssignmentStatus`` DRIVEN
+status                             through the product predicate an
+                                   Official's admission is decided by,
+                                   member by member, pinned in
+                                   ``OFFICIAL_STATUS_GRANTS`` and required
+                                   to equal the enum's own ``is_active`` —
+                                   so the check dropped, a member
+                                   reclassified and a member added each fail
+                                   by name (#205, #427 round 15)
 membership status      CLOSED      ``MembershipStatus`` x
                                    ``RosterService
                                    ._ELIGIBLE_MEMBERSHIP_STATUSES``, pinned
@@ -343,15 +363,26 @@ adjusted:
   NO path and ONE world-pair — ``season_roster_membership``, the EX-MEMBER,
   which is the state no world in this matrix contained;
 * measured on this machine, for the whole-surface property alone:
-  **43.4 s Memory, 23.1 s SQLite, 75.8 s real PostgreSQL** — one recorded
-  run, and it moves a few percent between runs with the machine's load;
-* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 82 tests in 284.9 s ...
-  OK** — against the **72 tests / 294.7 s** at the head this round started
-  from (c4a725b). Round 14 adds TEN tests and NONE of them drives a backend:
-  they are the six MODELS the admission derivation rests on, one per model
-  plus the consumer derivation, the interpreter-grammar check and the two
-  halves of the binding model, and every one is pure source analysis for the
-  reason :class:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority`'s own
+  **44.9 s Memory, 24.4 s SQLite, 82.7 s real PostgreSQL** — one recorded
+  run (round 15; round 14 recorded 43.4 / 23.1 / 75.8), and it moves a few
+  percent between runs with the machine's load: the run before this one, of
+  the identical tree, measured 45.9 / 24.5 / 82.7;
+* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 87 tests in 305.5 s ...
+  OK** — against **82 tests / 284.9 s** at round 14 (5c3caf8) and **72
+  tests / 294.7 s** at the head that round started from (c4a725b). Round 14
+  added TEN tests and round 15 adds FIVE, and NONE of the fifteen drives a
+  backend. Round 14's are the six MODELS the admission derivation rests on,
+  one per model plus the consumer derivation, the interpreter-grammar check
+  and the two halves of the binding model. Round 15's are the OFFICIAL
+  grant after `62a52b7` centralised it: that the pin FOLLOWS the predicate
+  the branch calls, that following is an allow-list which refuses six named
+  shapes rather than falling back to the function name, that the callee's
+  signature grammar is the running interpreter's, and — driven, not matched
+  — that the predicate's answer is
+  ``OfficialAssignmentStatus.is_active`` member by member, with its own
+  three-way falsifier. Every one is pure source analysis or a direct call of
+  the product predicate, for the reason
+  :class:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority`'s own
   docstring gives. The count of methods that DO loop every backend is
   unchanged at SIX, re-measured off this module's AST rather than assumed;
 * round 10 adds THREE more requests of a full sweep per backend —
@@ -446,6 +477,7 @@ rather than left in prose by
 
 import ast
 import contextlib
+import copy
 import dataclasses
 import datetime as _datetime
 import enum
@@ -467,12 +499,15 @@ from test_substitute_membership_cutover import ADMIN
 
 from hockey_scheduler.api.service import ApiService as _ApiService
 from hockey_scheduler.domain import (Game, GuardianLink, MembershipStatus,
-                                     OfficialAssignment, Role,
+                                     OfficialAssignment,
+                                     OfficialAssignmentStatus, OfficialRole,
+                                     Role,
                                      ROLE_PERMISSIONS, Permission,
                                      SeasonRosterMembership)
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.services import (game_side_scope, guardian_service,
-                                        lineup_visibility, side_provenance)
+                                        lineup_visibility, side_provenance,
+                                        subject_scope)
 from hockey_scheduler.services.account_service import AccountService
 from hockey_scheduler.services.roster_service import RosterService
 from hockey_scheduler.web import route_extract
@@ -2363,6 +2398,273 @@ def _gate_function(tree, name, where):
     return node
 
 
+# ---------------------------------------------------------------------------
+# FOLLOWING A CALL THE DECISION RESTS ON (#427 round 15, #205)
+# ---------------------------------------------------------------------------
+# A PIN THAT CANNOT SEE WHAT IT PROTECTS IS A PIN IN NAME ONLY. Until this
+# round the OFFICIAL entry of :data:`ADMISSION_AUTHORITIES` was pinned on
+#
+#     official_id is not None and any(a.official_id == official_id
+#                                     and a.status.is_active
+#                                     for a in store.assignments_for_game(...))
+#
+# and `d62473a` on this branch exists BECAUSE `a.status.is_active` was
+# missing: a DECLINED official kept 200 on the whole private-game family. The
+# ledger could SEE that check, which is what made re-deciding the pin a real
+# decision. `62a52b7` then centralised the predicate — the same question was
+# being answered in three places and the two it did not touch went on granting
+# a declined Official's Program, Season and League in the context switcher —
+# so the branch now spells `assignment_grants_official_scope(a, official_id)`
+# and the pin would have read a FUNCTION NAME. The one check the pin exists to
+# protect would have become invisible to it, and a pin on a name cannot tell a
+# predicate that still tests `status` from one that has stopped.
+#
+# So the derivation FOLLOWS THE CALL, the way it already follows the carrier's
+# delegation to the resolver, and what is pinned is what the branch DECIDES BY
+# rather than what it CALLS. The rules below are the same posture every other
+# axis in this file takes: an allow-list, refusing by name anything it has not
+# been taught to read, because a call this cannot follow is a decision nothing
+# audits.
+#
+# TWO LIMITS, DISCLOSED RATHER THAN DISCOVERED:
+#
+# * only the CARRIER's own decision expressions are inlined. The RESOLVER is
+#   followed by :func:`_resolver_authorities`, a different mechanism that
+#   reads its per-role answers, and those answers are not inlined further.
+#   MEASURED reason: `_player_team_for_game`, the resolver's answer for
+#   PLAYER, decides through a LOCAL binding (`player = store.get_player(...)`)
+#   guarded by an early return, and :func:`_substituted` refuses a decision
+#   that reads anything but its own parameters. Inlining it would refuse the
+#   REAL gate, which is not a closure, it is an outage.
+# * the SEMANTIC half of this — that `status.is_active` is still what the
+#   followed predicate answers — is not carried by text at all. An expression
+#   can be rewritten while still testing status, and can keep its text while
+#   testing nothing. See
+#   :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+#   .test_the_official_grant_answers_the_status_enum_member_by_member`.
+
+#: The product package a decision may be followed INTO, and the directory its
+#: modules live in — READ OFF THE GATE MODULE ITSELF, so moving the package
+#: follows automatically instead of being re-spelled here.
+GATE_PACKAGE = game_side_scope.__name__.split(".")[0]
+GATE_PACKAGE_DIR = Path(inspect.getsourcefile(game_side_scope)).resolve(
+    ).parents[game_side_scope.__name__.count(".") - 1]
+
+#: How many levels of followed call :func:`_inlined` will inline before
+#: refusing. A BOUND, not a recursion guard: a predicate chain deeper than
+#: this is a shape nobody has read, and the answer to that here is a refusal.
+FOLLOW_DEPTH = 4
+
+
+def _followed_module_source(node, name, where):
+    """The FILE a module-level ``from … import name`` binds ``name`` from.
+
+    RESOLVED ON THE FILESYSTEM, NEVER IMPORTED. This walk runs over MUTATED
+    copies of the gate as well as over the real one, and importing whatever a
+    mutated import line names would EXECUTE it — an analysis that runs the
+    code it is analysing is not an analysis.
+
+    Only the product package is followed. A stdlib or third-party callee is a
+    decision taken outside the source this axis is derived from, so it is
+    refused by name rather than pinned by its own."""
+    package = ".".join(
+        Path(where).resolve().relative_to(GATE_PACKAGE_DIR.parent)
+        .with_suffix("").parts[:-1])
+    anchor = package.split(".")
+    if node.level:
+        if node.level > len(anchor):
+            raise AdmissionExtractionError(
+                f"{where} line {node.lineno}: a decision calls {name!r}, "
+                f"imported {node.level} levels above {package!r}, which is "
+                f"past the top of the package — so there is no file this "
+                f"walk can read the definition out of")
+        anchor = anchor[:len(anchor) - node.level + 1]
+        parts = ".".join(anchor + ([node.module] if node.module else [])
+                         ).split(".")
+    else:
+        parts = (node.module or "").split(".")
+    if parts[0] != GATE_PACKAGE:
+        raise AdmissionExtractionError(
+            f"{where} line {node.lineno}: a decision calls {name!r}, which "
+            f"is imported from {'.'.join(parts)!r} — outside the product "
+            f"package {GATE_PACKAGE!r}. What that call decides is not in "
+            f"this codebase's source, so the branch is REFUSED rather than "
+            f"booked under the name of a function nothing here can read")
+    base = GATE_PACKAGE_DIR.joinpath(*parts[1:])
+    for candidate in (base.with_suffix(".py"), base / "__init__.py"):
+        if candidate.is_file():
+            return candidate
+    raise AdmissionExtractionError(
+        f"{where} line {node.lineno}: {name!r} is imported from "
+        f"{'.'.join(parts)!r}, which resolves to no file under "
+        f"{GATE_PACKAGE_DIR} — so the definition this call actually runs is "
+        f"not something this walk can read")
+
+
+def _followed_definition(name, tree, where):
+    """``(the ONE def a call to ``name`` runs, its module's tree, its file)``
+    — or ``None`` when ``name`` is not bound at module level of ``where``.
+
+    ``None`` is the answer for a BUILTIN (``any``), for a parameter and for a
+    local: none of those is a decision this module's source states, and each
+    stays in the pin as the text it already is. THE DISCRIMINATOR IS
+    :func:`_module_bindings_of` AND NOT A LIST OF NAMES TO FOLLOW, which is
+    what makes it closed: a module-level ``any = _something_else`` IS
+    followed rather than skipped, because the question asked is "does this
+    module's own source bind this name", not "is this name one of the ones
+    somebody remembered".
+
+    The ONE-DEFINITION model applies to the callee for exactly the reason it
+    applies to the carrier — Python binds the LAST definition and this would
+    read one of them — so :func:`_gate_function` is what answers, in the
+    callee's own module."""
+    bindings = _module_bindings_of(tree, name)
+    if not bindings:
+        return None
+    if len(bindings) == 1 and isinstance(bindings[0], ast.ImportFrom):
+        source = _followed_module_source(bindings[0], name, where)
+        sub_tree = ast.parse(source.read_text())
+        return _gate_function(sub_tree, name, source), sub_tree, source
+    return _gate_function(tree, name, where), tree, where
+
+
+def _decided_by(body, fn, where):
+    """The ONE expression a straight-line ``body`` evaluates to.
+
+    AN ALLOW-LIST, for the reason :func:`_decisions` is one: a statement kind
+    this cannot fold into an expression is REFUSED NAMING ITS TYPE, never
+    skipped, because a statement nothing reads is a decision nothing audits.
+
+    * a docstring — a constant evaluated and discarded — is inert;
+    * an ``if`` becomes the conditional expression it already is, with its
+      ``orelse`` AND EVERYTHING AFTER IT as the else. That is what keeps a
+      GUARD in the pin: ``if assignment is None: return False`` is part of
+      what the predicate decides, and a fold that took only the last return
+      would let the guard be deleted without moving the pin;
+    * a ``return`` is the value, and it must be the LAST statement of its
+      body — anything after it is unreachable and would be silently unread;
+    * A BODY THAT CAN FALL THROUGH IS REFUSED. Its value is not the value of
+      anything this fold can name: an ``if`` whose body falls through
+      continues into the statements AFTER the ``if``, so reading it as the
+      then-arm of a conditional expression would be simply false.
+
+    Everything else — an assignment, a loop, a ``with``, a ``match`` — is
+    refused. Each of them is a modelling job, and the whole of round 14 is
+    what happens when one of those is done by hand and quietly."""
+    for index, stmt in enumerate(body):
+        if isinstance(stmt, ast.Pass) or (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Constant)):
+            # `pass` and a docstring alike bind nothing, decide nothing and
+            # produce no value — inert for the same reason `_decisions` calls
+            # them inert. A body made only of these still FALLS THROUGH, and
+            # that is refused below rather than read as a value.
+            continue
+        if isinstance(stmt, ast.Return):
+            if index != len(body) - 1:
+                raise AdmissionExtractionError(
+                    f"{where} line {stmt.lineno}: {fn.name} has "
+                    f"{len(body) - index - 1} statement(s) after this "
+                    f"`return`, which this fold would never read")
+            return (stmt.value if stmt.value is not None
+                    else ast.Constant(value=None))
+        if isinstance(stmt, ast.If):
+            return ast.IfExp(
+                test=stmt.test,
+                body=_decided_by(stmt.body, fn, where),
+                orelse=_decided_by(list(stmt.orelse) + list(body[index + 1:]),
+                                   fn, where))
+        raise AdmissionExtractionError(
+            f"{where} line {stmt.lineno}: {type(stmt).__name__} in "
+            f"{fn.name} — {ast.unparse(stmt).splitlines()[0]!r} — is a "
+            f"statement kind this walk cannot fold into the expression a "
+            f"call to {fn.name} decides by. A branch whose admission rests "
+            f"on a call nothing here can read is REFUSED rather than booked "
+            f"under that call's own name")
+    raise AdmissionExtractionError(
+        f"{where} line {fn.lineno}: a body of {fn.name} reaches its end "
+        f"without deciding anything, so what a call to it evaluates to "
+        f"depends on the statements AFTER the block it is in — which this "
+        f"fold does not model and will not guess")
+
+
+def _substituted(node, fn, call, where):
+    """``node`` — what ``fn`` decides by — with each PARAMETER replaced by
+    the ARGUMENT this call passes for it.
+
+    NARROW ON PURPOSE. Only a plain positional call onto a plain positional
+    signature is read: ``*args``, ``**kwargs``, keyword-only parameters,
+    defaults, a starred argument and a keyword argument are each refused by
+    name, because each is an argument-matching rule this would otherwise
+    have to model and could be wrong about.
+
+    AND EVERY FREE NAME IN THE DECISION MUST BE A PARAMETER. A decision that
+    reads its own module's globals, or its own locals, means something in the
+    CALLEE's namespace that the identical text would not mean at the call
+    site — pasting it would produce a pin that reads plausibly and describes
+    nothing. Refused instead."""
+    args = fn.args
+    params = [arg.arg for arg in list(args.posonlyargs) + list(args.args)]
+    if (args.vararg or args.kwarg or args.kwonlyargs or args.defaults
+            or args.kw_defaults):
+        raise AdmissionExtractionError(
+            f"{where} line {fn.lineno}: {fn.name} takes *args, **kwargs, a "
+            f"keyword-only parameter or a default, so which argument answers "
+            f"which parameter is a matching rule this walk does not model")
+    if call.keywords or any(isinstance(a, ast.Starred) for a in call.args) \
+            or len(call.args) != len(params):
+        raise AdmissionExtractionError(
+            f"{where}: the call {ast.unparse(call)!r} does not hand "
+            f"{fn.name} exactly its {len(params)} positional parameter(s) as "
+            f"plain positional arguments, so what the callee decides about "
+            f"cannot be re-stated in the caller's own names")
+    outside = sorted({sub.id for sub in ast.walk(node)
+                      if isinstance(sub, ast.Name)} - set(params))
+    if outside:
+        raise AdmissionExtractionError(
+            f"{where} line {fn.lineno}: what {fn.name} decides by reads "
+            f"{', '.join(repr(n) for n in outside)}, which is not one of its "
+            f"parameters — a global or a local of its own module. The same "
+            f"text at the call site would name something else or nothing, so "
+            f"it is refused rather than pasted")
+    mapping = dict(zip(params, call.args))
+
+    class _Bind(ast.NodeTransformer):
+        def visit_Name(self, sub):
+            bound = mapping.get(sub.id)
+            return sub if bound is None else copy.deepcopy(bound)
+
+    return ast.fix_missing_locations(_Bind().visit(node))
+
+
+def _inlined(node, tree, where, depth=FOLLOW_DEPTH):
+    """``node`` with every call this walk CAN follow replaced by what the
+    called function decides by, so the pin reads the DECISION and not the
+    name of whatever takes it."""
+    if depth <= 0:
+        raise AdmissionExtractionError(
+            f"{where}: following what this decision rests on ran past "
+            f"{FOLLOW_DEPTH} levels of call. A chain that deep is a shape "
+            f"nobody has read, and this axis refuses those rather than "
+            f"stopping partway and reporting the part it managed")
+
+    class _Follow(ast.NodeTransformer):
+        def visit_Call(self, call):
+            self.generic_visit(call)
+            if not isinstance(call.func, ast.Name):
+                return call
+            found = _followed_definition(call.func.id, tree, where)
+            if found is None:
+                return call
+            fn, fn_tree, fn_where = found
+            return _substituted(
+                _inlined(_decided_by(fn.body, fn, fn_where),
+                         fn_tree, fn_where, depth - 1),
+                fn, call, fn_where)
+
+    return ast.fix_missing_locations(_Follow().visit(copy.deepcopy(node)))
+
+
 def _resolver_authorities(tree, aliases, constants, where):
     """``{role: the normalized expression the RESOLVER answers it with}`` —
     how the carrier's single ``role in (Role.COACH, Role.PLAYER)`` branch
@@ -2441,6 +2743,15 @@ def admission_branches(source=None):
         # talked this inventory out of measuring — see `needs_authority`.
         grants_side = not (isinstance(own_team, ast.Constant)
                            and own_team.value is None)
+        # WHAT THIS BRANCH DECIDES BY, not what it CALLS (#427 round 15).
+        # The three booleans above are read off the RAW resolved keywords and
+        # deliberately not off these: inlining can only turn an expression
+        # into a literal, and a branch whose `admitted=` folded down to
+        # `False` would stop needing an authority — the permissive direction.
+        # The PINS are read off these, because a pin that stops at a function
+        # name cannot see the check it exists to protect.
+        decides_admission = _inlined(admitted, tree, where)
+        decides_side = _inlined(own_team, tree, where)
         # The names this branch bound to the RESOLVER'S answer. A branch may
         # only be excused on the ground that the resolver decides it if what
         # it returns actually RESTS ON that answer — see below.
@@ -2472,7 +2783,7 @@ def admission_branches(source=None):
                 # ADMISSION_AUTHORITIES entry it produced `_audit() == []`.
                 continue
             if authority is None:
-                authority = ast.unparse(admitted)
+                authority = ast.unparse(decides_admission)
             out.setdefault(role, []).append(AdmissionBranch(
                 role=role, lineno=node.lineno, admits=admits,
                 carries_game=carries_game, authority=authority,
@@ -2482,9 +2793,12 @@ def admission_branches(source=None):
                 # the resolver's expression whenever the branch delegates,
                 # and a branch that delegates and then ignores the answer was
                 # booked under the resolver's authority and reported green —
-                # see `ADMISSION_AUTHORITIES`.
-                admits_source=ast.unparse(admitted),
-                side_source=ast.unparse(own_team)))
+                # see `ADMISSION_AUTHORITIES`. Both are what the branch
+                # DECIDES BY — every call this walk can follow already
+                # replaced by what the called function decides (#427 round
+                # 15), so a pin cannot be satisfied by a function name.
+                admits_source=ast.unparse(decides_admission),
+                side_source=ast.unparse(decides_side)))
     return {role: tuple(branches) for role, branches in sorted(out.items())}
 
 #: The roles whose authority over a game is LEAGUE-WIDE rather than earned by
@@ -2578,13 +2892,53 @@ ADMISSION_AUTHORITIES = {
     # branch does not delegate, so `authority` and `admits` are the same
     # expression — MEASURED, not arranged: an official has no side of their
     # own, which is what `side` being a literal `None` says.
+    #
+    # RE-DECIDED IN ROUND 15, and this is what re-deciding it means. The
+    # branch stopped spelling its own conjunction: `62a52b7` centralised the
+    # question as `subject_scope.assignment_grants_official_scope`, called
+    # from the private-game admission AND from
+    # `context_scope._official_program_seasons` / `_official_league_ids`,
+    # because the same declined grant was being answered two ways — refused
+    # on `/board`, `/lineups` and `/roster` while the target Program, Season
+    # and League stayed on offer in the context switcher.
+    #
+    # THE STALE PIN DID NOT SIMPLY GO RED, IT WENT VACUOUS. Reported as
+    # `Ran 82 tests … FAILED (failures=12)` on the integrated tree: because
+    # the OFFICIAL branch was mis-described on EVERY mutation, the negative
+    # controls that require `_audit() == []` all saw it, and the falsifiers
+    # for `_poison`, `_rests_on`, `_refuse_a_rebound_role`,
+    # `_refuse_a_second_binding`, `_module_bindings_of` and the delegation
+    # pins each detected their own vacuity and said so — "the mutation is
+    # ALREADY reported with `_poison` removed, so this test is not measuring
+    # `_poison` at all". That is the suite working: a stale pin had stopped
+    # six rules from measuring anything.
+    #
+    # AND THE PIN COULD NOT SIMPLY BE MOVED ONTO THE CALL. `d62473a` exists
+    # BECAUSE `status.is_active` was missing here and a DECLINED official
+    # kept 200 on the private-game family; a pin reading
+    # `assignment_grants_official_scope(a, official_id)` cannot see that
+    # check at all, and neither can one asserting that three modules resolve
+    # the same function object — that proves they share A predicate, never
+    # that the predicate still tests status. So the derivation now FOLLOWS
+    # THE CALL (`_inlined`) and this pin is what the branch DECIDES BY. It
+    # gained the predicate's GUARD, which the inline spelling never had:
+    # deleting `if assignment is None or not official_id: return False` now
+    # moves the pin too. The BEHAVIOURAL half — that the answer still equals
+    # `OfficialAssignmentStatus.is_active`, member by member, read off the
+    # product enum — is
+    # :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+    # .test_the_official_grant_answers_the_status_enum_member_by_member`,
+    # because text can be rewritten while still testing status and can be
+    # kept while testing nothing.
     "OFFICIAL": _DeclaredAuthority(
         klass=OFFICIAL_SUBMITTED_LINEUP_ONLY,
-        authority="official_id is not None and any((a.official_id == "
-                  "official_id and a.status.is_active for a in "
+        authority="official_id is not None and any((False if a is None or "
+                  "not official_id else a.official_id == official_id and "
+                  "a.status.is_active for a in "
                   "store.assignments_for_game(game_id)))",
-        admits="official_id is not None and any((a.official_id == "
-               "official_id and a.status.is_active for a in "
+        admits="official_id is not None and any((False if a is None or "
+               "not official_id else a.official_id == official_id and "
+               "a.status.is_active for a in "
                "store.assignments_for_game(game_id)))",
         side="None"),
 }
@@ -9853,6 +10207,355 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         ``services/game_side_scope.py``."""
         self.assertEqual([], self._audit(),
                          "\n".join(self._audit()))
+
+    # -- THE OFFICIAL GRANT: the pin follows the predicate, and the grant
+    #    is proved BY BEHAVIOUR against the product enum (#427 round 15) ---
+    #
+    # `62a52b7` moved the Official's grant out of this branch and into
+    # `subject_scope.assignment_grants_official_scope`, shared with the two
+    # context projections. Two separate things then have to be true, and
+    # NEITHER implies the other:
+    #
+    #  1. the PIN must see what is decided, not the name of the thing that
+    #     decides it — `_inlined`, proved by
+    #     `test_the_official_pin_follows_the_predicate_the_branch_calls`;
+    #  2. the DECISION must still be the status. Text cannot carry that: an
+    #     expression can be rewritten while still testing status, and can
+    #     keep every character while testing nothing. So it is driven.
+
+    #: ``{OfficialAssignmentStatus member NAME: does it grant scope}`` —
+    #: DECIDED HERE, member by member, and required to equal what the
+    #: product enum's own ``is_active`` says. Two pins in one: a status
+    #: RECLASSIFIED in the product, or a NEW member added to it, fails by
+    #: name here instead of being inherited by an Official's admission.
+    OFFICIAL_STATUS_GRANTS = {"PROPOSED": True,
+                              "ACCEPTED": True,
+                              "DECLINED": False}
+
+    #: The Official the driven rows below belong to.
+    GRANTEE = "official_under_test"
+
+    def _assignment(self, status):
+        """A REAL ``OfficialAssignment`` row carrying ``status``."""
+        return OfficialAssignment(id="oa_under_test", game_id="g_under_test",
+                                  official_id=self.GRANTEE,
+                                  role=OfficialRole.REFEREE, status=status)
+
+    def _assert_the_grant_is_the_status(self, predicate, members):
+        """``predicate`` answers every member of ``members`` with exactly
+        what :data:`OFFICIAL_STATUS_GRANTS` says that member grants, and that
+        table is what the enum itself says.
+
+        NO ``subTest`` HERE ON PURPOSE: a failure inside one is recorded on
+        the result rather than raised, and the three falsifiers below have to
+        CATCH this failing. Each half instead names the offending members in
+        its own message."""
+        unclassified = sorted(m.name for m in members
+                              if m.name not in self.OFFICIAL_STATUS_GRANTS)
+        self.assertEqual(
+            [], unclassified,
+            f"{unclassified} are members of the assignment-status enum that "
+            f"nothing has decided a grant for, so an Official holding one "
+            f"would be admitted or refused by whatever the predicate happens "
+            f"to answer — decide it")
+        reclassified = {m.name: m.is_active for m in members
+                        if m.is_active != self.OFFICIAL_STATUS_GRANTS[m.name]}
+        self.assertEqual(
+            {}, reclassified,
+            f"the product's own OfficialAssignmentStatus.is_active now "
+            f"classifies {reclassified}, and this file's grant table says "
+            f"otherwise. `is_active` is what the whole private-game family "
+            f"and both context projections read, so re-decide the grant")
+        answered = {m.name: predicate(self._assignment(m), self.GRANTEE)
+                    for m in members}
+        disagrees = sorted(name for name, granted in answered.items()
+                           if granted is not self.OFFICIAL_STATUS_GRANTS[name])
+        self.assertEqual(
+            [], disagrees,
+            f"the predicate an Official's admission is decided by answers "
+            f"{answered}, and {disagrees} is not what that status grants. "
+            f"d62473a exists because this check was missing and a DECLINED "
+            f"official kept 200 on /board, /lineups and /roster")
+
+    def test_the_official_grant_answers_the_status_enum_member_by_member(
+            self):
+        """THE SEMANTIC HALF OF THE OFFICIAL PIN — driven, never matched.
+
+        The owner's ruling on the centralisation is explicit that following
+        the shared predicate is not enough on its own and that "function-
+        object identity or a function-name ledger alone is insufficient":
+        `test_official_scope_grant_predicate
+        .test_one_predicate_is_shared_by_all_three_call_sites` proves the
+        three surfaces resolve the SAME function object, which proves they
+        share A predicate and says nothing whatever about what it tests.
+
+        So the product predicate is DRIVEN, against a real
+        ``OfficialAssignment`` row per member of the real
+        ``OfficialAssignmentStatus``, and its answer must equal that
+        member's own ``is_active``. `_assert_the_grant_is_the_status` is
+        what the three falsifiers in
+        `test_the_status_grant_fails_by_name_three_ways` remove a piece of,
+        one at a time."""
+        self.assertEqual(
+            frozenset(self.OFFICIAL_STATUS_GRANTS),
+            frozenset(OfficialAssignmentStatus.__members__),
+            "the grant table and the product's assignment-status enum name "
+            "different sets of statuses")
+        self._assert_the_grant_is_the_status(
+            subject_scope.assignment_grants_official_scope,
+            list(OfficialAssignmentStatus))
+        # THE OTHER CONJUNCT, so "equals is_active" cannot be satisfied by a
+        # predicate that has stopped caring WHOSE assignment it is reading —
+        # `resolve_private_game_read` iterates `assignments_for_game`, so
+        # every Official on the sheet reaches every row.
+        for status in OfficialAssignmentStatus:
+            self.assertFalse(
+                subject_scope.assignment_grants_official_scope(
+                    self._assignment(status), "a_different_official"),
+                f"a {status.name} assignment belonging to somebody else "
+                f"granted scope, so the exact-Official half of the predicate "
+                f"is not being tested by the status half passing")
+        self.assertFalse(
+            subject_scope.assignment_grants_official_scope(None,
+                                                           self.GRANTEE),
+            "a missing assignment must grant nothing")
+        self.assertFalse(
+            subject_scope.assignment_grants_official_scope(
+                self._assignment(OfficialAssignmentStatus.ACCEPTED), None),
+            "a caller with no official_id must grant nothing")
+
+    def test_the_status_grant_fails_by_name_three_ways(self):
+        """THE FALSIFIER FOR THE ASSERTION ABOVE — all three ways the grant
+        can stop being the status, each required to fail BY NAME.
+
+        A refusal nothing can falsify may already have stopped biting, which
+        is the standard round 14 set and the reason this exists: the
+        assertion reads `predicate(row) == member.is_active`, and a predicate
+        that DELEGATES to `is_active` can never disagree with it, so that
+        half alone would be vacuous against a reclassification. The grant
+        TABLE is the second half, and these three prove both halves bite."""
+        # 1. THE CHECK DROPPED FROM THE PREDICATE — the shape d62473a fixed,
+        #    re-spelled as the centralised predicate would now have to spell
+        #    it. DECLINED must be named.
+        def _no_status_test(assignment, official_id):
+            if assignment is None or not official_id:
+                return False
+            return assignment.official_id == official_id
+
+        with self.assertRaises(self.failureException) as dropped:
+            self._assert_the_grant_is_the_status(
+                _no_status_test, list(OfficialAssignmentStatus))
+        self.assertIn("DECLINED", str(dropped.exception))
+
+        # 2. A MEMBER RECLASSIFIED IN THE PRODUCT ENUM. The real predicate,
+        #    unchanged, driven against a status enum that has changed its
+        #    mind about ACCEPTED — which the predicate follows silently,
+        #    because it reads `is_active` rather than a literal.
+        class _Reclassified(str, enum.Enum):
+            PROPOSED = "proposed"
+            ACCEPTED = "accepted"
+            DECLINED = "declined"
+
+            @property
+            def is_active(self):
+                return self is not _Reclassified.ACCEPTED
+
+        with self.assertRaises(self.failureException) as moved:
+            self._assert_the_grant_is_the_status(
+                subject_scope.assignment_grants_official_scope,
+                list(_Reclassified))
+        self.assertIn("ACCEPTED", str(moved.exception))
+
+        # 3. A NEW MEMBER. The predicate answers it confidently — that is
+        #    the whole hazard — so the enumeration is what has to notice.
+        class _WithANewMember(str, enum.Enum):
+            PROPOSED = "proposed"
+            ACCEPTED = "accepted"
+            DECLINED = "declined"
+            WITHDRAWN = "withdrawn"
+
+            @property
+            def is_active(self):
+                return self in (_WithANewMember.PROPOSED,
+                                _WithANewMember.ACCEPTED)
+
+        with self.assertRaises(self.failureException) as added:
+            self._assert_the_grant_is_the_status(
+                subject_scope.assignment_grants_official_scope,
+                list(_WithANewMember))
+        self.assertIn("WITHDRAWN", str(added.exception))
+
+        # …and the real thing still passes, so none of the three is failing
+        # for a reason the real predicate shares.
+        self._assert_the_grant_is_the_status(
+            subject_scope.assignment_grants_official_scope,
+            list(OfficialAssignmentStatus))
+
+    def test_the_official_pin_follows_the_predicate_the_branch_calls(self):
+        """THE PIN IS ON WHAT IS DECIDED, NOT ON WHAT IS CALLED.
+
+        MUTATION: the gate's OFFICIAL branch keeps the call it has today,
+        CHARACTER FOR CHARACTER — ``assignment_grants_official_scope(a,
+        official_id)`` — and the name resolves to a definition that has
+        dropped ``status.is_active``. Nothing about the branch's own text
+        moves, so a pin that stopped at the function name could not see it,
+        and neither could a ledger asserting that three modules share one
+        function object: they still would.
+
+        THE FALSIFIER IS THE FOLLOW ITSELF. Neuter ``_inlined`` — which is
+        exactly what round 14 had — re-pin OFFICIAL on the call text that
+        then derives, and the audit goes SILENT on the same mutation. That
+        is what shows the following is what bites."""
+        source = self._gate_source()
+        importline = ("from .subject_scope import "
+                      "assignment_grants_official_scope\n")
+        self.assertIn(importline, source)
+        source = source.replace(importline, "", 1)
+        source = source.replace(
+            "def _player_team_for_game(",
+            "def assignment_grants_official_scope(assignment, official_id):\n"
+            "    if assignment is None or not official_id:\n"
+            "        return False\n"
+            "    return assignment.official_id == official_id\n\n\n"
+            "def _player_team_for_game(", 1)
+        failures = self._audit(source)
+        self.assertTrue(
+            any("OFFICIAL" in f and "a.status.is_active" in f
+                for f in failures),
+            f"the branch's own text is byte-identical and the predicate it "
+            f"resolves to no longer tests the status, and the audit did not "
+            f"report it: {failures}")
+        # RE-PINNED ON WHAT THE MUTATION ITSELF DECIDES: silent, so what
+        # caught it is the pin and not something else in the chain.
+        moved = next(b for b in admission_branches(source=source)["OFFICIAL"]
+                     if b.needs_authority)
+        repinned = dict(ADMISSION_AUTHORITIES)
+        repinned["OFFICIAL"] = dataclasses.replace(
+            ADMISSION_AUTHORITIES["OFFICIAL"], authority=moved.authority,
+            admits=moved.admits_source, side=moved.side_source)
+        with mock.patch.dict(ADMISSION_AUTHORITIES, repinned, clear=True):
+            self.assertEqual(
+                [], self._audit(source),
+                "the mutation is still reported after the pin is moved onto "
+                "it, so this test is not measuring the pin")
+        # AND WITHOUT THE FOLLOW — round 14's derivation exactly — the pin
+        # is the CALL, the call is unchanged, and the mutation is invisible.
+        with self._without("_inlined", lambda node, tree, where, depth=None:
+                           node):
+            unfollowed = next(b for b in admission_branches()["OFFICIAL"]
+                              if b.needs_authority)
+            self.assertIn("assignment_grants_official_scope(a, official_id)",
+                          unfollowed.authority,
+                          "neutering the follow did not put the pin back on "
+                          "the function name, so this half measures nothing")
+            stale = dict(ADMISSION_AUTHORITIES)
+            stale["OFFICIAL"] = dataclasses.replace(
+                ADMISSION_AUTHORITIES["OFFICIAL"],
+                authority=unfollowed.authority,
+                admits=unfollowed.admits_source, side=unfollowed.side_source)
+            with mock.patch.dict(ADMISSION_AUTHORITIES, stale, clear=True):
+                blind = self._audit(source)
+        self.assertEqual(
+            [], blind,
+            f"a pin that stops at the function name was expected to be blind "
+            f"to a predicate that stopped testing the status, and it was "
+            f"not — so this test is not measuring the follow: {blind}")
+
+    def test_a_call_the_pin_cannot_follow_is_refused_by_name(self):
+        """FOLLOWING IS AN ALLOW-LIST TOO, which is the only reason it is
+        worth having.
+
+        A follow that gave up quietly on a shape it had not seen would be
+        the round-14 defect exactly: the pin would fall back to the function
+        name and report green, and "this branch calls something" would once
+        again be the whole of the judgement. So every shape this cannot read
+        RAISES, naming what it could not read — and each is a shape somebody
+        would plausibly write.
+
+        The predicate's own module is not touched by any of these: each
+        mutation is spliced into a COPY of the GATE, which is how the rest of
+        this class works and what keeps the real product source out of it."""
+        replaced = ("from .subject_scope import "
+                    "assignment_grants_official_scope\n")
+        local = "def _player_team_for_game("
+        for label, prelude, expected in (
+                ("decided outside the product package",
+                 (replaced,
+                  "from json import loads as "
+                  "assignment_grants_official_scope\n"),
+                 "outside the product package"),
+                ("bound twice at module level",
+                 (local,
+                  "def assignment_grants_official_scope(assignment, oid):\n"
+                  "    return assignment.official_id == oid\n\n\n"
+                  + local),
+                 "is bound 2 times at module level"),
+                ("a statement kind the fold cannot read",
+                 (replaced,
+                  "def assignment_grants_official_scope(assignment, oid):\n"
+                  "    for _ in (1,):\n"
+                  "        return assignment.official_id == oid\n"
+                  "    return False\n\n\n"),
+                 "is a statement kind this walk cannot fold"),
+                ("a body that falls through",
+                 (replaced,
+                  "def assignment_grants_official_scope(assignment, oid):\n"
+                  "    if assignment is None:\n"
+                  "        pass\n"
+                  "    return assignment.official_id == oid\n\n\n"),
+                 "reaches its end without deciding anything"),
+                ("a decision that reads its own module's globals",
+                 (replaced,
+                  "_ALWAYS = True\n\n\n"
+                  "def assignment_grants_official_scope(assignment, oid):\n"
+                  "    return _ALWAYS and assignment.official_id == oid\n\n\n"
+                  ),
+                 "which is not one of its parameters"),
+                ("called by keyword",
+                 (replaced,
+                  "def assignment_grants_official_scope(assignment, oid):\n"
+                  "    return assignment.official_id == oid\n\n\n"),
+                 "as plain positional arguments")):
+            with self.subTest(shape=label):
+                source = self._injected(prelude=prelude)
+                if label == "called by keyword":
+                    source = source.replace(
+                        "assignment_grants_official_scope(a, official_id)",
+                        "assignment_grants_official_scope("
+                        "a, official_id=official_id)", 1)
+                failures = self._audit(source)
+                self.assertTrue(
+                    any("unresolvable admission shape" in f
+                        and expected in f for f in failures),
+                    f"a call the follow cannot read was not refused naming "
+                    f"why: {failures}")
+
+    def test_the_signature_fields_the_substitution_reads_are_this_grammar(
+            self):
+        """THE 3.11 CHECK FOR THE FOLLOW, made by the interpreter running it.
+
+        :func:`_substituted` decides whether a callee's signature is one this
+        walk may read at all by naming the fields of ``ast.arguments``, and
+        CI runs 3.11 while this was written on 3.14. A field this did not
+        look at would be an argument-matching rule silently not modelled —
+        the callee's decision pasted into the caller as though every argument
+        were plain positional — so EVERY field of the running interpreter's
+        ``ast.arguments`` must be read, and the fields are read off
+        :func:`_substituted`'s OWN SOURCE rather than off a list somebody
+        copied out of the grammar. Round 13 checked ``ast.Match``'s PEP 634
+        fields the same way, and round 14 ``_assigned_names``' 17 pairs."""
+        fn = ast.parse(textwrap.dedent(inspect.getsource(_substituted))).body[0]
+        read = {node.attr for node in ast.walk(fn)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "args"}
+        self.assertEqual(
+            frozenset(ast.arguments._fields), read,
+            f"{sorted(frozenset(ast.arguments._fields) ^ read)} is the "
+            f"difference between the signature grammar this interpreter has "
+            f"and the fields the substitution refusal looks at. A field it "
+            f"does not read is a call shape it does not model, substituted "
+            f"as though it were plain positional")
 
     def test_the_derivation_finds_the_branches_the_gate_actually_has(self):
         """The premise: the extraction is not vacuously green.
