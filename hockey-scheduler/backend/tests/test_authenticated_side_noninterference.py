@@ -135,6 +135,48 @@ rule applies to is derived from the domain rows their grants live in rather
 than listed, which :class:`NoGrantIsAggregatedAcrossADimensionItIsKeyedOn`
 asserts in both directions.
 
+…AND PER EVERY OTHER DIMENSION THOSE ROWS CARRY, WHICH IS THE ACTUAL RULE
+========================================================================
+Round 11 read the rest of the same two rows. ``GRANT_RECORD_FIELDS`` had been
+reading their field NAMES since round 10 and round 10 used exactly one of
+them, ``game_id``; three more instances of the same species were in the
+others.
+
+* the GUARDIAN's grant was aggregated across JUNIORS exactly as the
+  official's had been across games. :meth:`_SweepHarness._permitted_ids`
+  returned the constant ``fx["guardian_junior_id"]`` and never received the
+  junior the PATH named — and both swept bindings for that path were the
+  guardian's own junior, so the unentitled direction was never swept at all.
+* ``OfficialAssignment.status``. The row declares it, the product declares
+  what it means (``OfficialAssignmentStatus.is_active``: "Proposed or
+  accepted assignments hold the official's time"), and four other consumers
+  honour it. The read gate did not, and neither did this file:
+  ``_official_is_assigned`` reproduced the gate's predicate VERBATIM, so the
+  expectation widened in lockstep with the behaviour — the exact failure the
+  comment above :meth:`_SweepHarness._subject_narrowed` says it avoids.
+  MEASURED: the swept official DECLINED through ``respond_assignment``, kept
+  200 on ``/board``, ``/lineups`` and ``/roster``, and the primary sweep
+  passed on all three backends — ``Ran 1 test in 110.641s … OK``.
+* ``GuardianLink.guardian_user_id``. The oracle asked "does this JUNIOR have
+  a verified link", not "does THIS GUARDIAN have one", so another guardian's
+  link granted the swept one.
+
+The rule is therefore no longer "key on the game" but A GRANT IS KEYED BY
+EVERY DIMENSION THE PRODUCT ROW THAT STORES IT CARRIES — the rows it names
+(:func:`_subject_fields`) and the activation state it declares about itself
+(:func:`_activation_fields`), both derived from the record. Every field of
+every grant row is now either a derived dimension or carries a typed reason
+in :data:`GRANT_FIELDS_THAT_KEY_NOTHING`, and
+:class:`TheGrantIsKeyedByEveryDimensionOfItsRow` MEASURES the partition in
+both directions per field: moving a field in the store must change what the
+oracles grant if and only if it is a declared dimension. A grant row that
+gains a column is an ERROR NAMING IT.
+
+The gate was wrong too, and is fixed rather than described:
+``game_side_scope.resolve_private_game_read`` now requires
+``a.status.is_active``, so a DECLINED official is refused the private-game
+family — see ``docs/architecture/api-contract.md``.
+
 Round 7 found the SAME SHAPE ONE SEAT OVER: narrowing the official had left
 the GUARDIAN globally entitled to a whole side, on every route and for every
 data class. A registered route handing ``Role.GUARDIAN`` alone the junior's
@@ -176,12 +218,17 @@ route                  CLOSED      ``route_registry.REGISTRY``
 principal (role)       CLOSED      ``domain.Role``
 session scope          CLOSED      ``AccountService._ALLOWED_SCOPE_KEYS``
 query parameter        CLOSED      ``route_extract.query_parameter_names``
-subject (which game)   **LIMIT**   entitlement recomputed from the store's
-                                   own rows, and WHICH GRANTS ARE KEYED ON A
-                                   GAME derived from those rows' own fields
-                                   (``GRANT_RECORD_FIELDS``); the REVOCATION
-                                   KINDS remain a test construction (see
-                                   ``relationship kind``)
+subject (what the      **LIMIT**   entitlement recomputed from the store's
+path names)                        own rows, matched on EVERY DIMENSION the
+                                   grant row declares — derived from the
+                                   record by ``GRANT_DIMENSIONS``, with the
+                                   partition against
+                                   ``GRANT_FIELDS_THAT_KEY_NOTHING`` measured
+                                   in both directions per field, and every
+                                   path-varied dimension swept in the
+                                   UNENTITLED direction too. Still a LIMIT
+                                   because the REVOCATION KINDS remain a test
+                                   construction (see ``relationship kind``)
 backend                CLOSED      ``_assert_matrix_ran``: a skip is not a pass
 HTTP method            **LIMIT**   GET only; the VOCABULARY is closed
 =====================  ==========  ==================================
@@ -211,10 +258,11 @@ closure needs an authority in the PRODUCT and neither has one yet: there is
 no enum of relationship kinds, and ``Player``'s fields are authoritative
 about that record, not about every way a person can be named.
 
-RUNTIME, MEASURED AND STATED, AND IT IS NOT CHEAP ANY MORE. TWENTY worlds —
-a fresh base and a changed world for each of the two sides x each kind in
-:data:`PERTURBATIONS` in each game of :data:`PERTURBED_GAMES` (sixteen), plus
-one for each kind in :data:`RELATIONSHIP_REVOCATIONS` (four) — x every
+RUNTIME, MEASURED AND STATED, AND IT IS NOT CHEAP ANY MORE. TWENTY-TWO
+worlds — a fresh base and a changed world for each of the two sides x each
+kind in :data:`PERTURBATIONS` in each game of :data:`PERTURBED_GAMES`
+(sixteen), plus one for each kind in :data:`RELATIONSHIP_REVOCATIONS` (SIX,
+since round 11 drives DECLINED as well as unassigned) — x every
 authenticated GET route x 10 principals x the FOUR per-world variants in
 :data:`HINTS`. The other six live in :data:`FULL_HINTS` and are swept once
 per backend, for the reason measured at :data:`HINTS` itself.
@@ -228,22 +276,36 @@ exists to prevent, in the file whose whole thesis is MEASURED RATHER THAN
 IMPLIED, so the numbers below are re-measured on the current tree rather than
 adjusted:
 
-* **2,480 real HTTP requests per world, 49,600 per backend** for the main
-  property — 62 concrete paths x 10 principals x the 4 per-world variants in
-  :data:`HINTS`;
+* **2,560 real HTTP requests per world, 56,320 per backend** for the main
+  property — 64 concrete paths x 10 principals x the 4 per-world variants in
+  :data:`HINTS`. Round 11 adds two concrete paths and one world-pair: the
+  guardian route is now bound to a junior the guardian is NOT linked to (see
+  :class:`TheSweptBindingsExerciseTheUnentitledDirection`),
+  ``get_officials_id_availability`` to a second official, and
+  ``official_assignment_declined`` is a third revocation kind;
 * measured on this machine, for the whole-surface property alone:
-  **31.5 s Memory, 19.3 s SQLite, 66.5 s real PostgreSQL** — one recorded
-  run, and it moves a few percent between runs with the machine's load;
-* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 49 tests in 243.9 s ...
-  OK**, against the **43 tests** at the head this round started from (whose
-  223.5 s is the previous round's own measurement, carried forward rather
-  than re-measured here);
+  **36.6 s Memory, 21.3 s SQLite, 68.9 s real PostgreSQL** — one recorded
+  run, and it moves a few percent between runs with the machine's load (the
+  same property measured 34.6/20.1/68.2 two runs earlier on the same tree);
+* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 59 tests in 260.1 s ...
+  OK** — 273.4 s on a second run of the same tree, which is the "few
+  percent" above made concrete — against the **49 tests / 225.6 s** at the
+  head this round started from, re-measured on that head rather than
+  carried forward;
 * round 10 adds THREE more requests of a full sweep per backend —
   :class:`AGameKeyedGrantDoesNotSpanASecondGame` sweeps once for the
   identity falsifier and twice for the non-interference one, and its third
-  test sweeps not at all;
+  test sweeps not at all — and round 11 adds EIGHT more, all on the FIRST
+  backend only: :class:`TheGrantIsKeyedByEveryDimensionOfItsRow` sweeps ONCE
+  for the ``status`` falsifier, TWICE for ``official_id`` (the widened world
+  and the control without the second official's row), ONCE for
+  ``guardian_user_id``, and FOUR times for ``player_id`` — two sweeps on
+  each of two fixtures, because ``_perturbed`` cannot be entered twice on
+  one. Its three AUDIT tests, and both of
+  :class:`TheSweptBindingsExerciseTheUnentitledDirection`'s, sweep NOTHING:
+  they read the oracles directly;
 * and the full derived parameter matrix — :data:`FULL_HINTS`, ten variants,
-  6,200 requests — once per backend on a fresh world, which is the shape
+  6,400 requests — once per backend on a fresh world, which is the shape
   that made closing the query-string axis affordable at all.
 
 Closing the hint axis is most of that increase: probing every parameter the
@@ -299,9 +361,10 @@ written — the obvious candidates each return a single ``_serialized`` row —
 but "none found" is not "none exists", and a POST-shaped sweep is a separate
 piece of work rather than a line that can be added here.
 
-**3. ORACLE 2 REACHES 18 OF THE 50 SWEPT ROUTES.** Re-measured on the round-9
-tree across all sixteen perturbation worlds — unchanged from round 8, and
-unchanged by the wider hint matrix: only eighteen route names ever move, so
+**3. ORACLE 2 REACHES 18 OF THE 50 SWEPT ROUTES.** Re-measured on the
+round-11 tree across all sixteen perturbation worlds — unchanged from rounds
+8, 9 and 10, and unchanged by the wider hint matrix or by the two paths round
+11 adds: only eighteen route NAMES ever move, so
 :meth:`_SweepHarness._assert_non_interference` CANNOT fail on the other
 thirty-two for any principal. This is not "thirty-two unprotected routes" —
 oracle 1 and hint-inertness are asserted on every route in every world, and
@@ -317,9 +380,12 @@ rather than left in prose by
 
 import contextlib
 import dataclasses
+import datetime as _datetime
+import enum
 import json
 import re
 import time
+import typing
 import unittest
 
 from helpers import BACKEND  # noqa: F401
@@ -330,7 +396,8 @@ from test_substitute_membership_cutover import ADMIN
 from hockey_scheduler.api.service import ApiService as _ApiService
 from hockey_scheduler.domain import GuardianLink, OfficialAssignment, Role
 from hockey_scheduler.store import InMemoryStore
-from hockey_scheduler.services import game_side_scope, lineup_visibility
+from hockey_scheduler.services import (game_side_scope, guardian_service,
+                                        lineup_visibility)
 from hockey_scheduler.services.account_service import AccountService
 from hockey_scheduler.services.roster_service import RosterService
 from hockey_scheduler.web import route_extract
@@ -702,8 +769,16 @@ PERTURBED_GAMES = {
 #: loss really reached the surface, which
 #: :meth:`_SweepHarness._assert_relationship_loss_is_observed` asserts so
 #: the world cannot pass vacuously.
+#: ``official_assignment_declined`` is #427 round 11's addition, and it is
+#: the state the two halves of this map had never been driven into agreement
+#: on: the official half REVOKED BY DELETING THE ROW while the guardian half
+#: used the product's softer "grants nothing" state. ``DECLINED`` is the
+#: official's own softer state — the row survives, still names this official
+#: and this game, and ``OfficialAssignmentStatus.is_active`` says it holds
+#: nothing — so it is the sharper subject the guardian half already had.
 RELATIONSHIP_REVOCATIONS = {
     "official_assignment": "official",
+    "official_assignment_declined": "official",
     "guardian_link": "guardian",
 }
 
@@ -856,10 +931,109 @@ def _record_fields(record):
     return frozenset(f.name for f in dataclasses.fields(record))
 
 
+def _record_types(record):
+    """``{field name: its DECLARED type}``, resolved through
+    ``typing.get_type_hints`` so a stringified annotation still yields the
+    real class. The TYPE is what makes the two derivations below possible
+    without a list: a field's meaning to a grant is carried by how the
+    product declared it, not by how this module reads it."""
+    return typing.get_type_hints(record)
+
+
+def _base_type(annotation):
+    """``Optional[X]``/``Union[X, None]`` reduced to ``X``; anything else
+    unchanged. Every optional column in these rows is ``Optional[X]``."""
+    args = [a for a in typing.get_args(annotation) if a is not type(None)]
+    return args[0] if len(args) == 1 else annotation
+
+
+def _subject_fields(record):
+    """The field names of ``record`` that NAME ANOTHER ROW — every field
+    ending in ``_id`` except the record's OWN ``id``.
+
+    This is the first half of "which dimensions is a grant keyed on", and it
+    is DERIVED rather than listed on purpose (#427 round 11): the last two
+    rounds each found an entitlement computed over a coarser key than the
+    response it governs, and both times the missing dimension was sitting in
+    plain sight as a field of the row. ``OfficialAssignment`` names a
+    ``game_id`` AND an ``official_id``; ``GuardianLink`` names a
+    ``guardian_user_id`` AND a ``player_id``. Reading the ``_id`` suffix off
+    the record catches a row that GAINS one."""
+    return frozenset(f.name for f in dataclasses.fields(record)
+                     if f.name.endswith("_id") and f.name != "id")
+
+
+def _activation_fields(record):
+    """The field names whose DECLARED TYPE carries the product's own answer
+    to "does this row grant anything at all".
+
+    The second half, and the one F2 was: ``OfficialAssignment.status`` is
+    typed ``OfficialAssignmentStatus``, which declares ``is_active`` —
+    "Proposed or accepted assignments hold the official's time" — and
+    ``GuardianLink.verified`` is a ``bool`` whose own docstring says an
+    unverified link grants nothing. Both are ACTIVATION state, and both are
+    recognised HERE by the shape of the type rather than by name:
+
+    * ``bool`` — a flag the row carries about itself;
+    * an ``Enum`` exposing an ``is_active`` PROPERTY — the product's own
+      predicate, which :func:`_row_is_active` then calls rather than
+      re-deriving.
+
+    ``OfficialRole`` is an Enum and declares no ``is_active``, so it is not
+    activation state and does not land here — which the measured audit in
+    :class:`TheGrantIsKeyedByEveryDimensionOfItsRow` then has to confirm
+    rather than assume."""
+    hints = _record_types(record)
+    out = set()
+    for field in dataclasses.fields(record):
+        declared = _base_type(hints.get(field.name))
+        if declared is bool:
+            out.add(field.name)
+        elif isinstance(declared, type) and issubclass(declared, enum.Enum) \
+                and isinstance(getattr(declared, "is_active", None), property):
+            out.add(field.name)
+    return frozenset(out)
+
+
+def _keying_fields(record):
+    """Every DIMENSION a grant row carries: the rows it names, plus the
+    activation state it declares about itself."""
+    return _subject_fields(record) | _activation_fields(record)
+
+
+def _row_is_active(record, row):
+    """Does this stored grant row grant anything — asked of the PRODUCT'S OWN
+    declared state, never of the gate.
+
+    That distinction is the whole of F2 and of the claim
+    :meth:`_SweepHarness._subject_narrowed` makes above it. ``bool`` fields
+    must be true; an activation Enum is coerced back through its own class
+    (the SQL backends hydrate it as a plain string) and asked ``is_active``.
+    So deleting a status check from ``game_side_scope`` does NOT move this
+    answer, which is what makes that deletion a RED sweep instead of a
+    silent widening of the expectation."""
+    hints = _record_types(record)
+    for name in sorted(_activation_fields(record)):
+        value = getattr(row, name)
+        declared = _base_type(hints[name])
+        if declared is bool:
+            if not value:
+                return False
+        elif not declared(value).is_active:
+            return False
+    return True
+
+
 #: ``{entitlement class: the field names of the row the PRODUCT stores that
-#: class's grant in}`` — and therefore WHICH DIMENSIONS that grant is keyed
-#: on. Every value is DERIVED from an authority outside this module: a domain
-#: dataclass's own fields, or ``AccountService._ALLOWED_SCOPE_KEYS``.
+#: class's grant in}`` — the WHOLE row, every column of it. Every value is
+#: DERIVED from an authority outside this module: a domain dataclass's own
+#: fields, or ``AccountService._ALLOWED_SCOPE_KEYS``.
+#:
+#: WHICH of those fields KEY the grant is :data:`GRANT_DIMENSIONS`, and the
+#: rest carry a typed reason in :data:`GRANT_FIELDS_THAT_KEY_NOTHING`. Those
+#: two together must partition THIS map exactly — which is what makes a grant
+#: row gaining a column an error naming it rather than a dimension nobody
+#: keyed on (#427 round 11).
 #:
 #: WHY THIS MAP EXISTS (#427 round 10, D10). The owner's blocker was that an
 #: assigned official's permitted identities were aggregated ACROSS GAMES while
@@ -895,7 +1069,94 @@ GRANT_RECORD_FIELDS = {
     VIEWER_ENTITLED_TO_NOTHING: frozenset(),
 }
 
-#: The classes whose grant row NAMES A GAME, DERIVED from the map above.
+#: ``{entitlement class: the DOMAIN ROW the product stores its grant in}`` —
+#: the two classes whose grant is a ROW rather than an account scope.
+#:
+#: WHY THIS EXISTS (#427 round 11). :data:`GRANT_RECORD_FIELDS` reads the
+#: FIELD NAMES off these records and the previous round used exactly one of
+#: them, ``game_id``. Three more instances of the same species were sitting
+#: in the rest: the guardian's grant was aggregated across juniors exactly as
+#: the official's had been across games, the guardian's link was read for ANY
+#: guardian rather than the swept one, and ``OfficialAssignment.status`` — a
+#: dimension the row DECLARES, with the product's own ``is_active`` predicate
+#: on it — was keyed on by neither the gate nor this file. So the record
+#: itself is carried, not just its field names, and every dimension it
+#: carries keys the grant.
+GRANT_ROWS = {
+    GUARDIAN_OF_A_JUNIOR: GuardianLink,
+    OFFICIAL_SUBMITTED_LINEUP_ONLY: OfficialAssignment,
+}
+
+#: ``{domain row: the store method that reads EVERY row of that kind}``.
+#:
+#: DELIBERATELY THE UNFILTERED READER. ``assignments_for_game`` and
+#: ``guardian_links_for_player`` each pre-key the fetch on ONE dimension,
+#: which is how a dimension hides: ``_guardian_link_is_verified`` asked
+#: ``guardian_links_for_player(junior)`` and then tested only ``verified``,
+#: so the swept guardian was granted the junior on the strength of ANOTHER
+#: guardian's link (F3). Fetching every row and filtering on every DECLARED
+#: dimension means the fetch itself can conceal none of them.
+GRANT_ROW_READERS = {
+    GuardianLink: "all_guardian_links",
+    OfficialAssignment: "all_official_assignments",
+}
+
+#: ``{entitlement class: the field names of its grant row that KEY the
+#: grant}`` — derived, never listed. For the two row-backed classes this is
+#: :func:`_keying_fields` of the record; for the scope-backed classes every
+#: accepted scope key IS a subject binding, so the two coincide.
+GRANT_DIMENSIONS = {
+    klass: (_keying_fields(GRANT_ROWS[klass]) if klass in GRANT_ROWS
+            else fields)
+    for klass, fields in GRANT_RECORD_FIELDS.items()
+}
+
+#: ``{domain row: {field name: why it keys NOTHING}}`` — the residue of every
+#: grant row, typed with a reason each.
+#:
+#: THE FAIL-CLOSED HALF, and the point of the whole round. Every field of
+#: every grant row lands in exactly one of two places: :data:`GRANT_DIMENSIONS`
+#: (derived, and then MEASURED to move the oracles) or here (typed, and then
+#: MEASURED not to). A row that GAINS a field is therefore an ERROR NAMING
+#: IT — the property the route, role and query-parameter axes already have —
+#: rather than a dimension nobody keyed on, which is what the last three
+#: rounds each found one of.
+GRANT_FIELDS_THAT_KEY_NOTHING = {
+    OfficialAssignment: {
+        "id": "the row's OWN primary key: it IS the grant, not a dimension "
+              "of it. See GRANT_FIELDS_NOT_PERTURBABLE.",
+        "role": "referee / linesperson / scorekeeper. OfficialRole declares "
+                "no is_active, and the sheet an assigned official may read "
+                "is the same whichever role they hold — measured, not "
+                "assumed: perturbing it moves no oracle answer.",
+        "assigned_at": "when the offer was made — bookkeeping",
+        "responded_at": "when it was answered — bookkeeping; the ANSWER "
+                        "itself lives in `status`, which IS a dimension",
+        "assigned_by": "which operator made the offer — an audit trail, not "
+                       "an authority the official holds",
+        "note": "operator free text",
+    },
+    GuardianLink: {
+        "id": "the row's OWN primary key — see above",
+        "created_at": "when the link was made — bookkeeping",
+        "consent_method": "the GDPR Art. 8 consent RECORD (#35): HOW an "
+                          "operator obtained authorization. `verified` is "
+                          "what gates authority, and it is a dimension; this "
+                          "is the paperwork behind it",
+        "consented_at": "when that consent was recorded — bookkeeping",
+    },
+}
+
+#: The one field of a grant row no perturbation can express, and why.
+#:
+#: A row's primary key is not a value the row CARRIES about something else —
+#: it is what makes the row that row. Changing it in the store does not move
+#: the grant; it makes a DIFFERENT grant and orphans the old one. So the
+#: measured audit below skips exactly this field, and asserts that the set it
+#: skips is exactly this one, so "not measurable" cannot quietly grow.
+GRANT_FIELDS_NOT_PERTURBABLE = frozenset({"id"})
+
+#: The classes whose grant row NAMES A GAME, DERIVED from the dimensions.
 #:
 #: For these, and only these, state of a game OTHER than the response's own
 #: subject may never excuse a diff: the grant was issued against one game, so
@@ -904,7 +1165,7 @@ GRANT_RECORD_FIELDS = {
 #: derived set against the sweep's own MEASURED behaviour, so the declared
 #: authority and the running code have to agree.
 GAME_KEYED_CLASSES = frozenset(
-    klass for klass, fields in GRANT_RECORD_FIELDS.items()
+    klass for klass, fields in GRANT_DIMENSIONS.items()
     if "game_id" in fields)
 
 
@@ -946,6 +1207,23 @@ class _SweepHarness(_OverviewHarness):
     guardian linked to them cannot express the guardian half of it at all.
     Here the guardian is verified for the Mover instead, which is the shape
     that reproduced.
+
+    AND TWO ROWS THAT EXIST ONLY TO BE THE OTHER ONE (#427 round 11). A
+    finding that is real but unreachable is still a finding, and "the fixture
+    cannot express it" was the standing the owner's own blocker had, so the
+    fixture expresses these:
+
+    * a SECOND OFFICIAL holding the only assignment on the SECOND GAME. Until
+      round 11 ``gid2`` carried no assignment row at all, so deleting
+      ``a.official_id == official_id`` from the gate admitted the swept
+      official to precisely the game they were already assigned to and moved
+      nothing — the ``official_id`` dimension was unfalsifiable.
+    * a SECOND GUARDIAN verified for the SAME JUNIOR. The oracle asked
+      whether the JUNIOR had a verified link, and with one guardian in the
+      world that reading was indistinguishable from the correct one. The
+      ``guardian_link`` revocation now un-verifies the SWEPT guardian's link
+      and leaves this one standing, which is the world where the two
+      readings disagree.
     """
 
     #: Fields whose value is a function of WHEN the request ran rather than of
@@ -1004,6 +1282,21 @@ class _SweepHarness(_OverviewHarness):
         officials = api.store.all_officials()
         assert len(officials) == 1, officials
         fx["official_id"] = officials[0].id
+        # A SECOND OFFICIAL, ASSIGNED TO THE SECOND GAME AND NOWHERE ELSE
+        # (#427 round 11). Without it the swept official's `official_id`
+        # dimension is unfalsifiable: `gid2` carried no assignment row at
+        # all, so dropping `official_id == …` from the gate admitted the
+        # swept official to exactly the game they were already assigned to
+        # and changed nothing anyone could observe. With a row on `gid2` that
+        # belongs to SOMEBODY ELSE, that deletion admits the swept official
+        # to a game they do not referee, which the primary sweep must catch —
+        # see `TheGrantIsKeyedByEveryDimensionOfItsRow`.
+        second = api.create_official("Ref Morgan", actor_id=ADMIN)
+        assert "error" not in second, second
+        fx["official2_id"] = second["id"]
+        assigned2 = api.assign_official(fx["gid2"], second["id"], "referee",
+                                        actor_id=ADMIN)
+        assert "error" not in assigned2, assigned2
         extra = {
             "thirdcoach": (DEMO_USERS["coach"], {"team_id": fx["third"]}),
             "guardian": (DEMO_USERS["guardian"], {}),
@@ -1028,6 +1321,41 @@ class _SweepHarness(_OverviewHarness):
                 assert "error" not in verified, verified
                 fx["guardian_junior_id"] = fx["people"]["awayside"]["id"]
             who[user] = self._sign_in(user)
+        # A SECOND GUARDIAN, VERIFIED FOR THE SAME JUNIOR (#427 round 11, F3).
+        # The oracle asked `any(link.verified for link in
+        # guardian_links_for_player(junior))` — ANY guardian's link — and the
+        # fixture held exactly one guardian, so the reading that grants the
+        # swept guardian the junior on the strength of SOMEBODY ELSE'S link
+        # was indistinguishable from the correct one. "Not demonstrable
+        # because the fixture cannot reach the state" is the same standing
+        # the owner's own blocker had, so the fixture reaches it.
+        #
+        # NOT A SWEPT PRINCIPAL. This account holds a link identical in every
+        # dimension but `guardian_user_id`, so sweeping it would only
+        # duplicate the swept guardian's own rows; what it is FOR is to be the
+        # OTHER row, and the `guardian_link` revocation now un-verifies the
+        # swept guardian's link and leaves this one verified.
+        second_guardian = api.accounts.create_account(
+            "guardian2", DEMO_PASSWORD, DEMO_USERS["guardian"], scope={},
+            actor_id="test_seed")
+        fx["guardian2_account_id"] = second_guardian.id
+        other_link = api.create_guardian_link(
+            second_guardian.id, fx["guardian_junior_id"], actor_id=ADMIN)
+        assert "error" not in other_link, other_link
+        verified = api.verify_guardian_link(other_link["id"], "signed_form",
+                                            actor_id=ADMIN)
+        assert "error" not in verified, verified
+        # THE JUNIOR NOBODY IN THIS SWEEP IS A GUARDIAN OF, and the
+        # UNENTITLED direction of the guardian route's own path argument
+        # (#427 round 11, F1). A real HOME-side player, so a widening that
+        # served them would also be a cross-side identity oracle 1 can see.
+        fx["unlinked_junior_id"] = fx["people"]["seated"]["id"]
+        assert fx["unlinked_junior_id"] != fx["guardian_junior_id"]
+        assert not api.store.guardian_links_for_player(
+            fx["unlinked_junior_id"]), (
+                "the junior bound as the UNENTITLED direction of the "
+                "guardian route already has a guardian link, so binding it "
+                "sweeps the entitled direction twice")
         # Every principal's account id, taken from the store rather than from
         # the two created above — `get_accounts/{}/sessions` needs a real
         # subject and the six base principals are created by
@@ -1035,6 +1363,24 @@ class _SweepHarness(_OverviewHarness):
         fx["account_ids"] = {a.username: a.id
                              for a in api.accounts.list_accounts()}
         assert set(PRINCIPALS) <= set(fx["account_ids"]), fx["account_ids"]
+        # THE SESSION'S OWN BINDING, READ BACK FROM THE PRODUCT rather than
+        # from the dicts above: `AccountService` canonicalizes a scope at
+        # creation (#160), so what a live session actually carries is what
+        # the stored account says it carries. This is the second of the three
+        # sources :meth:`_dimension_value` resolves a grant dimension from.
+        fx["scopes"] = {a.username: dict(a.scope or {})
+                        for a in api.accounts.list_accounts()}
+        # ``{grant-row dimension: a DIFFERENT, still-real value for it}`` —
+        # what the measured dimension audit substitutes to ask whether a
+        # dimension is keyed on at all. Every entry names a row this fixture
+        # really holds, because an id naming nothing would collapse the
+        # oracles for the wrong reason.
+        fx["other_subjects"] = {
+            "game_id": fx["gid2"],
+            "official_id": fx["official2_id"],
+            "player_id": fx["unlinked_junior_id"],
+            "guardian_user_id": fx["guardian2_account_id"],
+        }
         # Every session selects the Program/Season/League explicitly: the
         # context-scoped reads fail CLOSED to an empty payload otherwise, and
         # an empty payload would make this sweep pass vacuously.
@@ -1082,6 +1428,35 @@ class _SweepHarness(_OverviewHarness):
     # sweep would stay green. The authority is therefore the RELATIONSHIP
     # DATA (assignment rows, guardian links, the game's own two side ids),
     # which the gate reads but does not own.
+    #
+    # THAT CLAIM WAS FALSE AS WRITTEN UNTIL ROUND 11, AND THIS IS WHAT MADE IT
+    # TRUE. Reading the store's rows is necessary and was not sufficient:
+    # `_official_is_assigned` read the assignment rows and then reproduced the
+    # gate's predicate over them VERBATIM —
+    #
+    #     any(a.official_id == fx["official_id"]
+    #         for a in store.assignments_for_game(game_id))
+    #
+    # which is character-for-character `services/game_side_scope.py`'s own
+    # OFFICIAL branch. A predicate copied from the gate widens with the gate
+    # whatever it is copied out of, so the expectation moved in lockstep on
+    # every dimension the gate happened to omit. It omitted one:
+    # `OfficialAssignment.status`. MEASURED at the head this corrects — the
+    # swept official DECLINED through the product's own `respond_assignment`
+    # write path, the fixture otherwise untouched, `is_active` False, HTTP
+    # `/board`, `/lineups` and `/roster` still 200 carrying `player_1` and
+    # `player_12` — the PRIMARY SWEEP PASSED on all three backends:
+    # `Ran 1 test in 110.641s … OK`.
+    #
+    # So the expectation is no longer a predicate at all. It is a MATCH
+    # AGAINST THE GRANT ROW ON EVERY DIMENSION THE ROW DECLARES
+    # (`_grant_rows` below), with the dimensions derived from the record by
+    # `_keying_fields` and the row's own "does this grant anything" answer
+    # taken from the PRODUCT'S OWN declared state by `_row_is_active`
+    # (`OfficialAssignmentStatus.is_active`, `GuardianLink.verified`).
+    # Deleting the gate's `and a.status.is_active` therefore does NOT move
+    # this answer — it reddens the sweep, which
+    # `TheGrantIsKeyedByEveryDimensionOfItsRow` requires by name.
     #: Set ONLY inside :meth:`_frozen_relationships`. See there for why a
     #: cache is sound in that window and nowhere else.
     _relationships = None
@@ -1095,9 +1470,13 @@ class _SweepHarness(_OverviewHarness):
         window — which is why it is a context manager and not a cache. An
         oracle pass runs AFTER ``_sweep`` has returned: every request is
         answered, no perturbation or revocation is in flight, and the store
-        cannot move until the pass ends. Within it the same three questions
-        are asked ten times per swept path — once per principal — and on
-        real PostgreSQL that was tens of thousands of round-trips per pass.
+        cannot move until the pass ends. Within it the same two questions —
+        "which grant rows cover this read" and "what are this game's two
+        sides" — are asked ten times per swept path, once per principal, and
+        on real PostgreSQL that was tens of thousands of round-trips per
+        pass. Round 11 made the first of them read EVERY row of the kind
+        rather than a pre-filtered slice (see :data:`GRANT_ROW_READERS`), so
+        the memo matters more than it did, not less.
 
         The memo is torn down unconditionally, so a relationship read
         OUTSIDE a pass — the one a revocation changes — always reaches the
@@ -1119,23 +1498,91 @@ class _SweepHarness(_OverviewHarness):
             memo[key] = compute()
         return memo[key]
 
-    def _official_is_assigned(self, fx, game_id):
-        """Is the swept official assigned to THIS game? — the store's
-        assignment rows, not ``resolve_private_game_read``."""
-        if game_id is None:
-            return False
-        return self._remember(
-            ("assigned", game_id),
-            lambda: any(a.official_id == fx["official_id"]
-                        for a in fx["api"].store.assignments_for_game(game_id)))
+    def _dimension_value(self, fx, principal, field, subjects):
+        """The value THIS REQUEST supplies for one dimension of a grant row —
+        or ``None``, meaning it supplies none.
 
-    def _guardian_link_is_verified(self, fx):
-        """Does the swept guardian still hold a VERIFIED link to the junior?
-        — the store's ``GuardianLink`` rows, and ``verified`` specifically,
-        because an unverified link grants nothing."""
-        return self._remember("guardian_link", lambda: any(
-            link.verified for link in fx["api"].store.guardian_links_for_player(
-                fx["guardian_junior_id"])))
+        THREE SOURCES, RESOLVED IN THIS ORDER, AND NONE OF THEM IS THIS
+        MODULE. A dimension is either something about WHO IS ASKING or
+        something about WHAT IS BEING READ, and both halves are read off the
+        product:
+
+        1. a ``*_user_id`` dimension is the SESSION'S OWN ACCOUNT ID — the
+           id ``web/server._require_guardian_scope`` hands
+           ``guardians.is_verified_guardian`` as its first argument, and the
+           id ``GuardianLink.guardian_user_id`` stores;
+        2. a dimension the ACCOUNT SCOPE binds is that scope's value, read
+           back from the stored account (``fx["scopes"]``) rather than from
+           the dict this fixture passed in — an Official's ``official_id``
+           is the case that matters;
+        3. anything else is what the PATH NAMES — the subject axis, in the
+           same vocabulary, from :meth:`_path_subjects`.
+
+        ``None`` FOR AN UNSUPPLIED DIMENSION IS DELIBERATE AND IS NOT THE
+        HOLE F1 WAS. A route that names no junior (``get_me_guardian_home``)
+        genuinely is a read of EVERY junior the caller is a guardian of, so
+        the grant is not narrowed by a junior nobody named; the route that
+        DOES name one is narrowed by it. What F1 actually was is that the
+        oracle never received the argument the route DID supply — and
+        :class:`TheSweptBindingsExerciseTheUnentitledDirection` is what keeps
+        "the request supplies it" from silently becoming "the request never
+        supplies anything but the entitled value"."""
+        if field.endswith("_user_id"):
+            return fx["account_ids"][principal]
+        scope = fx["scopes"][principal]
+        if field in scope:
+            return scope[field]
+        return subjects.get(field)
+
+    @staticmethod
+    def _session_fixed(fx, principal, field):
+        """Is this dimension supplied by the SESSION rather than by the path?
+
+        Answered from the two SOURCES — the account's own id under any
+        ``*_user_id`` name, and the keys of the stored account scope — and
+        deliberately NOT by asking :meth:`_dimension_value` what it returns.
+        An audit that classified a dimension by the behaviour of the function
+        under audit would call a dimension the function had stopped reading
+        "session-fixed" and skip it, which is the shape of the finding it is
+        supposed to catch."""
+        return (field.endswith("_user_id")
+                or field in fx["scopes"][principal])
+
+    def _grant_rows(self, fx, klass, principal, subjects):
+        """Every STORED grant row of ``klass`` that grants THIS principal
+        THIS read — matched on EVERY DIMENSION the row declares.
+
+        THE GOVERNING RULE OF ROUND 11, in one method. Read every row of the
+        kind with nothing pre-filtered (:data:`GRANT_ROW_READERS`), drop the
+        ones the PRODUCT'S OWN declared state says grant nothing
+        (:func:`_row_is_active`), and keep the ones that agree with the
+        request on every subject dimension the request supplies. Nothing
+        here names ``game_id``, ``official_id``, ``player_id`` or
+        ``guardian_user_id``: they arrive from :func:`_subject_fields`, so a
+        grant row that GAINS a dimension is keyed on it the same day, and
+        :class:`TheGrantIsKeyedByEveryDimensionOfItsRow` fails if the new one
+        is not also MEASURED to matter."""
+        record = GRANT_ROWS[klass]
+        wanted = tuple(
+            (field, self._dimension_value(fx, principal, field, subjects))
+            for field in sorted(_subject_fields(record)))
+
+        def read():
+            rows = getattr(fx["api"].store, GRANT_ROW_READERS[record])()
+            return tuple(
+                row for row in rows
+                if _row_is_active(record, row)
+                and all(want is None or str(getattr(row, field)) == str(want)
+                        for field, want in wanted))
+        return self._remember(("grant", klass, principal, wanted), read)
+
+    def _official_is_assigned(self, fx, subjects):
+        """Does the swept official hold an ACTIVE assignment that covers this
+        read? — the store's own rows, matched on every dimension
+        ``OfficialAssignment`` declares, never ``resolve_private_game_read``
+        and never that function's predicate copied out."""
+        return bool(self._grant_rows(
+            fx, OFFICIAL_SUBMITTED_LINEUP_ONLY, "official", subjects))
 
     def _subject_sides(self, fx, subject):
         """The two side ids OF THE GAME BEING READ — ``game.home_team_id`` /
@@ -1147,8 +1594,9 @@ class _SweepHarness(_OverviewHarness):
             return frozenset({game.home_team_id, game.away_team_id}) - {None}
         return self._remember(("sides", subject), read)
 
-    def _subject_narrowed(self, fx, klass, teams, subject):
-        """``teams`` narrowed by the principal's RELATIONSHIP to ``subject``.
+    def _subject_narrowed(self, fx, klass, teams, subjects, principal):
+        """``teams`` narrowed by the principal's RELATIONSHIP to what this
+        path names.
 
         THE BLIND SPOT THIS CLOSES (#427 round 9). Entitlement was keyed on
         ``(principal, ROUTE, data class)`` and never on WHICH GAME the route
@@ -1170,27 +1618,36 @@ class _SweepHarness(_OverviewHarness):
         would make the sweep report their own legitimate row as a leak.
         Subject narrowing applies exactly where there is a subject to narrow
         against.
-        """
+
+        AND THE NARROWING IS NOW ONE RULE FOR BOTH ROW-BACKED CLASSES (#427
+        round 11). It used to be two hand-written questions — "is the
+        official assigned to this game" and "is the guardian's link
+        verified" — and each omitted a dimension its own row declares: the
+        first ignored ``status``, the second ignored BOTH
+        ``guardian_user_id`` (so another guardian's link granted the swept
+        one, F3) and ``player_id`` (so the junior in the path never reached
+        the oracle at all, F1). :meth:`_grant_rows` asks the single question
+        both were approximations of."""
+        subject = subjects.get("game_id")
+        if klass in GRANT_ROWS \
+                and not self._grant_rows(fx, klass, principal, subjects):
+            # No stored row grants this principal this read: an official
+            # refereeing a DIFFERENT game, an official whose assignment the
+            # product records as DECLINED, a guardian of a DIFFERENT junior,
+            # a guardian whose own link is unverified. Each is a stranger to
+            # this read — the same standing this sweep gives a coach of
+            # neither team.
+            return frozenset()
         if subject is None:
             return teams
-        sides = self._subject_sides(fx, subject)
-        if klass == OFFICIAL_SUBMITTED_LINEUP_ONLY \
-                and not self._official_is_assigned(fx, subject):
-            # An official refereeing a DIFFERENT game is a stranger to this
-            # one — the same standing this sweep gives a coach of neither
-            # team.
-            return frozenset()
-        if klass == GUARDIAN_OF_A_JUNIOR \
-                and not self._guardian_link_is_verified(fx):
-            return frozenset()
         # …and nobody is entitled to a side that is not one of THIS game's
         # two, whatever their class: a stale grant cannot survive the game
         # it was granted against.
-        return frozenset(teams) & sides
+        return frozenset(teams) & self._subject_sides(fx, subject)
 
-    def _grant_spans(self, klass, subject, perturbed_game):
+    def _grant_spans(self, klass, subjects, perturbed_game):
         """May private state of ``perturbed_game`` legitimately move a
-        response whose subject is ``subject``, for a principal of ``klass``?
+        response whose subject is ``subjects``, for a principal of ``klass``?
 
         THE BLIND SPOT THIS CLOSES (#427 round 10, D10, owner comment
         5432572444). Oracle 2 was handed the perturbed TEAM and never the
@@ -1208,15 +1665,16 @@ class _SweepHarness(_OverviewHarness):
         names no game — a coach's ``team_id`` scope, a guardian's
         ``GuardianLink`` — is a standing authority over every game its
         subject appears in, and narrowing it here would report the real
-        product grant as a leak. See :data:`GRANT_RECORD_FIELDS`.
+        product grant as a leak. See :data:`GRANT_DIMENSIONS`.
 
         ``perturbed_game is None`` means "no perturbation is in question" —
         the identity oracle's path — and spans everything by construction."""
         if perturbed_game is None or klass not in GAME_KEYED_CLASSES:
             return True
+        subject = subjects.get("game_id")
         return subject is not None and subject == perturbed_game
 
-    def _entitled_teams(self, fx, principal, route, subject, data_class,
+    def _entitled_teams(self, fx, principal, route, subjects, data_class,
                         perturbed_game=None):
         """WHICH SIDES this principal may observe ON THIS ROUTE, for THIS
         KIND of private state — the number both oracles are read against
@@ -1253,12 +1711,12 @@ class _SweepHarness(_OverviewHarness):
         # THE SUBJECT AXIS FIRST: whatever the route and the data class say,
         # a principal with no relationship to the thing being read is
         # entitled to nothing of it.
-        teams = self._subject_narrowed(fx, klass, teams, subject)
+        teams = self._subject_narrowed(fx, klass, teams, subjects, principal)
         # …AND A GAME-KEYED GRANT CANNOT SPAN A SECOND GAME (#427 round 10,
         # D10). The team id alone cannot separate "this game's sheet moved"
         # from "the other game's sheet moved" when both games share both
         # teams, which is what made this invisible.
-        if not self._grant_spans(klass, subject, perturbed_game):
+        if not self._grant_spans(klass, subjects, perturbed_game):
             return frozenset()
         if klass == GUARDIAN_OF_A_JUNIOR:
             # The junior's own SIDE, on the junior's own two routes — not a
@@ -1294,9 +1752,20 @@ class _SweepHarness(_OverviewHarness):
 
         Keyed by route NAME rather than by path, so a route whose pattern is
         edited keeps its binding and a route that is ADDED has none — which is
-        what makes :meth:`_assert_inventory_is_closed` fail closed."""
+        what makes :meth:`_assert_inventory_is_closed` fail closed.
+
+        EVERY PATH ARGUMENT THAT NAMES A GRANT-ROW DIMENSION IS BOUND IN BOTH
+        DIRECTIONS (#427 round 11, F1). It is not enough that a route is
+        swept: if every value the sweep ever binds for an argument is one the
+        principal IS entitled to, the unentitled direction is never
+        exercised and a widening that served somebody else's row passes. The
+        guardian's junior was bound to the guardian's OWN junior both times,
+        which is exactly how F1 stayed invisible.
+        :class:`TheSweptBindingsExerciseTheUnentitledDirection` audits this
+        against :data:`GRANT_DIMENSIONS` rather than against this comment."""
         games = [(fx["gid"],), (fx["gid2"],)]
         junior = fx["guardian_junior_id"]
+        stranger = fx["unlinked_junior_id"]
         return {
             # -- no path arguments --------------------------------------
             **{name: [()] for name in (
@@ -1324,10 +1793,19 @@ class _SweepHarness(_OverviewHarness):
                 "get_games_id_substitutes")},
             # -- one real subject each ----------------------------------
             "get_accounts_id_sessions": [(fx["account_ids"]["operator"],)],
-            "get_officials_id_availability": [(fx["official_id"],)],
+            # BOTH DIRECTIONS of the `official_id` dimension: the swept
+            # official's own row, and the SECOND official's, whom they are
+            # not.
+            "get_officials_id_availability": [(fx["official_id"],),
+                                              (fx["official2_id"],)],
             "get_me_substitute_opportunities_id": list(games),
+            # BOTH DIRECTIONS of the `player_id` dimension: the junior this
+            # guardian holds a verified link to, and one they do not (#427
+            # round 11, F1). Both games for the linked junior keeps the
+            # `game_id` axis of this route unchanged.
             "get_me_guardian_id_substitute_opportunities_id": [
-                (junior, fx["gid"]), (junior, fx["gid2"])],
+                (junior, fx["gid"]), (junior, fx["gid2"]),
+                (stranger, fx["gid"])],
             "get_setup_leagues_id_teams": [(fx["league"]["id"],)],
             "get_setup_seasons_id_team_registrations": [(fx["s1"]["id"],)],
             "get_v2_setup_programs_id_teams": [(fx["program"]["id"],)],
@@ -1444,7 +1922,7 @@ class _SweepHarness(_OverviewHarness):
                 path = spec.template
                 for arg in args:
                     path = path.replace("{}", arg, 1)
-                subject_of[(spec.name, path)] = self._subject_game(fx, args)
+                subject_of[(spec.name, path)] = self._path_subjects(fx, args)
                 for principal in PRINCIPALS:
                     for hint in hints:
                         status, body = self._req(
@@ -1455,18 +1933,52 @@ class _SweepHarness(_OverviewHarness):
                             status, self._canonical(body))
         return _Sweep(rows, time.time() - started, requests, subject_of)
 
-    def _subject_game(self, fx, args):
-        """WHICH GAME this concrete path is a read ABOUT, or ``None``.
+    #: ``{grant-row dimension: the store reader that answers "does this id
+    #: name one of THOSE?"}`` — how a path argument is resolved to a
+    #: DIMENSION rather than to "the game argument, if any".
+    #:
+    #: THE VOCABULARY IS THE GRANT ROWS' OWN (#427 round 11). Round 9 asked
+    #: only ``get_game``, so a path could name a game and nothing else; the
+    #: junior in ``/api/me/guardian/{}/substitute-opportunities/{}`` was
+    #: discarded before any oracle saw it, which is F1. Every subject field
+    #: any grant row declares must be answerable here, and
+    #: :meth:`TheGrantIsKeyedByEveryDimensionOfItsRow
+    #: .test_every_subject_dimension_is_resolvable_from_a_path` asserts that
+    #: — so a row that gains a subject field the sweep cannot recognise in a
+    #: path is an ERROR NAMING IT.
+    SUBJECT_READERS = {
+        "game_id": "get_game",
+        "player_id": "get_player",
+        "official_id": "get_official",
+        "team_id": "get_team",
+    }
 
-        Answered by ASKING THE STORE whether an argument names a game, not
-        by a hand-written map of which routes take a game id — so a new
-        game-subject route acquires a subject the moment it acquires a
+    def _path_subjects(self, fx, args):
+        """``{dimension: value}`` — WHAT this concrete path is a read ABOUT.
+
+        Answered by ASKING THE STORE what each argument names, not by a
+        hand-written map of which routes take which id, so a new
+        subject-bearing route acquires its subjects the moment it acquires a
         binding in :meth:`_route_subjects`, with nothing to keep in step.
-        """
+        An argument that names none of them (a Season, a League, a Program,
+        an account, :data:`ABSENT`) contributes nothing, which is correct:
+        no grant row in this product is keyed on one."""
+        store = fx["api"].store
+        out = {}
         for arg in args:
-            if fx["api"].store.get_game(arg) is not None:
-                return arg
-        return None
+            for field, reader in self.SUBJECT_READERS.items():
+                if field in out:
+                    continue
+                if getattr(store, reader)(arg) is not None:
+                    out[field] = arg
+                    break
+        return out
+
+    def _subject_of(self, fx, *args):
+        """The subject a test means when it says "a read about these rows" —
+        built by the SAME resolution the sweep uses, so a hand-written call
+        site cannot mean something the sweep never produces."""
+        return self._path_subjects(fx, args)
 
     # -- oracle 1: identity ------------------------------------------------
     def _durable_ids(self, fx, team_id):
@@ -1604,18 +2116,21 @@ class _SweepHarness(_OverviewHarness):
         by one. Counted by walking every swept body for a dict carrying a
         non-null ``jersey_number``:
 
-        * **789 jersey-bearing NODES**, on **112 of the 2,480 requests** of
+        * **789 jersey-bearing NODES**, on **112 of the 2,560 requests** of
           the base world — a node is one player on one response, so the two
           are different units and 779-of-2,480 read as neither;
         * on **FOUR** routes, not three: ``get_games_id_lineups`` (424),
           ``get_games_id_board`` (316), ``get_players`` (41) and
           ``get_games_id_roster`` (8). ``get_players`` is a flat roster list
           outside the private-game family and was missing from the list;
-        * across the matrix's TWENTY worlds the node count runs **789 to
+        * across the matrix's TWENTY-TWO worlds the node count runs **789 to
           1,080** and the request count **100 to 112** — it is never 779 in
           any of them. (The floor is the first base world; the ceiling is a
           late world, because each ``seated_lineup_row`` perturbation adds a
           player and the store grows monotonically across a run.)
+          RE-MEASURED ON THE ROUND-11 TREE: the two paths round 11 adds
+          carry no jersey and the world it adds seats nobody, so both
+          ranges are unchanged — but the DENOMINATOR is not;
 
         WHAT BOUNDS IT, ALSO MEASURED: **all 789 of the 789 nodes carry the
         player ``id`` as well**, so a realistic ``_lineup_rows`` disclosure
@@ -1812,7 +2327,7 @@ class _SweepHarness(_OverviewHarness):
                 out[(gid, side)] = frozenset(row["id"] for row in rows)
         return out
 
-    def _permitted_ids(self, fx, principal, route, subject, private,
+    def _permitted_ids(self, fx, principal, route, subjects, private,
                        submitted):
         """WHICH IDENTITIES this principal may receive ON THIS ROUTE.
 
@@ -1838,6 +2353,18 @@ class _SweepHarness(_OverviewHarness):
           ``get_me_guardian_home`` — so the narrowing is sufficient for the
           real grant, which is why the residual is closed rather than
           documented.
+
+          AND THE JUNIOR IS NOW READ OFF THE MATCHING GRANT ROWS (#427 round
+          11, F1). It used to be the constant ``fx["guardian_junior_id"]``,
+          returned for either of the two guardian routes whatever junior the
+          PATH named — this method never received the junior at all. The
+          swept binding was the guardian's own junior in both of its rows,
+          so the unentitled direction was never exercised and a widening
+          that served another junior's identity would have passed. What is
+          returned now is ``row.player_id`` of every ``GuardianLink`` that
+          matches this request on every dimension the row declares, which is
+          the guardian's own junior for the linked path and NOTHING for the
+          stranger's.
         * :data:`OFFICIAL_SUBMITTED_LINEUP_ONLY` — the OCCUPYING rows of both
           sides OF THE RESPONSE'S OWN SUBJECT GAME, on
           :data:`OFFICIAL_ASSIGNED_GAME_ROUTES`, and no identity anywhere
@@ -1847,19 +2374,24 @@ class _SweepHarness(_OverviewHarness):
           :meth:`_entitled_teams` grants them.
         """
         klass, _teams = self._entitlement(fx)[principal]
+        subject = subjects.get("game_id")
         if klass == GUARDIAN_OF_A_JUNIOR:
             if route not in GUARDIAN_JUNIOR_ROUTES:
                 return frozenset()
-            # THE SUBJECT AXIS: a revoked link is not a grant.
-            if not self._guardian_link_is_verified(fx):
-                return frozenset()
-            return frozenset({fx["guardian_junior_id"]})
+            # THE SUBJECT AXIS, on every dimension `GuardianLink` declares:
+            # an unverified link is not a grant, ANOTHER guardian's link is
+            # not this guardian's grant, and a junior this guardian holds no
+            # link to is not theirs to receive.
+            return frozenset(
+                row.player_id for row in
+                self._grant_rows(fx, klass, principal, subjects))
         if klass == OFFICIAL_SUBMITTED_LINEUP_ONLY:
             if route not in OFFICIAL_ASSIGNED_GAME_ROUTES:
                 return frozenset()
-            # THE SUBJECT AXIS: the sheet of a game they REFEREE, read from
-            # the store's assignment rows — not "any sheet, anywhere".
-            if not self._official_is_assigned(fx, subject):
+            # THE SUBJECT AXIS: the sheet of a game they REFEREE under an
+            # assignment the product still records as ACTIVE, read from the
+            # store's own rows — not "any sheet, anywhere".
+            if not self._official_is_assigned(fx, subjects):
                 return frozenset()
             # …and THAT GAME'S sheet, both of ITS sides. Indexed rather than
             # `.get`-ed on purpose: a subject game missing from the map is a
@@ -1869,7 +2401,7 @@ class _SweepHarness(_OverviewHarness):
                 submitted[(subject, side)]
                 for side in sorted(self._subject_sides(fx, subject))))
         teams = self._entitled_teams(
-            fx, principal, route, subject, SUBMITTED_LINEUP_DATA)
+            fx, principal, route, subjects, SUBMITTED_LINEUP_DATA)
         out = set()
         for team in (fx["home"], fx["away"]):
             if team in teams:
@@ -1917,9 +2449,9 @@ class _SweepHarness(_OverviewHarness):
         places = {(key[1], key[2]) for key in sweep.rows}
         for principal in PRINCIPALS:
             for route, path in places:
-                subject = sweep.subject_of.get((route, path))
+                subjects = sweep.subject_of.get((route, path), {})
                 permitted = self._permitted_ids(
-                    fx, principal, route, subject, private, submitted)
+                    fx, principal, route, subjects, private, submitted)
                 permits[(principal, route, path)] = self._tokens_of(
                     fx, permitted, index)
                 forbidden[(principal, route, path)] = (
@@ -1928,7 +2460,8 @@ class _SweepHarness(_OverviewHarness):
         # route, so they are read at the path whose SUBJECT is the game the
         # fixture built those claims around.
         assigned = {route: path for route, path in places
-                    if sweep.subject_of.get((route, path)) == fx["gid"]}
+                    if sweep.subject_of.get((route, path), {}).get("game_id")
+                    == fx["gid"]}
 
         def at(principal, route):
             return forbidden[(principal, route, assigned[route])]
@@ -1996,9 +2529,15 @@ class _SweepHarness(_OverviewHarness):
         # is never forbidden to the guardian" is false — correctly, and that
         # is the closure working rather than a premise failing. Both
         # directions are asserted, so neither world passes vacuously.
-        linked = self._guardian_link_is_verified(fx)
         for route in sorted(GUARDIAN_JUNIOR_ROUTES):
             for path in sorted(p for r, p in places if r == route):
+                # THE GRANT IS PER PATH, NOT PER PRINCIPAL (#427 round 11,
+                # F1): the junior route is now bound to a junior this
+                # guardian is NOT linked to as well as to their own, so
+                # "linked" is a fact about THIS path's subjects.
+                linked = bool(self._grant_rows(
+                    fx, GUARDIAN_OF_A_JUNIOR, "guardian",
+                    sweep.subject_of.get((route, path), {})))
                 self.assertLessEqual(
                     rest_of_the_side, forbidden[("guardian", route, path)],
                     f"[{label}] on {route} the guardian is permitted "
@@ -2014,10 +2553,12 @@ class _SweepHarness(_OverviewHarness):
                 else:
                     self.assertLessEqual(
                         junior_tokens, forbidden[("guardian", route, path)],
-                        f"[{label}] the guardian's link is no longer "
-                        f"verified and they are STILL permitted the junior "
-                        f"on {route} — a grant that outlived the "
-                        f"relationship it was granted for")
+                        f"[{label}] no GuardianLink grants this guardian "
+                        f"this read — their own link is unverified, or this "
+                        f"path names a junior they hold no link to — and "
+                        f"they are STILL permitted the junior on {route} "
+                        f"({path}): a grant that outlived, or reached past, "
+                        f"the relationship it was granted for")
         # ONE COMPILED ALTERNATION PER PLACE, and redaction only by the
         # tokens that can actually shadow another. Both are performance, not
         # semantics: `search` over an alternation answers the same question
@@ -2192,49 +2733,103 @@ class _SweepHarness(_OverviewHarness):
             ``ApiService.unassign_official`` on the assignment that admits
             the swept official to ``fx["gid"]``. They remain a real,
             signed-in Official with a real ``official_id``; what changes is
-            that this game is no longer theirs.
+            that this game is no longer theirs. The row is DELETED.
+
+        ``official_assignment_declined``
+            THE SHARPER SUBJECT, and the one F2 was about (#427 round 11).
+            The official DECLINES through the product's own write path,
+            ``ApiService.respond_assignment(accept=False)``. The row SURVIVES
+            and still names this official and this game — every dimension of
+            it is unchanged except ``status``, which the product's own
+            ``OfficialAssignmentStatus.is_active`` declares grants nothing.
+            That is the official's exact analogue of the guardian's
+            ``verified=False`` below, and until this round nothing drove it:
+            the official half deleted the row while the guardian half used
+            the product's softer state, so the one state where the two
+            halves could disagree was never entered.
 
         ``guardian_link``
-            The junior's ``GuardianLink`` loses ``verified``. The link row
-            survives — an UNVERIFIED link is the product's own "grants
-            nothing" state, which is a sharper subject than deleting the row
-            would be, because the guardian still resolves to the junior.
+            The SWEPT GUARDIAN'S OWN ``GuardianLink`` loses ``verified``. The
+            link row survives — an UNVERIFIED link is the product's own
+            "grants nothing" state, which is a sharper subject than deleting
+            the row would be, because the guardian still resolves to the
+            junior.
+
+            AND THE SECOND GUARDIAN'S LINK TO THE SAME JUNIOR IS LEFT
+            VERIFIED (#427 round 11, F3), which is what makes this world
+            sharp: the store still holds a verified link FOR THAT JUNIOR, so
+            an oracle keyed on the junior alone answers "verified" and hands
+            the swept guardian a grant built out of somebody else's row. It
+            used to un-verify every link the junior had, which hid exactly
+            that.
         """
         api = fx["api"]
         assert kind in RELATIONSHIP_REVOCATIONS, kind
-        if kind == "official_assignment":
+        gid = self._subject_of(fx, fx["gid"])
+        if kind in ("official_assignment", "official_assignment_declined"):
             rows = [a for a in api.store.assignments_for_game(fx["gid"])
-                    if a.official_id == fx["official_id"]]
-            assert rows, ("the swept official is not assigned to the first "
-                          "game, so revoking the assignment revokes nothing")
-            assert self._official_is_assigned(fx, fx["gid"])
+                    if a.official_id == fx["official_id"]
+                    and a.status.is_active]
+            assert rows, ("the swept official holds no active assignment to "
+                          "the first game, so revoking it revokes nothing")
+            assert self._official_is_assigned(fx, gid)
             for row in rows:
-                out = api.unassign_official(row.id, actor_id=ADMIN)
+                if kind == "official_assignment":
+                    out = api.unassign_official(row.id, actor_id=ADMIN)
+                else:
+                    out = api.respond_assignment(row.id, accept=False,
+                                                 actor_id=ADMIN)
                 assert "error" not in out, out
-            assert not self._official_is_assigned(fx, fx["gid"]), (
-                "unassign_official left an assignment row behind")
+            if kind == "official_assignment_declined":
+                # THE PREMISE: the row is still there, still names this
+                # official and this game, and the PRODUCT says it is dead.
+                for row in rows:
+                    still = api.store.get_official_assignment(row.id)
+                    assert still is not None, "respond_assignment deleted it"
+                    assert still.game_id == row.game_id
+                    assert still.official_id == row.official_id
+                    assert not still.status.is_active, still.status
+            assert not self._official_is_assigned(fx, gid), (
+                f"revoking {kind} left the swept official an ACTIVE "
+                f"assignment to the first game")
             try:
                 yield
             finally:
+                for row in rows:
+                    if kind == "official_assignment_declined":
+                        # Clear the dead row before re-offering: leaving it
+                        # would make the next base world hold two rows for
+                        # one (official, game) pair, which is a fixture this
+                        # sweep never otherwise measures.
+                        out = api.unassign_official(row.id, actor_id=ADMIN)
+                        assert "error" not in out, out
                 back = api.assign_official(fx["gid"], fx["official_id"],
                                            "referee", actor_id=ADMIN)
                 assert "error" not in back, back
-                assert self._official_is_assigned(fx, fx["gid"])
+                assert self._official_is_assigned(fx, gid)
             return
+        swept = fx["account_ids"]["guardian"]
         links = [x for x in api.store.guardian_links_for_player(
-            fx["guardian_junior_id"]) if x.verified]
+            fx["guardian_junior_id"])
+            if x.verified and x.guardian_user_id == swept]
         assert links, ("the swept guardian holds no verified link, so "
                        "revoking it revokes nothing")
         for link in links:
             api.store.save_guardian_link(
                 dataclasses.replace(link, verified=False))
-        assert not self._guardian_link_is_verified(fx)
+        # THE PREMISE THAT MAKES THIS WORLD SHARP: the junior still HAS a
+        # verified guardian — just not this one.
+        assert api.guardians.is_verified_guardian(
+            fx["guardian2_account_id"], fx["guardian_junior_id"]), (
+                "the second guardian's link was revoked too, so this world "
+                "cannot show a grant built out of another guardian's row")
+        assert not self._grant_rows(fx, GUARDIAN_OF_A_JUNIOR, "guardian", {})
         try:
             yield
         finally:
             for link in links:
                 api.store.save_guardian_link(link)
-            assert self._guardian_link_is_verified(fx)
+            assert self._grant_rows(fx, GUARDIAN_OF_A_JUNIOR, "guardian", {})
 
     def _assert_relationship_loss_is_observed(self, base, world, fx, kind,
                                               label):
@@ -2287,9 +2882,9 @@ class _SweepHarness(_OverviewHarness):
         offenders, entitled_moved = [], set()
         for key in base.diff(perturbed):
             principal, route, path = key[0], key[1], key[2]
-            subject = base.subject_of.get((route, path))
+            subjects = base.subject_of.get((route, path), {})
             if team_id in self._entitled_teams(
-                    fx, principal, route, subject, data_class,
+                    fx, principal, route, subjects, data_class,
                     perturbed_game=game_id):
                 entitled_moved.add(principal)
                 continue
@@ -2426,7 +3021,7 @@ class TheSweepCoversEveryAuthenticatedRoute(_SweepHarness, unittest.TestCase):
 # 2. THE TWO ORACLES, OVER THE WHOLE SURFACE, ON EVERY BACKEND.
 # ---------------------------------------------------------------------------
 class NoAuthenticatedRouteLeaksTheOtherSide(_SweepHarness, unittest.TestCase):
-    """THE ASSET. Twenty worlds, all three oracles, both perturbation
+    """THE ASSET. Twenty-two worlds, all three oracles, both perturbation
     directions, every authenticated GET route, ten principals, four hint
     variants, three backends.
 
@@ -2952,6 +3547,65 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
             finally:
                 self._close(label, store)
             return   # these are claims about the fixture and the gates
+
+    def test_each_scoped_principals_side_is_the_same_in_both_games(self):
+        """THE STATED LIMIT OF :meth:`_entitlement`, MEASURED (#427 round 11).
+
+        ``_entitlement`` returns ONE side per principal, for every game. For
+        a Coach that is exact — a Coach's team is permanently bound, and
+        ``game_scoped_own_team_id``'s own docstring records that there is no
+        season-scoped Coach model in this codebase at all. For a PLAYER it is
+        not exact in general: a Player's side is resolved from their
+        GAME-SCOPED MEMBERSHIP, so a mid-season transfer can put the same
+        Player on different sides of two games, and a single number would
+        then be right once and wrong once.
+
+        IT IS EXACT ON THIS FIXTURE, and this is the measurement that says so
+        rather than a sentence claiming it: both games hang off the SAME
+        LeagueSeason, so one membership resolves both. Asked of the
+        PRODUCT'S OWN resolver per game — which is a PIN, not the oracle
+        reading the gate: ``_entitlement`` keeps its independent constant and
+        this test fails if the product ever disagrees with it.
+
+        The day a fixture puts the two games on different LeagueSeasons, or a
+        Player's membership moves between them, this fails with the two
+        answers in the message — and the fix is to make ``_entitlement``
+        subject-aware, not to relax this."""
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            self._serve(fx)
+            api = fx["api"]
+            g1, g2 = (api.store.get_game(fx["gid"]),
+                      api.store.get_game(fx["gid2"]))
+            self.assertEqual(
+                g1.season_id, g2.season_id,
+                "the two games no longer share a Season, so one membership "
+                "no longer resolves both and a per-principal side constant "
+                "is not safe")
+            for principal, (klass, teams) in sorted(
+                    self._entitlement(fx).items()):
+                if klass != SCOPED_TO_ONE_SIDE:
+                    continue
+                scope = fx["scopes"][principal]
+                with self.subTest(principal=principal):
+                    resolved = {
+                        game.id: game_side_scope.game_scoped_own_team_id(
+                            PRINCIPAL_ROLES[principal], scope, game,
+                            api.store)
+                        for game in (g1, g2)}
+                    self.assertEqual(
+                        {g1.id: sorted(teams)[0], g2.id: sorted(teams)[0]},
+                        resolved,
+                        f"{principal}'s side, resolved by the product per "
+                        f"game, is {resolved} — but `_entitlement` states "
+                        f"the single value {sorted(teams)} for both. A "
+                        f"principal whose side DIFFERS between the two games "
+                        f"cannot be described by one number, and every "
+                        f"oracle reading that number is wrong for one of "
+                        f"them.")
+        finally:
+            store.clear_all_data()
 
 # ---------------------------------------------------------------------------
 # 3b. THE OFFICIAL'S GRANT IS ROUTE- AND DATA-CLASS-SPECIFIC — AND THE SWEEP
@@ -4621,7 +5275,8 @@ class TheForbiddenSetIsEverySidePrivateIdentity(_SweepHarness,
                     f"'entitled to the sheet' is vacuous")
                 for route in sorted(OFFICIAL_ASSIGNED_GAME_ROUTES):
                     permitted = self._permitted_ids(
-                        fx, "official", route, fx["gid"], private, submitted)
+                        fx, "official", route, self._subject_of(fx, fx["gid"]),
+                        private, submitted)
                     self.assertEqual(
                         frozenset(), unsubmitted & permitted,
                         f"[{label}] on {route} the official is PERMITTED "
@@ -4710,7 +5365,10 @@ class TheGuardianGrantIsRowSpecific(_SweepHarness, unittest.TestCase):
                 whole_side = frozenset(others | {junior})
                 for route in sorted(GUARDIAN_JUNIOR_ROUTES):
                     permitted = self._permitted_ids(
-                        fx, "guardian", route, fx["gid"], private, submitted)
+                        fx, "guardian", route,
+                        self._subject_of(fx, fx["guardian_junior_id"],
+                                         fx["gid"]),
+                        private, submitted)
                     self.assertEqual(
                         frozenset({junior}), permitted,
                         f"[{label}] on {route} the guardian is permitted "
@@ -5082,8 +5740,10 @@ class TheSubjectAxisIsClosedAgainstTheRelationshipRows(_SweepHarness,
                 specs, subjects = self._assert_inventory_is_closed(fx)
                 # The premise: the fixture really does contain a game this
                 # official does not referee.
-                self.assertTrue(self._official_is_assigned(fx, fx["gid"]))
-                self.assertFalse(self._official_is_assigned(fx, fx["gid2"]))
+                self.assertTrue(self._official_is_assigned(
+                    fx, self._subject_of(fx, fx["gid"])))
+                self.assertFalse(self._official_is_assigned(
+                    fx, self._subject_of(fx, fx["gid2"])))
                 with _an_official_admitted_to_every_game():
                     status, body = self._req(
                         who["official"], "GET",
@@ -5114,8 +5774,8 @@ class TheSubjectAxisIsClosedAgainstTheRelationshipRows(_SweepHarness,
                     real_narrow = self._subject_narrowed
                     real_assigned = self._official_is_assigned
                     self._subject_narrowed = (
-                        lambda _fx, _klass, teams, _subject: teams)
-                    self._official_is_assigned = lambda _fx, _gid: True
+                        lambda _fx, _klass, teams, _subj, _who: teams)
+                    self._official_is_assigned = lambda _fx, _subj: True
                     try:
                         blind = self._reported(
                             self._assert_no_foreign_ids, sweep, fx,
@@ -5163,7 +5823,7 @@ class TheSubjectAxisIsClosedAgainstTheRelationshipRows(_SweepHarness,
                             # what makes the oracle above non-vacuous.
                             for route, path in sorted(world.subject_of):
                                 subject = world.subject_of[(route, path)]
-                                if subject != fx["gid"]:
+                                if subject.get("game_id") != fx["gid"]:
                                     continue
                                 self.assertEqual(
                                     frozenset(),
@@ -5515,11 +6175,11 @@ class AGameKeyedGrantDoesNotSpanASecondGame(_SweepHarness, unittest.TestCase):
             g1.home_team_id, g2.home_team_id,
             f"[{label}] the sides are not swapped between the two games")
         self.assertTrue(
-            self._official_is_assigned(fx, fx["gid"]),
+            self._official_is_assigned(fx, self._subject_of(fx, fx["gid"])),
             f"[{label}] the official is not assigned to the first game, so "
             f"'their grant covers this game' is vacuous")
         self.assertFalse(
-            self._official_is_assigned(fx, fx["gid2"]),
+            self._official_is_assigned(fx, self._subject_of(fx, fx["gid2"])),
             f"[{label}] the official IS assigned to the second game, so "
             f"'a game they do not referee' is vacuous")
         # READ FROM THE PRODUCT, NOT FROM `_submitted_side_ids` — the method
@@ -5740,7 +6400,8 @@ class AGameKeyedGrantDoesNotSpanASecondGame(_SweepHarness, unittest.TestCase):
                 with self.subTest(backend=label):
                     for route in sorted(OFFICIAL_ASSIGNED_GAME_ROUTES):
                         permitted = self._permitted_ids(
-                            fx, "official", route, fx["gid"], private,
+                            fx, "official", route,
+                            self._subject_of(fx, fx["gid"]), private,
                             submitted)
                         self.assertEqual(
                             first, permitted,
@@ -5759,17 +6420,19 @@ class AGameKeyedGrantDoesNotSpanASecondGame(_SweepHarness, unittest.TestCase):
                         # to either oracle.
                         self.assertEqual(
                             frozenset(),
-                            self._permitted_ids(fx, "official", route,
-                                                fx["gid2"], private,
-                                                submitted),
+                            self._permitted_ids(
+                                fx, "official", route,
+                                self._subject_of(fx, fx["gid2"]), private,
+                                submitted),
                             f"[{label}] on {route} the official is permitted "
                             f"an identity of a game carrying no assignment "
                             f"row for them")
                         self.assertEqual(
                             frozenset(),
-                            self._entitled_teams(fx, "official", route,
-                                                 fx["gid2"],
-                                                 SUBMITTED_LINEUP_DATA),
+                            self._entitled_teams(
+                                fx, "official", route,
+                                self._subject_of(fx, fx["gid2"]),
+                                SUBMITTED_LINEUP_DATA),
                             f"[{label}] on {route} the official is entitled "
                             f"to a SIDE of a game they do not referee")
                     # THE PRODUCT, over real authenticated HTTP: game 1
@@ -5824,7 +6487,8 @@ class AGameKeyedGrantDoesNotSpanASecondGame(_SweepHarness, unittest.TestCase):
 # THE AUTHORITY IS THE GRANT ROW ITSELF: `OfficialAssignment` carries
 # `game_id`, `GuardianLink` does not, and an account scope's accepted keys
 # (`AccountService._ALLOWED_SCOPE_KEYS`) are `team_id`/`player_id`/
-# `official_id` — no game anywhere. See `GRANT_RECORD_FIELDS`.
+# `official_id` — no game anywhere. See `GRANT_DIMENSIONS`, and section 11.5
+# for the same question asked of EVERY dimension rather than of the game.
 # ---------------------------------------------------------------------------
 class NoGrantIsAggregatedAcrossADimensionItIsKeyedOn(_SweepHarness,
                                                     unittest.TestCase):
@@ -5863,7 +6527,7 @@ class NoGrantIsAggregatedAcrossADimensionItIsKeyedOn(_SweepHarness,
 
         Measured on this tree: the OFFICIAL is the only one. The guardian's
         `GuardianLink` names a junior and no game; a coach's account scope
-        names a team; the two unscoped operators and the viewer read
+        names a team; the two unscoped operators and the viewer read no
         relationships at all."""
         store = InMemoryStore()
         try:
@@ -5874,6 +6538,8 @@ class NoGrantIsAggregatedAcrossADimensionItIsKeyedOn(_SweepHarness,
             private, _ambiguous = self._private_side_ids(fx)
             submitted = self._submitted_side_ids(fx)
             entitlement = self._entitlement(fx)
+            here_at = self._subject_of(fx, fx["gid"])
+            there_at = self._subject_of(fx, fx["gid2"])
             measured, narrowed = set(), set()
             for principal in PRINCIPALS:
                 klass = entitlement[principal][0]
@@ -5881,21 +6547,21 @@ class NoGrantIsAggregatedAcrossADimensionItIsKeyedOn(_SweepHarness,
                     for data_class in sorted(
                             {SUBMITTED_LINEUP_DATA, TEAM_WORKFLOW_DATA}):
                         here = self._entitled_teams(
-                            fx, principal, route, fx["gid"], data_class)
+                            fx, principal, route, here_at, data_class)
                         there = self._entitled_teams(
-                            fx, principal, route, fx["gid2"], data_class)
+                            fx, principal, route, there_at, data_class)
                         if here != there:
                             measured.add(klass)
                         # …and the D10 rule: state of the OTHER game may not
                         # excuse a diff about this one.
                         if here and not self._entitled_teams(
-                                fx, principal, route, fx["gid"], data_class,
+                                fx, principal, route, here_at, data_class,
                                 perturbed_game=fx["gid2"]):
                             narrowed.add(klass)
-                    if (self._permitted_ids(fx, principal, route, fx["gid"],
+                    if (self._permitted_ids(fx, principal, route, here_at,
                                             private, submitted)
                             != self._permitted_ids(fx, principal, route,
-                                                   fx["gid2"], private,
+                                                   there_at, private,
                                                    submitted)):
                         measured.add(klass)
             self.assertEqual(
@@ -5920,6 +6586,875 @@ class NoGrantIsAggregatedAcrossADimensionItIsKeyedOn(_SweepHarness,
                 "change, not a test detail: re-run this audit and decide "
                 "what the new one may observe, rather than adjusting this "
                 "line.")
+        finally:
+            store.clear_all_data()
+
+
+
+# ---------------------------------------------------------------------------
+# 11.5 EVERY DIMENSION THE GRANT ROW CARRIES KEYS THE GRANT.
+#
+# THE SPECIES, THREE ROUNDS RUNNING: an entitlement computed over a COARSER
+# KEY than the response it governs. Round 10 was the official's grant
+# aggregated across GAMES while `OfficialAssignment` names one. Round 11 found
+# three more of it in the rest of the same two rows:
+#
+#   F1  the guardian's grant aggregated across JUNIORS. `_permitted_ids` never
+#       received the junior the path named, and both swept bindings were the
+#       guardian's OWN junior, so the unentitled direction was never swept.
+#   F2  `OfficialAssignment.status`. The row DECLARES it, the product declares
+#       what it means (`OfficialAssignmentStatus.is_active`), four other
+#       consumers honour it — and neither the read gate nor this file keyed on
+#       it. Driven through `respond_assignment(accept=False)`, the swept
+#       official DECLINED and still read `/board`, `/lineups` and `/roster`,
+#       and the primary sweep passed: `Ran 1 test in 110.641s … OK`.
+#   F3  `GuardianLink.guardian_user_id`. The oracle asked "does this junior
+#       have a verified link", not "does THIS guardian have one".
+#
+# So the rule stops being "key on the game" and becomes: A GRANT IS KEYED BY
+# EVERY DIMENSION THE PRODUCT ROW THAT STORES IT CARRIES. `GRANT_DIMENSIONS`
+# derives those dimensions from the record — `_subject_fields` for the rows it
+# names, `_activation_fields` for the state it declares about itself — and
+# this section pins the derivation in BOTH DIRECTIONS PER FIELD:
+#
+#   * every field of every grant row is either a DERIVED dimension or carries
+#     a TYPED reason in `GRANT_FIELDS_THAT_KEY_NOTHING`, so a row that gains
+#     one is an ERROR NAMING IT;
+#   * and each half is MEASURED rather than asserted: perturbing a field moves
+#     the oracles if and only if it is a declared dimension.
+# ---------------------------------------------------------------------------
+
+#: Every dimension name that is ACTIVATION state rather than a named row,
+#: across every grant row — derived, and used only to choose which half of the
+#: oracle a blindness control has to disable.
+_ACTIVATION_DIMENSIONS = frozenset().union(*(
+    _activation_fields(record) for record in GRANT_ROWS.values()))
+
+
+def _alternative_value(fx, record, field, current):
+    """A DIFFERENT, still-VALID value for one field of a grant row.
+
+    Derived from the field's DECLARED TYPE, so there is no per-field recipe
+    list to fall out of step with the record:
+
+    * a SUBJECT field takes another real row of that kind from
+      ``fx["other_subjects"]`` — an id naming nothing would collapse the
+      oracles for the wrong reason, and a ``KeyError`` here NAMES a subject
+      dimension this fixture holds no second instance of;
+    * an ACTIVATION field takes a value whose ACTIVATION differs, not merely
+      whose value does: ``PROPOSED`` → ``ACCEPTED`` moves no authority and
+      would report ``status`` as a dead dimension, so the member is chosen by
+      ``is_active``;
+    * any other Enum takes a different member, a datetime moves a day, a
+      string takes a sentinel.
+
+    Anything else is an ``AssertionError`` naming the field and its type
+    rather than a silently unmeasured field."""
+    if field in _subject_fields(record):
+        return fx["other_subjects"][field]
+    declared = _base_type(_record_types(record)[field])
+    if field in _activation_fields(record):
+        if declared is bool:
+            return not current
+        return next(m for m in declared
+                    if m.is_active != declared(current).is_active)
+    if isinstance(declared, type) and issubclass(declared, enum.Enum):
+        return next(m for m in declared if m != declared(current))
+    if declared is _datetime.datetime:
+        base = current or _datetime.datetime(
+            2031, 1, 1, tzinfo=_datetime.timezone.utc)
+        return base + _datetime.timedelta(days=1)
+    if declared is str:
+        return "sweep_alternative_value"
+    raise AssertionError(
+        f"{record.__name__}.{field} is declared {declared!r}, which this "
+        f"audit does not know how to move. A grant-row field nothing can "
+        f"perturb is a field nothing can MEASURE, which is exactly the "
+        f"standing every finding this section exists for had.")
+
+
+@contextlib.contextmanager
+def _an_official_admitted_on_a_dead_assignment():
+    """`resolve_private_game_read`'s OFFICIAL branch WITHOUT the status test
+    — byte-for-byte the predicate this round replaces, restored in process.
+
+    This is the falsifier the module's own "the oracle does not widen in
+    lockstep with the gate" claim needs: the gate loses a dimension, the
+    expectation must NOT follow it."""
+    real = game_side_scope.resolve_private_game_read
+
+    def widened(role, scope, game_id, store):
+        if role != Role.OFFICIAL:
+            return real(role, scope, game_id, store)
+        official_id = (scope or {}).get("official_id")
+        return game_side_scope.PrivateGameRead(
+            role=role, game=store.get_game(game_id), own_team=None,
+            admitted=official_id is not None and any(
+                a.official_id == official_id
+                for a in store.assignments_for_game(game_id)))
+
+    srv.resolve_private_game_read = widened
+    web_scope.resolve_private_game_read = widened
+    try:
+        yield
+    finally:
+        srv.resolve_private_game_read = real
+        web_scope.resolve_private_game_read = real
+
+
+@contextlib.contextmanager
+def _an_official_admitted_on_anyone_s_assignment():
+    """The same branch with the ``official_id`` half deleted instead:
+    admission on the EXISTENCE of an active assignment for the game, whoever
+    it names."""
+    real = game_side_scope.resolve_private_game_read
+
+    def widened(role, scope, game_id, store):
+        if role != Role.OFFICIAL:
+            return real(role, scope, game_id, store)
+        return game_side_scope.PrivateGameRead(
+            role=role, game=store.get_game(game_id), own_team=None,
+            admitted=(scope or {}).get("official_id") is not None and any(
+                a.status.is_active
+                for a in store.assignments_for_game(game_id)))
+
+    srv.resolve_private_game_read = widened
+    web_scope.resolve_private_game_read = widened
+    try:
+        yield
+    finally:
+        srv.resolve_private_game_read = real
+        web_scope.resolve_private_game_read = real
+
+
+@contextlib.contextmanager
+def _a_guardian_admitted_on_another_guardians_link():
+    """``GuardianService``'s two read helpers with ``guardian_user_id``
+    IGNORED — the two-line widening shape, aimed at F3's dimension. A
+    guardian is now whoever asks about a junior somebody is verified for."""
+    cls = guardian_service.GuardianService
+    real_is, real_ids = cls.is_verified_guardian, cls.verified_junior_ids
+
+    def is_verified(self, guardian_user_id, player_id):
+        return any(link.verified
+                   for link in self.store.guardian_links_for_player(player_id))
+
+    def junior_ids(self, guardian_user_id):
+        return sorted({link.player_id
+                       for link in self.store.all_guardian_links()
+                       if link.verified})
+
+    cls.is_verified_guardian = is_verified
+    cls.verified_junior_ids = junior_ids
+    try:
+        yield
+    finally:
+        cls.is_verified_guardian = real_is
+        cls.verified_junior_ids = real_ids
+
+
+@contextlib.contextmanager
+def _a_guardian_admitted_to_any_junior():
+    """``Handler._guardian_link_or_403`` neutered — the junior NAMED IN THE
+    PATH is no longer checked against the caller's links at all. F1's
+    dimension, and the one whose whole point is that the sweep must be
+    BINDING that path argument in both directions to see it."""
+    real = srv.Handler._guardian_link_or_403
+    srv.Handler._guardian_link_or_403 = (
+        lambda self, guardian_user_id, player_id: False)
+    try:
+        yield
+    finally:
+        srv.Handler._guardian_link_or_403 = real
+
+
+class TheGrantIsKeyedByEveryDimensionOfItsRow(_SweepHarness,
+                                              unittest.TestCase):
+    """The declared dimensions, the typed residue, the measurement that
+    separates them, and one required-RED falsifier per dimension."""
+
+    def _reported(self, fn, *args):
+        try:
+            fn(*args)
+        except AssertionError as exc:
+            return str(exc)
+        return None
+
+    @contextlib.contextmanager
+    def _oracle_blind_to(self, dimension):
+        """THE ORACLE AS IT WAS BEFORE THIS ROUND, one dimension at a time.
+
+        Each falsifier below is paired with this so it cannot be circular: a
+        test that reddens on a widening the PREVIOUS oracle also caught is
+        not measuring the change it claims to. An activation dimension is
+        disabled by reading every row as live; a subject dimension by making
+        the request supply no value for it, which is exactly the state F1
+        and F3 were in."""
+        real_dim = self._dimension_value
+        real_active = globals()["_row_is_active"]
+        real_memo = self._relationships
+        self._relationships = None
+        if dimension in _ACTIVATION_DIMENSIONS:
+            globals()["_row_is_active"] = lambda record, row: True
+        else:
+            self._dimension_value = (
+                lambda fx, principal, field, subjects:
+                None if field == dimension
+                else real_dim(fx, principal, field, subjects))
+        try:
+            yield
+        finally:
+            self._dimension_value = real_dim
+            globals()["_row_is_active"] = real_active
+            self._relationships = real_memo
+
+    def _oracle_answer(self, fx, principal, subjects, private, submitted):
+        """Everything both oracles say about one principal, over EVERY path
+        the sweep binds — the number a dimension either moves or does not."""
+        out = {}
+        for name, arglists in sorted(subjects.items()):
+            for args in arglists:
+                at = self._path_subjects(fx, args)
+                out[(name, args)] = (
+                    tuple(sorted(self._permitted_ids(
+                        fx, principal, name, at, private, submitted))),
+                    tuple(sorted(self._entitled_teams(
+                        fx, principal, name, at, SUBMITTED_LINEUP_DATA))),
+                    tuple(sorted(self._entitled_teams(
+                        fx, principal, name, at, TEAM_WORKFLOW_DATA))))
+        return out
+
+    # -- the DECLARED half -------------------------------------------------
+    def test_every_field_of_every_grant_row_is_declared_one_way_or_the_other(
+            self):
+        """FAIL-CLOSED ON A GRANT ROW GAINING A FIELD.
+
+        Not "the dimensions are these": the PARTITION is the property. Every
+        field of every grant row is either derived into
+        :data:`GRANT_DIMENSIONS` or carries a typed reason in
+        :data:`GRANT_FIELDS_THAT_KEY_NOTHING`, and the two never overlap. A
+        product change that adds a column therefore stops this test with the
+        column's name in the message, which is what the route, role and
+        query-parameter axes already do and what the grant rows did not."""
+        self.assertEqual(frozenset(GRANT_RECORD_FIELDS),
+                         frozenset(GRANT_DIMENSIONS),
+                         "a class declares a grant row but no dimensions")
+        for klass, record in sorted(GRANT_ROWS.items()):
+            with self.subTest(row=record.__name__):
+                fields = _record_fields(record)
+                dims = GRANT_DIMENSIONS[klass]
+                residue = frozenset(GRANT_FIELDS_THAT_KEY_NOTHING[record])
+                self.assertEqual(
+                    frozenset(), dims & residue,
+                    f"{record.__name__}: a field is declared BOTH a keying "
+                    f"dimension and a field that keys nothing")
+                self.assertEqual(
+                    fields, dims | residue,
+                    f"{record.__name__} has a field that is neither a "
+                    f"derived keying dimension nor typed as keying nothing: "
+                    f"{sorted(fields - (dims | residue))}. A grant row that "
+                    f"gains a dimension nobody keys on is the whole species "
+                    f"this section exists for — name it, then MEASURE it.")
+                self.assertTrue(
+                    dims, f"{record.__name__} declares no dimensions at all")
+                for field, why in GRANT_FIELDS_THAT_KEY_NOTHING[record].items():
+                    self.assertTrue(
+                        why.strip(),
+                        f"{record.__name__}.{field} carries an empty reason")
+        # …and the ONE field no perturbation can express is exactly the
+        # primary key, on every row. "Not measurable" cannot grow.
+        self.assertEqual(frozenset({"id"}), GRANT_FIELDS_NOT_PERTURBABLE)
+        for record in GRANT_ROWS.values():
+            self.assertLessEqual(GRANT_FIELDS_NOT_PERTURBABLE,
+                                 _record_fields(record))
+            self.assertEqual(
+                frozenset(),
+                GRANT_FIELDS_NOT_PERTURBABLE & _keying_fields(record),
+                f"{record.__name__}: a DIMENSION was excused from being "
+                f"measured, which is how a dimension stops being keyed on")
+
+    def test_every_subject_dimension_is_resolvable_from_a_path(self):
+        """A subject dimension the sweep cannot RECOGNISE in a path is a
+        dimension no binding can ever supply — F1 with the argument thrown
+        away one layer earlier. Every ``_id`` field of every grant row, and
+        every account-scope key, must have a store reader in
+        :data:`_SweepHarness.SUBJECT_READERS`."""
+        wanted = frozenset().union(
+            *(_subject_fields(record) for record in GRANT_ROWS.values()),
+            *(fields for klass, fields in GRANT_RECORD_FIELDS.items()
+              if klass not in GRANT_ROWS))
+        # A `*_user_id` names an ACCOUNT, which is not a subject any path in
+        # this product addresses; it is resolved from the session instead.
+        wanted = frozenset(f for f in wanted if not f.endswith("_user_id"))
+        self.assertEqual(
+            frozenset(), wanted - frozenset(self.SUBJECT_READERS),
+            f"a grant row or account scope names a subject this sweep "
+            f"cannot recognise in a path: "
+            f"{sorted(wanted - frozenset(self.SUBJECT_READERS))}")
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            self._serve(fx)
+            # …and every reader really resolves, on this fixture's own rows.
+            for field, value in sorted(fx["other_subjects"].items()):
+                if field.endswith("_user_id"):
+                    continue
+                self.assertEqual(
+                    {field: value}, self._path_subjects(fx, (value,)),
+                    f"{field}={value} does not resolve back to {field}")
+        finally:
+            store.clear_all_data()
+
+    # -- the MEASURED half -------------------------------------------------
+    def test_each_field_moves_the_oracles_iff_it_is_a_declared_dimension(
+            self):
+        """THE AUDIT IN BOTH DIRECTIONS, PER FIELD.
+
+        For every field of every grant row that a perturbation can express,
+        move it in the store — through :func:`_alternative_value`, which
+        derives the substitute from the field's own declared type — and ask
+        whether the oracles' answer over the whole swept surface changed.
+        It must change for exactly the DECLARED dimensions:
+
+        * a declared dimension that does NOT move the oracles is a dimension
+          nothing is keyed on, which is F1, F2 and F3;
+        * a residue field that DOES move them is an authority nobody
+          declared.
+
+        The oracles' own behaviour, not a per-backend property, so this runs
+        on one ``InMemoryStore`` — same standing as the sibling audit in
+        :class:`NoGrantIsAggregatedAcrossADimensionItIsKeyedOn`."""
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            self._serve(fx)
+            specs, subjects = self._assert_inventory_is_closed(fx)
+            subjects = {name: args for name, args in subjects.items()
+                        if name in {s.name for s in specs}}
+            private, _ambiguous = self._private_side_ids(fx)
+            submitted = self._submitted_side_ids(fx)
+            api = fx["api"]
+            for klass, record in sorted(GRANT_ROWS.items()):
+                principal = next(p for p in PRINCIPALS
+                                 if self._entitlement(fx)[p][0] == klass)
+                rows = self._grant_rows(fx, klass, principal, {})
+                self.assertEqual(
+                    1, len(rows),
+                    f"[{record.__name__}] {principal} holds {len(rows)} "
+                    f"grant rows, so 'move THE row' is ambiguous")
+                row = rows[0]
+                save = getattr(api.store,
+                               "save_guardian_link" if record is GuardianLink
+                               else "save_official_assignment")
+                base = self._oracle_answer(fx, principal, subjects, private,
+                                           submitted)
+                self.assertTrue(
+                    any(any(v) for v in base.values()),
+                    f"[{record.__name__}] {principal} is entitled to nothing "
+                    f"anywhere before the perturbation, so nothing below can "
+                    f"be observed to move")
+                for field in sorted(_record_fields(record)
+                                    - GRANT_FIELDS_NOT_PERTURBABLE):
+                    with self.subTest(row=record.__name__, field=field):
+                        current = getattr(row, field)
+                        moved_to = _alternative_value(fx, record, field,
+                                                      current)
+                        self.assertNotEqual(
+                            current, moved_to,
+                            f"{record.__name__}.{field}: the substitute "
+                            f"equals the current value, so this measures "
+                            f"nothing")
+                        save(dataclasses.replace(row, **{field: moved_to}))
+                        try:
+                            after = self._oracle_answer(
+                                fx, principal, subjects, private, submitted)
+                        finally:
+                            save(row)
+                        keyed = field in GRANT_DIMENSIONS[klass]
+                        declared = ("a DECLARED DIMENSION" if keyed
+                                    else "typed as keying NOTHING")
+                        happened = ("changed" if after != base
+                                    else "changed NOTHING")
+                        self.assertEqual(
+                            keyed, after != base,
+                            f"{record.__name__}.{field} is {declared} and "
+                            f"moving it {happened} "
+                            f"in what the oracles grant {principal}. "
+                            + ("A dimension the oracles do not key on is an "
+                               "entitlement computed over a coarser key than "
+                               "the response it governs — F1, F2 and F3 in "
+                               "one sentence."
+                               if keyed else
+                               "A field declared to key nothing is keying "
+                               "something, so the typed reason beside it in "
+                               "GRANT_FIELDS_THAT_KEY_NOTHING is false."))
+                        self.assertEqual(
+                            base,
+                            self._oracle_answer(fx, principal, subjects,
+                                                private, submitted),
+                            f"{record.__name__}.{field}: the restore did not "
+                            f"put the world back, so every later field in "
+                            f"this loop measures a different fixture")
+                # …AND THE OTHER DIRECTION OF THE SAME QUESTION: hold the ROW
+                # still and move what THE REQUEST says. Moving the row is not
+                # enough on its own — `_permitted_ids` reads the junior off
+                # the matching row, so re-pointing the row moves the answer
+                # even for an oracle that ignores the path entirely, which is
+                # exactly the state F1 was in. A dimension the REQUEST
+                # supplies must select between grants.
+                for field in sorted(_subject_fields(record)):
+                    elsewhere = fx["other_subjects"][field]
+                    if self._session_fixed(fx, principal, field):
+                        continue   # no request can move it — audited in
+                        # TheSweptBindingsExerciseTheUnentitledDirection
+                    with self.subTest(row=record.__name__, request=field):
+                        self.assertEqual(
+                            elsewhere,
+                            self._dimension_value(fx, principal, field,
+                                                  {field: elsewhere}),
+                            f"{record.__name__}.{field} is neither a "
+                            f"`*_user_id` nor a key of {principal}'s account "
+                            f"scope, so the REQUEST is the only thing that "
+                            f"can supply it — and `_dimension_value` does "
+                            f"not take it from the path. Nothing can name "
+                            f"this dimension, which is F1 one layer earlier.")
+                        self.assertTrue(
+                            self._grant_rows(fx, klass, principal,
+                                             {field: getattr(row, field)}),
+                            f"{record.__name__}.{field}: the request naming "
+                            f"the subject this row actually carries is "
+                            f"granted NOTHING, so the real product grant is "
+                            f"unreachable")
+                        self.assertFalse(
+                            self._grant_rows(fx, klass, principal,
+                                             {field: elsewhere}),
+                            f"{record.__name__}.{field}: a request naming "
+                            f"{elsewhere} — a subject this row does NOT name "
+                            f"— is granted this row anyway, so the oracle is "
+                            f"not keyed on what the request says. That is F1 "
+                            f"and F3 exactly.")
+        finally:
+            store.clear_all_data()
+
+    # -- one required-RED falsifier per dimension --------------------------
+    def test_a_declined_official_still_admitted_reddens_the_primary_sweep(
+            self):
+        """``status``. THE FALSIFIER THAT MAKES THE MODULE'S OWN LOCKSTEP
+        CLAIM TRUE, required to go RED.
+
+        The swept official DECLINES through the product's own write path, and
+        the gate is restored to the predicate that ignores ``status``. The
+        product serves them the sheet; the store's own row says the grant is
+        dead; oracle 1 must report it.
+
+        AND THE CONTROL: with the oracle blind to activation — the state this
+        file was in at ``40a5e29``, where ``_official_is_assigned``
+        reproduced the gate's predicate verbatim — the identical world is
+        GREEN. Without that half this test would pass for an oracle that had
+        not changed at all."""
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                specs, subjects = self._assert_inventory_is_closed(fx)
+                with self._revoked(fx, "official_assignment_declined"):
+                    with _an_official_admitted_on_a_dead_assignment():
+                        status, body = self._req(
+                            who["official"], "GET",
+                            f"/api/games/{fx['gid']}/lineups")
+                        self.assertEqual(
+                            status, 200,
+                            "the restored predicate did not actually admit "
+                            "the DECLINED official, so nothing below is a "
+                            "statement about this sweep")
+                        sweep = self._sweep(who, fx, specs, subjects)
+                        reported = self._reported(
+                            self._assert_no_foreign_ids, sweep, fx,
+                            f"{label}/declined-official")
+                        self.assertIsNotNone(
+                            reported,
+                            "THE PRIMARY SWEEP DID NOT CATCH AN OFFICIAL "
+                            "SERVED THE PRIVATE SHEET OF A GAME THEY "
+                            "DECLINED. `OfficialAssignmentStatus.is_active` "
+                            "says that row grants nothing.")
+                        self.assertIn("official", reported)
+                        with self._oracle_blind_to("status"):
+                            blind = self._reported(
+                                self._assert_no_foreign_ids, sweep, fx,
+                                f"{label}/status-blind")
+                        self.assertIsNone(
+                            blind,
+                            "the ACTIVATION-blind oracle this round replaces "
+                            "already catches the declined official, so this "
+                            "test is not measuring the change it claims to: "
+                            + str(blind))
+            finally:
+                self._close(label, store)
+            return   # the oracle's own behaviour, not a per-backend property
+
+    def test_admitting_an_official_on_another_officials_row_reddens_the_sweep(
+            self):
+        """``official_id``, required to go RED.
+
+        The gate keeps the game and the status and drops WHO the row names.
+        The second game carries an ACTIVE assignment belonging to the SECOND
+        official, so the swept official is admitted to a game that is not
+        theirs and served its sheet.
+
+        AND THE CONTROL, which is the fixture rather than the oracle: with
+        the second official's row removed — the fixture at ``40a5e29``, where
+        ``gid2`` carried no assignment at all — the identical widening
+        admits nobody new and the sweep is GREEN. That is why the second
+        official exists."""
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                specs, subjects = self._assert_inventory_is_closed(fx)
+                api = fx["api"]
+                other = [a for a in api.store.assignments_for_game(fx["gid2"])
+                         if a.official_id == fx["official2_id"]]
+                self.assertEqual(
+                    1, len(other),
+                    f"[{label}] the second game does not carry exactly one "
+                    f"assignment for the second official")
+                with _an_official_admitted_on_anyone_s_assignment():
+                    status, _body = self._req(
+                        who["official"], "GET",
+                        f"/api/games/{fx['gid2']}/lineups")
+                    self.assertEqual(
+                        status, 200,
+                        "the widening did not admit the swept official to "
+                        "the second game, so nothing below is a statement "
+                        "about this sweep")
+                    sweep = self._sweep(who, fx, specs, subjects)
+                    reported = self._reported(
+                        self._assert_no_foreign_ids, sweep, fx,
+                        f"{label}/anyones-assignment")
+                    self.assertIsNotNone(
+                        reported,
+                        "THE PRIMARY SWEEP DID NOT CATCH AN OFFICIAL SERVED "
+                        "THE SHEET OF A GAME WHOSE ONLY ASSIGNMENT NAMES "
+                        "SOMEBODY ELSE.")
+                    self.assertIn("official", reported)
+                    # THE CONTROL: the round-10 fixture, in which no other
+                    # official held a row anywhere.
+                    self.assertNotIn(
+                        "error", api.unassign_official(other[0].id,
+                                                       actor_id=ADMIN))
+                    try:
+                        thin = self._sweep(who, fx, specs, subjects)
+                        blind = self._reported(
+                            self._assert_no_foreign_ids, thin, fx,
+                            f"{label}/no-second-official")
+                    finally:
+                        back = api.assign_official(
+                            fx["gid2"], fx["official2_id"], "referee",
+                            actor_id=ADMIN)
+                        self.assertNotIn("error", back, back)
+                    self.assertIsNone(
+                        blind,
+                        "the fixture without a second official's assignment "
+                        "already reddens under this widening, so the second "
+                        "official is not what makes `official_id` "
+                        "falsifiable: " + str(blind))
+            finally:
+                self._close(label, store)
+            return   # the oracle's own behaviour, not a per-backend property
+
+    def test_a_guardian_admitted_on_another_guardians_link_reddens_the_sweep(
+            self):
+        """``guardian_user_id``, required to go RED — F3.
+
+        The swept guardian's own link is un-verified through the existing
+        revocation; the SECOND guardian's link to the same junior stays
+        verified; and ``GuardianService``'s two read helpers are widened to
+        ignore WHO is asking. The product then serves the swept guardian a
+        junior they hold no verified link to.
+
+        AND THE CONTROL: an oracle that does not key on ``guardian_user_id``
+        — the one at ``40a5e29``, which asked ``any(link.verified for link in
+        guardian_links_for_player(junior))`` — is GREEN on the identical
+        world."""
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                specs, subjects = self._assert_inventory_is_closed(fx)
+                with self._revoked(fx, "guardian_link"):
+                    with _a_guardian_admitted_on_another_guardians_link():
+                        status, body = self._req(
+                            who["guardian"], "GET", "/api/me/guardian/home")
+                        self.assertEqual(status, 200, body)
+                        self.assertTrue(
+                            body.get("juniors"),
+                            "the widening did not actually serve the swept "
+                            "guardian a junior, so nothing below is a "
+                            "statement about this sweep")
+                        sweep = self._sweep(who, fx, specs, subjects)
+                        reported = self._reported(
+                            self._assert_no_foreign_ids, sweep, fx,
+                            f"{label}/another-guardians-link")
+                        self.assertIsNotNone(
+                            reported,
+                            "THE PRIMARY SWEEP DID NOT CATCH A GUARDIAN "
+                            "SERVED A JUNIOR ON THE STRENGTH OF SOMEBODY "
+                            "ELSE'S VERIFIED LINK.")
+                        self.assertIn("guardian", reported)
+                        with self._oracle_blind_to("guardian_user_id"):
+                            blind = self._reported(
+                                self._assert_no_foreign_ids, sweep, fx,
+                                f"{label}/guardian-identity-blind")
+                        self.assertIsNone(
+                            blind,
+                            "the junior-keyed oracle this round replaces "
+                            "already catches it, so this test is not "
+                            "measuring the change it claims to: "
+                            + str(blind))
+            finally:
+                self._close(label, store)
+            return   # the oracle's own behaviour, not a per-backend property
+
+    def test_a_guardian_admitted_to_another_junior_reddens_the_sweep(self):
+        """``player_id``, required to go RED — F1, and the one that is about
+        the SWEPT BINDING rather than about the oracle.
+
+        ``Handler._guardian_link_or_403`` is neutered, so the junior named in
+        the path is no longer checked. The route carries no identity, so this
+        is ORACLE 2's to catch: the response is the HOME side's own roster
+        status and open-slot counts, and it moves under a HOME perturbation
+        for a caller entitled to nothing of that game.
+
+        AND THE CONTROL IS THE BINDING: swept with round 10's bindings — the
+        guardian's OWN junior in both rows — the identical widening moves
+        nothing at all and the sweep is GREEN. That is F1 exactly: not a
+        wrong rule, an argument the sweep never supplied."""
+        results = {}
+        # A FRESH WORLD PER BINDING SET, not two perturbations of one.
+        # `_perturbed` is entered ONCE per (side, game, kind) in the primary
+        # sweep, and its undo leaves the withdrawn enrolment row behind, so
+        # re-entering it on one fixture aborts on its own premise rather
+        # than measuring anything. Measured, not reasoned: the second entry
+        # answers `not_enrolled`.
+        for tag in ("bound", "round-10-bindings"):
+            for label, store in self._stores():
+                try:
+                    self._assert_backend(label, store)
+                    store.clear_all_data()
+                    fx = self._fixture(store)
+                    who = self._serve(fx)
+                    specs, subjects = self._assert_inventory_is_closed(fx)
+                    stranger = fx["unlinked_junior_id"]
+                    if tag == "round-10-bindings":
+                        subjects = dict(subjects)
+                        subjects[
+                            "get_me_guardian_id_substitute_opportunities_id"] = [
+                                (fx["guardian_junior_id"], fx["gid"]),
+                                (fx["guardian_junior_id"], fx["gid2"])]
+                    with _a_guardian_admitted_to_any_junior():
+                        status, _body = self._req(
+                            who["guardian"], "GET",
+                            f"/api/me/guardian/{stranger}/"
+                            f"substitute-opportunities/{fx['gid']}")
+                        self.assertEqual(
+                            status, 200,
+                            "the widening did not admit the guardian to a junior "
+                            "they hold no link to, so nothing below is a "
+                            "statement about this sweep")
+                        base = self._sweep(who, fx, specs, subjects)
+                        with self._perturbed(fx, fx["home"], fx["gid"],
+                                             "substitute_enrolment"):
+                            world = self._sweep(who, fx, specs, subjects)
+                        results[tag] = self._reported(
+                            self._assert_non_interference, base, world, fx,
+                            fx["home"], f"{label}/{tag}", TEAM_WORKFLOW_DATA,
+                            fx["gid"])
+                finally:
+                    self._close(label, store)
+                break   # the oracle's own behaviour, not a per-backend one
+        self.assertIsNotNone(
+            results["bound"],
+            "THE PRIMARY SWEEP DID NOT CATCH A GUARDIAN SERVED ANOTHER "
+            "JUNIOR'S SIDE. The junior is a path argument the sweep binds, "
+            "and binding only the direction the guardian IS entitled to is "
+            "what made this invisible.")
+        self.assertIn("guardian", results["bound"])
+        self.assertIsNone(
+            results["round-10-bindings"],
+            "round 10's bindings — the guardian's OWN junior in both rows — "
+            "already catch this, so the unentitled binding is not what makes "
+            "`player_id` falsifiable: " + str(results["round-10-bindings"]))
+
+
+# ---------------------------------------------------------------------------
+# 11.6 EVERY PATH ARGUMENT IS SWEPT IN THE UNENTITLED DIRECTION TOO.
+#
+# F1 was only half a keying bug. The other half was that both swept bindings
+# for the guardian route named the guardian's OWN junior, so however the
+# oracle was keyed, the sweep never asked the question. A dimension the
+# request can vary and the sweep never varies is a dimension no falsifier can
+# reach — which is why this is audited against `GRANT_DIMENSIONS` rather than
+# left to whoever adds the next binding.
+# ---------------------------------------------------------------------------
+
+#: ``{dimension: why the sweep binds no unentitled value for it}`` — typed,
+#: and MEASURED by the test below rather than trusted.
+DIMENSIONS_WITH_NO_PATH_DIRECTION = {
+    "team_id":
+        "no authenticated GET route in route_registry takes a TEAM id as a "
+        "path argument — measured off the registry by the test below, not "
+        "assumed — so there is no path for either direction of a coach's "
+        "`team_id` to be bound in. What stands in for it is the GAME "
+        "subject: `thirdcoach` is scoped to a team that plays in NEITHER "
+        "game and is swept on every path in every world.",
+}
+
+
+class TheSweptBindingsExerciseTheUnentitledDirection(_SweepHarness,
+                                                     unittest.TestCase):
+    """Every grant dimension is either fixed by the SESSION — a path cannot
+    vary it at all — or bound by the sweep in BOTH directions."""
+
+    def test_every_grant_dimension_is_session_fixed_or_swept_both_ways(self):
+        """THE PATH-ARGUMENT AUDIT (#427 round 11, item 5).
+
+        For every dimension of every row-backed grant, ask which of the three
+        sources :meth:`_dimension_value` resolves it from:
+
+        * THE SESSION — a ``*_user_id``, or a key of this principal's own
+          account scope. A path cannot make a caller somebody else, and that
+          is asserted here by MEASURING that ``_dimension_value`` ignores a
+          path that names a different one.
+        * THE PATH — then the sweep must bind at least one value that DOES
+          grant this principal the read and at least one that does NOT, or
+          carry a typed entry in :data:`DIMENSIONS_WITH_NO_PATH_DIRECTION`.
+          "Entitled" is not judged here: it is
+          :meth:`_SweepHarness._grant_rows` answering, so the audit and the
+          oracle cannot disagree about what a grant is."""
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            self._serve(fx)
+            specs, subjects = self._assert_inventory_is_closed(fx)
+            live = {s.name for s in specs}
+            bound = [args for name, arglists in subjects.items()
+                     if name in live for args in arglists]
+            audited = set()
+            for klass, record in sorted(GRANT_ROWS.items()):
+                principal = next(p for p in PRINCIPALS
+                                 if self._entitlement(fx)[p][0] == klass)
+                for field in sorted(_subject_fields(record)):
+                    audited.add(field)
+                    elsewhere = fx["other_subjects"][field]
+                    from_path = self._dimension_value(
+                        fx, principal, field, {field: elsewhere})
+                    with self.subTest(row=record.__name__, dimension=field):
+                        if self._session_fixed(fx, principal, field):
+                            # SESSION-FIXED, classified from the SOURCES:
+                            # naming another subject in the path must not
+                            # move the value at all.
+                            self.assertNotEqual(
+                                elsewhere, from_path,
+                                f"{field} is supplied by the session, and a "
+                                f"path naming {elsewhere} moved it — a "
+                                f"request can make this caller somebody else")
+                            self.assertIsNotNone(
+                                from_path,
+                                f"{field} is neither taken from the path nor "
+                                f"fixed by the session, so no request can "
+                                f"ever supply it and the dimension is dead")
+                            continue
+                        self.assertEqual(
+                            elsewhere, from_path,
+                            f"{field} is not session-fixed, so the PATH is "
+                            f"the only thing that can supply it — and it "
+                            f"does not reach the oracle. That is F1: the "
+                            f"junior in "
+                            f"/api/me/guardian/{{}}/substitute-opportunities/"
+                            f"{{}} was discarded before any oracle saw it.")
+                        values = {v for args in bound
+                                  for k, v in self._path_subjects(
+                                      fx, args).items() if k == field}
+                        granting = {v for v in values if self._grant_rows(
+                            fx, klass, principal, {field: v})}
+                        if field in DIMENSIONS_WITH_NO_PATH_DIRECTION:
+                            self.assertFalse(
+                                values,
+                                f"{field} carries a typed reason for having "
+                                f"no path direction, and the sweep binds "
+                                f"{sorted(values)} for it — delete the "
+                                f"reason rather than keeping a false one")
+                            continue
+                        self.assertTrue(
+                            granting,
+                            f"{field}: the sweep binds no value that GRANTS "
+                            f"{principal} the read, so the entitled "
+                            f"direction is never swept and the real product "
+                            f"grant is never exercised")
+                        self.assertTrue(
+                            values - granting,
+                            f"{field}: EVERY value the sweep binds for this "
+                            f"dimension grants {principal} the read, so the "
+                            f"UNENTITLED direction is never swept. That is "
+                            f"F1: the guardian's junior was bound to their "
+                            f"own junior in both rows, and a widening that "
+                            f"served another junior would have passed. Bind "
+                            f"one, or add a typed entry to "
+                            f"DIMENSIONS_WITH_NO_PATH_DIRECTION.")
+            # …and every typed excuse names a real dimension, measured
+            # against the registry rather than remembered.
+            for field in DIMENSIONS_WITH_NO_PATH_DIRECTION:
+                self.assertIn(
+                    field,
+                    frozenset().union(*GRANT_DIMENSIONS.values()),
+                    f"{field} is excused from the path audit but is not a "
+                    f"grant dimension at all")
+            self.assertEqual(
+                frozenset(DIMENSIONS_WITH_NO_PATH_DIRECTION) - audited,
+                frozenset(DIMENSIONS_WITH_NO_PATH_DIRECTION)
+                - frozenset().union(*(_subject_fields(r)
+                                      for r in GRANT_ROWS.values())),
+                "a typed excuse names a dimension this audit already covers")
+        finally:
+            store.clear_all_data()
+
+    def test_no_authenticated_get_route_takes_a_team_id_path_argument(self):
+        """THE MEASUREMENT BEHIND THE ONE TYPED EXCUSE.
+
+        ``team_id``'s entry in :data:`DIMENSIONS_WITH_NO_PATH_DIRECTION` is a
+        claim about the REGISTRY, so it is re-measured every run: no
+        authenticated GET route the sweep binds resolves any of its path
+        arguments to a Team. The day one does, the excuse stops being true
+        and this fails rather than the audit silently skipping a dimension."""
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            self._serve(fx)
+            specs, subjects = self._assert_inventory_is_closed(fx)
+            live = {s.name for s in specs}
+            offenders = sorted(
+                (name, args) for name, arglists in subjects.items()
+                if name in live for args in arglists
+                if "team_id" in self._path_subjects(fx, args))
+            self.assertEqual(
+                [], offenders,
+                f"these swept paths DO name a team, so `team_id` has a path "
+                f"direction after all and its typed excuse is false: "
+                f"{offenders}")
+            # The premise: a Team id really would be recognised if one
+            # appeared. Otherwise this test passes because the resolver is
+            # broken rather than because no route takes one.
+            self.assertEqual(
+                {"team_id": fx["third"]},
+                self._path_subjects(fx, (fx["third"],)),
+                "a team id no longer resolves to the team_id dimension, so "
+                "the audit above cannot see one even if a route grew it")
         finally:
             store.clear_all_data()
 
@@ -6210,7 +7745,7 @@ class TheDisclosedLimitsAreMeasuredNotRemembered(_SweepHarness,
         "get_games_id_roster": 8,
     }
 
-    #: Requests of the base world's 2,480 that carry at least one such node.
+    #: Requests of the base world's 2,560 that carry at least one such node.
     JERSEY_BEARING_REQUESTS = 112
 
     @staticmethod
