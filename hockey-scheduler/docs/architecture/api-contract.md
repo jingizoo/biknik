@@ -133,6 +133,25 @@ home default and answered the caller **HOME's** private pool, status,
 notifications and audit stream. Losing an authority now produces a refusal,
 not a fallback.
 
+**An official's admission is the ACTIVE assignment, not the row.** An
+`OfficialAssignment` the official has **declined** admits them to nothing:
+`resolve_private_game_read` requires `status.is_active`, which is the
+product's own statement of which assignments hold anything
+(`OfficialAssignmentStatus.is_active` — "Proposed or accepted assignments hold
+the official's time"). This read gate was the last consumer of those rows that
+did not honour it: `assign_official`'s duplicate and overlap checks,
+`setup_service._active_officials`, both game notification fan-outs and the
+official's own calendar feed all key on `is_active`, while `/board`,
+`/lineups` and `/roster` kept answering 200 with the game's submitted sheet
+after the official declined. The behavioural sweep is what found it — a
+declined official was served `player_1` and `player_12` on all three leaves
+with every test green — and
+`tests/test_authenticated_side_noninterference.py::TheGrantIsKeyedByEveryDimensionOfItsRow`
+now requires the primary sweep to go RED if the status test is removed again.
+`GET /api/games/{id}/officials` is unchanged: it *lists* who was assigned,
+declines included, which is a roster of the offer history rather than an
+authority to read anything.
+
 **The home default is audience-bound.** `/board` answers one side and still
 defaults to home — but only for an audience with no side of its own *by
 design*: an unscoped operator, an assigned official (whose default side is

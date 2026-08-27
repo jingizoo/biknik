@@ -201,9 +201,20 @@ def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
                                own_team=own_team if admitted else None,
                                admitted=admitted)
     if role == Role.OFFICIAL:
+        # AN ASSIGNMENT THE OFFICIAL DECLINED IS NOT AN ADMISSION (#427
+        # round 11). `OfficialAssignmentStatus.is_active` is the product's
+        # own statement of which assignments hold anything — "Proposed or
+        # accepted assignments hold the official's time" — and every other
+        # consumer of these rows already honours it: `assign_official`'s
+        # duplicate and overlap checks, `setup_service._active_officials`,
+        # the game notification fan-outs in `setup_service`/`roster_service`,
+        # and `calendar.py`, which will not even name an official's ROLE on
+        # their own feed for an inactive row. This read gate was the one
+        # place that did not, so a DECLINED official kept 200 on `/board`,
+        # `/lineups` and `/roster` and the private sheet they carry.
         official_id = scope.get("official_id")
         admitted = official_id is not None and any(
-            a.official_id == official_id
+            a.official_id == official_id and a.status.is_active
             for a in store.assignments_for_game(game_id))
         return PrivateGameRead(role=role, game=game, own_team=None,
                                admitted=admitted)
