@@ -24,6 +24,7 @@ from . import scope_bridge
 from . import season_guard
 from .league_scope import (
     exact_league_season_or_conflict, exact_registration_or_conflict)
+from .subject_scope import assignment_grants_official_scope
 from .subject_scope import own_team_id as _own_team_id
 
 # Roles that see every Program under the current account model (#211): the two
@@ -63,11 +64,21 @@ def _team_season_ids(store, team):
 
 def _official_program_seasons(store, official_id):
     """An Official's authorized (programs, seasons) — those of the games they are
-    assigned to (mirrors web.scope.can_read_private_game_data's official branch)."""
+    assigned to (mirrors web.scope.can_read_private_game_data's official branch).
+
+    Which assignments COUNT is
+    :func:`~.subject_scope.assignment_grants_official_scope`, the one shared
+    product predicate — not a status test spelled out again here. See that
+    function for the drift this closes: a DECLINED assignment stopped admitting
+    the Official to the private-game family while still offering them the
+    target Program and Season in the context switcher.
+    """
     programs, seasons = set(), set()
     if not official_id:
         return programs, seasons
     for a in store.assignments_for_official(official_id):
+        if not assignment_grants_official_scope(a, official_id):
+            continue
         game = store.get_game(a.game_id)
         if game is None or not game.season_id:
             continue
@@ -168,6 +179,11 @@ def _official_league_ids(store, official_id):
     if not official_id:
         return leagues
     for a in store.assignments_for_official(official_id):
+        # Which assignments COUNT is the one shared predicate, identical to
+        # the Program/Season projection above and to the private-game
+        # admission — see `subject_scope.assignment_grants_official_scope`.
+        if not assignment_grants_official_scope(a, official_id):
+            continue
         game = store.get_game(a.game_id)
         if game is None:
             continue

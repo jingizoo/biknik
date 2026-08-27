@@ -30,6 +30,7 @@ from typing import Optional, Tuple
 
 from ..domain import Role
 from .roster_service import RosterService
+from .subject_scope import assignment_grants_official_scope
 
 
 def _player_team_for_game(scope, game, store):
@@ -212,9 +213,20 @@ def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
         # their own feed for an inactive row. This read gate was the one
         # place that did not, so a DECLINED official kept 200 on `/board`,
         # `/lineups` and `/roster` and the private sheet they carry.
+        #
+        # THE TEST IS NOW THE SHARED PREDICATE, not the inline conjunction it
+        # was written as (#205). Fixing this surface alone left the SAME
+        # question answered in three places, and the two it did not touch —
+        # `context_scope._official_program_seasons` and `_official_league_ids`
+        # — went on granting the declined Official's Program, Season and
+        # League in the context switcher, so authorization disagreed across
+        # product surfaces. `subject_scope.assignment_grants_official_scope`
+        # is that one definition; this call site keeps byte-identical
+        # behaviour (exact official AND `status.is_active`) while ceasing to
+        # be an independent copy of it.
         official_id = scope.get("official_id")
         admitted = official_id is not None and any(
-            a.official_id == official_id and a.status.is_active
+            assignment_grants_official_scope(a, official_id)
             for a in store.assignments_for_game(game_id))
         return PrivateGameRead(role=role, game=game, own_team=None,
                                admitted=admitted)

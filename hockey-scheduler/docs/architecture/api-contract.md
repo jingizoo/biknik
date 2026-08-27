@@ -403,6 +403,16 @@ that did not occur. An unscoped operator (`authorized_team_id` unset) keeps the
 prior unconditional behaviour and receives the occupying row whatever side it
 names.
 
+### Which assignments grant an Official scope
+
+One predicate, applied on every surface: an `OfficialAssignment` grants scope
+only when it names **that** Official and its status **is active**
+(`proposed` or `accepted`). A **declined** assignment therefore grants nothing
+anywhere — it is refused admission to the private-game family (`/board`,
+`/lineups`, `/roster`) *and* contributes no Program, Season or League to
+`GET /api/context/options`. The two surfaces cannot disagree, because they call
+the same predicate rather than each spelling the status test out.
+
 ## Named schedule scenarios (#378)
 
 All four routes require a **signed-in session** plus server-side
