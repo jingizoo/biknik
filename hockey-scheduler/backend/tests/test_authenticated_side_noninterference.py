@@ -9,16 +9,20 @@ the asset — runs on Memory, SQLite and real PostgreSQL, and
 Every OTHER test in this module returns after the first backend, or builds an
 ``InMemoryStore`` directly, or touches no store at all — each with a written
 reason on the line that does it: they pin the behaviour of an ORACLE, of the
-fixture, or of a gate, none of which is a per-backend property. INSTRUMENTED,
-so the sentence is a count and not an impression: exactly TWO test methods in
-this file loop every configured backend and call ``_assert_matrix_ran``. The
-first is the whole-surface property above. The second is
+fixture, or of a gate, none of which is a per-backend property. MEASURED off
+the module's own AST rather than eyeballed, so the sentence is a count and
+not an impression: exactly FIVE test methods in this file loop every
+configured backend and call ``_assert_matrix_ran``. The first is the
+whole-surface property above. The second is
 :meth:`TheHintAxisIsClosedAgainstWhatTheServerReads
 .test_no_parameter_the_server_reads_selects_a_side`, added in round 9, which
 carries the FULL query-parameter matrix on one fresh world per backend
 because carrying it in all twenty worlds is not affordable — see
-:data:`HINTS`. (It said ONE until round 9. The count is stated because the
-headline sentence is easy to read as a claim about every test in the file.)
+:data:`HINTS`. The other three are the whole of
+:class:`AGameKeyedGrantDoesNotSpanASecondGame`, added in round 10, which the
+owner required on all three backends by name. (It said ONE until round 9 and
+TWO until round 10. The count is stated because the headline sentence is easy
+to read as a claim about every test in the file.)
 
 WHY THIS IS THE PRIMARY PROTECTION AND THE STATIC SCANNER IS SUPPLEMENTAL.
 Five rounds of this blocker found five leaks, each by a human enumerating
@@ -113,6 +117,24 @@ oracle, and that a FULL official projection on each of /board, /lineups and
 /roster does too, are asserted in
 :class:`TheOfficialGrantIsRouteAndDataClassSpecific`.
 
+…AND PER GAME, BECAUSE ONE OF THE THREE GRANTS IS ISSUED AGAINST A GAME
+======================================================================
+Round 10 found that the narrowing above was still a statement about a
+principal and a route and never about WHICH GAME. An
+``OfficialAssignment`` names one game; the two swept games share both teams
+with the sides swapped; and both oracles were reading a number computed
+across the pair. :meth:`_submitted_side_ids` UNIONED each side's occupants
+over both games, so an official assigned to the first was permitted an
+identity that occupies a slot only in the second; and
+:meth:`_assert_non_interference` was handed the perturbed TEAM and never the
+perturbed GAME, so a response about the assigned game could vary with the
+other game's sheet and never be an offender. Both are now keyed by game —
+see :meth:`_grant_spans`, :data:`GRANT_RECORD_FIELDS` and
+:class:`AGameKeyedGrantDoesNotSpanASecondGame` — and WHICH principals that
+rule applies to is derived from the domain rows their grants live in rather
+than listed, which :class:`NoGrantIsAggregatedAcrossADimensionItIsKeyedOn`
+asserts in both directions.
+
 Round 7 found the SAME SHAPE ONE SEAT OVER: narrowing the official had left
 the GUARDIAN globally entitled to a whole side, on every route and for every
 data class. A registered route handing ``Role.GUARDIAN`` alone the junior's
@@ -155,8 +177,11 @@ principal (role)       CLOSED      ``domain.Role``
 session scope          CLOSED      ``AccountService._ALLOWED_SCOPE_KEYS``
 query parameter        CLOSED      ``route_extract.query_parameter_names``
 subject (which game)   **LIMIT**   entitlement recomputed from the store's
-                                   own rows; the REVOCATION KINDS are a test
-                                   construction (see ``relationship kind``)
+                                   own rows, and WHICH GRANTS ARE KEYED ON A
+                                   GAME derived from those rows' own fields
+                                   (``GRANT_RECORD_FIELDS``); the REVOCATION
+                                   KINDS remain a test construction (see
+                                   ``relationship kind``)
 backend                CLOSED      ``_assert_matrix_ran``: a skip is not a pass
 HTTP method            **LIMIT**   GET only; the VOCABULARY is closed
 =====================  ==========  ==================================
@@ -207,9 +232,15 @@ adjusted:
   property — 62 concrete paths x 10 principals x the 4 per-world variants in
   :data:`HINTS`;
 * measured on this machine, for the whole-surface property alone:
-  **31.7 s Memory, 19.1 s SQLite, 64.8 s real PostgreSQL**;
-* the WHOLE MODULE, tri-store: **Ran 43 tests in 223.5 s ... OK**, against
-  **27 tests in 171.3 s** at the head this round started from;
+  **31.8 s Memory, 19.9 s SQLite, 68.0 s real PostgreSQL**;
+* the WHOLE MODULE, tri-store: **Ran 48 tests in 244.6 s ... OK**, against
+  the **43 tests** at the head this round started from (whose 223.5 s is
+  the previous round's own measurement, carried forward rather than
+  re-measured here);
+* round 10 adds THREE more requests of a full sweep per backend —
+  :class:`AGameKeyedGrantDoesNotSpanASecondGame` sweeps once for the
+  identity falsifier and twice for the non-interference one, and its third
+  test sweeps not at all;
 * and the full derived parameter matrix — :data:`FULL_HINTS`, ten variants,
   6,200 requests — once per backend on a fresh world, which is the shape
   that made closing the query-string axis affordable at all.
@@ -296,7 +327,7 @@ from test_overview_schedule_side import _OverviewHarness
 from test_substitute_membership_cutover import ADMIN
 
 from hockey_scheduler.api.service import ApiService as _ApiService
-from hockey_scheduler.domain import Role
+from hockey_scheduler.domain import GuardianLink, OfficialAssignment, Role
 from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.services import game_side_scope, lineup_visibility
 from hockey_scheduler.services.account_service import AccountService
@@ -806,6 +837,73 @@ UNSCOPED_OPERATOR_CLASSES = frozenset({
     UNSCOPED_OPERATOR_WITHOUT_ROSTER_AUTHORITY})
 
 
+def _scope_keys(*roles):
+    """The scope keys the PRODUCT accepts for these roles — the account-scope
+    half of :data:`GRANT_RECORD_FIELDS`, read from
+    ``AccountService._ALLOWED_SCOPE_KEYS`` rather than listed here."""
+    out = frozenset()
+    for role in roles:
+        out |= AccountService._ALLOWED_SCOPE_KEYS.get(role, frozenset())
+    return out
+
+
+def _record_fields(record):
+    """The field names of a domain record, from the record itself."""
+    return frozenset(f.name for f in dataclasses.fields(record))
+
+
+#: ``{entitlement class: the field names of the row the PRODUCT stores that
+#: class's grant in}`` — and therefore WHICH DIMENSIONS that grant is keyed
+#: on. Every value is DERIVED from an authority outside this module: a domain
+#: dataclass's own fields, or ``AccountService._ALLOWED_SCOPE_KEYS``.
+#:
+#: WHY THIS MAP EXISTS (#427 round 10, D10). The owner's blocker was that an
+#: assigned official's permitted identities were aggregated ACROSS GAMES while
+#: the grant that produces them — an ``OfficialAssignment`` row — names ONE
+#: game. The general shape is "an entitlement aggregated across a dimension
+#: the grant is keyed on", and answering "which other principal has it?" by
+#: reading this file's own entitlement code would put both sides of the
+#: question inside this module, which is the failure
+#: :data:`PRINCIPAL_ROLES` already records once.
+#:
+#: So the question is asked of the PRODUCT: what row carries the grant, and
+#: does that row name a game?
+#:
+#: * ``OFFICIAL_SUBMITTED_LINEUP_ONLY`` — ``OfficialAssignment``, which
+#:   carries ``game_id``. GAME-KEYED. The account's own ``official_id`` scope
+#:   says only WHICH official the caller is; it grants no read.
+#: * ``GUARDIAN_OF_A_JUNIOR`` — ``GuardianLink``, which carries
+#:   ``player_id`` and no game. A verified link is a standing authority over
+#:   one junior in every game, so narrowing it by game would report the real
+#:   product grant as a leak.
+#: * ``SCOPED_TO_ONE_SIDE`` / ``IN_NEITHER_SIDE`` — the ACCOUNT SCOPE, whose
+#:   accepted keys are ``team_id``/``player_id``. A coach manages a team's
+#:   roster across every game it plays; there is no per-game row to key on.
+#: * the three unscoped classes — no grant row at all: their authority is the
+#:   role's permissions, which name nothing.
+GRANT_RECORD_FIELDS = {
+    SCOPED_TO_ONE_SIDE: _scope_keys(Role.COACH, Role.PLAYER),
+    IN_NEITHER_SIDE: _scope_keys(Role.COACH),
+    GUARDIAN_OF_A_JUNIOR: _record_fields(GuardianLink),
+    OFFICIAL_SUBMITTED_LINEUP_ONLY: _record_fields(OfficialAssignment),
+    OPERATOR_UNSCOPED_BY_DESIGN: frozenset(),
+    UNSCOPED_OPERATOR_WITHOUT_ROSTER_AUTHORITY: frozenset(),
+    VIEWER_ENTITLED_TO_NOTHING: frozenset(),
+}
+
+#: The classes whose grant row NAMES A GAME, DERIVED from the map above.
+#:
+#: For these, and only these, state of a game OTHER than the response's own
+#: subject may never excuse a diff: the grant was issued against one game, so
+#: it cannot span another. See :meth:`_SweepHarness._grant_spans` and
+#: :class:`NoGrantIsAggregatedAcrossADimensionItIsKeyedOn`, which asserts this
+#: derived set against the sweep's own MEASURED behaviour, so the declared
+#: authority and the running code have to agree.
+GAME_KEYED_CLASSES = frozenset(
+    klass for klass, fields in GRANT_RECORD_FIELDS.items()
+    if "game_id" in fields)
+
+
 class _Sweep:
     """One world's measurement: ``{(principal, route, path, hint): result}``."""
 
@@ -1086,7 +1184,36 @@ class _SweepHarness(_OverviewHarness):
         # it was granted against.
         return frozenset(teams) & sides
 
-    def _entitled_teams(self, fx, principal, route, subject, data_class):
+    def _grant_spans(self, klass, subject, perturbed_game):
+        """May private state of ``perturbed_game`` legitimately move a
+        response whose subject is ``subject``, for a principal of ``klass``?
+
+        THE BLIND SPOT THIS CLOSES (#427 round 10, D10, owner comment
+        5432572444). Oracle 2 was handed the perturbed TEAM and never the
+        perturbed GAME, so "an official may observe the submitted lineup of a
+        game they referee" was applied to a response about their assigned
+        game that had moved because a DIFFERENT game's sheet changed. The two
+        games in this fixture share both teams, so the team id alone cannot
+        tell the two situations apart — which is exactly why keying on it
+        alone was undetectable.
+
+        THE RULE IS DERIVED FROM THE GRANT ROW, NOT LISTED. A class whose
+        grant row names a game (:data:`GAME_KEYED_CLASSES`) holds it against
+        THAT game and no other, so a diff is excusable only where the
+        response's own subject IS the perturbed game. A class whose grant row
+        names no game — a coach's ``team_id`` scope, a guardian's
+        ``GuardianLink`` — is a standing authority over every game its
+        subject appears in, and narrowing it here would report the real
+        product grant as a leak. See :data:`GRANT_RECORD_FIELDS`.
+
+        ``perturbed_game is None`` means "no perturbation is in question" —
+        the identity oracle's path — and spans everything by construction."""
+        if perturbed_game is None or klass not in GAME_KEYED_CLASSES:
+            return True
+        return subject is not None and subject == perturbed_game
+
+    def _entitled_teams(self, fx, principal, route, subject, data_class,
+                        perturbed_game=None):
         """WHICH SIDES this principal may observe ON THIS ROUTE, for THIS
         KIND of private state — the number both oracles are read against
         (#427 round 2, blocker 2).
@@ -1123,6 +1250,12 @@ class _SweepHarness(_OverviewHarness):
         # a principal with no relationship to the thing being read is
         # entitled to nothing of it.
         teams = self._subject_narrowed(fx, klass, teams, subject)
+        # …AND A GAME-KEYED GRANT CANNOT SPAN A SECOND GAME (#427 round 10,
+        # D10). The team id alone cannot separate "this game's sheet moved"
+        # from "the other game's sheet moved" when both games share both
+        # teams, which is what made this invisible.
+        if not self._grant_spans(klass, subject, perturbed_game):
+            return frozenset()
         if klass == GUARDIAN_OF_A_JUNIOR:
             # The junior's own SIDE, on the junior's own two routes — not a
             # standing grant over the junior's whole team on all 48, and not
@@ -1607,9 +1740,9 @@ class _SweepHarness(_OverviewHarness):
         return blob
 
     def _submitted_side_ids(self, fx):
-        """``{team_id: frozenset}`` — the identities that OCCUPY A SLOT on a
-        side's sheet, which is the strictly narrower population an assigned
-        official is entitled to.
+        """``{(game_id, team_id): frozenset}`` — the identities that OCCUPY A
+        SLOT on ONE side's sheet IN ONE GAME, which is the strictly narrower
+        population an assigned official is entitled to.
 
         ``ApiService._submitted_lineup_rows`` over ``_lineup_rows`` — the
         SAME pair the three official routes run, called rather than
@@ -1619,18 +1752,34 @@ class _SweepHarness(_OverviewHarness):
         official the candidate pool as PERMITTED on their three routes, and
         oracle 1 would have stopped being able to see an official receiving
         a candidate identity — closing D3 by opening a new hole one seat
-        over, which is this round's recurring shape."""
-        out = {fx["home"]: set(), fx["away"]: set()}
+        over, which is this round's recurring shape.
+
+        KEYED BY ``(GAME, SIDE)``, NEVER BY SIDE ALONE (#427 round 10, D10,
+        owner comment 5432572444). This used to UNION a side's occupants
+        across both games into ``{team_id: ids}``, and
+        :meth:`_permitted_ids` then handed that aggregate to an official on
+        the strength of an assignment to the RESPONSE's game. The two games
+        share both teams, so the aggregate silently carried the OTHER game's
+        sheet. MEASURED at the head this corrects: the official is assigned
+        to ``game_1`` and not to ``game_2``; ``game_1`` seats ``player_1``
+        and ``player_12`` while ``player_6`` occupies ``game_2`` alone; yet
+        ``_permitted_ids(official, get_games_id_board, subject=game_1)``
+        answered ``{player_1, player_12, player_6}``, and injecting
+        ``player_6`` into the official's authenticated ``GET
+        /api/games/game_1/board`` left ``_assert_no_foreign_ids`` GREEN with
+        that id in the raw swept body. Assignment is game-specific; an
+        aggregate over the games two teams happen to share is not."""
+        out = {}
         api = fx["api"]
         for gid in (fx["gid"], fx["gid2"]):
             game = api.store.get_game(gid)
             for side in (game.home_team_id, game.away_team_id):
-                if side not in out:
+                if not side:
                     continue
                 rows = api._submitted_lineup_rows(
                     api._lineup_rows(game, side))
-                out[side] |= {row["id"] for row in rows}
-        return {t: frozenset(v) for t, v in out.items()}
+                out[(gid, side)] = frozenset(row["id"] for row in rows)
+        return out
 
     def _permitted_ids(self, fx, principal, route, subject, private,
                        submitted):
@@ -1659,8 +1808,10 @@ class _SweepHarness(_OverviewHarness):
           real grant, which is why the residual is closed rather than
           documented.
         * :data:`OFFICIAL_SUBMITTED_LINEUP_ONLY` — the OCCUPYING rows of both
-          sides, on :data:`OFFICIAL_ASSIGNED_GAME_ROUTES`, and no identity
-          anywhere else. See :meth:`_submitted_side_ids`.
+          sides OF THE RESPONSE'S OWN SUBJECT GAME, on
+          :data:`OFFICIAL_ASSIGNED_GAME_ROUTES`, and no identity anywhere
+          else. Keyed by ``(subject game, side)`` rather than by side, which
+          is D10: see :meth:`_submitted_side_ids` for the measurement.
         * everyone else — the whole private population of each side
           :meth:`_entitled_teams` grants them.
         """
@@ -1679,7 +1830,13 @@ class _SweepHarness(_OverviewHarness):
             # the store's assignment rows — not "any sheet, anywhere".
             if not self._official_is_assigned(fx, subject):
                 return frozenset()
-            return submitted[fx["home"]] | submitted[fx["away"]]
+            # …and THAT GAME'S sheet, both of ITS sides. Indexed rather than
+            # `.get`-ed on purpose: a subject game missing from the map is a
+            # KeyError naming it, never a silent under-permission that would
+            # redden this oracle for the wrong reason (#427 round 10, D10).
+            return frozenset().union(*(
+                submitted[(subject, side)]
+                for side in sorted(self._subject_sides(fx, subject))))
         teams = self._entitled_teams(
             fx, principal, route, subject, SUBMITTED_LINEUP_DATA)
         out = set()
@@ -1779,8 +1936,11 @@ class _SweepHarness(_OverviewHarness):
         # (4) the official's DATA-CLASS narrowing is real for identities
         #     too: a candidate is not on the sheet, so it stays forbidden to
         #     them on the three routes their grant covers.
+        # Read at the FIRST GAME's sheet, which is the game the fixture's
+        # official is assigned to and the one `at()` above reads.
         unsubmitted = self._tokens_of(
-            fx, private[fx["home"]] - submitted[fx["home"]], index)
+            fx, private[fx["home"]] - submitted[(fx["gid"], fx["home"])],
+            index)
         self.assertTrue(
             unsubmitted,
             f"[{label}] every HOME private identity occupies a slot, so the "
@@ -2066,11 +2226,11 @@ class _SweepHarness(_OverviewHarness):
         return moved
 
     def _assert_non_interference(self, base, perturbed, fx, team_id, label,
-                                 data_class):
+                                 data_class, game_id):
         """ORACLE 2. Every diff must belong to a caller ENTITLED to the side
-        that was perturbed, ON THAT ROUTE, for THAT KIND of private state.
-        Anything else is a response that is a function of that side's private
-        state.
+        that was perturbed, IN THE GAME that was perturbed, ON THAT ROUTE,
+        for THAT KIND of private state. Anything else is a response that is a
+        function of that side's private state.
 
         ``data_class`` is what :meth:`_perturbed` actually moved, asserted
         there rather than assumed here. It is the dimension blocker 2 was
@@ -2078,28 +2238,38 @@ class _SweepHarness(_OverviewHarness):
         submitted lineup, and is nothing at all for availability, substitute,
         candidate, audit or backed-out roster history — so under a
         ``TEAM_WORKFLOW_DATA`` perturbation an official diff is an offender
-        exactly like anyone else's."""
+        exactly like anyone else's.
+
+        ``game_id`` is WHICH GAME :meth:`_perturbed` moved it in, and it is
+        D10 (#427 round 10, owner comment 5432572444): without it a response
+        ABOUT the official's assigned game could vary with ANOTHER game's
+        submitted state and never be an offender, because the perturbed TEAM
+        alone is identical in both games of this fixture. It is a REQUIRED
+        argument rather than an optional one so a caller cannot inherit the
+        old blindness by omission. See :meth:`_grant_spans`."""
         with self._frozen_relationships():
             self._non_interference(base, perturbed, fx, team_id, label,
-                                   data_class)
+                                   data_class, game_id)
 
     def _non_interference(self, base, perturbed, fx, team_id, label,
-                          data_class):
+                          data_class, game_id):
         offenders, entitled_moved = [], set()
         for key in base.diff(perturbed):
             principal, route, path = key[0], key[1], key[2]
             subject = base.subject_of.get((route, path))
             if team_id in self._entitled_teams(
-                    fx, principal, route, subject, data_class):
+                    fx, principal, route, subject, data_class,
+                    perturbed_game=game_id):
                 entitled_moved.add(principal)
                 continue
             offenders.append((key, base.rows[key], perturbed.rows[key]))
         self.assertEqual(
             [], [o[0] for o in offenders],
-            f"[{label}] PRIVATE STATE OF {team_id} REACHED A CALLER NOT "
-            f"ENTITLED TO IT. Each row below is (principal, route, path, "
-            f"hint) whose response changed when ONLY {team_id}'s private "
-            f"per-side state changed, so that response is a function of it:\n"
+            f"[{label}] PRIVATE STATE OF {team_id} IN {game_id} REACHED A "
+            f"CALLER NOT ENTITLED TO IT. Each row below is (principal, "
+            f"route, path, hint) whose response changed when ONLY "
+            f"{team_id}'s private per-side state in {game_id} changed, so "
+            f"that response is a function of it:\n"
             + "\n".join(
                 f"  {key}\n     before: {json.dumps(b, sort_keys=True, default=str)[:400]}"
                 f"\n     after:  {json.dumps(a, sort_keys=True, default=str)[:400]}"
@@ -2109,9 +2279,9 @@ class _SweepHarness(_OverviewHarness):
         # "nobody else moved" proves nothing.
         self.assertTrue(
             entitled_moved,
-            f"[{label}] perturbing {team_id} changed NO response at all, so "
-            f"this world is indistinguishable from the base one and the "
-            f"non-interference assertion is vacuous")
+            f"[{label}] perturbing {team_id} in {game_id} changed NO "
+            f"response at all, so this world is indistinguishable from the "
+            f"base one and the non-interference assertion is vacuous")
 
     # -- hint invariance ---------------------------------------------------
     def _assert_hints_are_inert(self, sweep, fx, label):
@@ -2288,7 +2458,7 @@ class NoAuthenticatedRouteLeaksTheOtherSide(_SweepHarness, unittest.TestCase):
                                 world, fx, f"{tag}/perturbed")
                             self._assert_non_interference(
                                 base, world, fx, team, f"{tag}/perturbed",
-                                data_class)
+                                data_class, fx[game_key])
                             self._assert_no_foreign_ids(
                                 world, fx, f"{tag}/perturbed")
                         total += base.elapsed + world.elapsed
@@ -2880,12 +3050,12 @@ class TheOfficialGrantIsRouteAndDataClassSpecific(_SweepHarness,
             finally:
                 self.probe_registered = False
 
-    def _offenders(self, base, world, fx, team, label, data_class):
+    def _offenders(self, base, world, fx, team, label, data_class, game_id):
         """``_assert_non_interference``'s failure text, or ``None`` when it
         passed. The sweep's OWN oracle — not a re-implementation of it."""
         try:
             self._assert_non_interference(base, world, fx, team, label,
-                                          data_class)
+                                          data_class, game_id)
         except AssertionError as exc:
             return str(exc)
         return None
@@ -2931,7 +3101,7 @@ class TheOfficialGrantIsRouteAndDataClassSpecific(_SweepHarness,
                             "widening this test is about")
                         reported = self._offenders(
                             base, world, fx, fx["home"], f"{label}/probe",
-                            TEAM_WORKFLOW_DATA)
+                            TEAM_WORKFLOW_DATA, fx["gid"])
                         self.assertIsNotNone(
                             reported,
                             "THE PRIMARY SWEEP DID NOT CATCH A REGISTERED "
@@ -2947,7 +3117,8 @@ class TheOfficialGrantIsRouteAndDataClassSpecific(_SweepHarness,
                         widest = self._entitlement(fx)
 
                         def blind(_fx, principal, _route, _subject,
-                                  _data_class, _widest=widest):
+                                  _data_class, perturbed_game=None,
+                                  _widest=widest):
                             return _widest[principal][1]
 
                         real = self._entitled_teams
@@ -2955,7 +3126,8 @@ class TheOfficialGrantIsRouteAndDataClassSpecific(_SweepHarness,
                         try:
                             still_green = self._offenders(
                                 base, world, fx, fx["home"],
-                                f"{label}/blind", TEAM_WORKFLOW_DATA)
+                                f"{label}/blind", TEAM_WORKFLOW_DATA,
+                                fx["gid"])
                         finally:
                             self._entitled_teams = real
                         self.assertIsNone(
@@ -3026,7 +3198,8 @@ class TheOfficialGrantIsRouteAndDataClassSpecific(_SweepHarness,
                             world = self._sweep(who, fx, specs, subjects)
                             reported = self._offenders(
                                 base, world, fx, fx["home"],
-                                f"{method}/{kind}", PERTURBATIONS[kind])
+                                f"{method}/{kind}", PERTURBATIONS[kind],
+                                fx["gid"])
                     caught = reported is not None and route in reported
                     measured[(route, kind)] = caught
                 finally:
@@ -3193,12 +3366,12 @@ class TheGuardianGrantIsRouteSpecific(_SweepHarness, unittest.TestCase):
             finally:
                 self.probe_registered = False
 
-    def _offenders(self, base, world, fx, team, label, data_class):
+    def _offenders(self, base, world, fx, team, label, data_class, game_id):
         """``_assert_non_interference``'s failure text, or ``None`` when it
         passed. The sweep's OWN oracle — not a re-implementation of it."""
         try:
             self._assert_non_interference(base, world, fx, team, label,
-                                          data_class)
+                                          data_class, game_id)
         except AssertionError as exc:
             return str(exc)
         return None
@@ -3251,7 +3424,8 @@ class TheGuardianGrantIsRouteSpecific(_SweepHarness, unittest.TestCase):
                             world, fx, f"{label}/guardian-probe")
                         reported = self._offenders(
                             base, world, fx, fx["away"],
-                            f"{label}/guardian-probe", TEAM_WORKFLOW_DATA)
+                            f"{label}/guardian-probe", TEAM_WORKFLOW_DATA,
+                            fx["gid"])
                         self.assertIsNotNone(
                             reported,
                             "THE PRIMARY SWEEP DID NOT CATCH A REGISTERED "
@@ -3267,7 +3441,8 @@ class TheGuardianGrantIsRouteSpecific(_SweepHarness, unittest.TestCase):
                         widest = self._entitlement(fx)
 
                         def blind(_fx, principal, _route, _subject,
-                                  _data_class, _widest=widest):
+                                  _data_class, perturbed_game=None,
+                                  _widest=widest):
                             return _widest[principal][1]
 
                         real = self._entitled_teams
@@ -3275,7 +3450,8 @@ class TheGuardianGrantIsRouteSpecific(_SweepHarness, unittest.TestCase):
                         try:
                             still_green = self._offenders(
                                 base, world, fx, fx["away"],
-                                f"{label}/blind", TEAM_WORKFLOW_DATA)
+                                f"{label}/blind", TEAM_WORKFLOW_DATA,
+                                fx["gid"])
                         finally:
                             self._entitled_teams = real
                         self.assertIsNone(
@@ -3370,11 +3546,12 @@ class TheGuardianGrantIsRouteSpecific(_SweepHarness, unittest.TestCase):
                 real = self._entitled_teams
 
                 def candidate(_fx, principal, route, subject, data_class,
-                              _v=variant, _real=real):
+                              perturbed_game=None, _v=variant, _real=real):
                     klass, teams = self._entitlement(_fx)[principal]
                     if klass != GUARDIAN_OF_A_JUNIOR:
                         return _real(_fx, principal, route, subject,
-                                     data_class)
+                                     data_class,
+                                     perturbed_game=perturbed_game)
                     if _v == "nothing":
                         return frozenset()
                     if _v == "submitted_only":
@@ -3391,7 +3568,7 @@ class TheGuardianGrantIsRouteSpecific(_SweepHarness, unittest.TestCase):
                     try:
                         outcomes[variant] = self._offenders(
                             base, world, fx, fx["away"], variant,
-                            TEAM_WORKFLOW_DATA) is None
+                            TEAM_WORKFLOW_DATA, fx["gid"]) is None
                     finally:
                         self._entitled_teams = real
             finally:
@@ -3467,7 +3644,8 @@ class TheSweepCatchesTheLeakItFound(_SweepHarness, unittest.TestCase):
                         with self.assertRaises(AssertionError) as caught:
                             self._assert_non_interference(
                                 base, world, fx, fx["home"],
-                                f"{label}/falsified", TEAM_WORKFLOW_DATA)
+                                f"{label}/falsified", TEAM_WORKFLOW_DATA,
+                                fx["gid"])
                 self.assertIn(
                     "get_me_player_home", str(caught.exception),
                     "the sweep went red, but not on /api/me/player-home — so "
@@ -4399,14 +4577,15 @@ class TheForbiddenSetIsEverySidePrivateIdentity(_SweepHarness,
                 self._serve(fx)
                 private, _ambiguous = self._private_side_ids(fx)
                 submitted = self._submitted_side_ids(fx)
-                unsubmitted = private[fx["home"]] - submitted[fx["home"]]
+                sheet = submitted[(fx["gid"], fx["home"])]
+                unsubmitted = private[fx["home"]] - sheet
                 self.assertTrue(
                     unsubmitted,
                     f"[{label}] every HOME private identity occupies a slot, "
                     f"so this test cannot distinguish the sheet from the "
                     f"side")
                 self.assertTrue(
-                    submitted[fx["home"]],
+                    sheet,
                     f"[{label}] HOME's submitted sheet is empty, so "
                     f"'entitled to the sheet' is vacuous")
                 for route in sorted(OFFICIAL_ASSIGNED_GAME_ROUTES):
@@ -4421,7 +4600,7 @@ class TheForbiddenSetIsEverySidePrivateIdentity(_SweepHarness,
                         f"private population, and widening the forbidden set "
                         f"must not have quietly widened their permit.")
                     self.assertLessEqual(
-                        submitted[fx["home"]], permitted,
+                        sheet, permitted,
                         f"[{label}] on {route} the official is no longer "
                         f"permitted HOME's own submitted sheet, so the grant "
                         f"has gone dead")
@@ -5150,6 +5329,566 @@ class TheIdentityAlphabetIsEveryWayToNameAPerson(_SweepHarness,
                 sample.team_id, self._identity_tokens(sample),
                 "team_id names a SIDE, not a person, and must not be an "
                 "identity token — every player of a side shares it")
+        finally:
+            store.clear_all_data()
+
+
+# ---------------------------------------------------------------------------
+# 11c. A GAME-KEYED GRANT DOES NOT SPAN A SECOND GAME.
+#
+# THE DEFECT THIS SECTION EXISTS FOR (#427 round 10, D10, owner comment
+# 5432572444). Round 9 added the SUBJECT axis and this file's own axis table
+# recorded it as narrowed. It was narrowed in ONE direction only: an official
+# with no assignment row for the response's game was correctly cut to
+# nothing, while an official WITH one was handed an aggregate computed over
+# BOTH games.
+#
+#   * ORACLE 1: `_submitted_side_ids` unioned each side's occupants across
+#     `gid` and `gid2` into `{team_id: ids}`, and `_permitted_ids` granted
+#     that aggregate on the strength of an assignment to the RESPONSE's game.
+#     Measured at f7ae9d7: the official is assigned to `game_1` and not to
+#     `game_2`; `game_1` seats `player_1`/`player_12` and `player_6` occupies
+#     `game_2` alone; `_permitted_ids(official, get_games_id_board,
+#     subject=game_1)` answered `{player_1, player_12, player_6}`. Injecting
+#     `player_6` into the official's authenticated `GET
+#     /api/games/game_1/board` put it in the raw swept body and
+#     `_assert_no_foreign_ids` STILL PASSED.
+#   * ORACLE 2: `_assert_non_interference` received the perturbed TEAM and
+#     never the perturbed GAME. Both games carry the same two teams, so the
+#     team id alone cannot separate "this game's sheet moved" from "the other
+#     game's did". Measured at the same head: a `/board` answer about
+#     `game_1` made to vary with `game_2`'s seated lineup moved for the
+#     official under a `game_2` `seated_lineup_row` perturbation, and
+#     `_assert_non_interference` PASSED.
+#
+# Assignment is game-specific, not team-wide. Production is clean today; this
+# was a hole in the PRIMARY PROTECTION, in the axis the previous round had
+# just added — which is this file's own recurring shape and the reason a
+# blind spot here is worse than a leak on one route.
+# ---------------------------------------------------------------------------
+@contextlib.contextmanager
+def _the_official_sheet_also_carries(extra_ids):
+    """The assigned official's ``/board`` answer carries ``extra_ids`` as
+    occupying rows, and changes nothing else.
+
+    Injected into the LIVE facade read rather than into a new probe route,
+    because the claim under test is about the THREE ROUTES THE GRANT ALREADY
+    COVERS. A probe route the official is entitled to nothing on would be
+    caught by the ROUTE narrowing that has stood since round 2 and would say
+    nothing about the game keying."""
+    real = _ApiService.get_board
+
+    def widened(self, game_id, team_id=None, viewer_role=None):
+        out = real(self, game_id, team_id=team_id, viewer_role=viewer_role)
+        if viewer_role == Role.OFFICIAL and out.get("players") is not None:
+            out["players"] = list(out["players"]) + [
+                {"id": pid, "group": "selected"} for pid in sorted(extra_ids)]
+        return out
+
+    _ApiService.get_board = widened
+    try:
+        yield
+    finally:
+        _ApiService.get_board = real
+
+
+@contextlib.contextmanager
+def _the_official_sheet_counts_another_game(subject_game, other_game):
+    """The assigned official's ``/board`` FOR ``subject_game`` carries a
+    field that is a function of ``other_game``'s SEATED LINEUP.
+
+    A COUNT, carrying no identity at all — deliberately, so oracle 1 cannot
+    see it and the test is unambiguous about which oracle bites. Same design
+    as the guardian probe in
+    :func:`_a_registered_route_that_widens_only_for_the_guardian`, and for
+    the same reason."""
+    real = _ApiService.get_board
+
+    def widened(self, game_id, team_id=None, viewer_role=None):
+        out = real(self, game_id, team_id=team_id, viewer_role=viewer_role)
+        if viewer_role == Role.OFFICIAL and game_id == subject_game:
+            other = self.store.get_game(other_game)
+            rs = RosterService(self.store)
+            seated = 0
+            for side in (other.home_team_id, other.away_team_id):
+                if not side:
+                    continue
+                seated += sum(
+                    1 for row in rs.lineup_population(other, side)
+                    if row.entry is not None
+                    and row.entry.status.occupies_slot)
+            out["other_game_seated_count"] = seated
+        return out
+
+    _ApiService.get_board = widened
+    try:
+        yield
+    finally:
+        _ApiService.get_board = real
+
+
+class AGameKeyedGrantDoesNotSpanASecondGame(_SweepHarness, unittest.TestCase):
+    """The owner's required regression coverage for D10, tri-store.
+
+    Two games share the same two teams with the sides SWAPPED, the official
+    is assigned to the FIRST only, and the second seats a player who occupies
+    no slot in the first. Both falsifiers are required to redden a PRIMARY
+    oracle, each with the rule this round replaces asserted STILL GREEN on
+    the identical measurement — so neither test can pass for a reason other
+    than the change it claims to measure. Nothing supplemental is consulted
+    here: ``test_side_provenance_guard`` cannot see either defect, because
+    neither is a spelling at a call site."""
+
+    #: One case name per test, so ``_assert_matrix_ran`` fails a loop that
+    #: silently covered fewer backends than were configured.
+    IDENTITY_CASE = "a_game_two_occupant_reddens_the_identity_oracle"
+    INTERFERENCE_CASE = "game_two_state_moving_game_one_reddens_oracle_two"
+    GRANT_CASE = "the_game_one_grant_survives_and_game_two_stays_refused"
+
+    def _reported(self, fn, *args):
+        """The oracle's own failure text, or ``None`` when it passed."""
+        try:
+            fn(*args)
+        except AssertionError as exc:
+            return str(exc)
+        return None
+
+    @staticmethod
+    def _aggregated_by_team(keyed):
+        """The keying this round REPLACES: a side's occupants unioned across
+        every game, then re-keyed back onto ``(game, side)``.
+
+        Re-keyed rather than returned in the old shape on purpose — the ONLY
+        thing that differs from the shipped rule is the AGGREGATION, so a
+        falsifier built on it measures the keying and not the plumbing."""
+        by_team = {}
+        for (_game, side), ids in keyed.items():
+            by_team[side] = by_team.get(side, frozenset()) | ids
+        return {key: by_team[key[1]] for key in keyed}
+
+    def _premises(self, fx, label):
+        """The fixture facts both falsifiers rest on, ASSERTED rather than
+        assumed — every one of them is a way this section could be vacuous.
+
+        Returns ``(game_1's occupants, the ids that occupy game_2 alone)``."""
+        api = fx["api"]
+        g1 = api.store.get_game(fx["gid"])
+        g2 = api.store.get_game(fx["gid2"])
+        self.assertEqual(
+            {g1.home_team_id, g1.away_team_id},
+            {g2.home_team_id, g2.away_team_id},
+            f"[{label}] the two games do not carry the SAME TWO TEAMS, so "
+            f"the perturbed team id alone would already separate them and "
+            f"this fixture cannot express D10 at all")
+        self.assertNotEqual(
+            g1.home_team_id, g2.home_team_id,
+            f"[{label}] the sides are not swapped between the two games")
+        self.assertTrue(
+            self._official_is_assigned(fx, fx["gid"]),
+            f"[{label}] the official is not assigned to the first game, so "
+            f"'their grant covers this game' is vacuous")
+        self.assertFalse(
+            self._official_is_assigned(fx, fx["gid2"]),
+            f"[{label}] the official IS assigned to the second game, so "
+            f"'a game they do not referee' is vacuous")
+        # READ FROM THE PRODUCT, NOT FROM `_submitted_side_ids` — the method
+        # under test. Taking the premise from the thing being falsified would
+        # make the falsifiers below degenerate the moment it is reverted:
+        # they would fail on a vacuous premise instead of on a blind oracle,
+        # which proves nothing about the oracle. `_submitted_lineup_rows`
+        # over `_lineup_rows` is the pair the three official routes run.
+        def occupants(game):
+            out = frozenset()
+            for side in (game.home_team_id, game.away_team_id):
+                if not side:
+                    continue
+                out |= {row["id"] for row in api._submitted_lineup_rows(
+                    api._lineup_rows(game, side))}
+            return out
+        first, second = occupants(g1), occupants(g2)
+        only_second = second - first
+        self.assertTrue(
+            first,
+            f"[{label}] nobody occupies a slot in the first game, so the "
+            f"official's real grant is empty and proof (3) is vacuous")
+        self.assertTrue(
+            only_second,
+            f"[{label}] no identity occupies the SECOND game and not the "
+            f"first, so there is nothing the aggregate could have carried "
+            f"across and both falsifiers below are vacuous")
+        return first, only_second
+
+    # -- FALSIFIER (1): the PRIMARY IDENTITY ORACLE ------------------------
+    def test_a_game_two_occupant_on_the_game_one_sheet_reddens_oracle_one(
+            self):
+        """THE OWNER'S FIRST REQUIRED FALSIFIER, required to go RED.
+
+        A row that occupies a slot in ``game_2`` and in no other game is
+        injected into the official's authenticated ``game_1`` ``/board``.
+        Oracle 1 must fail NAMING that id: the official referees ``game_1``,
+        and ``game_2``'s sheet is not theirs however many teams the two
+        games share."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                specs, subjects = self._assert_inventory_is_closed(fx)
+                _first, only_second = self._premises(fx, label)
+                with self.subTest(backend=label):
+                    with _the_official_sheet_also_carries(only_second):
+                        # THE PREMISE: the injection really reached the wire,
+                        # over a real authenticated session.
+                        status, body = self._req(
+                            who["official"], "GET",
+                            f"/api/games/{fx['gid']}/board")
+                        self.assertEqual(status, 200, (label, body))
+                        served = {row["id"] for row in body["players"]}
+                        self.assertLessEqual(
+                            only_second, served,
+                            f"[{label}] the injected game-2 occupant did not "
+                            f"reach the official's game-1 board, so nothing "
+                            f"below is measuring a leak")
+                        sweep = self._sweep(who, fx, specs, subjects)
+                        reported = self._reported(
+                            self._assert_no_foreign_ids, sweep, fx,
+                            f"{label}/d10")
+                        self.assertIsNotNone(
+                            reported,
+                            f"[{label}] THE PRIMARY IDENTITY ORACLE DID NOT "
+                            f"CATCH AN OFFICIAL RECEIVING "
+                            f"{sorted(only_second)} — an identity that "
+                            f"occupies a slot only in a game they do not "
+                            f"referee — on the sheet of the game they do. "
+                            f"The sweep is the primary protection: it must "
+                            f"fail here before anything supplemental is "
+                            f"consulted.")
+                        for pid in sorted(only_second):
+                            self.assertIn(
+                                pid, reported,
+                                f"[{label}] the oracle went red but did not "
+                                f"name {pid}, so it is not this leak it "
+                                f"caught")
+                        self.assertIn("official", reported)
+                        self.assertIn("get_games_id_board", reported)
+                        # THE FALSIFIER: the aggregate-by-team keying this
+                        # round replaces, on the IDENTICAL sweep, stays GREEN.
+                        real = self._submitted_side_ids
+                        self._submitted_side_ids = (
+                            lambda _fx, _r=real:
+                            self._aggregated_by_team(_r(_fx)))
+                        try:
+                            still_green = self._reported(
+                                self._assert_no_foreign_ids, sweep, fx,
+                                f"{label}/aggregate")
+                        finally:
+                            self._submitted_side_ids = real
+                        self.assertIsNone(
+                            still_green,
+                            f"[{label}] the AGGREGATE-BY-TEAM keying this "
+                            f"round replaces also catches the injected row, "
+                            f"so this test is not measuring the change it "
+                            f"claims to: {still_green}")
+                ran.append((label, self.IDENTITY_CASE))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, [self.IDENTITY_CASE])
+
+    # -- FALSIFIER (2): the PRIMARY NON-INTERFERENCE ORACLE ----------------
+    def test_a_game_one_response_moving_with_game_two_reddens_oracle_two(
+            self):
+        """THE OWNER'S SECOND REQUIRED FALSIFIER, required to go RED.
+
+        The official's ``game_1`` ``/board`` is made a function of
+        ``game_2``'s seated lineup — as a COUNT, so it carries no identity
+        and only oracle 2 can see it — and then ONLY ``game_2``'s seated
+        lineup is perturbed. Oracle 2 must report the official."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                specs, subjects = self._assert_inventory_is_closed(fx)
+                self._premises(fx, label)
+                path = f"/api/games/{fx['gid']}/board"
+                team = fx["home"]
+                with self.subTest(backend=label):
+                    with _the_official_sheet_counts_another_game(
+                            fx["gid"], fx["gid2"]):
+                        base = self._sweep(who, fx, specs, subjects)
+                        with self._perturbed(fx, team, fx["gid2"],
+                                             "seated_lineup_row"):
+                            world = self._sweep(who, fx, specs, subjects)
+                            # THE PREMISE: the game-1 response really moved.
+                            moved = [k for k in base.diff(world)
+                                     if k[0] == "official"
+                                     and k[2] == path]
+                            self.assertTrue(
+                                moved,
+                                f"[{label}] the official's game-1 board did "
+                                f"not move when game 2's seated lineup "
+                                f"changed, so there is no cross-game "
+                                f"dependence to catch")
+                            # ORACLE 1 CANNOT SEE IT — the probe is a count.
+                            self.assertIsNone(
+                                self._reported(self._assert_no_foreign_ids,
+                                               world, fx, f"{label}/count"),
+                                f"[{label}] the cross-game probe carries an "
+                                f"identity after all, so oracle 2 is not "
+                                f"the only oracle that could catch it")
+                            reported = self._reported(
+                                self._assert_non_interference, base, world,
+                                fx, team, f"{label}/d10",
+                                PERTURBATIONS["seated_lineup_row"],
+                                fx["gid2"])
+                            self.assertIsNotNone(
+                                reported,
+                                f"[{label}] THE PRIMARY NON-INTERFERENCE "
+                                f"ORACLE DID NOT CATCH A RESPONSE ABOUT THE "
+                                f"OFFICIAL'S ASSIGNED GAME THAT IS A "
+                                f"FUNCTION OF ANOTHER GAME'S SUBMITTED "
+                                f"STATE. It must fail here before anything "
+                                f"supplemental is consulted.")
+                            self.assertIn("official", reported)
+                            self.assertIn(path, reported)
+                            # THE FALSIFIER: the oracle WITHOUT the perturbed
+                            # game — exactly what stood at f7ae9d7 — stays
+                            # GREEN on the identical pair of worlds.
+                            real = self._entitled_teams
+
+                            def blind(_fx, principal, route, subject,
+                                      data_class, perturbed_game=None,
+                                      _real=real):
+                                return _real(_fx, principal, route, subject,
+                                             data_class)
+
+                            self._entitled_teams = blind
+                            try:
+                                still_green = self._reported(
+                                    self._assert_non_interference, base,
+                                    world, fx, team, f"{label}/blind",
+                                    PERTURBATIONS["seated_lineup_row"],
+                                    fx["gid2"])
+                            finally:
+                                self._entitled_teams = real
+                            self.assertIsNone(
+                                still_green,
+                                f"[{label}] the oracle that never received "
+                                f"the perturbed game also catches this, so "
+                                f"this test is not measuring the change it "
+                                f"claims to: {still_green}")
+                ran.append((label, self.INTERFERENCE_CASE))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, [self.INTERFERENCE_CASE])
+
+    # -- PROOF (3): THE REAL GRANT IS UNHARMED -----------------------------
+    def test_the_game_one_grant_survives_and_game_two_stays_refused(self):
+        """THE OWNER'S THIRD REQUIREMENT: the narrowing did not kill the
+        grant it narrows.
+
+        Game 1's occupying rows are still PERMITTED to the official on all
+        three of :data:`OFFICIAL_ASSIGNED_GAME_ROUTES`, game 2's
+        game-2-only occupant is not, and the official's real game 2 reads
+        are still REFUSED over authenticated HTTP. Without this, keying by
+        game would be indistinguishable from deleting the grant."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                first, only_second = self._premises(fx, label)
+                private, _ambiguous = self._private_side_ids(fx)
+                submitted = self._submitted_side_ids(fx)
+                with self.subTest(backend=label):
+                    for route in sorted(OFFICIAL_ASSIGNED_GAME_ROUTES):
+                        permitted = self._permitted_ids(
+                            fx, "official", route, fx["gid"], private,
+                            submitted)
+                        self.assertEqual(
+                            first, permitted,
+                            f"[{label}] on {route} the official's permitted "
+                            f"identities for game 1 are {sorted(permitted)}, "
+                            f"not game 1's own occupying rows "
+                            f"{sorted(first)} — keying by game must narrow "
+                            f"the grant, not delete or widen it")
+                        self.assertEqual(
+                            frozenset(), only_second & permitted,
+                            f"[{label}] on {route} the official is STILL "
+                            f"permitted {sorted(only_second & permitted)}, "
+                            f"which occupies a slot only in the game they "
+                            f"do not referee")
+                        # …and the game they do NOT referee grants nothing,
+                        # to either oracle.
+                        self.assertEqual(
+                            frozenset(),
+                            self._permitted_ids(fx, "official", route,
+                                                fx["gid2"], private,
+                                                submitted),
+                            f"[{label}] on {route} the official is permitted "
+                            f"an identity of a game carrying no assignment "
+                            f"row for them")
+                        self.assertEqual(
+                            frozenset(),
+                            self._entitled_teams(fx, "official", route,
+                                                 fx["gid2"],
+                                                 SUBMITTED_LINEUP_DATA),
+                            f"[{label}] on {route} the official is entitled "
+                            f"to a SIDE of a game they do not referee")
+                    # THE PRODUCT, over real authenticated HTTP: game 1
+                    # served, game 2 refused. Measured, not assumed — a
+                    # narrowing that only moved the test's expectation would
+                    # pass everything above.
+                    for leaf, name in (("board", "get_games_id_board"),
+                                       ("lineups", "get_games_id_lineups"),
+                                       ("roster", "get_games_id_roster")):
+                        status, body = self._req(
+                            who["official"], "GET",
+                            f"/api/games/{fx['gid']}/{leaf}")
+                        self.assertEqual(
+                            status, 200,
+                            f"[{label}] the official lost their real grant "
+                            f"on /{leaf} of the game they referee: {body}")
+                        blob = json.dumps(body, sort_keys=True, default=str)
+                        for pid in sorted(only_second):
+                            self.assertIsNone(
+                                re.search(rf"\b{re.escape(pid)}\b", blob),
+                                f"[{label}] the PRODUCT serves {pid} on "
+                                f"/{leaf} of game 1 — a live cross-game "
+                                f"disclosure, not merely an oracle that "
+                                f"would have missed one")
+                        status, body = self._req(
+                            who["official"], "GET",
+                            f"/api/games/{fx['gid2']}/{leaf}")
+                        self.assertEqual(
+                            status, 403,
+                            f"[{label}] the official is no longer REFUSED "
+                            f"/{leaf} of the game they do not referee, so "
+                            f"the product's own game keying moved: {body}")
+                        self.assertEqual(
+                            "forbidden", body["error"]["code"], (label, body))
+                ran.append((label, self.GRANT_CASE))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, [self.GRANT_CASE])
+
+
+# ---------------------------------------------------------------------------
+# 11d. NO GRANT IS AGGREGATED ACROSS A DIMENSION IT IS KEYED ON.
+#
+# THE QUESTION THE OWNER ASKED OF THE OTHER SEATS. D10 was found in the
+# official's chair; three of the last four rounds found the SAME SHAPE one
+# seat over from wherever it was last fixed. So the question is asked of
+# every principal at once, and against an authority OUTSIDE this module —
+# because "which of our own entitlements is game-keyed?" answered by reading
+# our own entitlement code puts both sides of the equality in this file,
+# which is the failure `PRINCIPAL_ROLES` already records once.
+#
+# THE AUTHORITY IS THE GRANT ROW ITSELF: `OfficialAssignment` carries
+# `game_id`, `GuardianLink` does not, and an account scope's accepted keys
+# (`AccountService._ALLOWED_SCOPE_KEYS`) are `team_id`/`player_id`/
+# `official_id` — no game anywhere. See `GRANT_RECORD_FIELDS`.
+# ---------------------------------------------------------------------------
+class NoGrantIsAggregatedAcrossADimensionItIsKeyedOn(_SweepHarness,
+                                                    unittest.TestCase):
+    """The declared authority and the running oracles must agree about which
+    principals are game-keyed — measured both ways, so a future principal
+    cannot acquire a game-keyed grant and keep a game-blind entitlement."""
+
+    def test_every_swept_class_declares_the_row_its_grant_lives_in(self):
+        """FAIL-CLOSED, like the route and principal axes: a class with no
+        entry in :data:`GRANT_RECORD_FIELDS` is an ERROR NAMING IT rather
+        than a silently game-blind grant."""
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            classes = {klass for klass, _teams in self._entitlement(fx).values()}
+            self.assertEqual(
+                frozenset(), classes - frozenset(GRANT_RECORD_FIELDS),
+                "an entitlement class this sweep drives declares no grant "
+                "row, so nothing says whether its grant is keyed on a game")
+            self.assertEqual(
+                frozenset(), frozenset(GRANT_RECORD_FIELDS) - classes,
+                "GRANT_RECORD_FIELDS names a class this sweep no longer "
+                "drives, so its declaration is dead")
+        finally:
+            store.clear_all_data()
+
+    def test_the_declared_game_keyed_set_is_the_measured_one(self):
+        """THE AUDIT THE OWNER REQUIRED, executable in both directions.
+
+        The two games carry the SAME TWO TEAMS, so any principal whose
+        entitlement differs between them can only be reading a relationship
+        that names a game. That measured set must equal
+        :data:`GAME_KEYED_CLASSES`, which is derived from the domain records
+        — and every game-keyed class must actually be cut to nothing when
+        the perturbed game is not the subject, which is the rule D10 added.
+
+        Measured on this tree: the OFFICIAL is the only one. The guardian's
+        `GuardianLink` names a junior and no game; a coach's account scope
+        names a team; the two unscoped operators and the viewer read
+        relationships at all."""
+        store = InMemoryStore()
+        try:
+            fx = self._fixture(store)
+            self._serve(fx)
+            specs, subjects = self._assert_inventory_is_closed(fx)
+            routes = sorted({s.name for s in specs if s.name in subjects})
+            private, _ambiguous = self._private_side_ids(fx)
+            submitted = self._submitted_side_ids(fx)
+            entitlement = self._entitlement(fx)
+            measured, narrowed = set(), set()
+            for principal in PRINCIPALS:
+                klass = entitlement[principal][0]
+                for route in routes:
+                    for data_class in sorted(
+                            {SUBMITTED_LINEUP_DATA, TEAM_WORKFLOW_DATA}):
+                        here = self._entitled_teams(
+                            fx, principal, route, fx["gid"], data_class)
+                        there = self._entitled_teams(
+                            fx, principal, route, fx["gid2"], data_class)
+                        if here != there:
+                            measured.add(klass)
+                        # …and the D10 rule: state of the OTHER game may not
+                        # excuse a diff about this one.
+                        if here and not self._entitled_teams(
+                                fx, principal, route, fx["gid"], data_class,
+                                perturbed_game=fx["gid2"]):
+                            narrowed.add(klass)
+                    if (self._permitted_ids(fx, principal, route, fx["gid"],
+                                            private, submitted)
+                            != self._permitted_ids(fx, principal, route,
+                                                   fx["gid2"], private,
+                                                   submitted)):
+                        measured.add(klass)
+            self.assertEqual(
+                GAME_KEYED_CLASSES, frozenset(measured),
+                "the entitlement classes whose answer MEASURABLY depends on "
+                "which of the two games is being read are not the classes "
+                "whose grant row NAMES a game. A class in the measured set "
+                "and not the declared one is reading a game relationship "
+                "nothing declared; a class in the declared set and not the "
+                "measured one has a game-keyed grant this sweep is applying "
+                "game-blind — which is D10 in another seat.")
+            self.assertEqual(
+                GAME_KEYED_CLASSES, frozenset(narrowed),
+                "the classes cut to nothing when the perturbed game is not "
+                "the subject are not the game-keyed ones, so oracle 2 is "
+                "either still blind to a cross-game diff or is reporting a "
+                "standing team-wide grant as one")
+            self.assertEqual(
+                frozenset({OFFICIAL_SUBMITTED_LINEUP_ONLY}),
+                GAME_KEYED_CLASSES,
+                "the set of game-keyed grants moved. That is a product "
+                "change, not a test detail: re-run this audit and decide "
+                "what the new one may observe, rather than adjusting this "
+                "line.")
         finally:
             store.clear_all_data()
 
