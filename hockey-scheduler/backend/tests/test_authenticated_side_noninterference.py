@@ -258,7 +258,12 @@ admission branch       CLOSED      ``admission_branches()`` — the GATE'S OWN
                                    query axis from ``server.py``, and every
                                    non-operator branch must carry an entry
                                    in ``ADMISSION_AUTHORITIES``. Proved by
-                                   INJECTION, in ten spellings
+                                   INJECTION, in fifteen spellings; and the
+                                   statement walk that derives them is an
+                                   ALLOW-LIST, so a statement kind it cannot
+                                   attribute is refused by name rather than
+                                   skipped (#427 round 13 — a ``match`` arm
+                                   was)
 membership status      CLOSED      ``MembershipStatus`` x
                                    ``RosterService
                                    ._ELIGIBLE_MEMBERSHIP_STATUSES``, pinned
@@ -323,12 +328,15 @@ adjusted:
   NO path and ONE world-pair — ``season_roster_membership``, the EX-MEMBER,
   which is the state no world in this matrix contained;
 * measured on this machine, for the whole-surface property alone:
-  **44.3 s Memory, 24.0 s SQLite, 79.5 s real PostgreSQL** — one recorded
+  **42.7 s Memory, 24.0 s SQLite, 81.6 s real PostgreSQL** — one recorded
   run, and it moves a few percent between runs with the machine's load;
-* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 71 tests in 299.3 s ...
+* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 72 tests in 294.7 s ...
   OK** — against the **59 tests / 285.2 s** at the head this round started
   from (63db78f), re-measured on that head on this machine rather than
-  carried forward;
+  carried forward. Round 13 adds the ONE test, and it drives no backend:
+  :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+  .test_an_unhandled_statement_kind_is_refused_naming_its_type` is pure
+  source analysis, for the reason its class docstring gives;
 * round 10 adds THREE more requests of a full sweep per backend —
   :class:`AGameKeyedGrantDoesNotSpanASecondGame` sweeps once for the
   identity falsifier and twice for the non-interference one, and its third
@@ -427,6 +435,8 @@ import enum
 import inspect
 import json
 import re
+import sys
+import textwrap
 import time
 import typing
 import unittest
@@ -1473,7 +1483,7 @@ GAME_KEYED_CLASSES = frozenset(
 # here, so renaming the gate breaks one place loudly instead of leaving this
 # axis pointed at a function that no longer exists.
 #
-# WHAT MAKES IT FAIL-CLOSED, in three rules:
+# WHAT MAKES IT FAIL-CLOSED, in four rules:
 #
 # * every ``return`` in the carrier must be a ``PrivateGameRead(...)`` naming
 #   every field of the record — anything else is an
@@ -1485,7 +1495,12 @@ GAME_KEYED_CLASSES = frozenset(
 #   an unconstrained branch is attributed to EVERY role. That is the safe
 #   direction: a nested helper, ``role.value == "coach"`` or
 #   ``getattr(Role, name)`` makes a branch look like one that admits
-#   everybody, and every non-operator role in it then demands an authority.
+#   everybody, and every non-operator role in it then demands an authority;
+# * and THE STATEMENT WALK ITSELF IS AN ALLOW-LIST (:func:`_decisions`): the
+#   statement kinds that can carry a decision are handled, the two that are
+#   provably inert are skipped with the proof written on the line, and
+#   EVERYTHING ELSE RAISES NAMING ITS TYPE. See that function for why the
+#   deny-list it replaces was the same defect one level along.
 #
 # THE COACH/PLAYER SPLIT IS PART OF THE DERIVATION, not an editorial choice.
 # The carrier tests ``role in (Role.COACH, Role.PLAYER)`` as ONE branch; the
@@ -1583,13 +1598,42 @@ def _module_constants(tree):
             and isinstance(node.value, (ast.Tuple, ast.List, ast.Set))}
 
 
-def _resolve_roles(test, aliases, constants):
+def _role_parameter(fn):
+    """The name the gate's own signature gives the role it decides by — its
+    FIRST positional parameter, read off the function rather than spelled
+    here, so renaming it follows automatically and REORDERING it fails loudly
+    (every later role test then names a Role on some other name, which
+    :func:`_resolve_roles` refuses).
+
+    Both walked functions take ``(role, scope, …)``. That the role is the
+    subject of the gate is the gate's own statement about itself."""
+    parameters = list(fn.args.posonlyargs) + list(fn.args.args)
+    if not parameters:
+        raise AdmissionExtractionError(
+            f"line {fn.lineno}: {fn.name} takes no positional parameter, so "
+            f"there is no name this inventory can read its role tests as "
+            f"being about")
+    return parameters[0].arg
+
+
+def _resolve_roles(test, aliases, constants, role_param):
     """The ``Role`` members ``test`` is true for, or ``None`` for a test that
     constrains no role — see the section comment for why ``None`` is the
-    fail-closed answer and not a permissive one."""
+    fail-closed answer and not a permissive one.
+
+    THE TEST MUST BE ABOUT ``role_param`` ITSELF (#427 round 13). It used to
+    be enough that the left of the comparison was ANY bare name, and the
+    enclosing branches' role sets are INTERSECTED — so two tests on two
+    DIFFERENT names, ``default_kind == Role.COACH`` outside and ``role ==
+    Role.GUARDIAN`` inside, intersected ``{COACH} & {GUARDIAN}`` to the EMPTY
+    SET and the return under them was attributed to NO role at all: a live
+    branch admitting a Guardian to a real game, recorded nowhere and audited
+    by nothing. A comparison of some other name against a ``Role`` member is
+    now refused by the clause below instead, which is the same answer this
+    already gave every other unreadable role test."""
     if isinstance(test, ast.Compare) and len(test.ops) == 1:
         left, op, right = test.left, test.ops[0], test.comparators[0]
-        if isinstance(left, ast.Name):
+        if isinstance(left, ast.Name) and left.id == role_param:
             if isinstance(op, (ast.Eq, ast.Is)):
                 member = _role_member(right, aliases)
                 if member:
@@ -1614,8 +1658,9 @@ def _resolve_roles(test, aliases, constants):
         raise AdmissionExtractionError(
             f"line {test.lineno}: the role test {ast.unparse(test)!r} names "
             f"a Role in a shape this inventory does not resolve. Spell it "
-            f"`role == Role.X` or `role in (Role.X, ...)`, or the roles this "
-            f"branch admits cannot be enumerated")
+            f"`{role_param} == Role.X` or `{role_param} in (Role.X, ...)` — "
+            f"about {role_param} ITSELF, the gate's own role parameter — or "
+            f"the roles this branch admits cannot be enumerated")
     return None
 
 
@@ -1633,6 +1678,50 @@ def _unfold(node, bindings, depth=4):
     return node
 
 
+def _pattern_roles(pattern, aliases):
+    """The ``Role`` members a ``case`` PATTERN matches, or ``None`` for the
+    bare ``case _:`` wildcard, which constrains no role.
+
+    Only the shapes a role gate is actually written in are resolved — the
+    value pattern ``case Role.X:``, the or-pattern ``case Role.X | Role.Y:``,
+    and the wildcard. EVERY OTHER PATTERN IS REFUSED rather than guessed at.
+    A capture (``case r:``), an as-pattern (``case Role.X as r:``), a class,
+    sequence, mapping or star pattern each bind a name or destructure a
+    subject in ways this inventory does not model, and a pattern attributed
+    to the WRONG roles is worse than one it declines to read: it would move a
+    live branch under somebody else's authority and report green."""
+    if isinstance(pattern, ast.MatchValue):
+        member = _role_member(pattern.value, aliases)
+        if member is None:
+            raise AdmissionExtractionError(
+                f"line {pattern.lineno}: the case pattern "
+                f"{ast.unparse(pattern.value)!r} is not a literal Role "
+                f"member, so the roles this case admits cannot be enumerated")
+        return frozenset({member})
+    if isinstance(pattern, ast.MatchOr):
+        members = set()
+        for alternative in pattern.patterns:
+            alternative_roles = _pattern_roles(alternative, aliases)
+            if alternative_roles is None:
+                # `case Role.X | _:` matches everything the wildcard does.
+                return None
+            members |= alternative_roles
+        return frozenset(members)
+    if isinstance(pattern, ast.MatchAs) and pattern.pattern is None \
+            and pattern.name is None:
+        # `case _:` — matches every remaining subject and binds nothing, so
+        # it constrains no role. That is the same UNCONSTRAINED answer
+        # `_resolve_roles` gives a test naming no Role, and it lands in the
+        # same safe direction: the arm is attributed to EVERY role.
+        return None
+    raise AdmissionExtractionError(
+        f"line {pattern.lineno}: the case pattern {ast.unparse(pattern)!r} "
+        f"({type(pattern).__name__}) is a shape this inventory does not "
+        f"resolve to a set of roles. Spell the role arms `case Role.X:` or "
+        f"`case Role.X | Role.Y:`, or the roles this branch admits cannot be "
+        f"enumerated")
+
+
 def _decisions(fn, aliases, constants, resolver_name=None):
     """``[(Return, roles|None, delegates, bindings), …]`` for every return in
     ``fn``, carrying the role constraint of the enclosing branches.
@@ -1640,32 +1729,132 @@ def _decisions(fn, aliases, constants, resolver_name=None):
     ROLES ARE OVER-APPROXIMATED, WHICH IS THE SAFE DIRECTION: an earlier
     branch's early return is not subtracted from a later one, so a role may
     be attributed to a branch it can never actually reach. That can only ADD
-    branches demanding an authority; it can never hide one."""
+    branches demanding an authority; it can never hide one.
+
+    THE STATEMENT WALK IS AN ALLOW-LIST, AND THAT IS THE WHOLE POINT (#427
+    round 13). It used to be a DENY-LIST: ``For``/``While``/``With``/``Try``
+    and friends raised, and any statement kind NOT named in that tuple fell
+    off the end of the ``elif`` chain and was SILENTLY SKIPPED. ``ast.Match``
+    was not in the tuple, so a ``match role: case Role.GUARDIAN:`` arm —
+    ordinary Python since 3.10, and the most natural way anyone would
+    refactor a seven-arm role gate — admitted a real caller to a real game
+    with a real side while this function reported NOTHING and the audit
+    returned no failures. Adding ``ast.Match`` to that tuple would have been
+    the same defect one instance further along: Python keeps gaining
+    statement kinds, and several already-existing ones were unlisted too.
+
+    So the default is now REFUSAL. A statement kind this cannot attribute to
+    a set of roles raises :class:`AdmissionExtractionError` NAMING ITS TYPE,
+    which is the posture every other closed axis in this file already takes
+    towards a member it has not seen — the route, principal, query-parameter
+    and session-scope axes all fail closed on a new one. The allow-list was
+    determined by WALKING THE REAL GATE, not by guessing: the two functions
+    this is ever called on contain exactly ``Assign``, ``Expr``, ``If`` and
+    ``Return``, and each kind below says why it is handled or why it is
+    inert.
+
+    ``ast.Match``'s fields (``subject``/``cases``, and ``match_case``'s
+    ``pattern``/``guard``/``body``) are the PEP 634 grammar and are identical
+    in 3.11 — the version CI runs — and 3.14, the version this was written
+    on; both were checked rather than assumed."""
     out = []
+    role_param = _role_parameter(fn)
 
     def walk(body, roles, delegates, bindings):
         bindings = dict(bindings)
         for stmt in body:
-            if isinstance(stmt, ast.Assign):
-                if resolver_name and _calls(stmt.value, resolver_name):
-                    delegates = True
-                if len(stmt.targets) == 1 \
-                        and isinstance(stmt.targets[0], ast.Name):
-                    bindings[stmt.targets[0].id] = stmt.value
+            # -- HANDLED: statement kinds that can carry a decision --------
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                # A binding `_unfold` may later have to see through, and the
+                # one place the carrier's delegation to the resolver shows
+                # up. `AnnAssign` is the SAME shape with a type on it
+                # (`own_team: str | None = game_scoped_own_team_id(...)`), so
+                # it is handled identically rather than left to be skipped.
+                target = (stmt.targets[0]
+                          if isinstance(stmt, ast.Assign)
+                          and len(stmt.targets) == 1 else
+                          stmt.target if isinstance(stmt, ast.AnnAssign)
+                          else None)
+                if stmt.value is not None:
+                    if resolver_name and _calls(stmt.value, resolver_name):
+                        delegates = True
+                    if isinstance(target, ast.Name):
+                        bindings[target.id] = stmt.value
             elif isinstance(stmt, ast.If):
-                narrowed = _resolve_roles(stmt.test, aliases, constants)
+                narrowed = _resolve_roles(stmt.test, aliases, constants,
+                                          role_param)
                 inner = roles if narrowed is None else (
                     narrowed if roles is None else roles & narrowed)
                 walk(stmt.body, inner, delegates, bindings)
                 walk(stmt.orelse, roles, delegates, bindings)
+            elif isinstance(stmt, ast.Match):
+                # A `match role:` role gate, ATTRIBUTED — the same way `if`
+                # is, and by the same rule: the SUBJECT must be the gate's
+                # own role parameter for `case Role.X:` to be a statement
+                # about the role at all, which is exactly the condition
+                # `_resolve_roles` puts on the left of its comparison and for
+                # exactly the same reason (a match on some OTHER name would
+                # narrow the enclosing role set to the empty intersection and
+                # record the arm under no role at all). When the subject is
+                # something else, a pattern that still NAMES a Role is
+                # refused rather than read, while one that names none leaves
+                # the arm unconstrained and therefore attributed to everybody.
+                subject_is_the_role = (isinstance(stmt.subject, ast.Name)
+                                       and stmt.subject.id == role_param)
+                for case in stmt.cases:
+                    if case.guard is not None:
+                        raise AdmissionExtractionError(
+                            f"line {case.pattern.lineno}: the case guard "
+                            f"{ast.unparse(case.guard)!r} in {fn.name} is "
+                            f"part of what decides this arm, and this "
+                            f"inventory would attribute the arm to "
+                            f"{ast.unparse(case.pattern)!r} as though the "
+                            f"guard were not there — which would report a "
+                            f"real authority as an unconditional admission. "
+                            f"Spell the guard as a nested `if`")
+                    if subject_is_the_role:
+                        narrowed = _pattern_roles(case.pattern, aliases)
+                    elif _names_a_role(case.pattern, aliases):
+                        raise AdmissionExtractionError(
+                            f"line {case.pattern.lineno}: the case pattern "
+                            f"{ast.unparse(case.pattern)!r} names a Role but "
+                            f"the match subject is "
+                            f"{ast.unparse(stmt.subject)!r}, not a bare "
+                            f"name, so the roles this arm admits cannot be "
+                            f"enumerated")
+                    else:
+                        narrowed = None
+                    inner = roles if narrowed is None else (
+                        narrowed if roles is None else roles & narrowed)
+                    walk(case.body, inner, delegates, bindings)
             elif isinstance(stmt, ast.Return):
                 out.append((stmt, roles, delegates, bindings))
-            elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While,
-                                   ast.With, ast.AsyncWith, ast.Try)):
+            # -- INERT: skipped, with the proof on the line ----------------
+            elif isinstance(stmt, ast.Pass):
+                # `pass` is defined to do nothing. It binds no name, takes no
+                # branch and produces no value, so no decision can hide in
+                # it. (The `else_branch` injection below uses one.)
+                continue
+            elif isinstance(stmt, ast.Expr) \
+                    and isinstance(stmt.value, ast.Constant):
+                # A docstring, or any other bare literal: a constant
+                # expression evaluated and discarded. Both walked functions
+                # open with one. Note this is deliberately NARROWER than
+                # `ast.Expr` — a NON-constant expression statement can
+                # contain a walrus, which binds a name this walk does not
+                # track, so it falls through to the refusal below.
+                continue
+            # -- EVERYTHING ELSE: refused, by name -------------------------
+            else:
                 raise AdmissionExtractionError(
-                    f"line {stmt.lineno}: {type(stmt).__name__} control flow "
-                    f"in {fn.name}, which this inventory cannot attribute to "
-                    f"a set of roles")
+                    f"line {stmt.lineno}: {type(stmt).__name__} in "
+                    f"{fn.name} — {ast.unparse(stmt).splitlines()[0]!r} — is "
+                    f"a statement kind this inventory cannot attribute to a "
+                    f"set of roles. It is REFUSED rather than skipped: a "
+                    f"statement nothing here reads is an admission nothing "
+                    f"audits, which is exactly how a `match` arm went "
+                    f"unseen. Either teach this walk to attribute it or "
+                    f"spell the gate in a shape it already reads")
     walk(fn.body, None, False, {})
     return out
 
@@ -9140,7 +9329,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                 f"therefore now exempt from carrying an authority — decide "
                 f"that deliberately")
 
-    # -- THE INJECTION: the derivation is real, in ten spellings -----------
+    # -- THE INJECTION: the derivation is real, in FIFTEEN spellings ------
     def _injected(self, *, anchor=None, replacement, prelude=None):
         source = self._gate_source()
         if prelude is not None:
@@ -9152,9 +9341,11 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         return source.replace(anchor, replacement, 1)
 
     def _spellings(self):
-        """A new NON-ADMIN admission branch, spelled ten ways — chosen to
-        defeat a text matcher, which is what the query-parameter closure was
-        tested against and what this axis has to survive too."""
+        """A new NON-ADMIN admission branch, spelled FIFTEEN ways — chosen
+        to defeat a text matcher, which is what the query-parameter closure
+        was tested against and what this axis has to survive too, and — since
+        round 13 — to defeat a walk that reads only the statement kinds
+        somebody thought to list."""
         body, anchor = self.ADMITTING_BODY, self.ANCHOR
         resolver_player = ("    if role == Role.PLAYER:\n"
                            "        return _player_team_for_game("
@@ -9193,6 +9384,53 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             "else_branch":
                 dict(replacement=f"    if role == Role.OFFICIAL:\n"
                                  f"        pass\n    else:\n{body}{anchor}"),
+            # THE SPELLING THE DENY-LIST WALK MISSED ENTIRELY (#427 round
+            # 13). `ast.Match` was not in the tuple the old walk raised on
+            # and there was no `else`, so this arm was SILENTLY SKIPPED: the
+            # gate admitted a Guardian to a real game with a real side while
+            # `admission_branches()` reported nothing at all. It is now
+            # ATTRIBUTED — not merely refused — so it fails naming GUARDIAN,
+            # at the same line and with the same message the `if` spelling
+            # of the identical body produces.
+            "match_statement":
+                dict(replacement="    match role:\n"
+                                 "        case Role.GUARDIAN:\n"
+                                 + textwrap.indent(body, "    ") + anchor),
+            "match_or_pattern":
+                dict(replacement="    match role:\n"
+                                 "        case Role.VIEWER | Role.GUARDIAN:\n"
+                                 + textwrap.indent(body, "    ") + anchor),
+            # THE EMPTY-INTERSECTION SPELLING — the one found by hunting for
+            # a shape the ALLOW-LIST would still not catch, and the sharpest
+            # of the set because every statement in it is one the walk
+            # handles. Two role tests on TWO DIFFERENT NAMES, both true at
+            # runtime: the outer narrowed to {COACH}, the inner to
+            # {GUARDIAN}, and the walk intersects enclosing role sets, so the
+            # return under them was attributed to NO ROLE AT ALL and
+            # recorded nowhere. A live branch admitting a Guardian to a real
+            # game, and `_audit()` returned []. `_resolve_roles` now requires
+            # the test to be about the gate's own role parameter.
+            "empty_intersection_two_names":
+                dict(replacement="    default_kind = Role.COACH\n"
+                                 "    if default_kind == Role.COACH:\n"
+                                 "        if role == Role.GUARDIAN:\n"
+                                 + textwrap.indent(body, "    ") + anchor),
+            "empty_intersection_match_subject":
+                dict(replacement="    default_kind = Role.COACH\n"
+                                 "    if default_kind == Role.COACH:\n"
+                                 "        match role:\n"
+                                 "            case Role.GUARDIAN:\n"
+                                 + textwrap.indent(body, "        ")
+                                 + anchor),
+            # `case _:` constrains no role, so the arm is attributed to
+            # EVERY role — the same over-approximation an `if` whose test
+            # names no Role gets, and the same safe direction.
+            "match_wildcard":
+                dict(replacement="    match role:\n"
+                                 "        case Role.OFFICIAL:\n"
+                                 "            pass\n"
+                                 "        case _:\n"
+                                 + textwrap.indent(body, "    ") + anchor),
             "returned_from_a_helper":
                 dict(replacement="    if role == Role.GUARDIAN:\n"
                                  "        return _guardian_read(role, game)\n"
@@ -9219,12 +9457,18 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
     def test_a_new_non_admin_admission_branch_fails_by_name(self):
         """THE PROOF THAT CONDITION 5 IS DERIVED AND NOT DECORATIVE.
 
-        Ten spellings of "admit the GUARDIAN", each injected into a COPY of
-        the gate's source, each required to produce a NAMED failure from the
-        same audit that guards the real gate. Aliased imports, a nested
-        helper, a module-level tuple, ``role.value``, ``getattr``, an
-        ``else`` branch, a decision returned from a second function, and the
-        two-place widening that touches both the carrier and the resolver.
+        FIFTEEN spellings of "admit the GUARDIAN", each injected into a
+        COPY of the gate's source, each required to produce a NAMED failure
+        from the same audit that guards the real gate. Aliased imports, a
+        nested helper, a module-level tuple, ``role.value``, ``getattr``, an
+        ``else`` branch, a decision returned from a second function, the
+        two-place widening that touches both the carrier and the resolver,
+        and — added in round 13, when the walk stopped being a deny-list —
+        three ``match`` statements (a value pattern, an or-pattern and a
+        wildcard arm) plus the two EMPTY-INTERSECTION shapes, which are the
+        ones that were found by hunting for a spelling the allow-list alone
+        would still not catch. The count is MEASURED: it is
+        ``len(self._spellings())`` and the loop below runs every key of it.
 
         A spelling this cannot READ fails as an unresolvable shape naming the
         line, which is the same fail-closed answer
@@ -9245,6 +9489,162 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                         for f in failures),
                     f"{name!r} was reported, but not in a way that NAMES the "
                     f"new branch: {failures}")
+
+    #: Statement kinds the walk does NOT handle, each wrapped around a body
+    #: that admits a Guardian. The point is not that any of these is a
+    #: likely refactor — it is that the walk's DEFAULT is refusal, so a
+    #: statement kind nobody anticipated cannot be silently stepped over.
+    #: ``try/except*`` is 3.11's addition and ``type X = …`` is 3.12's:
+    #: neither was in the deny-list this replaced, because neither existed
+    #: when it was written, which is the whole argument.
+    UNHANDLED_STATEMENTS = {
+        "while": "    while role == Role.GUARDIAN:\n{body}",
+        "for": "    for _ in (role,):\n{body}",
+        "with": "    with contextlib.nullcontext():\n{body}",
+        "try": "    try:\n{body}    except Exception:\n        pass\n",
+        "try_star": ("    try:\n{body}    except* Exception:\n"
+                     "        pass\n"),
+        "nested_def": ("    def _inner():\n{body}"
+                       "    return _inner()\n"),
+        "class_body": ("    class _C:\n"
+                       "        x = 1\n"),
+        "conditional_import": "    from ..domain import Role as _R2\n",
+        "delete": "    del store\n",
+        "aug_assign": "    scope += scope\n",
+        "assert": "    assert role != Role.GUARDIAN\n",
+        "raise": "    raise RuntimeError('no')\n",
+        "global_": "    global _cache\n",
+        "walrus_expression_statement": "    (admitted := True)\n",
+        "type_alias": "    type _Alias = int\n",
+    }
+
+    def test_an_unhandled_statement_kind_is_refused_naming_its_type(self):
+        """THE INVERSION ITSELF — the property this round exists for.
+
+        The walk used to be a DENY-LIST of control-flow statement kinds with
+        no ``else``, so anything unlisted fell through and was SKIPPED.
+        ``ast.Match`` was unlisted, and a ``match role: case Role.GUARDIAN:``
+        arm therefore admitted a real caller to a real game with a real side
+        while ``admission_branches()`` reported nothing — see the
+        ``match_statement`` spelling above, which is now attributed and
+        fails by name.
+
+        Adding ``ast.Match`` to that tuple would have been the same defect
+        one instance along. So the walk now REFUSES by default, and this
+        makes two claims about that default.
+
+        FIRST, IT FIRES AND IT NAMES THE TYPE: every kind in
+        :data:`UNHANDLED_STATEMENTS` — ``len()`` of it, FIFTEEN on the tree
+        this sentence was written on, and each one MEASURED below to build a
+        DISTINCT ``ast`` type rather than assumed to — is required to raise
+        an :class:`AdmissionExtractionError` whose message contains the
+        statement type, not to be stepped over and not to be reported as
+        some other shape. (``except*`` is its own node, ``ast.TryStar``, not
+        a ``Try``; that was measured too, after the first draft of this test
+        asserted otherwise and went red.) Exactly one is newer grammar than
+        CI's 3.11 — ``type X = …``, which is 3.12+ — and a ``SyntaxError``
+        from the interpreter under test is not a hole, so a template is
+        skipped ONLY when the grammar rejects it, never when the walk merely
+        fails to raise; the bookkeeping below asserts that partition rather
+        than trusting it.
+
+        SECOND, AND THIS IS THE PART THE SAMPLES CANNOT CARRY: that there IS
+        a default at all — that NO statement kind can fall off the end of
+        the chain the way ``ast.Match`` did, including kinds this Python
+        does not have yet — is a property of the chain's SHAPE, not of any
+        list of samples. So it is read off :func:`_decisions`' own source:
+        the ``if``/``elif`` chain must terminate in an ``else`` that raises.
+        A future round that adds a case and forgets the ``else`` reddens
+        here rather than in whichever release ships the next statement
+        kind."""
+        self._assert_the_walk_ends_in_a_raising_else()
+        seen, attempted, skipped = set(), [], []
+        for name, template in sorted(self.UNHANDLED_STATEMENTS.items()):
+            with self.subTest(statement=name):
+                source = self._injected(replacement=template.format(
+                    body=self.ADMITTING_BODY) + self.ANCHOR)
+                try:
+                    ast.parse(source)
+                except SyntaxError:
+                    skipped.append(name)
+                    self.skipTest(
+                        f"{name!r} is not this interpreter's grammar "
+                        f"(running {sys.version_info.major}."
+                        f"{sys.version_info.minor})")
+                with self.assertRaises(AdmissionExtractionError) as caught:
+                    admission_branches(source=source)
+                message = str(caught.exception)
+                node = next(
+                    type(s).__name__ for s in ast.walk(ast.parse(source))
+                    if isinstance(s, ast.stmt)
+                    and s.lineno == self._first_injected_line(source))
+                self.assertIn(
+                    node, message,
+                    f"a {node} statement was refused, but the message does "
+                    f"not name the type, so nobody reading the failure "
+                    f"learns which shape the gate grew: {message}")
+                seen.add(node)
+                attempted.append(name)
+        # Each template must build a DISTINCT statement kind, or the count
+        # in the docstring is measuring fewer shapes than it names. MEASURED
+        # both ways rather than pinned to a literal, so the interpreter's
+        # grammar decides how many run and nothing here has to remember
+        # which release added which kind.
+        self.assertEqual(
+            len(attempted), len(seen),
+            f"{len(attempted)} templates produced only {len(seen)} distinct "
+            f"statement kinds ({sorted(seen)}), so two of them build the "
+            f"same shape and one of the kinds this claims to cover is not "
+            f"actually exercised")
+        self.assertEqual(
+            frozenset(self.UNHANDLED_STATEMENTS) - frozenset(attempted),
+            frozenset(skipped),
+            "a template neither ran nor was refused by the grammar")
+
+    def _first_injected_line(self, source):
+        """The 1-based line of the first statement of the injection — the
+        line the anchor used to be on."""
+        return self._gate_source().splitlines().index(
+            self.ANCHOR) + 1
+
+    def _assert_the_walk_ends_in_a_raising_else(self):
+        """The ``if``/``elif`` chain inside :func:`_decisions`' statement
+        walk terminates in an ``else`` that raises
+        :class:`AdmissionExtractionError` — READ OFF ITS OWN SOURCE, because
+        "no statement kind falls through" is a claim about every kind,
+        including the ones no sample can name yet."""
+        module = ast.parse(Path(__file__).read_text())
+        decisions = next(n for n in module.body
+                         if isinstance(n, ast.FunctionDef)
+                         and n.name == "_decisions")
+        walk = next(n for n in ast.walk(decisions)
+                    if isinstance(n, ast.FunctionDef) and n.name == "walk")
+        loop = next(n for n in walk.body if isinstance(n, ast.For))
+        chain = next(n for n in loop.body if isinstance(n, ast.If))
+        while len(chain.orelse) == 1 and isinstance(chain.orelse[0], ast.If):
+            chain = chain.orelse[0]
+        self.assertTrue(
+            chain.orelse,
+            f"the statement chain in `_decisions` ends at line "
+            f"{chain.lineno} with NO `else`, so a statement kind it does not "
+            f"name is silently skipped — which is exactly the defect that "
+            f"let a `match` arm admit a Guardian with the audit green")
+        self.assertEqual(
+            1, len(chain.orelse), "the terminating `else` does more than "
+            "refuse, so what it does for an unrecognised statement is no "
+            "longer readable from its shape")
+        refusal = chain.orelse[0]
+        self.assertIsInstance(
+            refusal, ast.Raise,
+            f"the terminating `else` is a "
+            f"{type(refusal).__name__}, not a refusal")
+        self.assertEqual(
+            AdmissionExtractionError.__name__,
+            getattr(refusal.exc.func, "id", None),
+            f"the terminating `else` raises "
+            f"{ast.unparse(refusal.exc)!r}, which the audit does not turn "
+            f"into a NAMED failure the way it does an "
+            f"{AdmissionExtractionError.__name__}")
 
     def test_a_mutation_that_admits_nobody_is_not_reported(self):
         """THE CONTROL, without which the test above proves only that this
