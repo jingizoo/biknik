@@ -232,11 +232,12 @@ adjusted:
   property — 62 concrete paths x 10 principals x the 4 per-world variants in
   :data:`HINTS`;
 * measured on this machine, for the whole-surface property alone:
-  **31.8 s Memory, 19.9 s SQLite, 68.0 s real PostgreSQL**;
-* the WHOLE MODULE, tri-store: **Ran 48 tests in 244.6 s ... OK**, against
-  the **43 tests** at the head this round started from (whose 223.5 s is
-  the previous round's own measurement, carried forward rather than
-  re-measured here);
+  **31.5 s Memory, 19.3 s SQLite, 66.5 s real PostgreSQL** — one recorded
+  run, and it moves a few percent between runs with the machine's load;
+* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 49 tests in 243.9 s ...
+  OK**, against the **43 tests** at the head this round started from (whose
+  223.5 s is the previous round's own measurement, carried forward rather
+  than re-measured here);
 * round 10 adds THREE more requests of a full sweep per backend —
   :class:`AGameKeyedGrantDoesNotSpanASecondGame` sweeps once for the
   identity falsifier and twice for the non-interference one, and its third
