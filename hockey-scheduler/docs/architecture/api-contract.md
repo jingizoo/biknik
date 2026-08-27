@@ -413,6 +413,12 @@ anywhere — it is refused admission to the private-game family (`/board`,
 `GET /api/context/options`. The two surfaces cannot disagree, because they call
 the same predicate rather than each spelling the status test out.
 
+An Official's League also requires the assigned Game's own identity to **agree**
+with its frozen `LeagueSeason`: the Game's `season_id` and `league_id` are each
+compared by plain equality, with no exemption for a missing or empty value. A
+bound regular Game whose own League identity is `null` or `""` is internally
+inconsistent, so it grants no League rather than being waved through.
+
 ## Named schedule scenarios (#378)
 
 All four routes require a **signed-in session** plus server-side

@@ -200,19 +200,37 @@ def _official_league_ids(store, official_id):
         # through any supported write path, so disagreement means corrupted or
         # legacy data -- fail closed rather than trust either side.
         #
-        # PR #427: the Season comparison is UNCONDITIONAL, and the League one
-        # stays as it was. The `game.season_id and` prefix it used to carry was
-        # the same falsy-skip the two write guards carried: a bound Game with a
-        # NULL `season_id` skipped the check entirely and the Official was
-        # granted the League anyway -- widening a scoped role's visibility off a
-        # Game whose identity does not hold together, which is precisely what
-        # this module exists to prevent. `games.season_id` is nullable with no
-        # FK and no CHECK, so NULL is the reachable corrupted shape, not an
-        # exemption. Same reasoning as #331 review round 24 applied to
-        # `league_id` one line down.
+        # BOTH comparisons are UNCONDITIONAL plain equality. The `game.season_id
+        # and` prefix the Season check used to carry was a falsy-skip: a bound
+        # Game with a NULL `season_id` skipped the check entirely and the
+        # Official was granted the League anyway -- widening a scoped role's
+        # visibility off a Game whose identity does not hold together, which is
+        # precisely what this module exists to prevent. `games.season_id` is
+        # nullable with no FK and no CHECK, so NULL is the reachable corrupted
+        # shape, not an exemption.
+        #
+        # THE LEAGUE CHECK CARRIED THE IDENTICAL DEFECT ONE LINE DOWN and is now
+        # fixed the identical way (#205). While it read `if game.league_id and
+        # ...`, a Game whose own `league_id` was `None` -- or the empty string,
+        # equally schema-permitted on a nullable TEXT column with no CHECK --
+        # was treated as EXEMPT from having to agree with its frozen
+        # `LeagueSeason`, so the Official kept League visibility from precisely
+        # the corrupt, restored, legacy or direct-written rows that cannot prove
+        # anything. Reproduced through public `get_context_options` on Memory,
+        # SQLite and PostgreSQL: the target League stayed on offer for both the
+        # `None` and the `""` shape, while a coherent anchor assignment proved
+        # the surrounding Program/Season authorization was non-vacuous.
+        #
+        # This is the standing rule on this PR, applied a third time: identity
+        # is compared with `is not None` / plain equality and NEVER with
+        # truthiness (`season_guard.game_is_league_season_bound` is the
+        # reference spelling). A bound regular Game whose own League identity is
+        # missing or falsy is internally INCONSISTENT, and an inconsistent
+        # identity must fail closed rather than be waved through -- the write
+        # side already applies plain equality for this exact threat.
         if ls.season_id != game.season_id:
             continue
-        if game.league_id and ls.league_id != game.league_id:
+        if ls.league_id != game.league_id:
             continue
         if ls.league_id:
             leagues.add(ls.league_id)
