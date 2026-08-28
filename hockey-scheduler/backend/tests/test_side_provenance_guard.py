@@ -267,8 +267,9 @@ def case_carrier_stops_calling_the_resolver(sources):
     record's shape."""
     return _replace(
         sources, GAME_SIDE_SCOPE,
-        """        own_team = game_scoped_own_team_id(role, scope, game, store)""",
-        """        own_team = (scope or {}).get("team_id")""")
+        """        own_team = game_scoped_own_team_id(role, scoped_team_id,
+                                           scoped_player_id, game, store)""",
+        """        own_team = scope.get("team_id")""")
 
 
 def case_producer_reached_through_an_alias_of_the_hint(sources):
@@ -1057,7 +1058,9 @@ class TheGuardCatchesEveryLeakThisBlockerFixed(_GuardHarness,
     def test_round_4_the_dashboard_schedule_row(self):
         """THE ONE THIS ROUND FIXED, restored verbatim: the schedule loop
         called `compute_roster_status(g.id)` with no side at all."""
-        leaked = _replace(_sources(), FACADE, """        own_side = game_scoped_own_team_id(role, scope, game, self.store)""",
+        leaked = _replace(_sources(), FACADE, """        own_side = game_scoped_own_team_id(
+            role, scope.get("team_id"), scope.get("player_id"), game,
+            self.store)""",
                           """        own_side = None""")
         leaked = _replace(leaked, FACADE, """            "roster_status": self.roster.compute_roster_status(
                 game.id, side).status.value,""",
@@ -1112,7 +1115,7 @@ class TheGuardCatchesEveryLeakThisBlockerFixed(_GuardHarness,
         only condition was "takes no caller-supplied side". It takes none;
         it derived the OPPONENT's side from ``Player.team_id``."""
         leaked = _replace(_sources(), FACADE, """            my_team_id = game_scoped_own_team_id(
-                Role.PLAYER, {"player_id": player_id}, next_game, self.store)""",
+                Role.PLAYER, None, player_id, next_game, self.store)""",
                           """            my_team_id = player.team_id""")
         violations, _errors = self._audit(leaked)
         self.assertTrue(

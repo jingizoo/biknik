@@ -33,7 +33,7 @@ from .roster_service import RosterService
 from .subject_scope import assignment_grants_official_scope
 
 
-def _player_team_for_game(scope, game, store):
+def _player_team_for_game(scoped_player_id, game, store):
     """Which team a Player-scoped caller acts for, in THIS ``game``
     specifically (#205 blocker 1) — resolved through the SAME game-scoped
     membership resolver the substitute workflow itself uses
@@ -49,24 +49,39 @@ def _player_team_for_game(scope, game, store):
     pointer only when ``game`` carries no LeagueSeason binding (exhibitions
     and unbound legacy games), exactly as ``team_for_game`` itself does —
     byte-for-byte pre-#205 behavior there.
+
+    TAKES THE PLAYER'S ID, NOT THE SESSION MAPPING (#427 round 20, the
+    owner's blocker-2 ruling). It used to take ``scope`` and read
+    ``scope.get("player_id")`` out of it for itself, which put a MUTABLE
+    mapping one call deeper than the boundary that vouches for it — see
+    :func:`resolve_private_game_read`'s "THE PROJECTION" note. The value is
+    the same value; what is gone is the object it used to arrive inside.
     """
-    scope = scope or {}
-    player_id = scope.get("player_id")
-    if not player_id:
+    if not scoped_player_id:
         return None
-    player = store.get_player(player_id)
+    player = store.get_player(scoped_player_id)
     if player is None or not player.is_active:
         return None
     return RosterService(store).team_for_game(game, player)
 
 
-def game_scoped_own_team_id(role, scope, game, store):
+def game_scoped_own_team_id(role, scoped_team_id, scoped_player_id, game,
+                            store):
     """The team the caller acts for, resolved specifically against ``game``
     (#205 blocker 1) — the game-scoped analogue of
     ``subject_scope.own_team_id``.
 
+    IT TAKES TWO IMMUTABLE IDS, NOT THE SESSION MAPPING (#427 round 20, the
+    owner's blocker-2 ruling). Every caller PROJECTS its own scope into
+    these two scalars and hands the scalars over; the mapping itself never
+    crosses this boundary. See :func:`resolve_private_game_read`'s "THE
+    PROJECTION" note for why the mapping's absence is the whole point and
+    not a tidying: between the projection and this decision there is no
+    longer a mutable object for anything to change.
+
     A Coach's team is unchanged: still the permanently-bound
-    ``scope["team_id"]``. There is no ``CoachSeasonMembership`` (or any
+    ``scope["team_id"]``, now arriving as ``scoped_team_id``. There is no
+    ``CoachSeasonMembership`` (or any
     season-scoped Coach model) anywhere in this codebase — a Coach's team
     assignment genuinely IS permanent, so no game-scoped resolution applies
     there. A Player's team is resolved live against ``game`` via
@@ -89,11 +104,10 @@ def game_scoped_own_team_id(role, scope, game, store):
     family's single hoisted ``own_team`` in ``web/server.py``, and — per
     schedule row — ``ApiService.get_demo_overview``.
     """
-    scope = scope or {}
     if role == Role.COACH:
-        return scope.get("team_id")
+        return scoped_team_id
     if role == Role.PLAYER:
-        return _player_team_for_game(scope, game, store)
+        return _player_team_for_game(scoped_player_id, game, store)
     return None
 
 
@@ -178,7 +192,50 @@ def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
     # are team-scoped" is the drift shape this whole boundary exists to
     # remove; `services/lineup_visibility.py` holds the one that classifies
     # PROJECTIONS, and nothing here needs a copy of it.
+    #
+    # THE PROJECTION (#427 round 20, the owner's blocker-2 ruling). The raw
+    # session `scope` is read HERE, ONCE, BEFORE ANY ROLE BRANCH, into three
+    # explicit immutable scalar ids — and it is never read again. Only those
+    # scalars cross into `game_scoped_own_team_id`.
+    #
+    # WHY THE SHAPE CHANGED RATHER THAN THE RULES. Five rounds tried to
+    # INFER from the source whether the mutable mapping had been tampered
+    # with between the gate receiving it and the resolver deciding from it,
+    # and each was defeated one spelling later: a forged argument, a rebuilt
+    # value, an in-place mutation, a resolver-side rebuild, and finally the
+    # OFFICIAL branch's own read hoisted two branches up —
+    #
+    #     official_id = (scope.update({'team_id': game.home_team_id})
+    #                    or scope.get("official_id"))
+    #
+    # which the liveness rule admits (`official_id` really is read) while
+    # the mutation runs for every caller. Measured at `f9b094e`: static
+    # audit `[]`, and over real authenticated HTTP twenty of the fifty
+    # derived unentitled cells answered 200, with EIGHT of HOME's private
+    # players in the `gid` `/lineups` body at `restricted=false`, on Memory,
+    # SQLite and real PostgreSQL alike. An ALIAS of the same statement
+    # (`_alias = scope`, mutated through `_alias`) measured byte-identically.
+    #
+    # "Which calls mutate shared state" is not decidable from a source tree,
+    # so no liveness rule over a mutable mapping can be sound. This removes
+    # the question instead of answering it: after these three lines there is
+    # no mutable object left between the projection and the decision, and
+    # the audit's job shrinks to three SYNTACTIC facts — each scalar is
+    # assigned exactly once, each reaches the resolver unchanged, and raw
+    # `scope` is never read again.
+    #
+    # BEHAVIOUR-PRESERVING, NOT MERELY INTENDED TO BE. `dict.get` is a pure
+    # read, so hoisting the three reads above the role branches changes no
+    # value any branch decides from; the operator short-circuit, the
+    # not-found passthrough and all three grant branches answer exactly what
+    # they answered before. Proven rather than asserted: every
+    # (principal x game x leaf) cell of the private-game family was driven
+    # over real authenticated HTTP, tri-store, before and after, and the
+    # two matrices are equal.
     scope = scope or {}
+    scoped_team_id = scope.get("team_id")
+    scoped_player_id = scope.get("player_id")
+    scoped_official_id = scope.get("official_id")
     if role in (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER):
         # Admitted before the game matters, exactly as
         # `can_read_private_game_data` short-circuited: an operator's
@@ -193,7 +250,8 @@ def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
         return PrivateGameRead(role=role, game=None, own_team=None,
                                admitted=True)
     if role in (Role.COACH, Role.PLAYER):
-        own_team = game_scoped_own_team_id(role, scope, game, store)
+        own_team = game_scoped_own_team_id(role, scoped_team_id,
+                                           scoped_player_id, game, store)
         admitted = own_team is not None and own_team in (
             game.home_team_id, game.away_team_id)
         # `own_team` is deliberately dropped on refusal: a refused read must
@@ -224,9 +282,8 @@ def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
         # is that one definition; this call site keeps byte-identical
         # behaviour (exact official AND `status.is_active`) while ceasing to
         # be an independent copy of it.
-        official_id = scope.get("official_id")
-        admitted = official_id is not None and any(
-            assignment_grants_official_scope(a, official_id)
+        admitted = scoped_official_id is not None and any(
+            assignment_grants_official_scope(a, scoped_official_id)
             for a in store.assignments_for_game(game_id))
         return PrivateGameRead(role=role, game=game, own_team=None,
                                admitted=admitted)

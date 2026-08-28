@@ -7219,7 +7219,7 @@ class ApiService:
         # no caller can name a side here.
         if next_game is not None:
             my_team_id = game_scoped_own_team_id(
-                Role.PLAYER, {"player_id": player_id}, next_game, self.store)
+                Role.PLAYER, None, player_id, next_game, self.store)
             # FAIL-CLOSED, and unreachable by construction rather than a new
             # user-visible state: `find_next_game_for_player` selected this
             # game through the SAME membership authority (`_plays_in` ->
@@ -10514,7 +10514,13 @@ class ApiService:
         ungated Games list, an operator readiness checklist, which now renders
         the marker rather than a guess.
         """
-        own_side = game_scoped_own_team_id(role, scope, game, self.store)
+        # PROJECTED, NOT PASSED (#427 round 20): `game_scoped_own_team_id`
+        # takes immutable ids, never the session mapping — see its own
+        # docstring and `resolve_private_game_read`'s "THE PROJECTION" note.
+        scope = scope or {}
+        own_side = game_scoped_own_team_id(
+            role, scope.get("team_id"), scope.get("player_id"), game,
+            self.store)
         audience = lineup_visibility.route_audience(
             role, own_side, game.home_team_id, game.away_team_id)
         if audience == lineup_visibility.FULL:

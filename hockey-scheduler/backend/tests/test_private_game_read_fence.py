@@ -146,7 +146,10 @@ class _FenceHarness(_ProjectionHarness):
 
         def two_independent_resolutions(role, scope, game_id, store):
             game = store.get_game(game_id)
-            own = (game_scoped_own_team_id(role, scope, game, store)
+            scope = scope or {}
+            own = (game_scoped_own_team_id(
+                       role, scope.get("team_id"), scope.get("player_id"),
+                       game, store)
                    if game is not None else None)
             return PrivateGameRead(role=role, game=game, own_team=own,
                                    admitted=True)
