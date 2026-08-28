@@ -3531,8 +3531,21 @@ def _refuse_a_resolver_caller_that_still_passes_a_mapping(where):
                 # projected id. Whether the object behind a name is a mapping
                 # is not decidable here; whether the name is the one this
                 # slot's key declares is.
+                #
+                # THE MATCH IS EXACT, AND ROUND 22 TIGHTENED IT FROM
+                # `endswith`. A suffix test accepts `their_team_id` and
+                # `other_team_id` in the `scoped_team_id` slot — somebody
+                # else's identifier, in a slot every pin downstream reads as
+                # the SESSION'S own, which is the second half of what this
+                # refusal says it refuses. MEASURED before tightening: all
+                # THREE real call sites already pass the exact test —
+                # `scoped_team_id`/`scoped_player_id` (the carrier, the
+                # parameter's own name), `player_id` (the facade's next-game
+                # projection, the key's own name) and `None`/`.get("…")` for
+                # the rest — so the loosening bought the product nothing and
+                # cost the rule its second claim.
                 if isinstance(argument, ast.Name) \
-                        and argument.id.endswith(key):
+                        and argument.id in (parameter, key):
                     continue
                 if isinstance(argument, ast.Constant) \
                         and argument.value is None:
@@ -17121,6 +17134,19 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                  'player_id, next_game,\n'
                  '                self.store)',
                  "slot is handed"),
+                # ROUND 22: SOMEBODY ELSE'S IDENTIFIER, in a slot every pin
+                # downstream reads as the SESSION'S own. This is the case the
+                # rule's own sentence claims — "or somebody else's identifier
+                # in a slot every pin would read the same text either way" —
+                # and until the bare-name match was tightened from `endswith`
+                # to an exact one it was ACCEPTED: `other_team_id` ends with
+                # `team_id`. A rule that states two claims and enforces one
+                # is worse than a rule that states one.
+                ('game_scoped_own_team_id(\n'
+                 '                role, other_team_id, '
+                 'scope.get("player_id"), game,\n'
+                 '                self.store)',
+                 "is handed 'other_team_id'"),
         ):
             with self.subTest(spelling=spelling[:40]):
                 with mock.patch.object(
