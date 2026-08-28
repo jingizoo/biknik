@@ -258,7 +258,7 @@ admission branch       CLOSED      ``admission_branches()`` — the GATE'S OWN
                                    query axis from ``server.py``, and every
                                    non-operator branch must carry an entry
                                    in ``ADMISSION_AUTHORITIES``. Proved by
-                                   INJECTION, in twenty-eight spellings; the
+                                   INJECTION, in thirty-six spellings; the
                                    statement walk that derives them is an
                                    ALLOW-LIST, so a statement kind it cannot
                                    attribute is refused by name rather than
@@ -289,7 +289,26 @@ admission branch       CLOSED      ``admission_branches()`` — the GATE'S OWN
                                    containing a statement the fold cannot
                                    read, able to fall through, deciding on
                                    its own globals, or called other than
-                                   plain-positionally
+                                   plain-positionally. #427 round 16: and
+                                   what a DELEGATING BRANCH HANDS the
+                                   audited resolver — every argument must be
+                                   the resolver's own parameter for that
+                                   slot, PASSED STRAIGHT THROUGH, resolving
+                                   through this body's bindings to an
+                                   expression built only out of the gate's
+                                   own parameters. A forged scope, a forged
+                                   role, a different variable, and the
+                                   session scope REBUILT one line above
+                                   every branch each left all three pins
+                                   reading exactly what they pinned while a
+                                   Coach of a team in NEITHER game received
+                                   the HOME side's private roster over real
+                                   HTTP; the argument shape allow-list is
+                                   ONE expression kind, so a kind Python has
+                                   not shipped yet is refused too. The same
+                                   round closes the resolver's own per-role
+                                   answers, which were pinned as a FUNCTION
+                                   NAME whose body nothing derived
 official assignment    CLOSED      ``OfficialAssignmentStatus`` DRIVEN
 status                             through the product predicate an
                                    Official's admission is decided by,
@@ -363,15 +382,17 @@ adjusted:
   NO path and ONE world-pair — ``season_roster_membership``, the EX-MEMBER,
   which is the state no world in this matrix contained;
 * measured on this machine, for the whole-surface property alone:
-  **44.9 s Memory, 24.4 s SQLite, 82.7 s real PostgreSQL** — one recorded
-  run (round 15; round 14 recorded 43.4 / 23.1 / 75.8), and it moves a few
-  percent between runs with the machine's load: the run before this one, of
-  the identical tree, measured 45.9 / 24.5 / 82.7;
-* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 87 tests in 305.5 s ...
-  OK** — against **82 tests / 284.9 s** at round 14 (5c3caf8) and **72
-  tests / 294.7 s** at the head that round started from (c4a725b). Round 14
-  added TEN tests and round 15 adds FIVE, and NONE of the fifteen drives a
-  backend. Round 14's are the six MODELS the admission derivation rests on,
+  **46.0 s Memory, 24.6 s SQLite, 83.2 s real PostgreSQL** — one recorded
+  run (round 16; round 15 recorded 44.9 / 24.4 / 82.7 and round 14
+  43.4 / 23.1 / 75.8), and it moves a few percent between runs with the
+  machine's load: the run before this one, of a tree differing only in this
+  paragraph, measured 45.5 / 24.7 / 83.5;
+* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 91 tests in 310.3 s ...
+  OK** — against **87 tests / 305.5 s** at round 15 (d3f5f1e), **82 tests /
+  284.9 s** at round 14 (5c3caf8) and **72 tests / 294.7 s** at the head
+  round 14 started from (c4a725b). Round 14 added TEN tests, round 15 FIVE
+  and round 16 FOUR, and NONE of the nineteen drives a backend. Round 14's
+  are the six MODELS the admission derivation rests on,
   one per model plus the consumer derivation, the interpreter-grammar check
   and the two halves of the binding model. Round 15's are the OFFICIAL
   grant after `62a52b7` centralised it: that the pin FOLLOWS the predicate
@@ -380,7 +401,13 @@ adjusted:
   signature grammar is the running interpreter's, and — driven, not matched
   — that the predicate's answer is
   ``OfficialAssignmentStatus.is_active`` member by member, with its own
-  three-way falsifier. Every one is pure source analysis or a direct call of
+  three-way falsifier. Round 16's are the SEVENTH model — what a DELEGATING
+  BRANCH HANDS the audited resolver: that a forged argument is refused over
+  twelve expression shapes, that a session scope the gate REBUILT is not
+  the one it received, that a subject the resolver could have computed for
+  itself carries none, and that the PLAYER authority is what its helper
+  DECIDES BY rather than the helper's name. Every one is pure source
+  analysis or a direct call of
   the product predicate, for the reason
   :class:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority`'s own
   docstring gives. The count of methods that DO loop every backend is
@@ -1900,9 +1927,20 @@ def _resolve_roles(test, aliases, constants, role_param):
     return None
 
 
+def _calls_to(node, name):
+    """Every ``name(...)`` call inside ``node``, as CALL NODES.
+
+    The nodes and not merely the fact of them (#427 round 16): "this branch
+    delegates" was all that was ever read off a resolver call, and WHAT THE
+    BRANCH HANDED THE RESOLVER was therefore in none of the three pins. The
+    arguments are on these nodes."""
+    return [sub for sub in ast.walk(node)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+            and sub.func.id == name]
+
+
 def _calls(node, name):
-    return any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
-               and sub.func.id == name for sub in ast.walk(node))
+    return bool(_calls_to(node, name))
 
 
 def _rests_on(node, names):
@@ -2148,6 +2186,177 @@ def _refuse_a_second_binding(fn, stmt, bindings, bound):
         f"guessed at")
 
 
+def _refuse_an_unvouched_argument(call, carrier, resolver, bindings, where):
+    """WHAT A DELEGATING BRANCH HANDS THE AUDITED RESOLVER (#427 round 16,
+    the seventh model — and the one that made the other six describable
+    while the answer was forged).
+
+    ``admission_branches`` recorded WHETHER a branch delegates and WHAT THE
+    RESOLVER RETURNS FOR THAT ROLE. It never recorded what THIS BRANCH HANDED
+    THE RESOLVER, and none of the three pins can: ``authority`` is the
+    resolver's own return expression, and ``admits_source``/``side_source``
+    unfold to ``own_team is not None and own_team in (...)`` and ``own_team
+    if admitted else None`` — text a forged argument leaves CHARACTER FOR
+    CHARACTER unchanged. MEASURED at ``d3f5f1e``, changing only the argument
+    list::
+
+        own_team = game_scoped_own_team_id(
+            role, {'team_id': game.home_team_id}, game, store)
+
+    ``_audit()`` returned ``[]``, all three pins still read exactly what they
+    pinned, and ``thirdcoach`` — a Coach of a team in NEITHER game — received
+    200 over real authenticated HTTP on ``/lineups`` (HOME ``restricted
+    false``, eight private rows), ``/board``, ``/roster``, ``/roster-status``
+    and ``/substitutes``.
+
+    THE RULE IS THAT EVERY ARGUMENT IS TRACEABLE TO THE GATE'S OWN
+    PARAMETERS, UNFORGED, and it is three conditions because there are three
+    ways to break it. Each is derived from a signature this file READS
+    rather than from a list it keeps: the resolver's own parameter names and
+    the carrier's own parameter names.
+
+    1. SHAPE — an argument must be a bare ``Name``. EVERY other expression
+       kind is refused NAMING IT, which is the fail-closed default the
+       statement allow-list already establishes: a literal, an attribute, a
+       call, a reconstructed dict, a subscript, a conditional and every kind
+       Python has not shipped yet are all "not a Name", so this cannot be
+       one shape behind the grammar the way a deny-list was.
+    2. IDENTITY — that name must be THE RESOLVER'S OWN PARAMETER NAME for
+       the slot it fills, read off the resolver's ``def``. "Passed straight
+       through" is the only relation between an argument and a parameter
+       this inventory can vouch for; A DIFFERENT VARIABLE in that slot —
+       ``forged`` for ``scope`` — is a substitution nothing here can check,
+       and it reaches the same disclosure by a longer road.
+    3. PROVENANCE — the name must resolve, through THIS BODY'S OWN BINDINGS,
+       to an expression built only out of the CARRIER'S parameters. Every
+       ``Name`` leaf must be one of them; a ``Constant`` leaf is refused
+       outright, because a literal is by definition not something the gate
+       was handed; and when the argument is named for a carrier parameter it
+       must still MENTION that parameter, which is what catches the
+       one-line rebinding that leaves the call site untouched::
+
+           scope = {'team_id': store.get_game(game_id).home_team_id}
+
+       ROUND 14'S BINDING MODEL IS WHAT ANSWERS HERE, reused rather than
+       re-implemented: the unfold and its refusal are :func:`_resolved`, so a
+       name a nested block may have changed is already :data:`UNRESOLVABLE`
+       (:func:`_poison`) and a name bound twice is already refused
+       (:func:`_refuse_a_second_binding`) — the literal
+       ``scope = scope or {}`` / ``scope = {...}`` pair is caught by that
+       rule and never reaches this one.
+    4. AND A SLOT FILLED BY A LOCAL MUST CARRY SOMETHING THE RESOLVER IS NOT
+       ALREADY BEING HANDED. Found by this round's OWN hunt, against the
+       three rules above, and MEASURED live::
+
+           game = store.all_games().pop()
+
+       — the gate's one line that selects the subject, replaced by a value
+       that is a function of ``store`` ALONE. It passes 1, 2 and 3: the call
+       site still reads ``game``, ``game`` is not a parameter so nothing
+       requires it to mention itself, and its only leaf IS a parameter. At
+       ``d3f5f1e`` with this rule absent it left ``_audit() == []`` while
+       ``thirdcoach`` — a Coach of a team in NEITHER side of ``game_1`` —
+       received 200 on ``/lineups`` and ``/board`` for that game, breaching
+       the family's 403 boundary (the projection layer then refused the rows
+       themselves, which is defence in depth and not this axis's answer).
+       The rule that closes it is an information statement rather than a
+       shape one: the resolver's ``game`` slot exists to carry the SUBJECT of
+       the request, and a value computed from nothing but arguments the
+       resolver already has in its other slots carries no subject at all.
+       ``store.get_game(game_id)`` carries ``game_id``, which no other slot
+       hands over; ``store.all_games().pop()`` carries nothing.
+
+    MEASURED against the real gate, all four arguments pass: ``role`` and
+    ``store`` are parameters read unchanged, ``scope`` resolves to
+    ``scope or {}`` (mentions its own parameter, no literal leaf — an empty
+    ``{}`` is a container node, not a ``Constant``), and ``game`` resolves to
+    ``store.get_game(game_id)``, whose only leaves are two parameters, one of
+    which — ``game_id`` — is handed to the resolver nowhere else."""
+    resolver_params = _positional_parameters(resolver, where)
+    carrier_params = _positional_parameters(carrier, where)
+    if call.keywords or any(isinstance(a, ast.Starred) for a in call.args) \
+            or len(call.args) != len(resolver_params):
+        raise AdmissionExtractionError(
+            f"line {call.lineno}: the branch hands {resolver.name} "
+            f"{ast.unparse(call)!r}, which is not exactly its "
+            f"{len(resolver_params)} positional parameter(s) as plain "
+            f"positional arguments. Which argument answers which parameter "
+            f"is then a matching rule this inventory does not model, so what "
+            f"this branch resolves the caller's side FROM cannot be vouched "
+            f"for")
+    handed = {a.id for a in call.args if isinstance(a, ast.Name)}
+    for argument, parameter in zip(call.args, resolver_params):
+        spelled = ast.unparse(argument)
+        if not isinstance(argument, ast.Name):
+            raise AdmissionExtractionError(
+                f"line {argument.lineno}: the branch hands {resolver.name} "
+                f"{spelled!r} ({type(argument).__name__}) for its "
+                f"{parameter!r} parameter. The only argument this inventory "
+                f"can vouch for is the gate's own {parameter!r} PASSED "
+                f"STRAIGHT THROUGH: what the resolver answers is pinned, "
+                f"what this branch tests is pinned and what it returns is "
+                f"pinned, and a forged argument leaves all three reading "
+                f"exactly what they pinned while the resolver answers a side "
+                f"nobody asked it about")
+        if argument.id != parameter:
+            raise AdmissionExtractionError(
+                f"line {argument.lineno}: the branch hands {resolver.name} "
+                f"{spelled!r} for its {parameter!r} parameter. A DIFFERENT "
+                f"VARIABLE in that slot is a substitution nothing this "
+                f"inventory measures can see — every pin reads the same text "
+                f"either way — so only {parameter!r} itself, the name the "
+                f"resolver's own signature gives this slot, is vouchable")
+        value = _resolved(
+            argument, bindings,
+            f"the {parameter!r} argument the branch at line {call.lineno} "
+            f"hands {resolver.name}")
+        names = sorted({sub.id for sub in ast.walk(value)
+                        if isinstance(sub, ast.Name)})
+        outside = [n for n in names if n not in carrier_params]
+        if outside or not names:
+            raise AdmissionExtractionError(
+                f"line {call.lineno}: the {parameter!r} the branch hands "
+                f"{resolver.name} holds {ast.unparse(value)!r}, which is "
+                f"built out of "
+                f"{', '.join(repr(n) for n in outside) or 'no name at all'} "
+                f"— not {carrier.name}'s own parameter(s) "
+                f"{', '.join(repr(n) for n in carrier_params)}. An argument "
+                f"the gate did not RECEIVE is one the pins cannot vouch for")
+        if parameter in carrier_params and parameter not in names:
+            raise AdmissionExtractionError(
+                f"line {call.lineno}: {carrier.name} hands {resolver.name} "
+                f"the name {parameter!r}, but by then {parameter!r} holds "
+                f"{ast.unparse(value)!r}, which no longer derives from the "
+                f"gate's OWN {parameter!r} parameter. The call site's text "
+                f"never moved and neither did any of the three pins, so a "
+                f"branch that resolves the caller's side from a value the "
+                f"gate REBUILT rather than RECEIVED would read green")
+        if parameter not in carrier_params and not (set(names) - handed):
+            raise AdmissionExtractionError(
+                f"line {call.lineno}: the {parameter!r} the branch hands "
+                f"{resolver.name} is the local {spelled!r}, which holds "
+                f"{ast.unparse(value)!r} — a value computed from "
+                f"{', '.join(repr(n) for n in names)} alone, and "
+                f"{resolver.name} is handed "
+                f"{', '.join(repr(n) for n in sorted(handed & set(names)))} "
+                f"already. This slot carries the SUBJECT of the request, and "
+                f"a value the resolver could have computed for itself out of "
+                f"its own other arguments carries no subject at all — so "
+                f"what side it answers about is not traceable to anything "
+                f"the gate was asked")
+        literals = [ast.unparse(sub) for sub in ast.walk(value)
+                    if isinstance(sub, ast.Constant)]
+        if literals:
+            raise AdmissionExtractionError(
+                f"line {call.lineno}: the {parameter!r} the branch hands "
+                f"{resolver.name} holds {ast.unparse(value)!r}, which is "
+                f"built partly out of the literal(s) "
+                f"{', '.join(literals)}. A literal is by definition not "
+                f"something this gate was handed, so what the resolver "
+                f"answers about is not traceable to the gate's own "
+                f"parameters")
+
+
 def _poison(bindings, stmt):
     """Mark every name ``stmt`` assigns ANYWHERE inside it
     :data:`UNRESOLVABLE` for the rest of the enclosing body.
@@ -2163,8 +2372,15 @@ def _poison(bindings, stmt):
 
 
 def _decisions(fn, aliases, constants, resolver_name=None):
-    """``[(Return, roles|None, delegates, bindings), …]`` for every return in
-    ``fn``, carrying the role constraint of the enclosing branches.
+    """``[(Return, roles|None, resolver calls, bindings), …]`` for every
+    return in ``fn``, carrying the role constraint of the enclosing branches.
+
+    THE THIRD ELEMENT IS THE CALL NODES AND NOT A BOOLEAN (#427 round 16).
+    "This branch delegates" was the whole of what a resolver call was read
+    for, and the ARGUMENTS were therefore measured by nothing — see
+    :func:`_refuse_an_unvouched_argument`, which is handed these. Truthiness
+    is unchanged, so every reader that only asked whether the branch
+    delegates still asks it.
 
     THE BINDING MODEL FAILS CLOSED IN THREE RULES (#427 round 14), because
     the round-13 walk was flow-insensitive in the UNSAFE direction and
@@ -2235,9 +2451,9 @@ def _decisions(fn, aliases, constants, resolver_name=None):
                 bound = _assigned_names(stmt)
                 _refuse_a_rebound_role(fn, stmt, role_param, bound)
                 _refuse_a_second_binding(fn, stmt, bindings, bound)
-                if stmt.value is not None and resolver_name \
-                        and _calls(stmt.value, resolver_name):
-                    delegates = True
+                if stmt.value is not None and resolver_name:
+                    delegates = delegates + tuple(
+                        _calls_to(stmt.value, resolver_name))
                 if isinstance(target, ast.Name) and stmt.value is not None:
                     bindings[target.id] = stmt.value
                     bound.discard(target.id)
@@ -2308,7 +2524,11 @@ def _decisions(fn, aliases, constants, resolver_name=None):
                 # `ok = False` reported `admits=False`), and a later block's
                 # poisoning refused a read that was perfectly resolvable
                 # here.
-                out.append((stmt, roles, delegates, dict(bindings)))
+                out.append((
+                    stmt, roles,
+                    delegates + tuple(_calls_to(stmt, resolver_name)
+                                      if resolver_name else ()),
+                    dict(bindings)))
             # -- INERT: skipped, with the proof on the line ----------------
             elif isinstance(stmt, ast.Pass):
                 # `pass` is defined to do nothing. It binds no name, takes no
@@ -2335,7 +2555,7 @@ def _decisions(fn, aliases, constants, resolver_name=None):
                     f"audits, which is exactly how a `match` arm went "
                     f"unseen. Either teach this walk to attribute it or "
                     f"spell the gate in a shape it already reads")
-    walk(fn.body, None, False, {})
+    walk(fn.body, None, (), {})
     return out
 
 
@@ -2426,22 +2646,37 @@ def _gate_function(tree, name, where):
 # been taught to read, because a call this cannot follow is a decision nothing
 # audits.
 #
-# TWO LIMITS, DISCLOSED RATHER THAN DISCOVERED:
+# ROUND 15'S FIRST DISCLOSED LIMIT IS CLOSED HERE (#427 round 16, d14). It
+# read: "only the CARRIER's own decision expressions are inlined... the
+# resolver's per-role answers are not inlined further. MEASURED reason:
+# `_player_team_for_game`, the resolver's answer for PLAYER, decides through
+# a LOCAL binding (`player = store.get_player(...)`) guarded by an early
+# return, and `_substituted` refuses a decision that reads anything but its
+# own parameters. Inlining it would refuse the REAL gate."
 #
-# * only the CARRIER's own decision expressions are inlined. The RESOLVER is
-#   followed by :func:`_resolver_authorities`, a different mechanism that
-#   reads its per-role answers, and those answers are not inlined further.
-#   MEASURED reason: `_player_team_for_game`, the resolver's answer for
-#   PLAYER, decides through a LOCAL binding (`player = store.get_player(...)`)
-#   guarded by an early return, and :func:`_substituted` refuses a decision
-#   that reads anything but its own parameters. Inlining it would refuse the
-#   REAL gate, which is not a closure, it is an outage.
-# * the SEMANTIC half of this — that `status.is_active` is still what the
-#   followed predicate answers — is not carried by text at all. An expression
-#   can be rewritten while still testing status, and can keep its text while
-#   testing nothing. See
-#   :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
-#   .test_the_official_grant_answers_the_status_enum_member_by_member`.
+# THAT WAS A GAP, AND A LIVE ONE. The PLAYER authority was the TEXT
+# `_player_team_for_game(scope, game, store)` and that function's body was
+# derived by nothing: changing its `return` to `game.home_team_id` gave
+# `awayplayer` HOME's whole private sheet over real authenticated HTTP with
+# `_audit() == []`. So the fold was EXTENDED TO READ THAT SHAPE rather than
+# the limit being restated. Two named changes, each a refusal when it does
+# not hold: `_decided_by` folds a single bare-name assignment as the `let` it
+# is, and `_substituted` keeps a free name that is bound at module level BY A
+# DEFINITION in the SAME FILE as the call site, where the identical text
+# means the identical object. `_resolver_authorities` then follows its own
+# answers, and the PLAYER pin is the decision instead of the name.
+#
+# THE LIMIT THAT REMAINS, disclosed rather than discovered: the SEMANTIC half
+# of a followed pin — that `status.is_active` is still what the followed
+# predicate answers — is not carried by text at all. An expression can be
+# rewritten while still testing status, and can keep its text while testing
+# nothing. See :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+# .test_the_official_grant_answers_the_status_enum_member_by_member`. The
+# PLAYER pin has no such driven half yet; what it has is that the two things
+# the function NAME could not carry — the #270 `is_active` guard and the
+# `RosterService.team_for_game` membership spine — are both IN it, and
+# deleting either moves it (`test_the_player_authority_is_what_the_helper
+# _decides_by`).
 
 #: The product package a decision may be followed INTO, and the directory its
 #: modules live in — READ OFF THE GATE MODULE ITSELF, so moving the package
@@ -2517,15 +2752,55 @@ def _followed_definition(name, tree, where):
     The ONE-DEFINITION model applies to the callee for exactly the reason it
     applies to the carrier — Python binds the LAST definition and this would
     read one of them — so :func:`_gate_function` is what answers, in the
-    callee's own module."""
+    callee's own module.
+
+    A CLASS IS NOT FOLLOWED, AND THAT IS A STATEMENT ABOUT WHAT A CALL
+    DECIDES (#427 round 16). ``RosterService(store)`` constructs; what the
+    surrounding expression decides by is the METHOD then called on it, which
+    is an ``Attribute`` call and which this fold already declines to follow.
+    Reading a ``ClassDef`` as "the decision a call to this name takes" would
+    mean reading ``__init__``, which decides nothing about admission — so a
+    name bound EXACTLY ONCE, to a class, keeps its call text, the same
+    answer a builtin or a parameter gets. Bound any OTHER way it is still
+    refused by :func:`_gate_function`: two bindings, or a binding that is
+    neither a ``def`` nor a class, remain shapes this cannot read.
+
+    THE LIMIT THAT COMES WITH IT IS THE ONE THE FOLD ALREADY HAD, not a new
+    one: a decision taken inside a METHOD is pinned as the call TEXT, exactly
+    as ``store.get_game(...)`` and ``a.status.is_active`` already are,
+    because :class:`_Follow` only follows a call whose ``func`` is a bare
+    ``Name``. Moving an admission decision into a class method would put it
+    behind that text — and the SEMANTIC half of any pin is what
+    ``test_the_official_grant_answers_the_status_enum_member_by_member`` is
+    for."""
     bindings = _module_bindings_of(tree, name)
     if not bindings:
         return None
     if len(bindings) == 1 and isinstance(bindings[0], ast.ImportFrom):
         source = _followed_module_source(bindings[0], name, where)
-        sub_tree = ast.parse(source.read_text())
-        return _gate_function(sub_tree, name, source), sub_tree, source
-    return _gate_function(tree, name, where), tree, where
+        sub_tree, sub_where = ast.parse(source.read_text()), source
+    else:
+        sub_tree, sub_where = tree, where
+    resolved = _module_bindings_of(sub_tree, name)
+    if len(resolved) == 1 and isinstance(resolved[0], ast.ClassDef):
+        return None
+    return _gate_function(sub_tree, name, sub_where), sub_tree, sub_where
+
+
+def _bound_forward(node, name, value):
+    """``node`` with every read of ``name`` replaced by ``value`` — the `let`
+    :func:`_decided_by` folds an assignment into.
+
+    The pasted value is NOT re-visited (``NodeTransformer`` does not descend
+    into what a visitor returns), so ``scope = scope or {}`` substitutes the
+    PARAMETER's expression into later reads instead of expanding forever."""
+    class _Let(ast.NodeTransformer):
+        def visit_Name(self, sub):
+            if sub.id != name or not isinstance(sub.ctx, ast.Load):
+                return sub
+            return copy.deepcopy(value)
+
+    return ast.fix_missing_locations(_Let().visit(node))
 
 
 def _decided_by(body, fn, where):
@@ -2547,10 +2822,24 @@ def _decided_by(body, fn, where):
       anything this fold can name: an ``if`` whose body falls through
       continues into the statements AFTER the ``if``, so reading it as the
       then-arm of a conditional expression would be simply false.
+    * AN ASSIGNMENT TO ONE BARE NAME is folded by SUBSTITUTING ITS VALUE
+      FORWARD into everything after it (#427 round 16). This is the shape
+      round 15 disclosed it could not read and therefore did not close:
+      "``_player_team_for_game`` decides through a local binding behind an
+      early return". Reading it is not a modelling job — a single assignment
+      in straight-line code is a `let`, and pasting the value where the name
+      is read is what a `let` MEANS. Note the value is pasted WITHOUT being
+      re-visited, so ``scope = scope or {}`` substitutes the parameter's own
+      expression rather than recurring on itself; and ONE binding per name
+      is what round 14's :func:`_refuse_a_second_binding` already requires of
+      the walk that reads the gate. A target that is not exactly one bare
+      ``Name`` — a tuple unpack, an attribute, a subscript, a walrus — is
+      REFUSED, because which name holds what is then a rule this does not
+      model.
 
-    Everything else — an assignment, a loop, a ``with``, a ``match`` — is
-    refused. Each of them is a modelling job, and the whole of round 14 is
-    what happens when one of those is done by hand and quietly."""
+    Everything else — a loop, a ``with``, a ``match`` — is refused. Each of
+    them is a modelling job, and the whole of round 14 is what happens when
+    one of those is done by hand and quietly."""
     for index, stmt in enumerate(body):
         if isinstance(stmt, ast.Pass) or (
                 isinstance(stmt, ast.Expr)
@@ -2574,6 +2863,21 @@ def _decided_by(body, fn, where):
                 body=_decided_by(stmt.body, fn, where),
                 orelse=_decided_by(list(stmt.orelse) + list(body[index + 1:]),
                                    fn, where))
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            targets = (stmt.targets if isinstance(stmt, ast.Assign)
+                       else [stmt.target])
+            if len(targets) != 1 or not isinstance(targets[0], ast.Name) \
+                    or stmt.value is None:
+                raise AdmissionExtractionError(
+                    f"{where} line {stmt.lineno}: {fn.name} binds "
+                    f"{ast.unparse(stmt).splitlines()[0]!r}, which is not a "
+                    f"single bare name holding a value — which name holds "
+                    f"what afterwards is a rule this fold does not model, so "
+                    f"what a call to {fn.name} decides by cannot be written "
+                    f"out")
+            return _bound_forward(
+                _decided_by(body[index + 1:], fn, where),
+                targets[0].id, stmt.value)
         raise AdmissionExtractionError(
             f"{where} line {stmt.lineno}: {type(stmt).__name__} in "
             f"{fn.name} — {ast.unparse(stmt).splitlines()[0]!r} — is a "
@@ -2588,7 +2892,63 @@ def _decided_by(body, fn, where):
         f"fold does not model and will not guess")
 
 
-def _substituted(node, fn, call, where):
+def _positional_parameters(fn, where):
+    """``fn``'s parameter NAMES, in order — and a REFUSAL when its signature
+    is not one this file may read argument by argument.
+
+    THE ONE PLACE THAT DECIDES THAT, for the reason round 15 gave when
+    :func:`_substituted` was the only place: which argument answers which
+    parameter is a matching rule, ``*args``, ``**kwargs``, a keyword-only
+    parameter and a default each change it, and a rule modelled in two
+    places is a rule that can be right in one of them. Both the FOLD (which
+    pastes a callee's decision into its caller) and the ARGUMENT PROVENANCE
+    rule (#427 round 16, which reads what a delegating branch hands the
+    resolver) ask this same question, so they ask it here.
+
+    EVERY FIELD of the running interpreter's ``ast.arguments`` is read, and
+    :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+    .test_the_signature_fields_the_substitution_reads_are_this_grammar` is
+    what requires that of THIS function's own source: CI runs 3.11 and this
+    was written on 3.14, and a field that is not looked at is an
+    argument-matching rule silently not modelled."""
+    args = fn.args
+    if (args.vararg or args.kwarg or args.kwonlyargs or args.defaults
+            or args.kw_defaults):
+        raise AdmissionExtractionError(
+            f"{where} line {fn.lineno}: {fn.name} takes *args, **kwargs, a "
+            f"keyword-only parameter or a default, so which argument answers "
+            f"which parameter is a matching rule this walk does not model")
+    return [arg.arg for arg in list(args.posonlyargs) + list(args.args)]
+
+
+def _module_level_definitions(tree):
+    """Names bound at MODULE level of ``tree`` BY A DEFINITION — a ``def``, a
+    ``class`` or an ``import``.
+
+    Two conditions, and the second is what keeps this from being a hole.
+    A name here means the SAME OBJECT at every point of its module, which is
+    why :func:`_substituted` may leave one standing when the callee and the
+    call site are the same file. And it names a DEFINITION rather than a
+    VALUE: a module-level ASSIGNMENT is deliberately excluded, because what
+    it holds is part of what the callee decides, and letting its NAME stand
+    in the pin would put back exactly the defect round 15 removed — a pin
+    that reads a name instead of the decision behind it. ``_ALWAYS = True``
+    in a followed predicate is still refused by name, and
+    :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+    .test_a_call_the_pin_cannot_follow_is_refused_by_name` is what requires
+    that."""
+    out = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            out.update((alias.asname or alias.name).split(".")[0]
+                       for alias in node.names)
+    return frozenset(out)
+
+
+def _substituted(node, fn, call, where, in_scope=frozenset()):
     """``node`` — what ``fn`` decides by — with each PARAMETER replaced by
     the ARGUMENT this call passes for it.
 
@@ -2598,19 +2958,26 @@ def _substituted(node, fn, call, where):
     name, because each is an argument-matching rule this would otherwise
     have to model and could be wrong about.
 
-    AND EVERY FREE NAME IN THE DECISION MUST BE A PARAMETER. A decision that
-    reads its own module's globals, or its own locals, means something in the
-    CALLEE's namespace that the identical text would not mean at the call
-    site — pasting it would produce a pin that reads plausibly and describes
-    nothing. Refused instead."""
-    args = fn.args
-    params = [arg.arg for arg in list(args.posonlyargs) + list(args.args)]
-    if (args.vararg or args.kwarg or args.kwonlyargs or args.defaults
-            or args.kw_defaults):
-        raise AdmissionExtractionError(
-            f"{where} line {fn.lineno}: {fn.name} takes *args, **kwargs, a "
-            f"keyword-only parameter or a default, so which argument answers "
-            f"which parameter is a matching rule this walk does not model")
+    AND EVERY FREE NAME IN THE DECISION MUST BE A PARAMETER — OR A NAME THAT
+    MEANS THE SAME THING AT THE CALL SITE. A decision that reads its own
+    module's globals, or its own locals, means something in the CALLEE's
+    namespace that the identical text would not mean at the call site;
+    pasting it would produce a pin that reads plausibly and describes
+    nothing, so it is refused.
+
+    ``in_scope`` IS THAT EXCEPTION, AND IT IS AN IDENTITY ARGUMENT RATHER
+    THAN A LOOSENING (#427 round 16). When the callee is defined in the SAME
+    FILE as the call site, a name bound at that module's top level BY A
+    DEFINITION names the same object in both places — the text does not
+    change meaning, so there is nothing to be wrong about. :func:`_inlined`
+    passes :func:`_module_level_definitions` of the caller's own module ONLY
+    when the two files are the same one, and an empty set otherwise, so a
+    callee in another module is refused exactly as before, and a module-level
+    ASSIGNMENT is refused in both cases. This is what lets the PLAYER
+    authority be folded at all: ``_player_team_for_game`` decides through
+    ``RosterService(store).team_for_game(...)``, and ``RosterService`` is a
+    module-level import of the gate's own file."""
+    params = _positional_parameters(fn, where)
     if call.keywords or any(isinstance(a, ast.Starred) for a in call.args) \
             or len(call.args) != len(params):
         raise AdmissionExtractionError(
@@ -2619,7 +2986,8 @@ def _substituted(node, fn, call, where):
             f"plain positional arguments, so what the callee decides about "
             f"cannot be re-stated in the caller's own names")
     outside = sorted({sub.id for sub in ast.walk(node)
-                      if isinstance(sub, ast.Name)} - set(params))
+                      if isinstance(sub, ast.Name)}
+                     - set(params) - set(in_scope))
     if outside:
         raise AdmissionExtractionError(
             f"{where} line {fn.lineno}: what {fn.name} decides by reads "
@@ -2657,21 +3025,41 @@ def _inlined(node, tree, where, depth=FOLLOW_DEPTH):
             if found is None:
                 return call
             fn, fn_tree, fn_where = found
+            # The callee's own module-level names, and ONLY when that module
+            # is this one: then the text means the same object here as
+            # there, which is the identity argument `_substituted` documents.
+            here = (_module_level_definitions(tree)
+                    if Path(fn_where) == Path(where) else frozenset())
             return _substituted(
                 _inlined(_decided_by(fn.body, fn, fn_where),
                          fn_tree, fn_where, depth - 1),
-                fn, call, fn_where)
+                fn, call, fn_where, here)
 
     return ast.fix_missing_locations(_Follow().visit(copy.deepcopy(node)))
 
 
 def _resolver_authorities(tree, aliases, constants, where):
-    """``{role: the normalized expression the RESOLVER answers it with}`` —
-    how the carrier's single ``role in (Role.COACH, Role.PLAYER)`` branch
-    becomes TWO authorization branches.
+    """``{role: what the RESOLVER answers it with, FOLLOWED}`` — how the
+    carrier's single ``role in (Role.COACH, Role.PLAYER)`` branch becomes TWO
+    authorization branches.
 
     A role the resolver answers with a literal ``None`` resolves no side and
-    therefore reaches no admission, so it does not appear."""
+    therefore reaches no admission, so it does not appear.
+
+    THE ANSWER IS FOLLOWED, NOT NAMED (#427 round 16, and this is what
+    closes d14). The PLAYER authority used to be pinned as the TEXT
+    ``_player_team_for_game(scope, game, store)`` and that function's BODY
+    was derived by nothing: changing its ``return`` to ``game.home_team_id``
+    gave ``awayplayer`` HOME's whole private sheet with ``_audit() == []``.
+    Round 15 disclosed exactly this gap and its reason — the helper "decides
+    through a local binding behind an early return, and ``_substituted``
+    refuses that" — so the fold was extended to READ THAT SHAPE rather than
+    the pin being moved somewhere else: :func:`_decided_by` now folds a
+    single bare-name assignment as the `let` it is, and :func:`_substituted`
+    keeps a free name that means the same object at the call site because
+    the callee is in the same file. Both are named refusals when they do not
+    hold, so the PLAYER authority is a decision this file can see rather
+    than a function name it cannot."""
     fn = _gate_function(tree, GATE_RESOLVER, where)
     out = {}
     for node, roles, _delegates, bindings in _decisions(fn, aliases,
@@ -2687,8 +3075,12 @@ def _resolver_authorities(tree, aliases, constants, where):
                 f"line {node.lineno}: {GATE_RESOLVER} resolves a side for "
                 f"EVERY role — no role test governs this return — so no "
                 f"caller's side can be attributed to an authority")
+        # FOLLOWED after the `None` test and not before: inlining can only
+        # turn an expression into a longer one, and "this role gets no side"
+        # is a fact about the literal the resolver returns.
+        answers = _inlined(value, tree, where)
         for role in roles:
-            out[role] = ast.unparse(value)
+            out[role] = ast.unparse(answers)
     return out
 
 
@@ -2710,11 +3102,19 @@ def admission_branches(source=None):
             f"role or it spells the roles in a way this cannot read")
     constants = _module_constants(tree)
     resolver = _resolver_authorities(tree, aliases, constants, where)
+    resolver_fn = _gate_function(tree, GATE_RESOLVER, where)
     carrier = _gate_function(tree, GATE_CARRIER, where)
     record = game_side_scope.PrivateGameRead.__name__
     out = {}
-    for node, roles, delegates, bindings in _decisions(
+    for node, roles, delegated_calls, bindings in _decisions(
             carrier, aliases, constants, GATE_RESOLVER):
+        # WHAT THIS BRANCH HANDED THE RESOLVER, before anything else about
+        # the branch is read — a forged argument is not a mis-described
+        # branch, it is a branch whose description is about somebody else.
+        for delegation in delegated_calls:
+            _refuse_an_unvouched_argument(delegation, carrier, resolver_fn,
+                                          bindings, where)
+        delegates = bool(delegated_calls)
         call = node.value
         if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
                 and call.func.id == record):
@@ -2882,9 +3282,37 @@ ADMISSION_AUTHORITIES = {
     # is why this class is ROW-backed and the Coach's is not. This one line
     # is the whole of LB1: the gate has always split here, and this file
     # modelled the two halves as one class.
+    #
+    # RE-PINNED IN ROUND 16, AND THIS IS WHAT CLOSES d14. The pin was the
+    # TEXT `_player_team_for_game(scope, game, store)` and that function's
+    # BODY was derived by nothing at all: changing its `return` to
+    # `game.home_team_id` gave `awayplayer` HOME's whole private sheet —
+    # `/lineups` home `restricted false` with eight rows, `roster-status`
+    # `team_id team_1`, against a baseline of AWAY's five — with `_audit()`
+    # returning `[]`. Round 15 DISCLOSED that gap and its reason: the helper
+    # "decides through a local binding behind an early return, and
+    # `_substituted` refuses that". The answer taken here is the first of the
+    # three the owner offered — EXTEND THE FOLD TO READ THAT SHAPE — because
+    # the shape is a `let` and pasting a single assignment's value where the
+    # name is read is what a `let` means, not a model of one. See
+    # `_decided_by`'s assignment clause and `_substituted`'s `in_scope`.
+    #
+    # SO THE PIN IS NOW WHAT THE HELPER DECIDES BY, and it carries the two
+    # things the function NAME could not: the #270 fail-closed guard
+    # (`player is None or not player.is_active`, so a deactivated player's
+    # login cannot outlive their roster exit) and the membership spine
+    # itself (`RosterService(store).team_for_game`, never the permanent
+    # `Player.team_id` pointer). Deleting either one now moves this pin.
+    # `RosterService` survives the fold as a NAME because it is a class —
+    # a constructor is not a decision — and because the helper and its
+    # caller are the same file, where that name means the same object.
     "PLAYER": _DeclaredAuthority(
         klass=PLAYER_SCOPED_BY_MEMBERSHIP,
-        authority="_player_team_for_game(scope, game, store)",
+        authority="None if not (scope or {}).get('player_id') else None if "
+                  "store.get_player((scope or {}).get('player_id')) is None "
+                  "or not store.get_player((scope or {}).get('player_id'))"
+                  ".is_active else RosterService(store).team_for_game(game, "
+                  "store.get_player((scope or {}).get('player_id')))",
         admits="own_team is not None and own_team in "
                "(game.home_team_id, game.away_team_id)",
         side="own_team if admitted else None"),
@@ -10129,6 +10557,26 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         "        admitted = own_team is not None and own_team in (\n"
         "            game.home_team_id, game.away_team_id)\n")
 
+    #: The delegation's FIRST line alone — the resolver call whose ARGUMENT
+    #: LIST is what round 16 vouches for. Split out so a mutation can forge
+    #: an argument without touching the participation test that follows it,
+    #: which is exactly the shape all three pins are blind to.
+    RESOLVER_CALL = ("        own_team = game_scoped_own_team_id("
+                     "role, scope, game, store)\n")
+
+    #: The gate's own normalisation of the session scope, ANCHORED ON THE
+    #: LINE AFTER IT because ``game_scoped_own_team_id`` opens with the
+    #: identical statement and a first-occurrence replace would move that one.
+    NORMALISED_SCOPE = "    scope = scope or {}\n    if role in (Role.LEAGUE"
+
+    #: What the PLAYER authority ultimately answers — the membership spine.
+    PLAYER_HELPER_ANSWER = ("    return RosterService(store).team_for_game("
+                            "game, player)\n")
+
+    #: The gate's one line that selects the SUBJECT of the request — the
+    #: game the caller asked about, fetched by the id the gate was handed.
+    SUBJECT_FETCH = "    game = store.get_game(game_id)\n"
+
     #: …and the decision it then returns. Split from :data:`DELEGATION` so a
     #: mutation can move one without the other, which is the whole point of
     #: the fourth model: what the branch RESOLVES and what it RETURNS are two
@@ -10440,19 +10888,31 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                 "it, so this test is not measuring the pin")
         # AND WITHOUT THE FOLLOW — round 14's derivation exactly — the pin
         # is the CALL, the call is unchanged, and the mutation is invisible.
+        #
+        # PLAYER IS RE-PINNED HERE TOO, because round 16 folds the RESOLVER'S
+        # per-role answers with the same function: neutering `_inlined` puts
+        # that pin back on `_player_team_for_game(scope, game, store)` as
+        # well, and a failure about the PLAYER pin in this stanza would be a
+        # failure about something other than the OFFICIAL follow.
         with self._without("_inlined", lambda node, tree, where, depth=None:
                            node):
-            unfollowed = next(b for b in admission_branches()["OFFICIAL"]
-                              if b.needs_authority)
+            unfollowed = {role: next(b for b in admission_branches()[role]
+                                     if b.needs_authority)
+                          for role in ("OFFICIAL", "PLAYER")}
             self.assertIn("assignment_grants_official_scope(a, official_id)",
-                          unfollowed.authority,
+                          unfollowed["OFFICIAL"].authority,
                           "neutering the follow did not put the pin back on "
                           "the function name, so this half measures nothing")
+            self.assertEqual("_player_team_for_game(scope, game, store)",
+                             unfollowed["PLAYER"].authority,
+                             "neutering the follow did not put the PLAYER "
+                             "pin back on the helper's NAME, so the fold "
+                             "this round added is not what carries it")
             stale = dict(ADMISSION_AUTHORITIES)
-            stale["OFFICIAL"] = dataclasses.replace(
-                ADMISSION_AUTHORITIES["OFFICIAL"],
-                authority=unfollowed.authority,
-                admits=unfollowed.admits_source, side=unfollowed.side_source)
+            for role, branch in unfollowed.items():
+                stale[role] = dataclasses.replace(
+                    ADMISSION_AUTHORITIES[role], authority=branch.authority,
+                    admits=branch.admits_source, side=branch.side_source)
             with mock.patch.dict(ADMISSION_AUTHORITIES, stale, clear=True):
                 blind = self._audit(source)
         self.assertEqual(
@@ -10534,17 +10994,26 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             self):
         """THE 3.11 CHECK FOR THE FOLLOW, made by the interpreter running it.
 
-        :func:`_substituted` decides whether a callee's signature is one this
-        walk may read at all by naming the fields of ``ast.arguments``, and
-        CI runs 3.11 while this was written on 3.14. A field this did not
-        look at would be an argument-matching rule silently not modelled —
-        the callee's decision pasted into the caller as though every argument
-        were plain positional — so EVERY field of the running interpreter's
-        ``ast.arguments`` must be read, and the fields are read off
-        :func:`_substituted`'s OWN SOURCE rather than off a list somebody
-        copied out of the grammar. Round 13 checked ``ast.Match``'s PEP 634
-        fields the same way, and round 14 ``_assigned_names``' 17 pairs."""
-        fn = ast.parse(textwrap.dedent(inspect.getsource(_substituted))).body[0]
+        :func:`_positional_parameters` decides whether a callee's signature
+        is one this file may read argument by argument, by naming the fields
+        of ``ast.arguments``, and CI runs 3.11 while this was written on
+        3.14. A field this did not look at would be an argument-matching rule
+        silently not modelled — the callee's decision pasted into the caller
+        as though every argument were plain positional — so EVERY field of
+        the running interpreter's ``ast.arguments`` must be read, and the
+        fields are read off that function's OWN SOURCE rather than off a list
+        somebody copied out of the grammar. Round 13 checked ``ast.Match``'s
+        PEP 634 fields the same way, and round 14 ``_assigned_names``' 17
+        pairs.
+
+        IT READS ONE FUNCTION AND NOT TWO (#427 round 16). The fields used to
+        be named inside :func:`_substituted`; the ARGUMENT PROVENANCE rule
+        asks the same question of the same grammar, and a signature model
+        written out twice is a model that can be right in one of the two
+        copies. :func:`_positional_parameters` is now the only place either
+        of them asks, which is also why this test still names one."""
+        fn = ast.parse(
+            textwrap.dedent(inspect.getsource(_positional_parameters))).body[0]
         read = {node.attr for node in ast.walk(fn)
                 if isinstance(node, ast.Attribute)
                 and isinstance(node.value, ast.Name)
@@ -10643,7 +11112,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                 f"therefore now exempt from carrying an authority — decide "
                 f"that deliberately")
 
-    # -- THE INJECTION: the derivation is real, in TWENTY-EIGHT spellings -
+    # -- THE INJECTION: the derivation is real, in THIRTY-SIX spellings -
     def _injected(self, *, anchor=None, replacement=None, prelude=None,
                   suffix=None):
         source = self._gate_source()
@@ -10663,15 +11132,20 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         return source
 
     def _spellings(self):
-        """A new NON-ADMIN admission branch, spelled TWENTY-EIGHT ways —
+        """A new NON-ADMIN admission branch, spelled THIRTY-SIX ways —
         chosen to defeat a text matcher, which is what the query-parameter
         closure was tested against and what this axis has to survive too;
         since round 13, to defeat a walk that reads only the statement kinds
-        somebody thought to list; and since round 14, to defeat each of the
-        SIX MODELS the walk rests on. The last thirteen do not all inject
-        a new branch at all — four move only the gate's EXISTING COACH/PLAYER
-        branch, one adds no branch whatever but a SECOND DEFINITION of the
-        carrier, and one binds a name only AFTER the return that reads it."""
+        somebody thought to list; since round 14, to defeat each of the
+        SIX MODELS the walk rests on; and since round 16, to defeat the
+        SEVENTH — what a delegating branch HANDS the audited resolver.
+        Twenty-one of the thirty-six do not inject a new branch at all: eleven
+        move only the gate's EXISTING COACH/PLAYER branch, one adds no branch
+        whatever but a SECOND DEFINITION of the carrier, one binds a name
+        only AFTER the return that reads it, one replaces the gate's
+        normalisation of the session scope with a scope the gate BUILT, and
+        one changes no line of the carrier at all — it edits the HELPER the
+        PLAYER authority rests on."""
         body, anchor = self.ADMITTING_BODY, self.ANCHOR
         resolver_player = ("    if role == Role.PLAYER:\n"
                            "        return _player_team_for_game("
@@ -10923,12 +11397,77 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                               "own_team in (\n"
                               "            game.home_team_id, "
                               "game.away_team_id)\n")),
+            # ---- ROUND 16: WHAT THE BRANCH HANDS THE RESOLVER. None of
+            # these adds a branch, and none of them moves a single character
+            # of any of the three pins: `authority` is the resolver's own
+            # return expression, `admits_source` unfolds to the participation
+            # predicate and `side_source` to `own_team if admitted else
+            # None`, all of which a forged ARGUMENT leaves exactly as they
+            # were. Every one was measured at `d3f5f1e` with `_audit() == []`
+            # and four of them driven to a live HTTP disclosure.
+            "forged_scope_into_the_resolver":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.RESOLVER_CALL,
+                              "        own_team = game_scoped_own_team_id(\n"
+                              "            role, {'team_id': "
+                              "game.home_team_id}, game, store)\n")),
+            "forged_role_into_the_resolver":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.RESOLVER_CALL,
+                              "        own_team = game_scoped_own_team_id("
+                              "Role.COACH, scope, game, store)\n")),
+            "forged_role_and_scope_into_the_resolver":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.RESOLVER_CALL,
+                              "        own_team = game_scoped_own_team_id(\n"
+                              "            Role.COACH, {'team_id': "
+                              "game.home_team_id}, game, store)\n")),
+            # THE CALL SITE'S TEXT NEVER MOVES — one line, above every
+            # branch, replacing the gate's own normalisation of the session
+            # scope with a scope the gate BUILT.
+            "the_scope_rebuilt_before_every_branch":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.NORMALISED_SCOPE,
+                              "    scope = {'team_id': "
+                              "store.get_game(game_id).home_team_id}\n"
+                              "    if role in (Role.LEAGUE")),
+            # A DIFFERENT VARIABLE in the slot — the same disclosure by a
+            # longer road, and a bare `Name` at the call site, so only the
+            # IDENTITY half of the rule can answer it.
+            "a_different_variable_in_the_scope_slot":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.RESOLVER_CALL,
+                              "        _side_scope = {'team_id': "
+                              "game.home_team_id}\n"
+                              "        own_team = game_scoped_own_team_id("
+                              "role, _side_scope, game, store)\n")),
+            # A CALL SHAPE THE VOUCHING DOES NOT MODEL is refused, not read
+            # position by position as though it were plain positional.
+            "the_resolver_called_by_keyword":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.RESOLVER_CALL,
+                              "        own_team = game_scoped_own_team_id("
+                              "role, scope, game, store=store)\n")),
+            # THE SAME DEFECT ONE CALL DEEPER. The PLAYER authority was
+            # pinned as the TEXT `_player_team_for_game(scope, game, store)`
+            # and that function's BODY was derived by nothing.
+            "the_player_helper_answers_home":
+                dict(anchor=anchor, replacement=anchor, names="PLAYER",
+                     prelude=(self.PLAYER_HELPER_ANSWER,
+                              "    return game.home_team_id\n")),
+            # FOUND BY THIS ROUND'S OWN HUNT, against the three rules it had
+            # already written: the gate's one line that selects the SUBJECT,
+            # replaced by a value that is a function of `store` alone.
+            "the_subject_the_resolver_already_has":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.SUBJECT_FETCH,
+                              "    game = store.all_games().pop()\n")),
         }
 
     def test_a_new_non_admin_admission_branch_fails_by_name(self):
         """THE PROOF THAT CONDITION 5 IS DERIVED AND NOT DECORATIVE.
 
-        TWENTY-EIGHT spellings, each injected into a COPY of the gate's
+        THIRTY-SIX spellings, each injected into a COPY of the gate's
         source, each required to produce a NAMED failure from the same audit
         that guards the real gate. Aliased imports, a nested helper, a
         module-level tuple, ``role.value``, ``getattr``, an ``else`` branch,
@@ -10936,20 +11475,43 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         that touches both the carrier and the resolver; three ``match``
         statements (a value pattern, an or-pattern and a wildcard arm) and
         the two EMPTY-INTERSECTION shapes, both added in round 13 when the
-        walk stopped being a deny-list; and THIRTEEN added in round 14,
+        walk stopped being a deny-list; THIRTEEN added in round 14,
         which are the six hand-reasoned MODELS the statement allow-list could
         not speak to — two stale-binding shapes, two side-without-a-game
         shapes, two role-parameter rebindings, four that move only the
         existing COACH/PLAYER branch, one that calls the resolver and ignores
         it, one that adds a SECOND DEFINITION of the carrier and leaves the
         first untouched, and one that binds a name only AFTER the return that
-        reads it. TWELVE of the thirteen were measured at ``c4a725b``
+        reads it; and EIGHT added in round 16, which are the seventh model —
+        what the branch HANDS the resolver. TWELVE of round 14's thirteen
+        were measured at ``c4a725b``
         producing a LIVE admission while ``_audit()`` returned ``[]``, six of
         those driven to a real HTTP disclosure of the HOME side's private
         roster to ``thirdcoach``, a coach of a team in NEITHER game; the
         thirteenth would raise ``NameError`` and is here because a walk that
         describes a return by state that did not exist at it is wrong in both
         directions.
+
+        ROUND 16'S EIGHT are a forged scope, a forged role, both together, a
+        DIFFERENT VARIABLE in the scope slot, the resolver called by keyword,
+        the session scope REBUILT one line above every branch, the PLAYER
+        helper answering HOME, and the SUBJECT of the request replaced by a
+        value the resolver could have computed for itself. SIX of the eight
+        were measured at ``d3f5f1e``
+        producing a LIVE HTTP disclosure with ``_audit() == []`` —
+        ``thirdcoach`` receiving HOME's eight private rows on all five leaves
+        of the private-game family for the first four, and ``awayplayer``
+        AND ``homeplayer`` receiving HOME's sheet for the helper one, and
+        ``thirdcoach`` receiving 200 on ``/lineups`` and ``/board`` for a
+        game they play in NEITHER side of for the subject one. The
+        forged-role-alone spelling is included even though it FAILS CLOSED on
+        this fixture: the derivation was equally blind to it, and a forgery
+        that happens to be denied by the resolver it forges is not a
+        different defect, only a luckier one.
+
+        THE LAST OF THE EIGHT WAS FOUND BY HUNTING THIS ROUND'S OWN RULE
+        rather than handed to it: it passed all three of the argument
+        conditions as first written, and is what the fourth exists for.
 
         The count is MEASURED: it is ``len(self._spellings())`` and the loop
         below runs every key of it.
@@ -11304,14 +11866,44 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         ever checking the name still HOLDS the parameter. The walk ALREADY
         RECORDED the binding; the information needed to refuse this was
         present and unused."""
+        nothing = lambda fn, stmt, role_param, bound: None     # noqa: E731
+
+        def no_vouch(call, carrier, resolver, bindings, where):
+            return None
+
         for spelling in ("role_parameter_rebound_if",
                          "role_parameter_rebound_match"):
             with self.subTest(spelling=spelling):
-                self._assert_only_this_rule_catches(
-                    self._injected(**self._spellings()[spelling]),
-                    "_refuse_a_rebound_role",
-                    lambda fn, stmt, role_param, bound: None,
-                    "ASSIGNS TO ITS OWN ROLE PARAMETER")
+                source = self._injected(**self._spellings()[spelling])
+                failures = self._audit(source)
+                self.assertTrue(
+                    any("ASSIGNS TO ITS OWN ROLE PARAMETER" in f
+                        for f in failures),
+                    f"the role parameter was rebound and the refusal did not "
+                    f"name it: {failures}")
+                # THE OVERLAP, MEASURED AND STATED rather than arranged away
+                # (#427 round 16), the way round 14 states the one between
+                # its two binding rules. With this rule removed the mutation
+                # is STILL reported — by the ARGUMENT PROVENANCE rule, one
+                # branch further down: the gate's COACH/PLAYER branch hands
+                # the resolver `role`, and `role` now holds
+                # `Role.LEAGUE_ADMIN`, which is not a parameter of the gate.
+                # So the falsifier removes BOTH, and only then is the
+                # mutation green — which is what shows this MODEL, and not
+                # something else, is what carries the shape.
+                with self._without("_refuse_a_rebound_role", nothing):
+                    self.assertTrue(
+                        self._audit(source),
+                        "the rebinding is answered by the role-identity "
+                        "rule ALONE, so the argument rule is not the second "
+                        "line of defence this claims")
+                    with self._without("_refuse_an_unvouched_argument",
+                                       no_vouch):
+                        self.assertEqual(
+                            [], self._audit(source),
+                            "the rebinding is still reported with BOTH the "
+                            "role-identity rule and the argument rule "
+                            "removed, so neither of them is what catches it")
 
     def test_a_real_side_with_no_game_still_needs_an_authority(self):
         """THE GRANT MODEL.
@@ -11524,6 +12116,261 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         self.assertEqual([], self._audit(self._injected(
             replacement="    if role in (Role.COACH, Role.PLAYER, "
                         "Role.GUARDIAN):")))
+
+    # -- ROUND 16: WHAT A DELEGATING BRANCH FEEDS THE AUDITED RESOLVER ----
+
+    #: Argument expressions to hand the resolver in the ``scope`` slot, one
+    #: per ``ast`` expression kind somebody might plausibly write. NOT a list
+    #: of kinds the rule knows: the rule allows exactly ``ast.Name`` and
+    #: refuses everything else, so this table only has to show that "refuses
+    #: everything else" is a real answer over a real spread of shapes —
+    #: including kinds this Python has and kinds it may gain.
+    FORGED_SCOPE_ARGUMENTS = {
+        "a reconstructed dict": "{'team_id': game.home_team_id}",
+        "a literal": "None",
+        "a string literal": "'team_id'",
+        "an attribute": "game.home_team_id",
+        "a call": "dict(scope)",
+        "a subscript": "[scope][0]",
+        "a conditional": "scope if scope else {'team_id': game.home_team_id}",
+        "a walrus": "(_s := {'team_id': game.home_team_id})",
+        "a tuple": "(scope,)",
+        "a comparison": "scope or {'team_id': game.home_team_id}",
+        "a lambda's result": "(lambda g: {'team_id': g.home_team_id})(game)",
+        "a starred argument": "*[role, scope, game, store]",
+    }
+
+    def test_a_forged_argument_into_the_resolver_is_refused(self):
+        """THE SEVENTH MODEL: what a delegating branch HANDS the resolver.
+
+        ``admission_branches`` recorded WHETHER a branch delegates and WHAT
+        THE RESOLVER RETURNS FOR THAT ROLE, and the resolver's call ARGUMENTS
+        appeared in none of the three pins — ``authority`` is the resolver's
+        own return expression, and ``admits``/``side`` unfold to the
+        participation predicate and ``own_team if admitted else None``, which
+        a forged argument leaves CHARACTER FOR CHARACTER unchanged.
+
+        MEASURED LIVE at ``d3f5f1e`` with the gate compiled into the running
+        server and driven over real authenticated HTTP, changing ONLY the
+        argument list to ``role, {'team_id': game.home_team_id}, game,
+        store``: ``thirdcoach`` — a Coach of a team in NEITHER game —
+        received 200 on ``/lineups`` (HOME ``restricted false``, eight
+        private rows: ``player_16``, ``player_2``, ``player_15``, ``player_8``,
+        ``player_9``, ``player_4``, ``player_3``, ``player_1``), on
+        ``/board`` (the full HOME pool and status block), on ``/roster``,
+        on ``/roster-status`` (``team_id: team_1``) and on ``/substitutes``
+        — while ``_audit()`` returned ``[]``.
+
+        THE RULE FAILS CLOSED ON A SHAPE IT HAS NOT SEEN, which is the
+        standard this round is held to. The allow-list is exactly ONE
+        expression kind — a bare ``Name`` — so a kind Python has not shipped
+        yet is refused for the same reason a ``Dict`` is, and there is no
+        list to be one release behind. The falsifier removes the rule and
+        requires every one of these to go green."""
+        def no_vouch(call, carrier, resolver, bindings, where):
+            return None
+
+        # THE PREMISE: the vouching actually runs on the real gate. A rule
+        # applied to no call would agree with everything.
+        tree = ast.parse(self._gate_source())
+        carrier = _gate_function(tree, GATE_CARRIER, "gate")
+        delegations = [calls for _n, _r, calls, _b in _decisions(
+            carrier, _role_aliases(tree), _module_constants(tree),
+            GATE_RESOLVER) if calls]
+        self.assertEqual(
+            [1], [len(c) for c in delegations],
+            "the gate's decisions rest on a different number of resolver "
+            "calls than the one this rule is measured against")
+        for label, argument in sorted(self.FORGED_SCOPE_ARGUMENTS.items()):
+            with self.subTest(shape=label):
+                source = self._injected(prelude=(
+                    self.RESOLVER_CALL,
+                    f"        own_team = game_scoped_own_team_id("
+                    f"role, {argument}, game, store)\n"))
+                failures = self._audit(source)
+                self.assertTrue(
+                    any("unresolvable admission shape" in f for f in
+                        failures),
+                    f"{label} in the scope slot was not refused: {failures}")
+                with self._without("_refuse_an_unvouched_argument", no_vouch):
+                    blind = self._audit(source)
+                self.assertEqual(
+                    [], blind,
+                    f"{label} is ALREADY reported with the argument rule "
+                    f"removed, so this test is not measuring it: {blind}")
+
+    def test_a_scope_the_gate_rebuilt_is_not_the_scope_it_received(self):
+        """THE HALF NO CALL-SITE READING CAN ANSWER.
+
+        ONE LINE, above every branch, replacing the gate's own normalisation
+        of the session scope::
+
+            scope = {'team_id': store.get_game(game_id).home_team_id}
+
+        The delegation's text does not move — it still reads ``scope`` —
+        and neither does any of the three pins. What moves is what ``scope``
+        HOLDS, so the rule that answers it is the PROVENANCE half: a name
+        the resolver's signature gives a slot must still derive from the
+        gate's own parameter of that name.
+
+        MEASURED LIVE at ``d3f5f1e``: ``thirdcoach`` received 200 with HOME's
+        eight private rows on all five leaves of the family, ``_audit() ==
+        []``.
+
+        AND THE OVERLAP IS STATED. Spelled as an EXTRA statement rather than
+        a replacement — ``scope = scope or {}`` followed by ``scope = {…}`` —
+        round 14's :func:`_refuse_a_second_binding` answers it first, because
+        that is a name bound twice in one body. It is the REPLACEMENT
+        spelling that reaches this rule, and it is the one that survived
+        everything before this round."""
+        source = self._injected(**{
+            k: v for k, v
+            in self._spellings()["the_scope_rebuilt_before_every_branch"]
+            .items() if k != "names"})
+        self._assert_only_this_rule_catches(
+            source, "_refuse_an_unvouched_argument",
+            lambda call, carrier, resolver, bindings, where: None,
+            "no longer derives from the gate's OWN 'scope' parameter")
+        # The EXTRA-statement spelling, and which rule answers it.
+        second = self._injected(prelude=(
+            self.NORMALISED_SCOPE,
+            "    scope = scope or {}\n"
+            "    scope = {'team_id': "
+            "store.get_game(game_id).home_team_id}\n"
+            "    if role in (Role.LEAGUE"))
+        self.assertTrue(
+            any("RE-ASSIGNS" in f for f in self._audit(second)),
+            "the second-binding spelling is not answered by round 14's "
+            "one-binding-per-body rule any more")
+
+    def test_a_subject_the_resolver_could_have_computed_is_refused(self):
+        """THE FOURTH CONDITION, and the one this round's own HUNT found.
+
+        The three shape/identity/provenance conditions were written first,
+        and then hunted against. This got through all of them::
+
+            game = store.all_games().pop()
+
+        The call site still reads ``game``; ``game`` is a LOCAL, so nothing
+        requires it to mention a parameter of its own name; and its only leaf
+        IS a parameter of the gate. MEASURED at ``d3f5f1e`` with the rule
+        absent: ``_audit() == []``, and with the gate compiled into the
+        running server and a third game seeded whose sides are ``home`` and
+        ``third``, ``thirdcoach`` — a Coach of a team in NEITHER side of
+        ``game_1`` — received 200 on ``GET /api/games/game_1/lineups`` and
+        ``/board``, which the family answers 403 for that caller. The rows
+        themselves were still redacted, because the projection layer resolves
+        the side again per leaf; that is defence in depth and not this axis's
+        answer, and the admission boundary was breached either way.
+
+        THE CONDITION IS AN INFORMATION STATEMENT, not another shape: the
+        resolver's ``game`` slot exists to carry the SUBJECT of the request,
+        and a local computed out of nothing but arguments the resolver is
+        already being handed carries no subject at all.
+        ``store.get_game(game_id)`` carries ``game_id``, which fills no other
+        slot."""
+        self._assert_only_this_rule_catches(
+            self._injected(**{
+                k: v for k, v
+                in self._spellings()["the_subject_the_resolver_already_has"]
+                .items() if k != "names"}),
+            "_refuse_an_unvouched_argument",
+            lambda call, carrier, resolver, bindings, where: None,
+            "carries no subject at all")
+
+    def test_the_player_authority_is_what_the_helper_decides_by(self):
+        """d14 — THE SAME DEFECT ONE CALL DEEPER, and round 15's own
+        disclosed gap.
+
+        The PLAYER authority was pinned as the TEXT
+        ``_player_team_for_game(scope, game, store)``, and that function's
+        BODY was derived by nothing at all. MEASURED LIVE at ``d3f5f1e``
+        with its ``return`` changed to ``game.home_team_id``: ``awayplayer``
+        received ``home[team_id=team_1 restricted=False n=8]`` on
+        ``/lineups`` and ``roster-status team_id=team_1``, against a baseline
+        of ``away[n=5]`` — and so did ``homeplayer``, whose membership is the
+        other side — with ``_audit()`` returning ``[]``.
+
+        ROUND 15 DISCLOSED THIS GAP AND ITS REASON: the helper "decides
+        through a local binding behind an early return, and ``_substituted``
+        refuses that — inlining it would refuse the real gate". The answer
+        taken here is the FIRST of the three the owner offered, EXTEND THE
+        FOLD TO READ THAT SHAPE, on the ground that a single assignment in
+        straight-line code is a `let` and pasting its value where the name is
+        read is what a `let` means rather than a model of one. Two things
+        had to be true and both are named refusals when they are not:
+        :func:`_decided_by` folds the assignment, and :func:`_substituted`
+        keeps ``RosterService`` — a name bound at module level BY A
+        DEFINITION, in the same file as the call site, where it means the
+        same object.
+
+        SO THE PIN NOW CARRIES THE TWO THINGS THE FUNCTION NAME COULD NOT:
+        the #270 fail-closed guard and the membership spine. Both are
+        required to move it, and both are checked below.
+
+        THE FALSIFIER IS THE FOLD ITSELF: neuter ``_inlined``, re-pin PLAYER
+        (and OFFICIAL, whose pin the same function carries) on what then
+        derives, and the audit goes silent on the identical mutation."""
+        source = self._injected(**{
+            k: v for k, v
+            in self._spellings()["the_player_helper_answers_home"].items()
+            if k != "names"})
+        failures = self._audit(source)
+        self.assertTrue(
+            any("PLAYER" in f and "team_for_game" in f for f in failures),
+            f"the helper the PLAYER authority rests on stopped answering "
+            f"from the membership spine and the audit did not report it: "
+            f"{failures}")
+        # THE OTHER HALF OF WHAT THE FOLD BOUGHT: the #270 guard is IN the
+        # pin now, so deleting it moves the pin too — which a pin on the
+        # helper's NAME could never have seen.
+        guard = self._injected(prelude=(
+            "    player = store.get_player(player_id)\n"
+            "    if player is None or not player.is_active:\n"
+            "        return None\n",
+            "    player = store.get_player(player_id)\n"))
+        self.assertTrue(
+            any("PLAYER" in f and "is_active" in f
+                for f in self._audit(guard)),
+            "deleting the deactivated-player guard from the helper did not "
+            "move the PLAYER pin")
+        # RE-PINNED ON WHAT THE MUTATION DECIDES: silent, so the pin bites.
+        moved = next(b for b in admission_branches(source=source)["PLAYER"]
+                     if b.needs_authority)
+        repinned = dict(ADMISSION_AUTHORITIES)
+        repinned["PLAYER"] = dataclasses.replace(
+            ADMISSION_AUTHORITIES["PLAYER"], authority=moved.authority,
+            admits=moved.admits_source, side=moved.side_source)
+        with mock.patch.dict(ADMISSION_AUTHORITIES, repinned, clear=True):
+            self.assertEqual(
+                [], self._audit(source),
+                "the mutation is still reported after the PLAYER pin is "
+                "moved onto it, so this test is not measuring the pin")
+        # AND WITHOUT THE FOLD — round 15's derivation exactly — the pin is
+        # the helper's NAME, the name is unchanged, and d14 is invisible.
+        with self._without("_inlined", lambda node, tree, where, depth=None:
+                           node):
+            unfollowed = {role: next(b for b in admission_branches()[role]
+                                     if b.needs_authority)
+                          for role in ("PLAYER", "OFFICIAL")}
+            self.assertEqual(
+                "_player_team_for_game(scope, game, store)",
+                unfollowed["PLAYER"].authority,
+                "neutering the fold did not put the PLAYER pin back on the "
+                "helper's name, so this half measures nothing")
+            stale = dict(ADMISSION_AUTHORITIES)
+            for role, branch in unfollowed.items():
+                stale[role] = dataclasses.replace(
+                    ADMISSION_AUTHORITIES[role], authority=branch.authority,
+                    admits=branch.admits_source, side=branch.side_source)
+            with mock.patch.dict(ADMISSION_AUTHORITIES, stale, clear=True):
+                blind = self._audit(source)
+        self.assertEqual(
+            [], blind,
+            f"a pin that stops at the helper's name was expected to be blind "
+            f"to a helper that stopped answering from the membership spine, "
+            f"and it was not — so this test is not measuring the fold: "
+            f"{blind}")
 
     def test_the_carrier_has_exactly_one_module_level_definition(self):
         """THE SIXTH MODEL, and the one that needs no edit to the gate at
