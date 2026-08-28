@@ -10658,9 +10658,14 @@ class ApiService:
         #
         # WHY "BEFORE ANY OTHER CALL" IS THE RULE AND NOT A PREFERENCE. This
         # method calls `self.context.resolve_with_league(user_id, role,
-        # scope)` — which is handed the mapping itself — and then, MEASURED
-        # off its own AST, THIRTY-EIGHT further calls in the forty-two
-        # statements between here and the schedule loop. Projecting inside
+        # scope)` — which is handed the mapping itself — and then DOZENS
+        # more calls before the schedule loop. No count is given here on
+        # purpose: three independent measurements of "how many" disagreed
+        # (30, 37 and 38 calls; 42 and 43 statements) because the answer
+        # depends entirely on where the slice is cut, and this file's rule
+        # is that a number in a docstring is MEASURED or absent. What is
+        # load-bearing is not the count but the shape — that ANY call at
+        # all sits there. Projecting inside
         # that loop — which is what it used to do, one file away from a gate
         # module that had already stopped taking the mapping — left every
         # one of those calls sitting between
