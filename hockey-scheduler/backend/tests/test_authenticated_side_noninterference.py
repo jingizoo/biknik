@@ -11,7 +11,7 @@ Every OTHER test in this module returns after the first backend, or builds an
 reason on the line that does it: they pin the behaviour of an ORACLE, of the
 fixture, or of a gate, none of which is a per-backend property. MEASURED off
 the module's own AST rather than eyeballed, so the sentence is a count and
-not an impression: exactly SIX test methods in this file loop every
+not an impression: exactly SEVEN test methods in this file loop every
 configured backend and call ``_assert_matrix_ran``. The first is the
 whole-surface property above. The second is
 :meth:`TheHintAxisIsClosedAgainstWhatTheServerReads
@@ -24,10 +24,17 @@ owner required on all three backends by name. The sixth is
 :meth:`ThePlayerGrantIsTheEligibleMembershipRow
 .test_the_ex_member_is_refused_and_a_blind_gate_reddens_the_sweep`, added in
 round 12, which LB1's close condition 4 required on all three backends by
-name. (It said ONE until round 9, TWO until round 10 and FIVE until round 12.
-The count is stated because the headline sentence is easy to read as a claim
-about every test in the file, and it is MEASURED off this module's own AST:
-six methods contain both ``_stores()`` and ``_assert_matrix_ran``.)
+name. The seventh is :meth:`NoPrincipalEntitledToNoSideIsAdmittedToTheFamily
+.test_no_principal_entitled_to_no_side_is_admitted_to_any_leaf`, added in
+round 17 — the ADMISSION MATRIX, on every backend because what a leaf
+answers a caller entitled to no side is a statement about the product over
+real HTTP and not about any gate's text. (It said ONE until round 9, TWO
+until round 10, FIVE until round 12 and SIX until round 17. The count is
+stated because the headline sentence is easy to read as a claim about every
+test in the file, and it is MEASURED off this module's own AST: seven
+methods contain both ``_stores()`` and ``_assert_matrix_ran``. NOTHING
+ENFORCES IT — no test in this file re-derives that number — so it is prose
+and has to be re-measured by hand by whoever moves it.)
 
 WHERE THE ENUMERATION KEEPS MOVING TO, AND WHY THIS ROUND IS ONE LEVEL UP
 AGAIN (#427 round 12, LB1). Round 11 derived every grant DIMENSION from the
@@ -86,6 +93,44 @@ only; the symmetric AWAY perturbation gave zero diffs, and that was a FIXTURE
 ARTIFACT — every Mover in the fixture had a pointer naming HOME, so no reader
 existed whose stale pointer named AWAY. This fixture adds one
 (``home_via_away_pointer``), so the mirror can genuinely fail.
+
+A THIRD QUESTION, ASKED OF THE STATUS: WAS THIS CALLER ADMITTED AT ALL
+=====================================================================
+(#427 round 17. This is NOT a third oracle in the sense the rest of this
+docstring uses "the two oracles" and "all three assertions" — those still
+mean the two data oracles and hint-inertness, and every sentence about them
+is unchanged. It is a separate, narrower assertion with its own section 6b.)
+
+BOTH DATA ORACLES ASK WHETHER PRIVATE DATA REACHED AN UNENTITLED CALLER, so
+both are STRUCTURALLY BLIND to an ADMISSION THAT CARRIES LITTLE OR NO DATA —
+and that blindness is measured, not feared. One branch added to
+``resolve_private_game_read`` ahead of its COACH/PLAYER branch, admitting a
+Coach whose scope names NEITHER side while filling neither grant-bearing
+field (``game=None``, ``own_team=None``), is exempt from needing an
+authority for the not-found passthrough's own reason. MEASURED at 6641fe7:
+``_audit()`` returns ``[]``, THE WHOLE MODULE STAYS GREEN — ``Ran 91 tests
+in 195.9s … OK`` — and ``thirdcoach``, a Coach of a team in NEITHER game,
+receives 200 on ``/board``, ``/lineups``, ``/officials`` and ``/reschedule``
+ON BOTH GAMES, carrying the officiating assignment's id and name. Both sides
+come back ``restricted: true, players: null``, which is exactly why nothing
+here sees it: no foreign identity to find, nothing that moves.
+
+So the admission matrix asks a question the payload cannot answer for:
+EVERY principal :meth:`_SweepHarness._entitlement` gives an EMPTY
+entitled-team set must be answered ``403`` on EVERY leaf of the private-game
+family, on BOTH games. Both axes are DERIVED — the principals from
+``_entitlement`` itself, the leaves from ``route_registry.REGISTRY`` via
+:func:`private_game_family` — and each is proved to fail closed by ADDING a
+member and requiring a named failure. MEASURED over a battery of ten hostile
+spellings of that exemption class, every one of them a live admission: the
+matrix reports 10 of 10, and 8 of the 10 leave ``_audit()`` empty.
+
+ITS HONEST BOUNDARY, MEASURED TOO: an escape that serves an ENTITLED
+principal the OPPONENT's side never moves a status, so the matrix stays
+GREEN on it and the DATA oracles are what report it — driven, with the home
+Coach handed the away side: admission matrix green, oracle 1 red naming
+``Away Legacy Sub`` on ``/availability-summary``. The two questions are
+complementary and neither subsumes the other.
 
 FAIL-CLOSED ON A NEW ROUTE
 ==========================
@@ -335,6 +380,20 @@ identity alphabet      **LIMIT**   ``Player``'s own fields, STRING-VALUED ONLY
 entitlement class      CLOSED      each principal BOUND by an assertion, and
                                    each ADMISSION BRANCH the gate takes bound
                                    to the class that models it
+admission (status      CLOSED      ``route_registry.REGISTRY`` x
+only, section 6b)                  ``_entitlement``. The LEAVES are the
+                                   private-game family derived from the
+                                   registry by ``private_game_family()`` —
+                                   an eleventh leaf acquires the assertion
+                                   with no edit, proved by REGISTERING one —
+                                   and the PRINCIPALS are every row of
+                                   ``_entitlement`` whose entitled-team set
+                                   is ``frozenset()``, so a row that enters
+                                   the map that way acquires it with no
+                                   edit either, proved by ADDING one. Asked
+                                   of the RESPONSE STATUS, which is what
+                                   makes it reach the admissions both data
+                                   oracles are blind to (#427 round 17)
 data class             **LIMIT**   no product enum exists; non-vacuity asserted
 perturbation kind      **LIMIT**   test constructions; PREMISES asserted
 relationship kind      **LIMIT**   test constructions; PREMISES asserted
@@ -382,16 +441,19 @@ adjusted:
   NO path and ONE world-pair — ``season_roster_membership``, the EX-MEMBER,
   which is the state no world in this matrix contained;
 * measured on this machine, for the whole-surface property alone:
-  **46.0 s Memory, 24.6 s SQLite, 83.2 s real PostgreSQL** — one recorded
-  run (round 16; round 15 recorded 44.9 / 24.4 / 82.7 and round 14
-  43.4 / 23.1 / 75.8), and it moves a few percent between runs with the
-  machine's load: the run before this one, of a tree differing only in this
-  paragraph, measured 45.5 / 24.7 / 83.5;
-* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 91 tests in 310.3 s ...
-  OK** — against **87 tests / 305.5 s** at round 15 (d3f5f1e), **82 tests /
+  **42.1 s Memory, 24.4 s SQLite, 81.1 s real PostgreSQL** — one recorded
+  run (round 17; round 16 recorded 46.0 / 24.6 / 83.2, round 15
+  44.9 / 24.4 / 82.7 and round 14 43.4 / 23.1 / 75.8), and it moves a few
+  percent between runs with the machine's load;
+* the WHOLE MODULE, tri-store, THE SAME RUN: **Ran 95 tests in 301.5 s ...
+  OK** — against **91 tests / 310.3 s** at round 16 (6641fe7), **87 tests /
+  305.5 s** at round 15 (d3f5f1e), **82 tests /
   284.9 s** at round 14 (5c3caf8) and **72 tests / 294.7 s** at the head
-  round 14 started from (c4a725b). Round 14 added TEN tests, round 15 FIVE
-  and round 16 FOUR, and NONE of the nineteen drives a backend. Round 14's
+  round 14 started from (c4a725b). Round 14 added TEN tests, round 15 FIVE,
+  round 16 FOUR and round 17 FOUR — twenty-three in all, of which TWENTY-TWO
+  drive no backend. The one exception is round 17's ADMISSION MATRIX, which
+  drives all three and is why the count of backend-looping methods moves
+  from SIX to SEVEN. Round 14's
   are the six MODELS the admission derivation rests on,
   one per model plus the consumer derivation, the interpreter-grammar check
   and the two halves of the binding model. Round 15's are the OFFICIAL
@@ -406,12 +468,15 @@ adjusted:
   twelve expression shapes, that a session scope the gate REBUILT is not
   the one it received, that a subject the resolver could have computed for
   itself carries none, and that the PLAYER authority is what its helper
-  DECIDES BY rather than the helper's name. Every one is pure source
-  analysis or a direct call of
+  DECIDES BY rather than the helper's name. Every one of those nineteen is
+  pure source analysis or a direct call of
   the product predicate, for the reason
   :class:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority`'s own
-  docstring gives. The count of methods that DO loop every backend is
-  unchanged at SIX, re-measured off this module's AST rather than assumed;
+  docstring gives. Round 17's FOUR are the ADMISSION MATRIX and its three
+  supporting proofs — the family's derivation and addressability, and the
+  two new-member falsifiers, one per axis — and the matrix itself DOES loop
+  every backend, so that count moves to SEVEN, re-measured off this
+  module's AST rather than assumed;
 * round 10 adds THREE more requests of a full sweep per backend —
   :class:`AGameKeyedGrantDoesNotSpanASecondGame` sweeps once for the
   identity falsifier and twice for the non-interference one, and its third
@@ -430,7 +495,12 @@ adjusted:
   nothing at all: it reads the GATE'S OWN SOURCE;
 * and the full derived parameter matrix — :data:`FULL_HINTS`, ten variants,
   6,400 requests — once per backend on a fresh world, which is the shape
-  that made closing the query-string axis affordable at all.
+  that made closing the query-string axis affordable at all;
+* round 17 sweeps NOTHING and adds FORTY plain requests per backend — the
+  two principals ``_entitlement`` gives an empty entitled-team set x the ten
+  derived leaves x both games. It is the cheapest assertion in the file and
+  it is the one that reaches an admission carrying no data at all, which is
+  the point of section 6b.
 
 Closing the hint axis is most of that increase: probing every parameter the
 server reads took the variants from four to ten, and the request count with
@@ -770,6 +840,16 @@ IN_NEITHER_SIDE = "in_neither_side"
 #: A Coach of a team that plays in NEITHER game. Entitled to NO side of
 #: either — the sharpest row in the matrix, and the one that showed round 4's
 #: leak was a WIDER gate than the family it sat beside.
+#:
+#: AND UNTIL #427 ROUND 17 NOTHING ASSERTED THAT IT IS REFUSED. Every other
+#: principal typed here had a per-leaf status matrix somewhere in this file —
+#: the official's, the guardian's, the viewer's, the two operators' — and
+#: this one, the sharpest, had none: it was subject to the two DATA oracles
+#: only, which see nothing when an admission carries no data. That is
+#: exactly the gap ``q07`` walks through. It is now covered by
+#: :class:`NoPrincipalEntitledToNoSideIsAdmittedToTheFamily`, which reaches
+#: it BECAUSE THE ENTITLED-TEAM SET IS EMPTY rather than because anybody
+#: named it.
 
 GUARDIAN_OF_A_JUNIOR = "guardian_of_a_junior"
 #: A guardian verified for one junior. Entitled to that junior's resolved side
@@ -796,8 +876,10 @@ GUARDIAN_OF_A_JUNIOR = "guardian_of_a_junior"
 #: :class:`TheGuardianGrantIsRouteSpecific`):
 #:
 #: * the guardian is REFUSED (403) every leaf of the private-game family —
-#:   all ten of them, ``/board`` and ``/lineups`` included, which is where it
-#:   differs from the official, who is ADMITTED to three of them;
+#:   all ten of them ON BOTH GAMES (#427 round 17 measured the second game;
+#:   until then only the first was asserted), ``/board`` and ``/lineups``
+#:   included, which is where it differs from the official, who is ADMITTED
+#:   to three of them with a projection and to two more that carry no side;
 #: * the only AWAY-durable identity it receives anywhere is on
 #:   ``get_me_guardian_home``;
 #: * under an AWAY ``substitute_enrolment`` it moves on exactly
@@ -854,11 +936,39 @@ OFFICIAL_SUBMITTED_LINEUP_ONLY = "official_submitted_lineup_only"
 #: either side, and the routes whose whole subject IS the submitted lineup:
 #: the Game Sheet (`/board`, `/lineups`) and the sheet-shaped `/roster`
 #: projection built from the same `_submitted_lineup_rows`. The official is
-#: REFUSED every other leaf of the family outright, which
+#: REFUSED every other OWN-SIDE leaf of the family outright, which
 #: :class:`TheDesignClassificationsAreStillTrue` asserts — so this set being
 #: exactly these three is a claim about the product, checked, not assumed.
+#:
+#: "EVERY OTHER LEAF" WAS WRONG AND IS NOW MEASURED (#427 round 17). This
+#: said the official is refused every other leaf of the family, and the
+#: assertion beside it named FIVE refusals out of a family of TEN. The
+#: remaining two, ``/officials`` and ``/reschedule``, answer 200 — they are
+#: not part of this grant and never were, they carry no side's private
+#: roster state, and nothing said so. They are typed in
+#: :data:`OFFICIAL_ADMITTED_BEYOND_THE_SHEET`, and the assertion now decides
+#: EVERY leaf of the derived family rather than five of them.
 OFFICIAL_ASSIGNED_GAME_ROUTES = frozenset({
     "get_games_id_board", "get_games_id_lineups", "get_games_id_roster"})
+
+#: The leaves of the family that ADMIT an assigned official although they
+#: are not part of the sheet grant above — so "admitted" and "granted a
+#: side" are two different statements and each leaf carries one of them.
+#:
+#: WHY THIS CONSTANT EXISTS (#427 round 17). The official's per-leaf matrix
+#: in :class:`TheDesignClassificationsAreStillTrue` used to name FIVE
+#: refusals by hand, and the family has TEN leaves: ``/officials`` and
+#: ``/reschedule`` appeared in neither half and no line anywhere said why.
+#: Deriving the refusals as "the family minus the sheet routes" would
+#: therefore have been wrong — MEASURED, both answer 200 — and leaving the
+#: five hand-written would have meant an eleventh leaf was asserted for the
+#: official by nobody. So the omission is now a typed claim instead: these
+#: two are game-level reads that carry NEITHER side's private roster state
+#: (which is also why they are the two family leaves oracle 2 cannot reach —
+#: see limit 3 in the module docstring), and a leaf that begins admitting an
+#: official has to join one of these two sets deliberately.
+OFFICIAL_ADMITTED_BEYOND_THE_SHEET = frozenset({
+    "get_games_id_officials", "get_games_id_reschedule"})
 
 #: WHAT KIND OF PRIVATE STATE a perturbation moves.
 #:
@@ -1027,10 +1137,15 @@ VIEWER_ENTITLED_TO_NOTHING = "viewer_entitled_to_nothing"
 #: :data:`IN_NEITHER_SIDE`.
 #:
 #: A viewer holds only ``Permission.VIEW`` and is measured 403 on all ten
-#: leaves of the private-game family. That is the product being correct today;
+#: leaves of the private-game family, on BOTH games (#427 round 17; it was
+#: measured on one game until then). That is the product being correct today;
 #: the value of the row is that it is now WATCHED. The two-line falsifier in
 #: :data:`PRINCIPAL_ROLES` — the one the whole suite missed — is required to
-#: redden this sweep by :class:`TheViewerFalsifierRedensThePrimarySweep`.
+#: redden this sweep by
+#: :meth:`TheViewerIsEntitledToNothingAndTheSweepProvesIt
+#: .test_admitting_the_viewer_to_the_operator_tuples_reddens_this_sweep`.
+#: (That reference named ``TheViewerFalsifierRedensThePrimarySweep``, a class
+#: this file does not contain, until round 17.)
 
 #: ``{(route name, query parameter): the registry auth it was classified
 #: against}`` — EVERY PLACE A CLIENT HINT LEGITIMATELY SELECTS SOMETHING, and
@@ -1113,6 +1228,62 @@ HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR = {
 UNSCOPED_OPERATOR_CLASSES = frozenset({
     OPERATOR_UNSCOPED_BY_DESIGN,
     UNSCOPED_OPERATOR_WITHOUT_ROSTER_AUTHORITY})
+
+#: THE STATUS A PRIVATE-GAME LEAF ANSWERS A CALLER WHO MAY READ NO SIDE OF
+#: IT, and every cell of the admission matrix is pinned at exactly this.
+#:
+#: MEASURED FIRST, PINNED SECOND (#427 round 17). The question "is 403 right
+#: for EVERY unentitled principal on EVERY leaf, or does some leaf
+#: legitimately answer 200 with an empty body" is a question about the
+#: product, so it was driven before it was decided: the two principals whose
+#: entitled-team set is empty — ``thirdcoach`` and ``viewer`` — were measured
+#: against all ten leaves of the derived family on BOTH games, forty cells,
+#: and every one of the forty answered 403. Nothing is being asserted here
+#: that the product does not already do; what is new is that it is WATCHED.
+#:
+#: THERE IS DELIBERATELY NO EXEMPTION MECHANISM. A leaf that begins answering
+#: something else — a 200 with a restricted body, a 404, a 400 — fails this
+#: matrix by name, and that is the intent: an unentitled caller reaching a
+#: private-game leaf at all is the judgement this round exists to force
+#: somebody to make, and a per-cell excuse would be the hand-written axis
+#: coming back one level down. Contrast the two operators, whose measured
+#: matrix in :class:`TheArenaManagerIsAnOperatorWithoutRosterAuthority`
+#: records 400s and 403s alike, because THEY ARE ENTITLED and the question
+#: there is a different one.
+REFUSED = 403
+
+#: THE PRIVATE-GAME FAMILY'S OWN SHAPE, in the registry's template
+#: vocabulary: a GET leaf UNDER one game id. Both placeholder spellings the
+#: registry uses are matched (``{}`` and the narrower ``{w}``) and so is any
+#: depth below the game — a leaf one segment deeper is IN the family and has
+#: to be DECIDED about, never silently outside the pattern.
+_PRIVATE_GAME_LEAF = re.compile(r"^/api/games/\{[^{}]*\}/.+$")
+
+
+def private_game_family(specs=None):
+    """``{route name: RouteSpec}`` — the private-game family, DERIVED FROM
+    ``route_registry.REGISTRY`` rather than listed.
+
+    ONE DEFINITION, AND IT IS DERIVED FROM THE PATH (#427 round 17). Five
+    places in this file asserted something about "the ten leaves of the
+    private-game family" and four of them spelled the ten by hand, in a
+    string literal, per test. The fifth derived them from the registry BY
+    NAME PREFIX (``get_games_id_``), which is a naming CONVENTION and not an
+    authority: a leaf whose route name did not happen to start that way was
+    outside every one of those assertions. The hand-written axis is where
+    the next leak hides — that is the whole lesson of this file's sixteen
+    rounds — and "the eleventh leaf" is the shape it would take here. So the
+    family is a function of the TEMPLATE, which is what makes a path a
+    private-game read in the first place, and every one of the five call
+    sites now asks this.
+
+    :meth:`_SweepHarness._private_game_family` is what the tests call: it
+    adds the assertions that make a leaf this file cannot ADDRESS an error
+    NAMING IT rather than a leaf quietly dropped."""
+    specs = route_registry.REGISTRY if specs is None else specs
+    return {s.name: s for s in specs
+            if s.method == "GET" and s.kind == "route"
+            and _PRIVATE_GAME_LEAF.match(s.template)}
 
 
 def _scope_keys(*roles):
@@ -4144,6 +4315,85 @@ class _SweepHarness(_OverviewHarness):
                     f"{spec.name}: this sweep only fills `{{}}` segments")
         return specs, subjects
 
+    # -- the private-game family, derived and ADDRESSABLE ------------------
+    def _private_game_family(self):
+        """:func:`private_game_family`, plus every property this file needs
+        in order to DRIVE each leaf — so a leaf it cannot address fails
+        NAMING THE LEAF instead of dropping out of the derivation.
+
+        FAIL-CLOSED IN FOUR DIRECTIONS, each one a way a new leaf could
+        otherwise become invisible: it is not in this sweep's own
+        authenticated-GET inventory; it carries a ``NOT_SWEPT`` excuse; it
+        takes a path argument besides the game id; or it spells that
+        argument with a placeholder :meth:`_path_of` does not fill."""
+        family = private_game_family()
+        self.assertGreater(
+            len(family), 5,
+            "the registry yielded almost no GET leaves under "
+            "/api/games/{id}/, so every assertion this file derives from "
+            "the private-game family would be vacuous")
+        authed = {spec.name for spec in self._authenticated_get_specs()}
+        for name, spec in sorted(family.items()):
+            self.assertIn(
+                name, authed,
+                f"{name} is a leaf of the private-game family that this "
+                f"sweep's own inventory does not carry — the registry "
+                f"records auth={spec.auth!r}. A family leaf outside "
+                f"`_authenticated_get_specs` is swept by no oracle and "
+                f"refused for no principal; decide it deliberately rather "
+                f"than letting the auth filter decide it silently.")
+            self.assertNotIn(
+                name, NOT_SWEPT,
+                f"{name} is a leaf of the private-game family carrying a "
+                f"NOT_SWEPT excuse. This family is the surface the whole of "
+                f"#205 is about; no leaf of it may be excused from the "
+                f"sweep.")
+            self.assertEqual(
+                (1, 1),
+                (spec.template.count("{"), spec.template.count("{}")),
+                f"{name}: the private-game family gained a leaf this file "
+                f"cannot ADDRESS — {spec.template!r} does not take exactly "
+                f"one `{{}}` game id. Bind its other arguments deliberately; "
+                f"a leaf nobody can drive is a leaf nobody asserts.")
+        return family
+
+    @staticmethod
+    def _leaf_word(spec):
+        """A leaf's last path segment — how the per-leaf matrices in this
+        file spell it. Derived from the template so the word and the route
+        are never two independent statements."""
+        return spec.template.rsplit("/", 1)[1]
+
+    def _family_status_matrix(self, who, fx, family, principals):
+        """``{(principal, route name, game key): HTTP status}`` — every
+        principal x every leaf x BOTH GAMES, over real authenticated HTTP.
+
+        BOTH GAMES BECAUSE THE FIXTURE SWAPS THE SIDES. A principal
+        unentitled to one game may be entitled to the other — that is
+        exactly the subject-axis defect round 11 found — so a matrix driven
+        on ``gid`` alone would be a statement about one arrangement of the
+        sides rather than about the rule.
+
+        Addressed through :meth:`_path_of`, the same one definition the
+        sweep itself builds paths with, so this cannot probe a path the
+        sweep never produces."""
+        measured = {}
+        for principal in principals:
+            for game_key in ("gid", "gid2"):
+                for name, spec in sorted(family.items()):
+                    status, _body = self._req(
+                        who[principal], "GET",
+                        self._path_of(spec, (fx[game_key],)))
+                    measured[(principal, name, game_key)] = status
+        return measured
+
+    def _admissions(self, measured):
+        """The cells of a status matrix that are NOT a refusal, named."""
+        return sorted(
+            f"{principal} was answered {status} on {name} ({game_key})"
+            for (principal, name, game_key), status in measured.items()
+            if status != REFUSED)
+
     # -- the sweep ---------------------------------------------------------
     def _canonical(self, body):
         """The body with the documented time-varying keys removed."""
@@ -5713,27 +5963,53 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
                 # REFUSED every own-side leaf outright. If that stopped being
                 # true, "entitled to both" would be silencing this sweep
                 # rather than describing the product.
-                for leaf in ("roster-status", "substitutes",
-                             "availability-summary", "substitute-candidates",
-                             "substitute-addable"):
-                    status, body = self._req(
+                #
+                # THE LEAF SET IS DERIVED (#427 round 17). This named FIVE
+                # refusals and THREE admissions by hand, out of a family of
+                # TEN — so an eleventh leaf would have been asserted for the
+                # official by nobody, and two existing ones already were.
+                # Every leaf of the derived family is now decided, and each
+                # 200 is classified into one of the two typed sets rather
+                # than left out of both.
+                family = self._private_game_family()
+                for name, declared in (
+                        ("OFFICIAL_ASSIGNED_GAME_ROUTES",
+                         OFFICIAL_ASSIGNED_GAME_ROUTES),
+                        ("OFFICIAL_ADMITTED_BEYOND_THE_SHEET",
+                         OFFICIAL_ADMITTED_BEYOND_THE_SHEET)):
+                    self.assertLessEqual(
+                        declared, set(family),
+                        f"[{label}] {name} names a route that is not a leaf "
+                        f"of the private-game family, so what it describes "
+                        f"about the official is a claim about a surface "
+                        f"that no longer exists")
+                self.assertEqual(
+                    frozenset(),
+                    OFFICIAL_ASSIGNED_GAME_ROUTES
+                    & OFFICIAL_ADMITTED_BEYOND_THE_SHEET,
+                    "a leaf claims both that it grants the official a side "
+                    "and that it grants them none")
+                admitted = (OFFICIAL_ASSIGNED_GAME_ROUTES
+                            | OFFICIAL_ADMITTED_BEYOND_THE_SHEET)
+                official = {
+                    name: self._req(
                         who["official"], "GET",
-                        f"/api/games/{fx['gid']}/{leaf}")
-                    self.assertEqual(
-                        status, 403,
-                        f"[{label}] an assigned official was ADMITTED to the "
-                        f"own-side leaf {leaf!r}; the "
-                        f"{OFFICIAL_SUBMITTED_LINEUP_ONLY} classification in "
-                        f"this sweep is no longer sound")
-                for leaf in ("board", "lineups", "roster"):
-                    status, body = self._req(
-                        who["official"], "GET",
-                        f"/api/games/{fx['gid']}/{leaf}")
-                    self.assertEqual(
-                        status, 200,
-                        f"[{label}] the official's two-sided projection on "
-                        f"{leaf!r} is gone, so this classification no longer "
-                        f"describes them")
+                        self._path_of(spec, (fx["gid"],)))[0]
+                    for name, spec in sorted(family.items())}
+                self.assertEqual(
+                    {name: (200 if name in admitted else REFUSED)
+                     for name in family}, official,
+                    f"[{label}] the assigned official's leaf-by-leaf matrix "
+                    f"moved. They are REFUSED every own-side leaf and "
+                    f"admitted to exactly "
+                    f"{sorted(OFFICIAL_ASSIGNED_GAME_ROUTES)} with the "
+                    f"submitted-lineup projection plus "
+                    f"{sorted(OFFICIAL_ADMITTED_BEYOND_THE_SHEET)}, which "
+                    f"carry no side's private roster state at all. A leaf "
+                    f"that has moved either way has to be re-classified "
+                    f"into one of those two sets or the "
+                    f"{OFFICIAL_SUBMITTED_LINEUP_ONLY} classification is no "
+                    f"longer sound.")
 
                 # HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR: the exception is
                 # reachable ONLY by a principal in
@@ -5835,21 +6111,26 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
                 # that matters: the official is ADMITTED to three leaves of
                 # the private-game family with a projection, the guardian is
                 # REFUSED ALL TEN outright.
-                for leaf in ("board", "lineups", "roster", "roster-status",
-                             "substitutes", "availability-summary",
-                             "substitute-candidates", "substitute-addable",
-                             "officials", "reschedule"):
-                    status, body = self._req(
-                        who["guardian"], "GET",
-                        f"/api/games/{fx['gid']}/{leaf}")
-                    self.assertEqual(
-                        status, 403,
-                        f"[{label}] a guardian was ADMITTED to the "
-                        f"private-game leaf {leaf!r}. A guardian speaks for "
-                        f"ONE junior; the {GUARDIAN_OF_A_JUNIOR} "
-                        f"classification confines them to "
-                        f"{sorted(GUARDIAN_JUNIOR_ROUTES)} and this leaf is "
-                        f"not one of them: {body}")
+                #
+                # DERIVED, AND ON BOTH GAMES (#427 round 17). The ten were
+                # spelled by hand and driven on `gid` alone. The guardian is
+                # NOT a member of the empty-entitlement matrix in section 6b
+                # — their entitled-team set is their junior's resolved side
+                # and is NOT empty — so this is where their confinement is
+                # asserted, and it has to fail closed on a new leaf by
+                # itself. MEASURED at #427 round 17: 403 on all ten leaves
+                # of BOTH games, so the second game was not a gap either,
+                # merely an unasserted one.
+                guardian = self._family_status_matrix(
+                    who, fx, self._private_game_family(), ["guardian"])
+                self.assertEqual(
+                    [], self._admissions(guardian),
+                    f"[{label}] a guardian was ADMITTED to a leaf of the "
+                    f"private-game family. A guardian speaks for ONE junior; "
+                    f"the {GUARDIAN_OF_A_JUNIOR} classification confines "
+                    f"them to {sorted(GUARDIAN_JUNIOR_ROUTES)} and no leaf "
+                    f"of this family is one of them: "
+                    + str(self._admissions(guardian)))
                 # …and the two routes the grant IS on really do answer them.
                 for path in ("/api/me/guardian/home",
                              f"/api/me/guardian/{fx['guardian_junior_id']}"
@@ -7129,6 +7410,19 @@ class TheArenaManagerIsAnOperatorWithoutRosterAuthority(_SweepHarness,
                 store.clear_all_data()
                 fx = self._fixture(store)
                 who = self._serve(fx)
+                # THE KEY SET IS DERIVED (#427 round 17). The values below
+                # are measurements and stay written down; WHICH leaves must
+                # be measured is not this table's decision to make, so an
+                # eleventh leaf of the family is an error naming it rather
+                # than a row nobody thought to add for the two operators.
+                self.assertEqual(
+                    sorted(self._leaf_word(spec) for spec
+                           in self._private_game_family().values()),
+                    sorted(self.MATRIX),
+                    f"[{label}] this matrix and the private-game family "
+                    f"derived from route_registry.REGISTRY disagree about "
+                    f"which leaves exist; measure the new one for both "
+                    f"operators rather than leaving it unclassified")
                 measured = {}
                 for leaf in sorted(self.MATRIX):
                     row = []
@@ -7240,27 +7534,33 @@ class TheViewerIsEntitledToNothingAndTheSweepProvesIt(_SweepHarness,
 
     def test_a_viewer_is_refused_every_leaf_of_the_private_game_family(self):
         """The product is CORRECT today, and this records that rather than
-        assuming it: the value of the row is that it is now watched."""
+        assuming it: the value of the row is that it is now watched.
+
+        THE LEAVES ARE DERIVED AND BOTH GAMES ARE DRIVEN (#427 round 17).
+        This spelled the ten leaves by hand and drove only ``gid``. The
+        generalisation of it — every principal ``_entitlement`` gives an
+        empty entitled-team set, not the viewer alone — is
+        :class:`NoPrincipalEntitledToNoSideIsAdmittedToTheFamily`; this stays
+        as :data:`VIEWER_ENTITLED_TO_NOTHING`'s own dedicated assertion, in
+        the shape every other typed class in this file has, and now shares
+        that section's derivation instead of restating it."""
         for label, store in self._stores():
             try:
                 self._assert_backend(label, store)
                 store.clear_all_data()
                 fx = self._fixture(store)
                 who = self._serve(fx)
-                for leaf in ("board", "lineups", "roster", "roster-status",
-                             "substitutes", "availability-summary",
-                             "substitute-candidates", "substitute-addable",
-                             "officials", "reschedule"):
-                    status, body = self._req(
-                        who["viewer"], "GET",
-                        f"/api/games/{fx['gid']}/{leaf}")
-                    self.assertEqual(
-                        status, 403,
-                        f"[{label}] a signed-in VIEWER was ADMITTED to the "
-                        f"private-game leaf {leaf!r}. A viewer holds only "
-                        f"Permission.VIEW and the "
-                        f"{VIEWER_ENTITLED_TO_NOTHING} classification gives "
-                        f"them no side of either game: {body}")
+                family = self._private_game_family()
+                measured = self._family_status_matrix(
+                    who, fx, family, ["viewer"])
+                self.assertEqual(
+                    [], self._admissions(measured),
+                    f"[{label}] a signed-in VIEWER was ADMITTED to a leaf of "
+                    f"the private-game family. A viewer holds only "
+                    f"Permission.VIEW and the "
+                    f"{VIEWER_ENTITLED_TO_NOTHING} classification gives "
+                    f"them no side of either game: "
+                    + str(self._admissions(measured)))
             finally:
                 self._close(label, store)
             return
@@ -7321,6 +7621,321 @@ class TheViewerIsEntitledToNothingAndTheSweepProvesIt(_SweepHarness,
                 self._close(label, store)
             return   # the oracle's own behaviour, not a per-backend property
 
+
+# ---------------------------------------------------------------------------
+# 6b. THE ADMISSION MATRIX: "WAS THIS CALLER ADMITTED AT ALL", DERIVED ON
+#     BOTH AXES FROM AUTHORITIES OUTSIDE THIS SECTION.
+#
+# WHY A THIRD QUESTION EXISTS AT ALL (#427 round 17). Both data oracles ask
+# "did private DATA reach a caller without entitlement". They are
+# STRUCTURALLY BLIND to an ADMISSION THAT CARRIES LITTLE OR NO DATA, and that
+# is not a hypothetical:
+#
+#   MEASURED at 6641fe7, one branch added to `resolve_private_game_read`
+#   ahead of its COACH/PLAYER branch --
+#
+#       if role == Role.COACH:
+#           if scope.get('team_id') not in (game.home_team_id,
+#                                           game.away_team_id):
+#               return PrivateGameRead(role=role, game=None,
+#                                      own_team=None, admitted=True)
+#
+#   -- admits a Coach whose scope names NEITHER side. It fills NEITHER
+#   grant-bearing field, so `needs_authority` is False and it takes the
+#   not-found passthrough's own exemption: `_audit()` returns `[]`, the
+#   delegation premise is unmoved, and THE WHOLE MODULE STAYS GREEN at
+#   `Ran 91 tests in 199.2s ... OK` -- while `thirdcoach`, a Coach of a team
+#   in NEITHER game, receives 200 on `/board`, `/lineups`, `/officials` and
+#   `/reschedule` ON BOTH GAMES, carrying the officiating assignment's id and
+#   name (`official_1`, "Ref Riley"). Both sides come back
+#   `restricted: true, players: null`, which is exactly why every data oracle
+#   in this file is silent: there is no foreign identity to find and nothing
+#   that moves under a perturbation. The dispatch re-fetches the game by id,
+#   so `game=None` costs the caller nothing.
+#
+# The question this section asks instead is answered by the RESPONSE STATUS,
+# which no amount of payload trimming evades.
+#
+# AND BOTH ITS AXES ARE DERIVED, because a hand-enumerated axis is where the
+# next leak hides and this section could repeat that mistake in two places:
+#
+#   PRINCIPALS  every principal in `_entitlement` whose entitled-team set is
+#               `frozenset()`. NOT a tuple of names: a principal that enters
+#               the map with an empty set acquires this assertion with NO
+#               EDIT HERE, which `test_a_new_principal_entitled_to_no_side
+#               _is_asserted_with_no_edit_here` proves by adding one.
+#   LEAVES      `private_game_family()`, off `route_registry.REGISTRY`. A
+#               leaf registered into the family acquires the assertion with
+#               NO EDIT HERE, which `test_a_new_leaf_of_the_family_is
+#               _asserted_with_no_edit_here` proves by registering one that
+#               returns an EMPTY BODY -- the shape both data oracles are
+#               blind to, caught here by its status alone.
+#
+# WHY THIS IS NOT AN OVER-REFUSAL. The matrix covers exactly the principals
+# the sweep's own entitlement map says may read NO side of EITHER game.
+# Everybody else keeps their measured grant, asserted where it already was:
+# the assigned official's three leaves and five refusals and the guardian's
+# ten refusals in `TheDesignClassificationsAreStillTrue`, the two operators'
+# leaf-by-leaf matrix in
+# `TheArenaManagerIsAnOperatorWithoutRosterAuthority`. All three of those
+# read their leaves from THIS derivation now, so a new family leaf is an
+# error naming it for the entitled principals too.
+#
+# WHAT THIS DOES NOT CLAIM. This is a BEHAVIOURAL assertion about the
+# family's admissions; it is not a closure of the admission-branch axis and
+# it does not make one. It catches a class of gate defect the static
+# derivation cannot see -- one whose branch is exempt from needing an
+# authority -- and the static models that remain open remain open.
+# ---------------------------------------------------------------------------
+
+#: A REGISTERED leaf of the private-game family, used ONLY to prove the leaf
+#: axis fails closed. It ADMITS every signed-in caller and returns an EMPTY
+#: BODY: no identity for oracle 1 to find, nothing for oracle 2 to move, so
+#: the only thing that can report it is the status.
+_FAMILY_PROBE_TEMPLATE = "/api/games/{}/round-seventeen-probe"
+_FAMILY_PROBE_NAME = "get_games_id_round_seventeen_probe"
+_FAMILY_PROBE_PATTERN = r"^/api/games/[^/]+/round-seventeen-probe$"
+_FAMILY_PROBE_SPEC = route_registry.RouteSpec(
+    "GET", _FAMILY_PROBE_PATTERN, _FAMILY_PROBE_TEMPLATE, _FAMILY_PROBE_NAME,
+    "_dispatch_get", kind="route", auth="session", scope_axis="none",
+    note="injected by test_authenticated_side_noninterference; never shipped")
+
+
+@contextlib.contextmanager
+def _a_registered_leaf_of_the_private_game_family():
+    """An ELEVENTH leaf, registered for real.
+
+    The spec goes into ``route_registry.REGISTRY`` and the branch into the
+    real ``Handler._dispatch_get``, so the derivation discovers it exactly as
+    it would discover a leaf somebody shipped — the same mechanism
+    :func:`_a_registered_route_that_widens_only_for_the_official` uses, for
+    the same reason: a faked route would prove something about the fake."""
+    real_registry = route_registry.REGISTRY
+    real_dispatch = srv.Handler._dispatch_get
+
+    def dispatch(self):
+        path = self.path.split("?", 1)[0]
+        if re.match(_FAMILY_PROBE_PATTERN, path) is None:
+            return real_dispatch(self)
+        _role, _scope, _user_id, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            return self._send_json(payload, code)
+        # ADMITTED, CARRYING NOTHING AT ALL.
+        return self._send_json({})
+
+    route_registry.REGISTRY = real_registry + (_FAMILY_PROBE_SPEC,)
+    srv.Handler._dispatch_get = dispatch
+    try:
+        yield
+    finally:
+        route_registry.REGISTRY = real_registry
+        srv.Handler._dispatch_get = real_dispatch
+
+
+class NoPrincipalEntitledToNoSideIsAdmittedToTheFamily(_SweepHarness,
+                                                       unittest.TestCase):
+    """THE ADMISSION MATRIX, derived on both axes — see section 6b."""
+
+    CASES = ["the_admission_matrix"]
+
+    #: Set by :meth:`_extra_principal`; a principal name aliased onto another
+    #: principal's real session, so the map can gain a member without the
+    #: fixture gaining an account.
+    extra_principal = None
+
+    def _entitlement(self, fx):
+        """The real map, plus — while the falsifier is installed — ONE more
+        principal entitled to no side."""
+        entitlement = super()._entitlement(fx)
+        if self.extra_principal is not None:
+            entitlement[self.extra_principal] = (IN_NEITHER_SIDE, frozenset())
+        return entitlement
+
+    @contextlib.contextmanager
+    def _extra_principal(self, name, aliases, who):
+        who[name] = who[aliases]
+        self.extra_principal = name
+        try:
+            yield
+        finally:
+            self.extra_principal = None
+            who.pop(name, None)
+
+    def _unentitled(self, fx):
+        """THE PRINCIPAL AXIS, derived: every principal ``_entitlement``
+        gives an EMPTY entitled-team set."""
+        return sorted(name for name, (_klass, teams)
+                      in self._entitlement(fx).items() if not teams)
+
+    # -- the derivation itself --------------------------------------------
+    def test_the_family_is_derived_from_the_registry_and_addressable(self):
+        """Every leaf comes from the registry, and every leaf can be
+        DRIVEN. Source-level, so one backend proves it."""
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                self._serve(fx)   # `_route_subjects` reads what it binds
+                family = self._private_game_family()
+                # The derivation is a function of the TEMPLATE, so it must
+                # agree with what the paths actually look like…
+                for name, spec in sorted(family.items()):
+                    self.assertTrue(
+                        self._path_of(spec, (fx["gid"],)).startswith(
+                            f"/api/games/{fx['gid']}/"),
+                        f"{name} was derived into the private-game family "
+                        f"but does not address one game: {spec.template!r}")
+                # …and every leaf is swept by the sweep itself, which is the
+                # property that makes "derived from the registry" mean the
+                # same thing here as it does for the inventory closure.
+                _specs, subjects = self._assert_inventory_is_closed(fx)
+                self.assertEqual(
+                    [], sorted(set(family) - set(subjects)),
+                    "a leaf of the private-game family is not bound in "
+                    "_route_subjects, so the sweep never drives it: "
+                    + str(sorted(set(family) - set(subjects))))
+            finally:
+                self._close(label, store)
+            return   # the derivation is source-level, not per-backend
+
+    # -- THE MATRIX --------------------------------------------------------
+    def test_no_principal_entitled_to_no_side_is_admitted_to_any_leaf(self):
+        """THE ASSERTION WHOSE ABSENCE FOR ``thirdcoach`` IS THE GAP.
+
+        On every backend, because this is a statement about what the PRODUCT
+        answers over real authenticated HTTP and not about a gate's text."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                family = self._private_game_family()
+                unentitled = self._unentitled(fx)
+                # NON-VACUITY, not an identity: pinning WHICH principals are
+                # unentitled would put the hand-written axis straight back.
+                self.assertTrue(
+                    unentitled,
+                    f"[{label}] no swept principal has an empty entitled-team "
+                    f"set, so this matrix asserts nothing. The two sharpest "
+                    f"rows in _entitlement — {IN_NEITHER_SIDE} and "
+                    f"{VIEWER_ENTITLED_TO_NOTHING} — are what it is for.")
+                for principal in unentitled:
+                    self.assertIn(
+                        principal, who,
+                        f"[{label}] {principal} is entitled to no side and "
+                        f"holds no session, so it is asserted by nothing")
+                measured = self._family_status_matrix(
+                    who, fx, family, unentitled)
+                self.assertEqual(
+                    [], self._admissions(measured),
+                    f"[{label}] A CALLER ENTITLED TO NO SIDE OF EITHER GAME "
+                    f"WAS ADMITTED TO A LEAF OF THE PRIVATE-GAME FAMILY. "
+                    f"Every cell of this matrix is pinned at {REFUSED}, "
+                    f"measured; an admission here is a disclosure whether or "
+                    f"not the body carries anything, because both data "
+                    f"oracles in this file are blind to an admission that "
+                    f"carries nothing: "
+                    + str(self._admissions(measured)))
+                ran.append((label, "the_admission_matrix"))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, self.CASES)
+
+    # -- BOTH AXES FAIL CLOSED ON A MEMBER THEY HAVE NOT SEEN --------------
+    def test_a_new_leaf_of_the_family_is_asserted_with_no_edit_here(self):
+        """REGISTER AN ELEVENTH LEAF that admits everybody and returns an
+        EMPTY body; the matrix must report it, naming the leaf.
+
+        The premise is asserted first — the leaf really is registered, really
+        is in the derived family, and really does answer 200 — so this cannot
+        pass because the injection did nothing."""
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                before = self._private_game_family()
+                self.assertNotIn(_FAMILY_PROBE_NAME, before)
+                with _a_registered_leaf_of_the_private_game_family():
+                    family = private_game_family()
+                    # THE PREMISE, in three parts.
+                    self.assertIn(
+                        _FAMILY_PROBE_NAME, family,
+                        "the registered leaf did not enter the derived "
+                        "family, so nothing below is a statement about it")
+                    unentitled = self._unentitled(fx)
+                    status, body = self._req(
+                        who[unentitled[0]], "GET",
+                        _FAMILY_PROBE_TEMPLATE.replace("{}", fx["gid"], 1))
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual({}, body, body)
+                    # …and the ORACLE. Nothing but the status can see this.
+                    measured = self._family_status_matrix(
+                        who, fx, family, unentitled)
+                    reported = self._admissions(measured)
+                self.assertTrue(
+                    reported,
+                    "A NEW LEAF OF THE PRIVATE-GAME FAMILY WAS NOT ASSERTED. "
+                    "The leaf axis is supposed to be derived from "
+                    "route_registry.REGISTRY, so an eleventh leaf must "
+                    "acquire this matrix with no edit in this file; if it "
+                    "does not, the ten are a hand-written list again.")
+                for principal in self._unentitled(fx):
+                    self.assertTrue(
+                        any(r.startswith(f"{principal} ")
+                            and _FAMILY_PROBE_NAME in r for r in reported),
+                        f"the report does not name {principal} on "
+                        f"{_FAMILY_PROBE_NAME}: {reported}")
+                # …and the injection really is gone afterwards.
+                self.assertEqual(before, self._private_game_family())
+            finally:
+                self._close(label, store)
+            return   # the axis's own behaviour, not a per-backend property
+
+    def test_a_new_principal_entitled_to_no_side_is_asserted_with_no_edit(
+            self):
+        """ADD A PRINCIPAL to ``_entitlement`` with an empty entitled-team
+        set, aliased onto the OPERATOR's real session — a caller the product
+        admits everywhere. The matrix must report it, naming the new
+        principal, with no edit to any list of principals."""
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                family = self._private_game_family()
+                self.assertNotIn("a_ninth_principal", self._unentitled(fx))
+                with self._extra_principal("a_ninth_principal", "operator",
+                                           who):
+                    unentitled = self._unentitled(fx)
+                    # THE PREMISE: the map really gained the member, and the
+                    # session behind it really is admitted.
+                    self.assertIn("a_ninth_principal", unentitled)
+                    status, body = self._req(
+                        who["a_ninth_principal"], "GET",
+                        f"/api/games/{fx['gid']}/lineups")
+                    self.assertEqual(status, 200, body)
+                    measured = self._family_status_matrix(
+                        who, fx, family, unentitled)
+                    reported = self._admissions(measured)
+                self.assertTrue(
+                    any(r.startswith("a_ninth_principal ") for r in reported),
+                    "A NEW PRINCIPAL ENTITLED TO NO SIDE WAS NOT ASSERTED. "
+                    "The principal axis is supposed to be derived from "
+                    "_entitlement itself, so a row that enters it with an "
+                    "empty entitled-team set must acquire this matrix with "
+                    "no edit in this file: " + str(reported))
+                # …and the falsifier really is gone afterwards.
+                self.assertNotIn("a_ninth_principal", self._unentitled(fx))
+            finally:
+                self._close(label, store)
+            return   # the axis's own behaviour, not a per-backend property
 
 
 # ---------------------------------------------------------------------------
@@ -10255,9 +10870,14 @@ class ThePlayerGrantIsTheEligibleMembershipRow(_SweepHarness,
     #: The whole private-game family, from the registry rather than listed —
     #: an ex-member must be refused EVERY leaf, not the three that carry a
     #: sheet.
+    #:
+    #: DERIVED FROM THE PATH, NOT FROM THE ROUTE NAME (#427 round 17). This
+    #: read `spec.name.startswith("get_games_id_")`, which is a naming
+    #: CONVENTION rather than an authority: a family leaf whose route name
+    #: did not happen to begin that way was outside this refusal entirely.
+    #: :func:`private_game_family` is the one definition now.
     def _family(self):
-        return sorted(spec.name for spec in self._authenticated_get_specs()
-                      if spec.name.startswith("get_games_id_"))
+        return sorted(self._private_game_family())
 
     CASES = ["an_ex_member_is_refused_the_whole_family",
              "every_status_admits_where_the_product_pins_it",
