@@ -116,12 +116,22 @@ come back ``restricted: true, players: null``, which is exactly why nothing
 here sees it: no foreign identity to find, nothing that moves.
 
 So the admission matrix asks a question the payload cannot answer for:
-EVERY principal :meth:`_SweepHarness._entitlement` gives an EMPTY
-entitled-team set must be answered ``403`` on EVERY leaf of the private-game
-family, on BOTH games. Both axes are DERIVED — the principals from
-``_entitlement`` itself, the leaves from ``route_registry.REGISTRY`` via
+EVERY ``(principal, GAME)`` CELL whose entitled-team set NARROWED AGAINST
+THAT GAME is empty must be answered ``403`` on EVERY leaf of the
+private-game family. Both axes are DERIVED — the cells from
+:meth:`_SweepHarness._subject_narrowed`, i.e. from the RELATIONSHIP ROWS and
+their declared active state; the leaves from ``route_registry.REGISTRY`` via
 :func:`private_game_family` — and each is proved to fail closed by ADDING a
-member and requiring a named failure. MEASURED over a battery of ten hostile
+member and requiring a named failure.
+
+IT WAS A PRINCIPAL AXIS UNTIL ROUND 18 AND THAT WAS THE HOLE. Selecting
+principals by ``_entitlement``'s GLOBAL team union can only ever select a
+caller entitled to nothing ANYWHERE, so the swept OFFICIAL — whose map says
+``{home, away}`` although the grant is assignment-keyed PER GAME — was
+outside the matrix on the game they do not referee. Measured at ``73faf4d``
+with ``200 {}`` answered to that official on the UNASSIGNED game's
+``/officials`` and ``/reschedule``, the whole module passed:
+``Ran 95 tests in 297.042s … OK``, tri-store. MEASURED over a battery of ten hostile
 spellings of that exemption class, every one of them a live admission: the
 matrix reports 10 of 10, and 8 of the 10 leave ``_audit()`` empty.
 
@@ -380,20 +390,31 @@ identity alphabet      **LIMIT**   ``Player``'s own fields, STRING-VALUED ONLY
 entitlement class      CLOSED      each principal BOUND by an assertion, and
                                    each ADMISSION BRANCH the gate takes bound
                                    to the class that models it
-admission (status      CLOSED      ``route_registry.REGISTRY`` x
-only, section 6b)                  ``_entitlement``. The LEAVES are the
+admission (status      **LIMIT**   ``route_registry.REGISTRY`` x the
+only, section 6b)                  RELATIONSHIP ROWS. The LEAVES are the
                                    private-game family derived from the
                                    registry by ``private_game_family()`` —
                                    an eleventh leaf acquires the assertion
-                                   with no edit, proved by REGISTERING one —
-                                   and the PRINCIPALS are every row of
-                                   ``_entitlement`` whose entitled-team set
-                                   is ``frozenset()``, so a row that enters
-                                   the map that way acquires it with no
-                                   edit either, proved by ADDING one. Asked
-                                   of the RESPONSE STATUS, which is what
-                                   makes it reach the admissions both data
-                                   oracles are blind to (#427 round 17)
+                                   with no edit, proved by REGISTERING one.
+                                   The other axis is no longer a set of
+                                   PRINCIPALS (#427 round 18): it is every
+                                   ``(principal, GAME SUBJECT)`` CELL whose
+                                   entitled-team set NARROWED AGAINST THAT
+                                   GAME is empty, via ``_subject_narrowed``
+                                   and therefore via the grant rows and
+                                   their declared active state. Selecting
+                                   principals by their GLOBAL team union
+                                   excluded the swept official on the game
+                                   they do not referee, which an empty-body
+                                   ``200`` walked straight through. Asked of
+                                   the RESPONSE STATUS, which is what makes
+                                   it reach the admissions both data oracles
+                                   are blind to (#427 round 17). A LIMIT
+                                   because the GAMES it is driven against —
+                                   ``_SweepHarness.GAME_KEYS`` — are still
+                                   hand-enumerated: round 18 makes the cell
+                                   axis a function of that list rather than
+                                   independent of it, and does NOT close it
 data class             **LIMIT**   no product enum exists; non-vacuity asserted
 perturbation kind      **LIMIT**   test constructions; PREMISES asserted
 relationship kind      **LIMIT**   test constructions; PREMISES asserted
@@ -1240,6 +1261,12 @@ UNSCOPED_OPERATOR_CLASSES = frozenset({
 #: against all ten leaves of the derived family on BOTH games, forty cells,
 #: and every one of the forty answered 403. Nothing is being asserted here
 #: that the product does not already do; what is new is that it is WATCHED.
+#:
+#: AND RE-MEASURED WHEN THE AXIS BECAME PER-GAME (#427 round 18). The
+#: derivation now yields FIVE ``(principal, game)`` cells rather than four —
+#: those two on both games plus the swept OFFICIAL on the game they do not
+#: referee — so FIFTY cells, and every one of the fifty answered 403 before
+#: this pinned them. The official's ten are the ones nothing asserted.
 #:
 #: THERE IS DELIBERATELY NO EXEMPTION MECHANISM. A leaf that begins answering
 #: something else — a 200 with a restricted body, a 404, a 400 — fails this
@@ -4364,28 +4391,56 @@ class _SweepHarness(_OverviewHarness):
         are never two independent statements."""
         return spec.template.rsplit("/", 1)[1]
 
-    def _family_status_matrix(self, who, fx, family, principals):
-        """``{(principal, route name, game key): HTTP status}`` — every
-        principal x every leaf x BOTH GAMES, over real authenticated HTTP.
+    #: The GAME SUBJECTS every family matrix in this file is driven against.
+    #:
+    #: STILL HAND-ENUMERATED, AND STILL OPEN — recorded here rather than
+    #: repeated at five call sites so the gap has ONE place to be closed
+    #: from. Deleting ``"gid2"`` leaves this module green; the owner has
+    #: ruled that cannot be deferred without an explicit scope change and it
+    #: is NOT closed by #427 round 18. What round 18 does change is that the
+    #: PRINCIPAL axis is no longer independent of this one — see
+    #: :meth:`_family_status_matrix_over`.
+    GAME_KEYS = ("gid", "gid2")
 
-        BOTH GAMES BECAUSE THE FIXTURE SWAPS THE SIDES. A principal
-        unentitled to one game may be entitled to the other — that is
-        exactly the subject-axis defect round 11 found — so a matrix driven
-        on ``gid`` alone would be a statement about one arrangement of the
-        sides rather than about the rule.
+    def _family_status_matrix_over(self, who, fx, family, cells):
+        """``{(principal, route name, game key): HTTP status}`` — every leaf
+        of ``family``, driven for exactly these ``(principal, game key)``
+        CELLS, over real authenticated HTTP.
+
+        THE CELL IS THE UNIT, NOT THE PRINCIPAL (#427 round 18, blocker 1).
+        "Which principals may read nothing" is a question with no answer in
+        this product: an official's grant is ASSIGNMENT-KEYED PER GAME, so
+        the same principal is entitled on one game and a stranger on the
+        other. A matrix whose rows were principals could only ask the
+        question of a principal entitled to NO game at all, which is why the
+        swept official — whose global entitled-team set is ``{home, away}``
+        — was outside it on the game they do not referee.
 
         Addressed through :meth:`_path_of`, the same one definition the
         sweep itself builds paths with, so this cannot probe a path the
         sweep never produces."""
         measured = {}
-        for principal in principals:
-            for game_key in ("gid", "gid2"):
-                for name, spec in sorted(family.items()):
-                    status, _body = self._req(
-                        who[principal], "GET",
-                        self._path_of(spec, (fx[game_key],)))
-                    measured[(principal, name, game_key)] = status
+        for principal, game_key in cells:
+            for name, spec in sorted(family.items()):
+                status, _body = self._req(
+                    who[principal], "GET",
+                    self._path_of(spec, (fx[game_key],)))
+                measured[(principal, name, game_key)] = status
         return measured
+
+    def _family_status_matrix(self, who, fx, family, principals):
+        """:meth:`_family_status_matrix_over` for every cell these
+        principals have — every leaf x BOTH GAMES.
+
+        BOTH GAMES BECAUSE THE FIXTURE SWAPS THE SIDES. A principal
+        unentitled to one game may be entitled to the other — that is
+        exactly the subject-axis defect round 11 found — so a matrix driven
+        on ``gid`` alone would be a statement about one arrangement of the
+        sides rather than about the rule."""
+        return self._family_status_matrix_over(
+            who, fx, family,
+            [(principal, game_key) for principal in principals
+             for game_key in self.GAME_KEYS])
 
     def _admissions(self, measured):
         """The cells of a status matrix that are NOT a refusal, named."""
@@ -7659,11 +7714,10 @@ class TheViewerIsEntitledToNothingAndTheSweepProvesIt(_SweepHarness,
 # AND BOTH ITS AXES ARE DERIVED, because a hand-enumerated axis is where the
 # next leak hides and this section could repeat that mistake in two places:
 #
-#   PRINCIPALS  every principal in `_entitlement` whose entitled-team set is
-#               `frozenset()`. NOT a tuple of names: a principal that enters
-#               the map with an empty set acquires this assertion with NO
-#               EDIT HERE, which `test_a_new_principal_entitled_to_no_side
-#               _is_asserted_with_no_edit_here` proves by adding one.
+#   CELLS       every `(principal, GAME SUBJECT)` whose entitled-team set,
+#               NARROWED AGAINST THAT GAME, is `frozenset()` -- see
+#               `_unentitled_cells`. NOT a tuple of names, and since #427
+#               round 18 NOT a set of principals either.
 #   LEAVES      `private_game_family()`, off `route_registry.REGISTRY`. A
 #               leaf registered into the family acquires the assertion with
 #               NO EDIT HERE, which `test_a_new_leaf_of_the_family_is
@@ -7671,15 +7725,51 @@ class TheViewerIsEntitledToNothingAndTheSweepProvesIt(_SweepHarness,
 #               returns an EMPTY BODY -- the shape both data oracles are
 #               blind to, caught here by its status alone.
 #
-# WHY THIS IS NOT AN OVER-REFUSAL. The matrix covers exactly the principals
-# the sweep's own entitlement map says may read NO side of EITHER game.
+# WHY THE PRINCIPAL AXIS BECAME A CELL AXIS (#427 round 18, blocker 1). It
+# was `every principal whose entitled-team set is frozenset()`, and that set
+# is `_entitlement`'s GLOBAL team union. So it drove `thirdcoach` and
+# `viewer` and EXCLUDED THE SWEPT OFFICIAL, whose map says `{home, away}`
+# although the real grant is ASSIGNMENT-KEYED PER GAME: an unassigned or
+# revoked official could be admitted to a status-only leaf of a game they do
+# not referee while both data oracles and this very matrix stayed green.
+# MEASURED at `73faf4d` with the owner's own falsifier -- `200 {}` for that
+# official on the UNASSIGNED `gid2`'s `/officials` and `/reschedule` -- the
+# WHOLE MODULE passed, `Ran 95 tests in 297.042s ... OK`, tri-store.
+#
+# The replacement is not one predicate wider. It is `_subject_narrowed`, the
+# same one definition both data oracles are read against, which asks the
+# RELATIONSHIP ROWS -- `OfficialAssignment` with its `status.is_active`,
+# `GuardianLink.verified`, the eligible `SeasonRosterMembership` statuses,
+# the account scope -- and then intersects with THIS game's own two sides.
+# A DECLINED or REVOKED row therefore grants nothing, which
+# `test_a_dead_assignment_row_does_not_create_a_grant` drives through the
+# product's own write paths.
+#
+# THREE AXES, AND THE THIRD IS STILL OPEN. The games this matrix is driven
+# against are `_SweepHarness.GAME_KEYS`, still hand-enumerated and protected
+# by nothing. Round 18 makes the CELL axis a function of it rather than
+# independent of it; it does NOT close it, and this file does not claim it.
+#
+# WHY THIS IS NOT AN OVER-REFUSAL. The matrix covers exactly the cells the
+# sweep's own relationship rows say may read NO side OF THAT GAME.
 # Everybody else keeps their measured grant, asserted where it already was:
 # the assigned official's three leaves and five refusals and the guardian's
 # ten refusals in `TheDesignClassificationsAreStillTrue`, the two operators'
 # leaf-by-leaf matrix in
 # `TheArenaManagerIsAnOperatorWithoutRosterAuthority`. All three of those
 # read their leaves from THIS derivation now, so a new family leaf is an
-# error naming it for the entitled principals too.
+# error naming it for the entitled principals too. And the official's own
+# refereed game is re-measured leaf by leaf, WITH ITS PRIVATE ROWS, inside
+# both of round 18's new tests -- `_assert_the_official_keeps_their_own_game`
+# -- because a round that widens a refusal rule is exactly the round that
+# breaks a real grant.
+#
+# WHICH PRINCIPALS FALL OUT OF THE GENERALISATION, MEASURED. `thirdcoach`
+# and `viewer` on both games, as before, plus the official on the game they
+# do not referee. NOT the guardian and NOT the players: `GuardianLink`
+# carries no `game_id` and this fixture's two games carry THE SAME TWO
+# TEAMS, so their side is a side of both. Their confinement is a ROUTE fact
+# and stays where it was asserted.
 #
 # WHAT THIS DOES NOT CLAIM. This is a BEHAVIOURAL assertion about the
 # family's admissions; it is not a closure of the admission-branch axis and
@@ -7733,11 +7823,61 @@ def _a_registered_leaf_of_the_private_game_family():
         srv.Handler._dispatch_get = real_dispatch
 
 
+#: THE OWNER'S OWN FALSIFIER for blocker 1 (#427 round 18), spelled here so
+#: the regression drives the exact shape the review describes: the two family
+#: leaves that carry NEITHER side's private roster state
+#: (:data:`OFFICIAL_ADMITTED_BEYOND_THE_SHEET`) admitting an OFFICIAL on ANY
+#: game, with an EMPTY body.
+#:
+#: WHY THIS SHAPE IS THE SHARP ONE. On the game the official REFEREES both
+#: leaves already answer 200 — that is the product's real, typed grant — so
+#: the only cell this widening moves is the UNASSIGNED game's, and it carries
+#: nothing for either data oracle to find. An axis keyed on the PRINCIPAL
+#: cannot see it, because the swept official's global entitled-team set is
+#: `{home, away}` and never enters the matrix at all.
+_UNASSIGNED_OFFICIAL_LEAVES = ("officials", "reschedule")
+_UNASSIGNED_OFFICIAL_LEAK = re.compile(
+    r"^/api/games/[^/]+/(" + "|".join(_UNASSIGNED_OFFICIAL_LEAVES) + r")$")
+
+
+@contextlib.contextmanager
+def _an_official_admitted_to_a_game_they_do_not_referee():
+    """Answer ``200 {}`` to any OFFICIAL on the two status-only leaves,
+    whatever game they name.
+
+    Installed into the REAL ``Handler._dispatch_get``, after the real
+    ``_resolve_role``, so what it widens is a real authenticated session's
+    real admission decision — the same mechanism
+    :func:`_a_registered_leaf_of_the_private_game_family` uses, for the same
+    reason: a faked route would prove something about the fake."""
+    real_dispatch = srv.Handler._dispatch_get
+
+    def dispatch(self):
+        path = self.path.split("?", 1)[0]
+        if _UNASSIGNED_OFFICIAL_LEAK.match(path) is None:
+            return real_dispatch(self)
+        role, _scope, _user_id, err = self._resolve_role()
+        if err is not None or role != Role.OFFICIAL:
+            return real_dispatch(self)
+        # ADMITTED, CARRYING NOTHING AT ALL — invisible to both data oracles.
+        return self._send_json({})
+
+    srv.Handler._dispatch_get = dispatch
+    try:
+        yield
+    finally:
+        srv.Handler._dispatch_get = real_dispatch
+
+
 class NoPrincipalEntitledToNoSideIsAdmittedToTheFamily(_SweepHarness,
                                                        unittest.TestCase):
     """THE ADMISSION MATRIX, derived on both axes — see section 6b."""
 
     CASES = ["the_admission_matrix"]
+    #: One case name per tri-store test, so `_assert_matrix_ran` fails a
+    #: loop that silently covered fewer backends than were configured.
+    UNREFEREED_CASE = "an_official_admitted_to_an_unrefereed_game"
+    DEAD_ROW_CASE = "a_dead_assignment_row_grants_nothing"
 
     #: Set by :meth:`_extra_principal`; a principal name aliased onto another
     #: principal's real session, so the map can gain a member without the
@@ -7763,10 +7903,84 @@ class NoPrincipalEntitledToNoSideIsAdmittedToTheFamily(_SweepHarness,
             who.pop(name, None)
 
     def _unentitled(self, fx):
-        """THE PRINCIPAL AXIS, derived: every principal ``_entitlement``
-        gives an EMPTY entitled-team set."""
+        """THE OLD PRINCIPAL AXIS: every principal ``_entitlement`` gives an
+        EMPTY entitled-team set GLOBALLY.
+
+        KEPT ONLY AS THE THING THE REAL AXIS MUST BE STRICTLY WIDER THAN
+        (#427 round 18, blocker 1). This is not what the matrix drives any
+        more — see :meth:`_unentitled_cells` — and
+        :meth:`test_no_principal_entitled_to_no_side_is_admitted_to_any_leaf`
+        asserts that the derived cells are NOT merely this set crossed with
+        both games, so a future edit that collapsed the subject axis back
+        into a global one would be reported rather than merely smaller."""
         return sorted(name for name, (_klass, teams)
                       in self._entitlement(fx).items() if not teams)
+
+    def _unentitled_cells(self, fx):
+        """THE AXIS, DERIVED PER ``(principal, GAME SUBJECT)``: every cell
+        whose principal may read NO SIDE OF THAT GAME.
+
+        THE GAP THIS CLOSES (#427 round 18, blocker 1). The axis used to be
+        a set of PRINCIPALS, selected by ``not teams`` off
+        :meth:`_entitlement` — a GLOBAL team union. That predicate can only
+        ever select a principal entitled to nothing ANYWHERE, so it drove
+        ``thirdcoach`` and ``viewer`` and EXCLUDED THE SWEPT OFFICIAL, whose
+        map says ``{home, away}`` although the actual grant is
+        ASSIGNMENT-KEYED PER GAME. MEASURED at ``73faf4d`` with an in-memory
+        HTTP widening that answered ``200 {}`` for that official on the
+        UNASSIGNED ``gid2``'s ``/officials`` and ``/reschedule``: both wire
+        calls were admitted and all three relevant tests stayed green — this
+        matrix (which never selected the official), the official's
+        design-classification matrix (which drives ``gid`` only) and
+        ``AGameKeyedGrantDoesNotSpanASecondGame
+        .test_the_game_one_grant_survives_and_game_two_stays_refused``
+        (which drives ``gid2`` only on ``/board``, ``/lineups`` and
+        ``/roster``).
+
+        SO THE ANSWER IS NOT ONE PREDICATE WIDER, IT IS THE RELATIONSHIP
+        ROWS. The cell is derived by :meth:`_subject_narrowed` — the same
+        one definition both oracles are read against — which asks
+        :meth:`_grant_rows` for every STORED row of the principal's grant
+        kind, drops the ones the PRODUCT'S OWN declared state says grant
+        nothing (:func:`_row_is_active`: ``OfficialAssignmentStatus
+        .is_active``, ``GuardianLink.verified``, the eligible membership
+        statuses), matches the survivors on EVERY dimension the row
+        declares, and finally intersects with THIS GAME'S OWN TWO SIDES.
+        Nothing here is a hand list and nothing here asks the gate under
+        test. A DECLINED or REVOKED assignment therefore produces an
+        unentitled cell exactly as a missing one does, which
+        :meth:`test_a_dead_assignment_row_does_not_create_a_grant` measures
+        through the product's own write paths.
+
+        WHICH PRINCIPALS FALL OUT OF IT, MEASURED rather than predicted (see
+        ``test_no_principal_entitled_to_no_side_is_admitted_to_any_leaf``'s
+        own non-vacuity assertions): ``thirdcoach`` and ``viewer`` on both
+        games, as before, AND the official on the game they do not referee.
+        The GUARDIAN does NOT fall out, and that is a fact about this
+        product rather than an omission: ``GuardianLink`` carries no
+        ``game_id`` (:data:`GAME_KEYED_CLASSES`), so a guardian's grant is a
+        standing authority over every game their junior's side appears in,
+        and this fixture's two games carry THE SAME TWO TEAMS. Their
+        confinement is a ROUTE fact, not a SUBJECT fact, and it stays
+        asserted where it already was —
+        :meth:`TheDesignClassificationsAreStillTrue
+        .test_every_principal_carries_a_documented_class` pins all ten
+        leaves of BOTH games at 403 for them. The Players are the same
+        shape: their membership row names a side of both games.
+
+        THE THIRD AXIS — WHICH GAMES — IS STILL :data:`GAME_KEYS`, still
+        hand-enumerated, and NOT closed by this. Round 18 makes the
+        principal axis a function of it; it does not derive it."""
+        entitlement = self._entitlement(fx)
+        cells = []
+        for principal in sorted(entitlement):
+            klass, teams = entitlement[principal]
+            for game_key in self.GAME_KEYS:
+                subjects = self._path_subjects(fx, (fx[game_key],))
+                if not self._subject_narrowed(
+                        fx, klass, teams, subjects, principal):
+                    cells.append((principal, game_key))
+        return cells
 
     # -- the derivation itself --------------------------------------------
     def test_the_family_is_derived_from_the_registry_and_addressable(self):
@@ -7814,31 +8028,54 @@ class NoPrincipalEntitledToNoSideIsAdmittedToTheFamily(_SweepHarness,
                 fx = self._fixture(store)
                 who = self._serve(fx)
                 family = self._private_game_family()
-                unentitled = self._unentitled(fx)
-                # NON-VACUITY, not an identity: pinning WHICH principals are
+                cells = self._unentitled_cells(fx)
+                # NON-VACUITY, not an identity: pinning WHICH cells are
                 # unentitled would put the hand-written axis straight back.
                 self.assertTrue(
-                    unentitled,
-                    f"[{label}] no swept principal has an empty entitled-team "
-                    f"set, so this matrix asserts nothing. The two sharpest "
-                    f"rows in _entitlement — {IN_NEITHER_SIDE} and "
-                    f"{VIEWER_ENTITLED_TO_NOTHING} — are what it is for.")
-                for principal in unentitled:
+                    cells,
+                    f"[{label}] no (principal, game) cell resolves to an "
+                    f"empty entitled-team set, so this matrix asserts "
+                    f"nothing. The two sharpest rows in _entitlement — "
+                    f"{IN_NEITHER_SIDE} and {VIEWER_ENTITLED_TO_NOTHING} — "
+                    f"and the swept official's UNASSIGNED game are what it "
+                    f"is for.")
+                # …AND STRICTLY WIDER THAN THE GLOBAL PREDICATE IT REPLACES
+                # (#427 round 18, blocker 1). This is the whole finding in
+                # one assertion: if every derived cell belonged to a
+                # principal whose GLOBAL entitled-team set is empty, the
+                # subject axis would have collapsed back into
+                # `not teams` and the swept official on the game they do not
+                # referee would be outside this matrix again.
+                globally = set(self._unentitled(fx))
+                per_subject = sorted(
+                    cell for cell in cells if cell[0] not in globally)
+                self.assertTrue(
+                    per_subject,
+                    f"[{label}] EVERY derived cell belongs to a principal "
+                    f"entitled to no side ANYWHERE, so this axis is the "
+                    f"global `not teams` predicate again under a new name. "
+                    f"A grant this product keys PER GAME — an official's "
+                    f"assignment — must produce a refusal cell on the game "
+                    f"it does not cover: {sorted(cells)}")
+                for principal, _game_key in cells:
                     self.assertIn(
                         principal, who,
-                        f"[{label}] {principal} is entitled to no side and "
-                        f"holds no session, so it is asserted by nothing")
-                measured = self._family_status_matrix(
-                    who, fx, family, unentitled)
+                        f"[{label}] {principal} is entitled to no side of a "
+                        f"game and holds no session, so it is asserted by "
+                        f"nothing")
+                measured = self._family_status_matrix_over(
+                    who, fx, family, cells)
                 self.assertEqual(
                     [], self._admissions(measured),
-                    f"[{label}] A CALLER ENTITLED TO NO SIDE OF EITHER GAME "
-                    f"WAS ADMITTED TO A LEAF OF THE PRIVATE-GAME FAMILY. "
-                    f"Every cell of this matrix is pinned at {REFUSED}, "
-                    f"measured; an admission here is a disclosure whether or "
-                    f"not the body carries anything, because both data "
-                    f"oracles in this file are blind to an admission that "
-                    f"carries nothing: "
+                    f"[{label}] A CALLER ENTITLED TO NO SIDE OF THE GAME "
+                    f"THEY ADDRESSED WAS ADMITTED TO A LEAF OF THE "
+                    f"PRIVATE-GAME FAMILY. Every cell of this matrix is "
+                    f"pinned at {REFUSED}, measured; an admission here is a "
+                    f"disclosure whether or not the body carries anything, "
+                    f"because both data oracles in this file are blind to an "
+                    f"admission that carries nothing. The derived cells were "
+                    f"{sorted(cells)}, of which {per_subject} are keyed on "
+                    f"the GAME rather than on the principal: "
                     + str(self._admissions(measured)))
                 ran.append((label, "the_admission_matrix"))
             finally:
@@ -7868,15 +8105,17 @@ class NoPrincipalEntitledToNoSideIsAdmittedToTheFamily(_SweepHarness,
                         _FAMILY_PROBE_NAME, family,
                         "the registered leaf did not enter the derived "
                         "family, so nothing below is a statement about it")
-                    unentitled = self._unentitled(fx)
+                    cells = self._unentitled_cells(fx)
+                    principal, game_key = cells[0]
                     status, body = self._req(
-                        who[unentitled[0]], "GET",
-                        _FAMILY_PROBE_TEMPLATE.replace("{}", fx["gid"], 1))
+                        who[principal], "GET",
+                        _FAMILY_PROBE_TEMPLATE.replace(
+                            "{}", fx[game_key], 1))
                     self.assertEqual(status, 200, body)
                     self.assertEqual({}, body, body)
                     # …and the ORACLE. Nothing but the status can see this.
-                    measured = self._family_status_matrix(
-                        who, fx, family, unentitled)
+                    measured = self._family_status_matrix_over(
+                        who, fx, family, cells)
                     reported = self._admissions(measured)
                 self.assertTrue(
                     reported,
@@ -7885,12 +8124,14 @@ class NoPrincipalEntitledToNoSideIsAdmittedToTheFamily(_SweepHarness,
                     "route_registry.REGISTRY, so an eleventh leaf must "
                     "acquire this matrix with no edit in this file; if it "
                     "does not, the ten are a hand-written list again.")
-                for principal in self._unentitled(fx):
+                for principal, game_key in self._unentitled_cells(fx):
                     self.assertTrue(
                         any(r.startswith(f"{principal} ")
-                            and _FAMILY_PROBE_NAME in r for r in reported),
+                            and _FAMILY_PROBE_NAME in r
+                            and r.endswith(f"({game_key})")
+                            for r in reported),
                         f"the report does not name {principal} on "
-                        f"{_FAMILY_PROBE_NAME}: {reported}")
+                        f"{_FAMILY_PROBE_NAME} ({game_key}): {reported}")
                 # …and the injection really is gone afterwards.
                 self.assertEqual(before, self._private_game_family())
             finally:
@@ -7910,19 +8151,26 @@ class NoPrincipalEntitledToNoSideIsAdmittedToTheFamily(_SweepHarness,
                 fx = self._fixture(store)
                 who = self._serve(fx)
                 family = self._private_game_family()
-                self.assertNotIn("a_ninth_principal", self._unentitled(fx))
+                self.assertNotIn(
+                    "a_ninth_principal",
+                    [p for p, _g in self._unentitled_cells(fx)])
                 with self._extra_principal("a_ninth_principal", "operator",
                                            who):
-                    unentitled = self._unentitled(fx)
-                    # THE PREMISE: the map really gained the member, and the
-                    # session behind it really is admitted.
-                    self.assertIn("a_ninth_principal", unentitled)
+                    cells = self._unentitled_cells(fx)
+                    # THE PREMISE: the map really gained the member, on BOTH
+                    # games — an empty entitled-team set cannot be narrowed
+                    # to anything by any subject — and the session behind it
+                    # really is admitted.
+                    self.assertEqual(
+                        [("a_ninth_principal", key)
+                         for key in self.GAME_KEYS],
+                        [c for c in cells if c[0] == "a_ninth_principal"])
                     status, body = self._req(
                         who["a_ninth_principal"], "GET",
                         f"/api/games/{fx['gid']}/lineups")
                     self.assertEqual(status, 200, body)
-                    measured = self._family_status_matrix(
-                        who, fx, family, unentitled)
+                    measured = self._family_status_matrix_over(
+                        who, fx, family, cells)
                     reported = self._admissions(measured)
                 self.assertTrue(
                     any(r.startswith("a_ninth_principal ") for r in reported),
@@ -7932,10 +8180,225 @@ class NoPrincipalEntitledToNoSideIsAdmittedToTheFamily(_SweepHarness,
                     "empty entitled-team set must acquire this matrix with "
                     "no edit in this file: " + str(reported))
                 # …and the falsifier really is gone afterwards.
-                self.assertNotIn("a_ninth_principal", self._unentitled(fx))
+                self.assertNotIn(
+                    "a_ninth_principal",
+                    [p for p, _g in self._unentitled_cells(fx)])
             finally:
                 self._close(label, store)
             return   # the axis's own behaviour, not a per-backend property
+
+    # -- THE SUBJECT HALF OF THE AXIS FAILS CLOSED TOO ---------------------
+    def test_an_official_admitted_to_an_unrefereed_game_is_reported(self):
+        """THE OWNER'S REQUIRED REGRESSION FOR BLOCKER 1 (#427 round 18), on
+        every backend over real authenticated HTTP.
+
+        Widen the two status-only leaves — ``/officials`` and
+        ``/reschedule``, the two the product legitimately answers an
+        ASSIGNED official 200 on — to answer ANY official ``200 {}``,
+        whatever game they name. On the game they referee that changes
+        nothing; on the game they do NOT it is a live admission carrying no
+        body, which is precisely the shape both data oracles are blind to.
+
+        MEASURED AT ``73faf4d``, with this exact falsifier installed: both
+        wire calls were admitted and the WHOLE MODULE stayed green —
+        ``Ran 95 tests in 297.042s … OK`` on Memory, SQLite and real
+        PostgreSQL — the three tests the owner named among them. The axis
+        selected principals by their GLOBAL entitled-team set, so the swept
+        official, whose map says ``{home, away}``, was never in the matrix
+        at all.
+
+        BOTH CELLS MUST BE NAMED. A report that named one leaf would leave
+        the other unasserted, which is the hand-written-axis failure one
+        level down."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                family = self._private_game_family()
+                cells = self._unentitled_cells(fx)
+                # THE PREMISE, from the RELATIONSHIP ROWS and not from the
+                # gate: the official holds an active assignment on `gid` and
+                # none on `gid2`, so exactly one of their two cells is
+                # unentitled.
+                self.assertTrue(self._official_is_assigned(
+                    fx, self._subject_of(fx, fx["gid"])), label)
+                self.assertFalse(self._official_is_assigned(
+                    fx, self._subject_of(fx, fx["gid2"])), label)
+                self.assertEqual(
+                    [("official", "gid2")],
+                    [c for c in cells if c[0] == "official"],
+                    f"[{label}] the derivation does not give the swept "
+                    f"official exactly one unentitled cell — the game they "
+                    f"do not referee — so this falsifier is not aimed at "
+                    f"what it claims: {sorted(cells)}")
+                for leaf in _UNASSIGNED_OFFICIAL_LEAVES:
+                    self.assertIn(f"get_games_id_{leaf}", family, label)
+                with _an_official_admitted_to_a_game_they_do_not_referee():
+                    # THE PREMISE, on the wire: the widening really is live
+                    # and really is an EMPTY body.
+                    for leaf in _UNASSIGNED_OFFICIAL_LEAVES:
+                        status, body = self._req(
+                            who["official"], "GET",
+                            f"/api/games/{fx['gid2']}/{leaf}")
+                        self.assertEqual((200, {}), (status, body), label)
+                    reported = self._admissions(
+                        self._family_status_matrix_over(
+                            who, fx, family, cells))
+                for leaf in _UNASSIGNED_OFFICIAL_LEAVES:
+                    self.assertIn(
+                        f"official was answered 200 on get_games_id_{leaf} "
+                        f"(gid2)", reported,
+                        f"[{label}] an official was ADMITTED to /{leaf} of a "
+                        f"game carrying no assignment row for them and this "
+                        f"matrix did not report the cell. A game-keyed grant "
+                        f"reduced to one GLOBAL team union is what let this "
+                        f"through at 73faf4d: " + str(reported))
+                # …AND NOTHING ELSE MOVED. The report is exactly the two
+                # widened cells, so this cannot pass by reporting the world.
+                self.assertEqual(
+                    sorted(f"official was answered 200 on "
+                           f"get_games_id_{leaf} (gid2)"
+                           for leaf in _UNASSIGNED_OFFICIAL_LEAVES),
+                    reported, label)
+                # …and the falsifier really is gone afterwards, with the
+                # REAL grant on the refereed game intact.
+                self.assertEqual(
+                    [], self._admissions(self._family_status_matrix_over(
+                        who, fx, family, self._unentitled_cells(fx))), label)
+                self._assert_the_official_keeps_their_own_game(
+                    who, fx, family, label)
+                ran.append((label, self.UNREFEREED_CASE))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, [self.UNREFEREED_CASE])
+
+    def _assert_the_official_keeps_their_own_game(self, who, fx, family,
+                                                  label):
+        """NO OVER-REFUSAL: the assigned game's grant is untouched.
+
+        Widening a refusal rule is exactly how something real breaks, so the
+        official's own leaf-by-leaf answers on ``gid`` are re-measured here
+        against the two TYPED sets rather than assumed — and the three
+        sheet leaves are read for the private rows they are supposed to
+        carry, so "still 200" cannot mean "200 and empty"."""
+        admitted = (OFFICIAL_ASSIGNED_GAME_ROUTES
+                    | OFFICIAL_ADMITTED_BEYOND_THE_SHEET)
+        for name, spec in sorted(family.items()):
+            status, body = self._req(
+                who["official"], "GET", self._path_of(spec, (fx["gid"],)))
+            self.assertEqual(
+                200 if name in admitted else REFUSED, status,
+                f"[{label}] the assigned official's answer on {name} of the "
+                f"game they REFEREE moved to {status}. This round widens a "
+                f"refusal rule; the grant it narrows must survive it: {body}")
+            if name in OFFICIAL_ASSIGNED_GAME_ROUTES:
+                blob = json.dumps(body, sort_keys=True, default=str)
+                self.assertTrue(
+                    any(re.search(rf"\b{re.escape(pid)}\b", blob)
+                        for pid in self._submitted_side_ids(fx).get(
+                            (fx["gid"], fx["home"]), frozenset())),
+                    f"[{label}] the official is still admitted to {name} of "
+                    f"their own game but it no longer carries the submitted "
+                    f"lineup their grant IS, so 'the grant survives' would "
+                    f"be a statement about a status code alone: {body}")
+
+    def test_a_dead_assignment_row_does_not_create_a_grant(self):
+        """THE NEGATIVE SUBJECT DERIVATION INCLUDES DECLINED AND REVOKED
+        ROWS — the owner's second requirement for blocker 1.
+
+        Give the swept official a REAL assignment on the game they do not
+        referee, through the product's own ``assign_official``, and then
+        take it away two ways the product itself spells:
+
+        * DECLINED — ``respond_assignment(accept=False)``. The row SURVIVES
+          and still names this official and this game; only ``status``
+          moves, and ``OfficialAssignmentStatus.is_active`` is the product's
+          own statement that it now grants nothing.
+        * REVOKED — ``unassign_official``. The row is gone.
+
+        In both states the cell must STILL be derived as unentitled. A
+        derivation that merely asked "is there a row for this official and
+        this game" would lose the cell in the DECLINED state, and an
+        official the product records as having declined would be back
+        outside this matrix — which is the F2 shape one axis over.
+
+        AND THE POSITIVE HALF IS MEASURED IN THE SAME WORLD: while the
+        assignment is ACTIVE the cell is GONE, so this is a statement about
+        the assignment's state and not about a cell that never moves."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                family = self._private_game_family()
+                api = fx["api"]
+                self.assertIn(("official", "gid2"),
+                              self._unentitled_cells(fx), label)
+                row = api.assign_official(fx["gid2"], fx["official_id"],
+                                          "linesperson", actor_id=ADMIN)
+                self.assertNotIn("error", row, (label, row))
+                # THE POSITIVE HALF: an ACTIVE row really does remove the
+                # cell, so the two negatives below are about `status`.
+                self.assertNotIn(
+                    ("official", "gid2"), self._unentitled_cells(fx),
+                    f"[{label}] an ACTIVE assignment on the second game "
+                    f"leaves the cell unentitled, so this test cannot tell "
+                    f"a dead row from a live one")
+                for kind in ("declined", "revoked"):
+                    with self.subTest(backend=label, kind=kind):
+                        if kind == "declined":
+                            api.respond_assignment(
+                                row["id"], accept=False, actor_id=ADMIN)
+                            # READ BACK FROM THE STORE, so what is asserted
+                            # is the state the derivation itself reads.
+                            answered = api.store.get_official_assignment(
+                                row["id"])
+                            self.assertIsNotNone(
+                                answered,
+                                "respond_assignment deleted the row, so this "
+                                "is the REVOKED case again")
+                            self.assertEqual(
+                                (fx["official_id"], fx["gid2"]),
+                                (answered.official_id, answered.game_id),
+                                f"[{label}] the declined row no longer names "
+                                f"this official and this game, so 'the row "
+                                f"survives and only status moves' is false")
+                            self.assertFalse(
+                                answered.status.is_active,
+                                (label, answered.status))
+                        else:
+                            api.unassign_official(row["id"], actor_id=ADMIN)
+                            self.assertIsNone(
+                                api.store.get_official_assignment(row["id"]),
+                                label)
+                        self.assertIn(
+                            ("official", "gid2"),
+                            self._unentitled_cells(fx),
+                            f"[{label}] a {kind} assignment row still grants "
+                            f"the official the game it names, so the "
+                            f"negative subject derivation reads the row's "
+                            f"EXISTENCE rather than the product's own "
+                            f"statement of what it holds")
+                        # …and the PRODUCT agrees, over real authenticated
+                        # HTTP, on every leaf of that game.
+                        self.assertEqual(
+                            [], self._admissions(
+                                self._family_status_matrix_over(
+                                    who, fx, family, [("official", "gid2")])),
+                            f"[{label}] a {kind} official is ADMITTED to a "
+                            f"leaf of the private-game family")
+                # …and the game they DO referee is untouched throughout.
+                self._assert_the_official_keeps_their_own_game(
+                    who, fx, family, label)
+                ran.append((label, self.DEAD_ROW_CASE))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, [self.DEAD_ROW_CASE])
 
 
 # ---------------------------------------------------------------------------
