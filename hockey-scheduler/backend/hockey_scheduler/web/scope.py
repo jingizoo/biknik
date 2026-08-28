@@ -26,8 +26,16 @@ from ..services.subject_scope import own_team_id, player_team_id  # noqa: F401
 # four rounds of #427 were spent deleting — the ONE definition moved to
 # `services/game_side_scope.py` and is imported straight back out here, so
 # `can_read_private_game_data` below and every existing
-# `from .scope import game_scoped_own_team_id` caller are byte-for-byte
-# unchanged.
+# `from .scope import game_scoped_own_team_id` IMPORT still resolves.
+#
+# THE CALL SITES ARE NOT BYTE-FOR-BYTE UNCHANGED, AND THIS USED TO CLAIM
+# THEY WERE (#427 round 20). That was true of the MOVE and false from the
+# moment the projection landed: `game_scoped_own_team_id` stopped taking the
+# session mapping and now takes two immutable ids, so its arity changed and
+# every caller was rewritten. What the re-export preserves is the IMPORT,
+# not the call — see `services/game_side_scope`'s module docstring, which
+# carries the same correction, and the caller inventory that fails by name
+# if one of them ever hands this function a mapping again.
 from ..services.game_side_scope import (  # noqa: F401
     _player_team_for_game, game_scoped_own_team_id,
     resolve_private_game_read)

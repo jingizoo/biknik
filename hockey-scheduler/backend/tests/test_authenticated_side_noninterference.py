@@ -639,6 +639,7 @@ import re
 import sys
 import textwrap
 import time
+import types
 import typing
 import unittest
 from pathlib import Path
@@ -3236,6 +3237,33 @@ def _refuse_a_rebound_resolver_parameter(resolver, where):
 #: defect the convention exists to make visible, and it fails by name.
 PROJECTION_PREFIX = "scoped_"
 
+#: THE ONE DECORATOR THE ADMISSION RECORD MAY CARRY. Condition 11 refuses a
+#: decorator on a GATE outright because the carrier, the resolver and the
+#: helper carry none; the record genuinely is a decorated class — the
+#: decorator is what GENERATES the constructor condition 14 then requires
+#: nobody to have written by hand — so the allow-list is one entry long
+#: rather than empty. It is checked against the SOURCE and, separately,
+#: against the running class's own ``__dataclass_params__.frozen``.
+RECORD_DECORATOR = "dataclass(frozen=True)"
+
+#: …and the one a METHOD of it may carry. `side_ids` is a `@property`
+#: and there is no other shape a read-only derived field of this record
+#: needs, so the allow-list is again one entry rather than a walk into
+#: whatever a wrapper does.
+RECORD_METHOD_DECORATOR = "property"
+
+#: WHAT ``side_ids`` MAY ANSWER, pinned as an expression rather than trusted
+#: — the same judgement :data:`ADMISSION_AUTHORITIES` makes about a branch,
+#: made about the one derived field of the record. MEASURED: widening it to
+#: ``(home, home)`` leaves admission untouched (``admitted=False,
+#: own_team=None``) and relabels the AWAY side as HOME, which admits nobody
+#: on this tree and is therefore a COVERAGE escape rather than a disclosure —
+#: refused for the reason `_refuse_a_binding_the_fold_would_drop` is, because
+#: the derivation could not see it. Re-decide this pin rather than inheriting
+#: it.
+RECORD_SIDE_IDS = ("(None, None)",
+                   "(self.game.home_team_id, self.game.away_team_id)")
+
 #: The scope keys THE PRODUCT ITSELF accepts, unioned over every role —
 #: ``AccountService._ALLOWED_SCOPE_KEYS``, read rather than restated. A
 #: projection of a key no account can ever carry is refused: it would be a
@@ -3376,6 +3404,157 @@ def _refuse_a_carrier_the_product_does_not_call(carrier, where):
             f"whichever parameter the gate reads, so a gate that projects "
             f"out of an argument nobody passes would be audited about a "
             f"mapping that is not the caller's")
+
+
+@functools.lru_cache(maxsize=1)
+def _resolver_call_sites():
+    """``{module: (call node, …)}`` for EVERY call of the resolver in the
+    package — the inventory the owner's fourth requirement names, DERIVED by
+    walking the tree rather than kept as a list (#427 round 21).
+
+    THE SAME MACHINERY AS :func:`_carrier_call_sites` AND FOR THE SAME
+    REASON. A caller added tomorrow appears here the moment it is written; a
+    caller list somebody maintained would not, and "every caller is migrated"
+    would then be a statement about the callers somebody remembered.
+
+    CACHED for the reason that one is: this runs on every ``_audit()`` and
+    the product source does not change inside a run. It reads the PRODUCT's
+    files only — a mutated copy is never on disk, which is exactly what makes
+    a mutation unable to widen its own call sites."""
+    root = Path(inspect.getsourcefile(game_side_scope)).parent.parent
+    out = {}
+    for path in sorted(root.rglob("*.py")):
+        source = path.read_text()
+        if GATE_RESOLVER not in source:
+            continue
+        rel = path.relative_to(root.parent).as_posix()
+        for node in ast.walk(ast.parse(source)):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == GATE_RESOLVER):
+                out.setdefault(rel, []).append(node)
+    return {rel: tuple(nodes) for rel, nodes in out.items()}
+
+
+def _refuse_a_resolver_caller_that_still_passes_a_mapping(where):
+    """CONDITION 13: EVERY CALLER OF THE RESOLVER HANDS IT IDS (#427 round
+    21) — the owner's first and fourth requirements, in one derived walk.
+
+    THE RULING ASKS FOR TWO THINGS THAT ARE THE SAME QUESTION. "No
+    compatibility path still accepts the mutable mapping" and "every resolver
+    caller is migrated and inventoried" are both answered by reading what the
+    PRODUCT hands this function, everywhere it hands it anything.
+
+    CONDITION 8 ALREADY ASKS IT OF THE CARRIER, and only of the carrier: it
+    reads the delegating call inside :data:`GATE_CARRIER` and matches each
+    ``scoped_*`` slot against the carrier's own projection. The two FACADE
+    call sites are outside that walk entirely — ``ApiService`` does not go
+    through the carrier — so before this rule the facade could hand the
+    resolver a mapping, or a dict display, or somebody else's id, and nothing
+    in this file would have looked.
+
+    WHAT A MIGRATED CALL SITE LOOKS LIKE, positively and fail-closed. Every
+    ``scoped_<key>`` slot must hold one of exactly three shapes:
+
+    * a bare ``Name`` — the projected id, which is what the carrier passes;
+    * ``None`` — the slot the caller genuinely has no value for, which is
+      what ``ApiService.find_next_game_for_player`` passes for the team slot
+      of a Player-scoped resolution;
+    * ``<anything>.get("<that slot's own key>")`` — a projection taken AT the
+      call site, which is what the facade's two do, and which must read the
+      key its slot is named for.
+
+    A dict display, a subscript, a comprehension, a bare name that is not
+    named for the slot's own key, a call that is not ``.get`` of that key, or
+    ``.get`` with a default or a computed key is REFUSED. All of those are ways to put a mapping — or somebody else's id —
+    where an immutable scalar is supposed to be, and the refactor's whole
+    claim is that between the projection and the decision there is no mutable
+    object left.
+
+    A separate function so it has its own seam: removing it must redden
+    :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+    .test_every_resolver_caller_is_migrated_and_inventoried`."""
+    # THE SIGNATURE IS READ OFF DISK, exactly as `_carrier_call_sites` reads
+    # the call sites off disk and for the same reason. This rule's question is
+    # entirely about the PRODUCT — does anything the product ships hand the
+    # resolver a mapping — and a mutated copy the battery injects is not the
+    # product. Taking the signature from the mutated tree instead made this
+    # rule answer for a signature nobody ships: MEASURED, a resolver widened
+    # with a sixth `scoped_venue_id` parameter (condition 8's own falsifier)
+    # left `zip` aligning that slot against the real caller's `game` argument,
+    # and condition 8 was reported by nothing.
+    on_disk = ast.parse(
+        Path(inspect.getsourcefile(game_side_scope)).read_text())
+    parameters = _positional_parameters(
+        _gate_function(on_disk, GATE_RESOLVER, where), where)
+    sites = _resolver_call_sites()
+    if not sites:
+        raise AdmissionExtractionError(
+            f"nothing in the package CALLS {GATE_RESOLVER}, so 'every caller "
+            f"is migrated' is a statement about an empty set and this "
+            f"inventory would agree with any signature at all")
+    for rel, calls in sorted(sites.items()):
+        for call in calls:
+            if call.keywords or any(isinstance(a, ast.Starred)
+                                    for a in call.args):
+                raise AdmissionExtractionError(
+                    f"{rel} line {call.lineno}: {GATE_RESOLVER} is called as "
+                    f"{ast.unparse(call)!r} — not its parameters as plain "
+                    f"positional arguments, so which argument answers which "
+                    f"slot is a matching rule this inventory does not model")
+            # THIS RULE IS ABOUT THE ARGUMENTS AND NOT ABOUT THE ARITY, and
+            # that is a decision with a measurement behind it. An earlier
+            # draft refused a call whose length disagreed with the
+            # signature — and a resolver that GROWS a `scoped_*` parameter
+            # disagrees with every existing caller, which is precisely
+            # condition 8's own falsifier
+            # (`a_resolver_slot_no_projection_fills`). MEASURED: with the
+            # arity clause in, `_assert_only_this_rule_catches` reported
+            # "declares 6 parameter(s) … and this caller passes 5" and
+            # condition 8 was left measuring nothing. Arity is already
+            # answered where it belongs — condition 8 for a slot no
+            # projection fills, condition 10 for the carrier's own signature
+            # — so `zip` stops at the shorter of the two and this rule keeps
+            # only the question that is its own.
+            for parameter, argument in zip(parameters, call.args):
+                if not parameter.startswith(PROJECTION_PREFIX):
+                    continue
+                key = parameter[len(PROJECTION_PREFIX):]
+                # A BARE NAME MUST STILL BE NAMED FOR THE KEY, which is the
+                # same convention `_refuse_an_unprojected_slot` enforces
+                # inside the carrier, asked at the facade's call sites. WHY
+                # IT IS NOT ENOUGH TO ACCEPT ANY BARE NAME: `scope` is a bare
+                # name too, and a facade that reverted to
+                # `game_scoped_own_team_id(role, scope, …)` would be exactly
+                # the compatibility path requirement one forbids, passed in a
+                # shape a "must be an `ast.Name`" rule cannot tell from the
+                # projected id. Whether the object behind a name is a mapping
+                # is not decidable here; whether the name is the one this
+                # slot's key declares is.
+                if isinstance(argument, ast.Name) \
+                        and argument.id.endswith(key):
+                    continue
+                if isinstance(argument, ast.Constant) \
+                        and argument.value is None:
+                    continue
+                if (isinstance(argument, ast.Call)
+                        and isinstance(argument.func, ast.Attribute)
+                        and argument.func.attr == "get"
+                        and not argument.keywords
+                        and len(argument.args) == 1
+                        and isinstance(argument.args[0], ast.Constant)
+                        and argument.args[0].value == key):
+                    continue
+                raise AdmissionExtractionError(
+                    f"{rel} line {call.lineno}: {GATE_RESOLVER}'s "
+                    f"{parameter!r} slot is handed "
+                    f"{ast.unparse(argument)!r}. That slot takes the "
+                    f"SESSION'S OWN {key!r}, as an immutable scalar — a bare "
+                    f"name, `None`, or a `.get({key!r})` projected right "
+                    f"here. Anything else is a compatibility path for the "
+                    f"mutable mapping this boundary was refactored to stop "
+                    f"carrying, or somebody else's identifier in a slot every "
+                    f"pin would read the same text either way")
 
 
 def _projections(carrier, where):
@@ -3588,6 +3767,578 @@ def _poison(bindings, stmt):
     anything that reads it."""
     for name in _assigned_names(stmt):
         bindings[name] = UNRESOLVABLE
+
+
+# ---------------------------------------------------------------------------
+# ROUND 21: THE TWO PLACES CONDITIONS 8-10 DO NOT LOOK (#427, hardening the
+# round-20 boundary rather than redoing it).
+#
+# CONDITIONS 8, 9 AND 10 ARE ALL STATEMENTS ABOUT THE CARRIER'S BODY, and an
+# independent verification of `1998b5a` found that the undecidable question
+# had not been answered so much as RELOCATED into two places none of them
+# reads. Neither is in the body, so all three pass while the mapping is
+# reached anyway.
+#
+#   * THE FRAME. `_refuse_a_raw_scope_use` walks for `ast.Name` nodes whose
+#     `id` is the mapping parameter. `locals()["scope"]` has none —
+#
+#         _s = locals()["scope"]
+#         _t = _s.update({"team_id": "team_1"})
+#         scope = scope or {}          # the SAME object; the mutation landed
+#         scoped_team_id = scope.get("team_id")        # -> "team_1"
+#
+#     Five spellings of this, all measured LIVE over authenticated HTTP.
+#   * THE DECORATOR LIST. `_gate_function` returns the `FunctionDef` and read
+#     `decorator_list` NOWHERE, so a wrapper that mutates the session mapping
+#     before the audited body ever runs is outside everything conditions 8-10
+#     look at. Condition 10 is what makes this sting: it pins the carrier's
+#     SIGNATURE against its callers, and a wrapper preserves the signature
+#     exactly. Five spellings, four live — on the carrier, on the resolver,
+#     and on the player helper.
+#
+# BOTH ARE CLOSED THE SAME WAY, AND IT IS THE SHAPE THAT HAS WORKED HERE
+# BEFORE: a POSITIVE ALLOW-LIST, fail-closed on anything nobody listed,
+# rather than a blacklist of the spellings somebody thought of. Reaching a
+# frame is not enumerable by name — that is the whole lesson of the mapping —
+# so what is enumerated is what an authorization gate may LEGITIMATELY do,
+# and everything else is refused by name.
+#
+# THE COST, STATED. Conditions 11 and 12 make the audited functions a
+# NARROWER language than Python:
+#
+#   * a gate may call no builtin outside :data:`GATE_BUILTINS`, and that
+#     constant is measured against the real gate in BOTH directions
+#     (`test_the_gate_builtins_are_the_ones_the_gate_uses`), so it can
+#     neither grow silently nor go stale;
+#   * a gate may read no attribute whose name begins with an underscore and
+#     none of the frame/namespace-bearing names the interpreter itself
+#     declares;
+#   * a gate may carry no decorator at all.
+#
+# Each of those is a real restriction on future legitimate code — a gate that
+# one day needs `len`, a private attribute or `@functools.cache` will fail by
+# name and somebody will have to decide it deliberately. That is the trade
+# this axis has taken every round: a refusal that has to be argued past is
+# the point, and the alternative is a rule that reads only the spellings
+# already known.
+# ---------------------------------------------------------------------------
+
+#: THE ONLY BUILTINS AN AUDITED GATE MAY CALL. Not a blacklist of
+#: `locals`/`globals`/`vars`/`eval`/`exec` — those are refused because they
+#: are not in HERE, along with every other name the gate's own module does
+#: not bind, including the ones this Python does not have yet.
+#:
+#: MEASURED IN BOTH DIRECTIONS by
+#: :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+#: .test_the_gate_builtins_are_the_ones_the_gate_uses`: this is exactly the
+#: set of free names the real carrier, resolver and followed helpers use that
+#: their own modules do not bind. It cannot grow without a spelling to
+#: justify it, and it cannot go stale — if the OFFICIAL branch ever stops
+#: spelling its grant as `any(...)`, this constant has to shrink or the test
+#: reddens.
+GATE_BUILTINS = frozenset({"any"})
+
+#: The interpreter types whose attributes hand out a FRAME, a NAMESPACE or a
+#: code object. READ OFF THE RUNNING INTERPRETER, never listed: a Python that
+#: grows a new frame accessor is covered the day it ships, which a
+#: hand-written list of `f_locals`, `gi_frame`, `cr_frame` would not be. This
+#: is the same discipline `PRODUCT_SCOPE_KEYS` and `OPERATOR_ROLES` are held
+#: to — derive the axis from an authority outside the test.
+NAMESPACE_BEARING_TYPES = (
+    types.FrameType, types.GeneratorType, types.CoroutineType,
+    types.AsyncGeneratorType, types.TracebackType, types.FunctionType,
+    types.LambdaType, types.MethodType, types.ModuleType,
+    types.BuiltinFunctionType, types.MethodWrapperType, type, object)
+
+#: …and the attribute NAMES that follows from. Every dunder in it is already
+#: refused by condition 12's underscore clause; what this adds on top, and
+#: the only reason it exists, are the THIRTY-EIGHT public frame accessors —
+#: `f_locals`, `f_globals`, `f_back`, `gi_frame`, `cr_frame`, `ag_frame`,
+#: `tb_frame` and their neighbours — which carry no underscore and are the
+#: one remaining way to reach a namespace without naming it. MEASURED against
+#: the real gate: the intersection with every attribute the gate module and
+#: the followed helper module read is EMPTY.
+NAMESPACE_BEARING_ATTRS = frozenset(
+    name for kind in NAMESPACE_BEARING_TYPES for name in dir(kind))
+
+
+def _names_bound_in(fn):
+    """Every name ``fn`` binds ANYWHERE inside itself — parameters included.
+
+    DELIBERATELY OVER-COLLECTING, and in the safe direction. This answers
+    "which names in this function are NOT free", and the refusal it feeds is
+    about free names, so counting a name as bound when a stricter scope
+    analysis would not is a name this rule declines to talk about — never a
+    name it wrongly refuses. Under-collecting would redden the real gate;
+    over-collecting can only let a *bound* name through, and a bound name
+    cannot reach a namespace the gate was not handed.
+    """
+    bound = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name) and isinstance(node.ctx,
+                                                     (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, ast.arguments):
+            for arg in (list(node.posonlyargs) + list(node.args)
+                        + list(node.kwonlyargs)
+                        + [a for a in (node.vararg, node.kwarg) if a]):
+                bound.add(arg.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            bound.update((alias.asname or alias.name).split(".")[0]
+                         for alias in node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+    return bound
+
+
+def _names_bound_in_statement(stmt):
+    """Every name ONE module-level statement binds — a `def`, a `class`, an
+    `import`, an assignment or an annotated assignment.
+
+    Broader than :func:`_module_level_definitions` ON PURPOSE, and the two
+    are answering different questions: that one asks "may a pin leave this
+    name standing" (a constant's VALUE is part of the decision, so no), this
+    one asks "is this name bound by the module rather than resolved out of
+    builtins" (a constant is, so yes). See :func:`_refuse_a_namespace_reach`.
+    """
+    out = set()
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        out.add(stmt.name)
+    elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        out.update((alias.asname or alias.name).split(".")[0]
+                   for alias in stmt.names)
+    elif isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = (stmt.targets if isinstance(stmt, ast.Assign)
+                   else [stmt.target])
+        out.update(sub.id for target in targets for sub in ast.walk(target)
+                   if isinstance(sub, ast.Name))
+    return out
+
+
+def _refuse_a_namespace_reach(fn, tree, where):
+    """CONDITION 12: THE GATE MAY NOT REACH A BINDING WITHOUT NAMING IT (#427
+    round 21) — the frame, and the answer to CLASS 1 of the verification of
+    ``1998b5a``.
+
+    CONDITION 9 ASKS WHERE A NAME MAY APPEAR, which is exactly what makes it
+    sound about the mapping and exactly what leaves this open: a mention it
+    cannot see is a mention it does not police. FIVE SPELLINGS, all measured
+    live over authenticated HTTP tri-store::
+
+        _s = locals()["scope"]
+        _t = _s.update({"team_id": "team_1"})
+        scope = scope or {}                    # the same object
+        scoped_team_id = scope.get("team_id")  # "team_1"
+
+    ``locals()`` contains no ``ast.Name`` whose ``id`` is ``scope``, so
+    condition 9 has nothing to look at, and the projection that follows is
+    impeccable — it reads the mapping once, above every role branch, into
+    correctly named scalars. The value it reads is simply not the one the
+    session sent.
+
+    THREE CLAUSES, EACH POSITIVE, EACH FAIL-CLOSED.
+
+    * A FREE NAME must be one the gate's own module binds by definition
+      (:func:`_module_level_definitions`) or one of :data:`GATE_BUILTINS`.
+      ``locals``, ``globals``, ``vars``, ``eval``, ``exec``, ``compile``,
+      ``__import__``, ``getattr``, ``setattr``, ``dir``, ``super``,
+      ``object`` and every builtin a later Python adds are refused WITHOUT
+      BEING NAMED HERE, which is the whole difference between this and a
+      blacklist.
+    * AN ATTRIBUTE may not begin with an underscore. ``sys._getframe``,
+      ``__dict__``, ``__globals__``, ``__closure__``, ``__code__``,
+      ``__subclasses__`` and every other private or dunder reach go together,
+      and an authorization gate reading a private attribute of anything is a
+      shape somebody should have to argue for.
+    * AN ATTRIBUTE may not be one of :data:`NAMESPACE_BEARING_ATTRS`, the
+      names the RUNNING INTERPRETER declares on its frame, generator,
+      coroutine, traceback, function, method and module types. This clause
+      exists for the thirty-eight PUBLIC ones — ``f_locals``, ``f_globals``,
+      ``f_back``, ``gi_frame``, ``cr_frame``, ``ag_frame``, ``tb_frame`` —
+      which the underscore clause does not cover and which are the last way
+      to hold a namespace. ``(x for x in scope).gi_frame.f_locals`` is not a
+      call and names no builtin; it is refused here.
+
+    TOGETHER THEY CLOSE THE REACH RATHER THAN THE SPELLINGS. To touch a frame
+    a gate must either name a builtin it is not allowed to name, read a
+    private attribute it is not allowed to read, or read a public frame
+    accessor the interpreter itself declares. There is no fourth way in, and
+    a Python that grows one grows it into ``dir()`` of one of those types.
+
+    APPLIED TO EVERY MODULE-LEVEL FUNCTION OF THE GATE'S OWN MODULE, not only
+    to the three this file names, because a helper that launders the frame is
+    a helper the carrier may simply call::
+
+        def peek():                       # module level, audited by nothing
+            return sys._getframe(1).f_locals
+
+    …AND, SINCE ROUND 22, TO EVERY MODULE-LEVEL STATEMENT RATHER THAN EVERY
+    MODULE-LEVEL ``def``. That is a correction to THIS rule and not a new
+    axis: the sweep's own argument is "a helper that launders the frame is a
+    helper the carrier may simply call", and a helper is not obliged to be a
+    ``def``. Round 21 swept ``ast.FunctionDef``/``ast.AsyncFunctionDef`` and
+    nothing else, so a ``class`` and an assignment both went unread while the
+    ``def`` beside them was read — TWO LIVE ESCAPES, measured at the round-21
+    head with conditions 1-14 all in force, each ``_audit() == []`` and each
+    executed against the unmutated control's ``admitted=False,
+    own_team=None``::
+
+        class _Peek:                      # a module-level CLASS
+            @staticmethod
+            def at(depth):
+                return sys._getframe(depth).f_locals
+        # -> COACH of team_THIRD: admitted=True, own_team='team_HOME'
+
+        _PEEK = lambda depth: sys._getframe(depth).f_locals   # an ASSIGNMENT
+        # -> COACH of team_THIRD: admitted=True, own_team='team_HOME'
+
+    Both are the SAME reach the ``def`` spelling makes, relocated into a
+    statement kind the sweep did not enumerate — which is the hand-written
+    axis this file exists to stop trusting, committed by this file. The
+    ``class`` case is the one an independent verification named, on the
+    ground that :class:`PrivateGameRead` is the type the ruling's own
+    boundary hands over and condition 14 pins every keyword passed INTO it
+    while reading only its ``def``-shaped members; the ASSIGNMENT case is the
+    same inconsistency found by asking what else ``tree.body`` holds. So the
+    sweep now enumerates NOTHING: it reads every statement the module has.
+
+    WHAT THIS DOES NOT CLOSE, and it is the same bound the whole axis carries:
+    a module-level statement can still REBIND a name the audited body
+    legitimately holds to an object sourced anywhere, and no free-name or
+    attribute clause can see that — `c4_services_init_patches_after_import`
+    is that class from outside the file and it remains beyond every rule
+    here. This closes a reach the sweep already claimed to close, nothing
+    more.
+
+    A separate function so it has its own seam: removing it must redden
+    :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+    .test_a_gate_that_reaches_the_frame_is_refused`."""
+    # THE SUBJECT IS ANY STATEMENT, so the refusals name one. A `def`, a
+    # `class` and a method all carry a `name`; a module-level assignment or
+    # expression carries only its line, and saying which KIND of statement it
+    # is puts the reader on the text rather than on the rule.
+    what = (fn.name
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef))
+            else f"the module-level `{type(fn).__name__}`")
+    # EVERY MODULE-LEVEL BINDING, not `_module_level_definitions`. That
+    # function deliberately excludes a module-level ASSIGNMENT, and it is
+    # right to for the FOLD — what a constant HOLDS is part of what a callee
+    # decides, so letting its name stand in a pin would put back the defect
+    # round 15 removed. This is a different question: a module-level constant
+    # is a binding the module makes and cannot reach a frame, so refusing it
+    # here would refuse legitimate code while closing nothing. MEASURED: with
+    # `_module_level_definitions` used instead, this rule stole
+    # `test_a_call_the_pin_cannot_follow_is_refused_by_name`'s `_ALWAYS =
+    # True` falsifier from `_substituted`.
+    module_names = set()
+    for node in tree.body:
+        module_names.update(_names_bound_in_statement(node))
+    bound = _names_bound_in(fn)
+    # TWO KINDS OF SUBTREE ARE NOT WALKED, each for its own stated reason.
+    skip = set()
+    # DECORATORS, because conditions 11 and 14 are the rules that read them —
+    # condition 11 refuses one on a gate outright, condition 14 allows
+    # exactly `property` on the admission record's own methods. Walking them
+    # here would refuse `@property` for the name `property`, which the record
+    # legitimately needs, and would do it in the FREE-NAME rule's voice
+    # rather than in the decorator rule's. MEASURED: with decorators walked,
+    # `_audit()` on the REAL gate reported "side_ids evaluates the FREE NAME
+    # 'property'".
+    for node in ast.walk(fn):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)):
+            for decorator in node.decorator_list:
+                skip.update(id(sub) for sub in ast.walk(decorator))
+    # ANNOTATIONS, because they are NOT EVALUATED and so cannot reach
+    # anything. PEP 526 is explicit that a local variable annotation is not
+    # evaluated at runtime. Walking them would refuse `_t: object = …` for
+    # the name `object` while closing nothing — MEASURED, as the spelling
+    # `the_store_mutated_by_an_annotated_assignment` is
+    # `_refuse_a_mutated_input`'s falsifier and this rule took it away.
+    for node in ast.walk(fn):
+        annotations = []
+        if isinstance(node, ast.AnnAssign):
+            annotations.append(node.annotation)
+        elif isinstance(node, ast.arg) and node.annotation is not None:
+            annotations.append(node.annotation)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.returns is not None:
+            annotations.append(node.returns)
+        for annotation in annotations:
+            skip.update(id(sub) for sub in ast.walk(annotation))
+    for node in ast.walk(fn):
+        if id(node) in skip:
+            continue
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                raise AdmissionExtractionError(
+                    f"{where} line {node.lineno}: {what} reads the PRIVATE "
+                    f"attribute {node.attr!r} — "
+                    f"{ast.unparse(node)!r}. An authorization gate reads the "
+                    f"public surface of the values it was handed and nothing "
+                    f"else; a private or dunder attribute is how a namespace, "
+                    f"a frame, a code object or a closure is reached without "
+                    f"naming any of them, which is the one thing this "
+                    f"boundary's whole refactor exists to make impossible")
+            if node.attr in NAMESPACE_BEARING_ATTRS:
+                declared_on = ", ".join(sorted(
+                    kind.__name__ for kind in NAMESPACE_BEARING_TYPES
+                    if node.attr in dir(kind)))
+                raise AdmissionExtractionError(
+                    f"{where} line {node.lineno}: {what} reads "
+                    f"{node.attr!r} — {ast.unparse(node)!r} — which the "
+                    f"running interpreter declares on {declared_on}. "
+                    f"That is a FRAME, a namespace or a code object, and a "
+                    f"gate holding one can read and write the caller's own "
+                    f"session mapping without this file ever seeing the name "
+                    f"{GATE_CARRIER}'s signature gives it")
+            continue
+        if not isinstance(node, ast.Name) or not isinstance(node.ctx,
+                                                            ast.Load):
+            continue
+        if node.id in bound or node.id in module_names \
+                or node.id in GATE_BUILTINS:
+            continue
+        raise AdmissionExtractionError(
+            f"{where} line {node.lineno}: {what} evaluates the FREE NAME "
+            f"{node.id!r} — "
+            f"{ast.unparse(_statement_of(fn, node)).splitlines()[0]!r} — "
+            f"which is neither one of its own bindings, nor a definition "
+            f"its module makes, nor one of the builtins an authorization "
+            f"gate may use ({', '.join(sorted(GATE_BUILTINS))}). A name that "
+            f"resolves out of builtins is how the session mapping is reached "
+            f"without being named: `locals()[\"scope\"]` contains no "
+            f"`ast.Name` for condition 9 to see, and the projection that "
+            f"follows it is impeccable about a value the caller never sent")
+
+
+def _refuse_a_forged_admission_record(tree, record, where):
+    """CONDITION 14: THE RECORD A DECISION IS EXPRESSED IN IS THE PRODUCT'S
+    OWN (#427 round 21) — THE FOURTH ESCAPE CLASS, found by hunting this
+    round's own new rules and measured LIVE before it was closed.
+
+    EVERY RULE IN THIS FILE READS THE KEYWORDS OF
+    ``PrivateGameRead(role=…, game=…, own_team=…, admitted=…)`` and resolves
+    what each one evaluates to. NOT ONE OF THEM ASKS WHAT THE RECORD DOES
+    WITH THEM. The one-definition model that :func:`_gate_function` applies
+    to the carrier and the resolver — Python binds the LAST binding, so two
+    of them means the audited text and the running text may be different
+    objects — was never applied to the TYPE the decision is expressed in.
+    APPENDED AT MODULE LEVEL, after the real ``class``::
+
+        class _Always:
+            def __init__(self, role, game, own_team, admitted):
+                self.role = role
+                self.game = game
+                self.own_team = game.home_team_id if game else None
+                self.admitted = True
+            …
+
+        PrivateGameRead = _Always
+
+    MEASURED with conditions 1-14 all in force: ``_audit() == []``, and
+    EXECUTED, a COACH of ``team_THIRD`` — a team in NEITHER game — receives
+    ``admitted=True, own_team='team_HOME'`` where the unmutated gate answers
+    ``admitted=False, own_team=None``. The carrier's own text is untouched
+    and impeccable; every branch returns exactly what it returned before; the
+    record throws it away.
+
+    THAT MEASUREMENT IS ROUND 22'S, AND IT REPLACES A ROUND-21 ONE THAT WAS
+    NOT TRUE OF THE TEXT IT WAS ATTACHED TO. Round 21 pinned this spelling
+    with the forgery PREPENDED, above the real ``class`` — so
+    ``class _Always(PrivateGameRead)`` named a class that did not exist yet
+    and the injected module raised ``NameError`` on import, while
+    ``PrivateGameRead = _Always`` ran BEFORE the real ``class`` statement and
+    would have been overwritten by it regardless. The class of defect was
+    real; the pinned spelling could not demonstrate it. Executing every
+    injected source, rather than only compiling it, is what found that — see
+    :data:`FORGING_RECORD`.
+
+    A SECOND SPELLING IS THE SAME CLASS THROUGH THE PROPERTY. Widening
+    ``side_ids`` to ``(home, home)`` leaves admission correct and relabels
+    the AWAY side as HOME — measured ``admitted=False, own_team=None,
+    side_ids=('team_HOME', 'team_HOME')``. It admits nobody, so it is a
+    COVERAGE escape rather than a disclosure on this tree, and it is refused
+    for the reason :func:`_refuse_a_binding_the_fold_would_drop` is: the
+    derivation could not see the statement.
+
+    FIVE CLAUSES, and each is the same argument some earlier rule already
+    won:
+
+    * ONE module-level binding, and it is a ``class`` — :func:`_gate_function`'s
+      own argument, asked about the record instead of the gate. This is the
+      clause the live escape hits.
+    * NO BASE CLASSES, so what the fields mean is not decided in a parent
+      this walk never reads.
+    * NO ``__init__``, ``__new__`` or ``__post_init__``. A frozen dataclass's
+      constructor is GENERATED from its fields; one written by hand is a
+      place the four keywords can be discarded between the branch that
+      computes them and the record that carries them.
+    * EVERY DECORATOR IS ``dataclass(frozen=True)``, IN TEXT, AND THE
+      IMPORTED CLASS AGREES — ``__dataclass_params__.frozen`` read off the
+      real object. Text and object must say the same thing: a decorator the
+      source does not show is a wrapper, and a source that claims ``frozen``
+      about an unfrozen class is a record whose fields can be written after
+      the gate has decided.
+    * CONDITION 12 OVER ITS METHODS, so ``side_ids`` cannot reach a frame
+      either.
+
+    WHY A DECORATOR IS ALLOWED HERE AND REFUSED ON A GATE. Condition 11 can
+    demand ABSENCE because the carrier, the resolver and the helper carry
+    none. The record genuinely IS a decorated class — ``@dataclass`` is what
+    generates the constructor this rule then requires nobody to have written
+    — so absence is not available and the allow-list is one entry long
+    instead.
+
+    A separate function so it has its own seam: removing it must redden
+    :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+    .test_a_forged_admission_record_is_refused`."""
+    bindings = _module_bindings_of(tree, record)
+    if len(bindings) != 1 or not isinstance(bindings[0], ast.ClassDef):
+        raise AdmissionExtractionError(
+            f"{where}: {record!r} is bound {len(bindings)} time(s) at module "
+            f"level "
+            f"(line(s) {', '.join(str(n.lineno) for n in bindings) or 'none'})"
+            f" and this inventory needs exactly ONE `class`. Python keeps the "
+            f"LAST binding, and every rule in this file reads the KEYWORDS a "
+            f"branch hands {record} without ever asking what {record} does "
+            f"with them — so a second binding is a decision that is audited "
+            f"in one class and taken in another")
+    node = bindings[0]
+    if node.bases or node.keywords:
+        raise AdmissionExtractionError(
+            f"{where} line {node.lineno}: {record} is declared as "
+            f"{ast.unparse(node).splitlines()[0]!r} — it has a base class. "
+            f"What its four fields MEAN would then be decided partly in a "
+            f"parent this walk never reads, and the whole of what this axis "
+            f"knows about an admission is those four fields")
+    for statement in node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and statement.name in ("__init__", "__new__",
+                                       "__post_init__"):
+            raise AdmissionExtractionError(
+                f"{where} line {statement.lineno}: {record} defines "
+                f"{statement.name!r}. A frozen dataclass's constructor is "
+                f"GENERATED from its fields; one written by hand is the one "
+                f"place the four keywords a branch computes can be thrown "
+                f"away between the branch and the record that carries them, "
+                f"and no rule in this file looks at it")
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            method_decorators = [ast.unparse(d)
+                                 for d in statement.decorator_list]
+            if method_decorators != [RECORD_METHOD_DECORATOR]:
+                raise AdmissionExtractionError(
+                    f"{where} line {statement.lineno}: "
+                    f"{record}.{statement.name} is decorated with "
+                    f"{method_decorators} and this "
+                    f"inventory reads exactly [{RECORD_METHOD_DECORATOR!r}]. "
+                    f"Condition 12 deliberately does not walk a decorator — "
+                    f"conditions 11 and 14 are the rules about decorators — "
+                    f"so a wrapper here would be read by nothing at all")
+            _refuse_a_namespace_reach(statement, tree, where)
+            if statement.name == "side_ids":
+                # SORTED BY LINE, because `ast.walk` is breadth-first and
+                # says nothing about source order — an unordered pin would
+                # compare two orderings of the same two expressions and
+                # redden the real record.
+                answered = tuple(
+                    ast.unparse(sub.value) for sub in sorted(
+                        (n for n in ast.walk(statement)
+                         if isinstance(n, ast.Return) and n.value is not None),
+                        key=lambda n: n.lineno))
+                if answered != RECORD_SIDE_IDS:
+                    raise AdmissionExtractionError(
+                        f"{where} line {statement.lineno}: {record}.side_ids "
+                        f"now answers {list(answered)} and it was classified "
+                        f"against {list(RECORD_SIDE_IDS)}. This is the ONE "
+                        f"derived field of the record — the pair of sides "
+                        f"every consumer names a side from — and it is a "
+                        f"judgement about a specific expression, so re-decide "
+                        f"it rather than inheriting it")
+    spelled = [ast.unparse(d) for d in node.decorator_list]
+    if spelled != [RECORD_DECORATOR]:
+        raise AdmissionExtractionError(
+            f"{where} line {node.lineno}: {record} is decorated with "
+            f"{spelled} and this inventory reads exactly "
+            f"[{RECORD_DECORATOR!r}]. A decorator is not in the class body, "
+            f"so nothing else here looks at it, and one that returns a "
+            f"DIFFERENT class keeps the name, the fields and every keyword "
+            f"the branches pass while deciding admission for itself")
+    live = getattr(game_side_scope, record, None)
+    params = getattr(live, "__dataclass_params__", None)
+    if params is None or not params.frozen:
+        raise AdmissionExtractionError(
+            f"{where}: the running {record} is not a FROZEN dataclass "
+            f"({params!r}), so the source's {RECORD_DECORATOR!r} and the "
+            f"object the server actually returns disagree. A record whose "
+            f"fields can be written after the gate has decided is a decision "
+            f"nothing carries")
+
+
+def _refuse_a_decorated_gate(node, where):
+    """CONDITION 11: AN AUTHORIZATION GATE CARRIES NO DECORATOR (#427 round
+    21) — the answer to CLASS 2 of the verification of ``1998b5a``.
+
+    :func:`_gate_function` returned the ``FunctionDef`` and read
+    ``decorator_list`` NOWHERE. A decorator is not in the body, so conditions
+    8, 9 and 10 are all satisfied while a wrapper mutates the session mapping
+    before the audited body ever runs::
+
+        @_prime
+        def resolve_private_game_read(role, scope, game_id, store):
+            ...
+
+    Measured live over authenticated HTTP tri-store: a decorator on the
+    CARRIER (two spellings), a decorator that SWAPS the mapping for another,
+    a decorator on the RESOLVER, and one on the player helper — which
+    admitted nobody but moved 33 of 600 response bodies.
+
+    CONDITION 10 IS WHAT MAKES THIS STING RATHER THAN MERELY EXIST. That rule
+    pins the carrier's signature against the arguments its callers pass, and
+    a wrapper spelled `functools.wraps`-style preserves the signature
+    exactly, so the one rule that reads the gate's shape from OUTSIDE the
+    module agreed with the wrapper too.
+
+    ABSENT, NOT AUDITED — and that is a decision rather than an omission.
+    Auditing a decorator means following an arbitrary wrapper chain to decide
+    what the composed function does, which is the same undecidable question
+    the mapping posed and which four rounds could not be made sound about:
+    the decorator may be a name imported from another package, may be built
+    at import time, may itself be decorated. Requiring ABSENCE is decidable
+    from the ``def`` alone, it costs the product nothing today — the carrier,
+    the resolver and both followed helpers carry none — and the one thing a
+    gate might plausibly want a decorator for, memoisation, is precisely what
+    an authorization boundary must not have.
+
+    ASKED WHEREVER :func:`_gate_function` IS, which is the carrier, the
+    resolver AND every followed helper, because a wrapper on
+    ``_player_team_for_game`` decides the PLAYER grant just as completely.
+
+    A separate function so it has its own seam: removing it must redden
+    :meth:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority
+    .test_a_decorated_gate_is_refused`."""
+    if not node.decorator_list:
+        return
+    raise AdmissionExtractionError(
+        f"{where} line {node.lineno}: {node.name} is DECORATED with "
+        f"{', '.join(repr(ast.unparse(d)) for d in node.decorator_list)}. "
+        f"What runs under this name is then the WRAPPER, and every rule in "
+        f"this file reads the body underneath it — conditions 8, 9 and 10 "
+        f"are all statements about statements INSIDE the `def`, and a "
+        f"wrapper preserves the signature condition 10 pins, so a decorator "
+        f"that mutates the session mapping before the audited body runs is "
+        f"outside all three. A gate is audited by its own text or it is not "
+        f"audited")
 
 
 def _decisions(fn, aliases, constants, resolver_name=None):
@@ -3834,6 +4585,26 @@ def _gate_function(tree, name, where):
             f"{where} line {node.lineno}: {name!r} is bound by a "
             f"{type(node).__name__}, not by a `def`, so the decisions it "
             f"takes are not in this module's source at all")
+    # ROUND 21: THE THING A `def` CARRIES THAT ITS BODY DOES NOT (#427).
+    # Asked HERE rather than in `admission_branches` so that it is asked of
+    # every function this file ever calls a gate — the carrier, the resolver
+    # AND every helper `_followed_definition` follows into, which is the set
+    # `_gate_function` already is the single door to. A wrapper on the player
+    # helper decides the PLAYER grant as completely as one on the carrier
+    # decides admission.
+    #
+    # CONDITION 12 IS DELIBERATELY *NOT* ASKED HERE, and the reason is the
+    # ordering discipline `admission_branches` already states about
+    # conditions 6 and 7: the STATEMENT ALLOW-LIST is the primary guard and
+    # its refusal has to NAME THE STATEMENT KIND the gate grew. `with
+    # contextlib.nullcontext():`, `raise RuntimeError(...)`, `try/except
+    # Exception:` and `type _Alias = int` all contain a free name, so asking
+    # condition 12 before the walk reported "evaluates the FREE NAME
+    # 'contextlib'" where `test_an_unhandled_statement_kind_is_refused_
+    # naming_its_type` requires "a With statement". MEASURED: five of that
+    # test's fifteen templates lost their own answer that way. Condition 12
+    # is asked AFTER the walk instead — see `admission_branches`.
+    _refuse_a_decorated_gate(node, where)
     return node
 
 
@@ -4003,7 +4774,17 @@ def _followed_definition(name, tree, where):
     resolved = _module_bindings_of(sub_tree, name)
     if len(resolved) == 1 and isinstance(resolved[0], ast.ClassDef):
         return None
-    return _gate_function(sub_tree, name, sub_where), sub_tree, sub_where
+    followed = _gate_function(sub_tree, name, sub_where)
+    # CONDITION 12 ON A FOLLOWED CALLEE (#427 round 21). The sweep in
+    # `admission_branches` reads every module-level function of the GATE's own
+    # module; this is the same question asked of a helper in ANOTHER module —
+    # `subject_scope.assignment_grants_official_scope` is the OFFICIAL
+    # authority and is not in the gate module at all. Asked here rather than
+    # in `_gate_function` for the ordering reason stated there: the statement
+    # allow-list must keep its own answers about the CARRIER, and a followed
+    # callee is never where those templates land.
+    _refuse_a_namespace_reach(followed, sub_tree, sub_where)
+    return followed, sub_tree, sub_where
 
 
 def _bound_forward(node, name, value):
@@ -4412,7 +5193,41 @@ def admission_branches(source=None):
     _refuse_a_carrier_the_product_does_not_call(carrier, where)
     scope_param, projected = _projections(carrier, where)
     _refuse_a_raw_scope_use(carrier, scope_param, projected, where)
+    # ROUND 21, CONDITION 12 ACROSS THE WHOLE GATE MODULE (#427). Asked of the
+    # carrier and the resolver by `_gate_function` already; asked here of
+    # EVERY module-level function of the gate's own module, because a helper
+    # that launders the frame is a helper the carrier may simply call and
+    # `_followed_definition` only follows what a DECISION rests on:
+    #
+    #     def peek():                    # audited by nothing before this
+    #         return sys._getframe(1).f_locals
+    #
+    # ROUND 22: EVERY MODULE-LEVEL STATEMENT, NOT EVERY MODULE-LEVEL `def`.
+    # The line above used to read `isinstance(node, (ast.FunctionDef,
+    # ast.AsyncFunctionDef))`, which made this sweep the very thing this file
+    # keeps refusing to be: a HAND-ENUMERATED axis. The helper that launders
+    # the frame is under no obligation to be a `def`, and TWO SPELLINGS OF
+    # EXACTLY THAT WERE LIVE at the round-21 head with conditions 1-14 in
+    # force — a module-level `class` holding a `staticmethod`, and a
+    # module-level ASSIGNMENT holding a `lambda`. Both returned
+    # `_audit() == []`; both, executed, answered `admitted=True,
+    # own_team='team_HOME'` to a COACH of `team_THIRD`, a team in NEITHER
+    # game, against the unmutated control's `admitted=False, own_team=None`.
+    # The `class` half is the one an independent verification named — the
+    # record `PrivateGameRead` is the type this boundary hands over, and
+    # condition 14 pins every keyword passed INTO it while reading only its
+    # `def`-shaped members — and the ASSIGNMENT half is the same
+    # inconsistency, found by asking what else `tree.body` can hold.
+    #
+    # So the enumeration is gone rather than lengthened: a statement kind
+    # nobody thought of is READ, not skipped. That is the only direction this
+    # file is allowed to be wrong in, and it costs the real gate nothing —
+    # MEASURED, `_audit()` on the unmutated module is still `[]`, and its
+    # module level is a docstring, five imports and one decorated `class`.
+    for node in tree.body:
+        _refuse_a_namespace_reach(node, tree, where)
     record = game_side_scope.PrivateGameRead.__name__
+    _refuse_a_forged_admission_record(tree, record, where)
     out = {}
     for node, roles, delegated_calls, bindings in decisions:
         # WHAT THIS BRANCH HANDED THE RESOLVER, before anything else about
@@ -4508,6 +5323,16 @@ def admission_branches(source=None):
                 # 15), so a pin cannot be satisfied by a function name.
                 admits_source=ast.unparse(decides_admission),
                 side_source=ast.unparse(decides_side)))
+    # CONDITION 13 LAST, and the order is load-bearing for the same reason
+    # conditions 6 and 7 run after the branch walk: each rule owns the
+    # spellings its own falsifier pins. This one reads the RESOLVER'S
+    # SIGNATURE against its callers, so a mutation that WIDENS that signature
+    # disagrees with every call site — and condition 8's own falsifier,
+    # `a_resolver_slot_no_projection_fills`, is exactly such a mutation.
+    # MEASURED: run before the loop, this rule reported "declares 6
+    # parameter(s) … and this caller passes 5" and condition 8 was left
+    # measuring nothing.
+    _refuse_a_resolver_caller_that_still_passes_a_mapping(where)
     return {role: tuple(branches) for role, branches in sorted(out.items())}
 
 #: The roles whose authority over a game is LEAGUE-WIDE rather than earned by
@@ -12884,6 +13709,80 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
     #: game the caller asked about, fetched by the id the gate was handed.
     SUBJECT_FETCH = "    game = store.get_game(game_id)\n"
 
+    #: THE THREE `def` LINES ROUND 21'S CLASS-2 SPELLINGS DECORATE (#427).
+    #: A decorator cannot be spelled by editing a body, so these are anchored
+    #: on the signature itself — the carrier, the resolver and the followed
+    #: PLAYER helper, which is the whole set `_gate_function` is the door to.
+    CARRIER_DEF = ("def resolve_private_game_read(role, scope, game_id, "
+                   "store) -> PrivateGameRead:")
+    RESOLVER_DEF = ("def game_scoped_own_team_id(role, scoped_team_id, "
+                    "scoped_player_id, game,")
+    HELPER_DEF = "def _player_team_for_game(scoped_player_id, game, store):"
+
+    #: THE ADMISSION RECORD'S OWN `class` LINE and its ONE derived field —
+    #: what round 21's FOURTH CLASS is spelled against. Every rule in this
+    #: file reads the KEYWORDS a branch hands `PrivateGameRead`; these
+    #: spellings change what `PrivateGameRead` DOES with them.
+    RECORD_DEF = "@dataclass(frozen=True)\nclass PrivateGameRead:"
+    RECORD_SIDE_IDS_ANSWER = ("        return (self.game.home_team_id, "
+                              "self.game.away_team_id)")
+
+    #: A REPLACEMENT record that keeps the name, the fields and every keyword
+    #: while deciding admission for itself.
+    #: CORRECTED TWICE IN ROUND 22, and both corrections are about this
+    #: spelling being the thing it CLAIMS to be.
+    #:
+    #: IT IS APPENDED, NOT PREPENDED. Round 21 injected it through `prelude`,
+    #: which put `class _Always(PrivateGameRead)` ABOVE the real class — so
+    #: the name it subclasses did not exist yet and the module raised
+    #: `NameError: name 'PrivateGameRead' is not defined` on import, while
+    #: `PrivateGameRead = _Always` ran before the real `class` statement and
+    #: would have been overwritten by it in any case. MEASURED in round 22 by
+    #: executing the injected source: the text pinned here could not run at
+    #: all, so the "and executed, a COACH of a team in NEITHER game receives
+    #: admitted=True" claim attached to it was a claim about a DIFFERENT
+    #: text. It is a `suffix` now — a module-level append, the same mechanism
+    #: the sixth model's second carrier definition uses — which is the only
+    #: placement where "Python keeps the LAST binding" is what the rule says
+    #: it is. Re-measured in that placement, and the numbers in
+    #: :func:`_refuse_a_forged_admission_record` are from that run.
+    #:
+    #: IT NO LONGER READS `object.__setattr__`. That reached a dunder, and
+    #: round 22 widened condition 12's sweep to every module-level statement
+    #: — so condition 12 answered this first and condition 14 was left
+    #: measuring nothing, which :meth:`_assert_only_this_rule_catches`
+    #: reported. The dunder was incidental to the forgery in any case: what
+    #: this spelling is ABOUT is that the record the branches hand their four
+    #: keywords to is a DIFFERENT CLASS, and a plain unfrozen class expresses
+    #: exactly that without reaching anywhere. The overlap was removed rather
+    #: than recorded, because condition 14's live escape is the one that
+    #: needs a falsifier of its own.
+    FORGING_RECORD = (
+        "\n\nclass _Always:\n"
+        "    def __init__(self, role, game, own_team, admitted):\n"
+        "        self.role = role\n"
+        "        self.game = game\n"
+        "        self.own_team = game.home_team_id if game else None\n"
+        "        self.admitted = True\n\n"
+        "    @property\n"
+        "    def side_ids(self):\n"
+        "        if self.game is None:\n"
+        "            return (None, None)\n"
+        "        return (self.game.home_team_id, self.game.away_team_id)\n\n\n"
+        "PrivateGameRead = _Always\n")
+
+    #: …and the wrapper they carry: signature-preserving, so condition 10 —
+    #: the one rule that reads the gate's shape from OUTSIDE the module —
+    #: agrees with it, while the session mapping is HOME before the audited
+    #: body runs.
+    PRIMING_DECORATOR = (
+        'def _prime(fn):\n'
+        '    def wrapper(role, scope, game_id, store):\n'
+        '        scope.update(\n'
+        '            {"team_id": store.get_game(game_id).home_team_id})\n'
+        '        return fn(role, scope, game_id, store)\n'
+        '    return wrapper\n\n\n')
+
     #: …and the decision it then returns. Split from :data:`DELEGATION` so a
     #: mutation can move one without the other, which is the whole point of
     #: the fourth model: what the branch RESOLVES and what it RETURNS are two
@@ -13423,7 +14322,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                 f"therefore now exempt from carrying an authority — decide "
                 f"that deliberately")
 
-    # -- THE INJECTION: the derivation is real, in SIXTY-FOUR spellings
+    # -- THE INJECTION: the derivation is real, in EIGHTY-TWO spellings
     def _injected(self, *, anchor=None, replacement=None, prelude=None,
                   prelude2=None, suffix=None):
         source = self._gate_source()
@@ -13452,7 +14351,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         return source
 
     def _spellings(self):
-        """A new NON-ADMIN admission branch, spelled SIXTY-FOUR ways —
+        """A new NON-ADMIN admission branch, spelled EIGHTY-TWO ways —
         chosen to defeat a text matcher, which is what the query-parameter
         closure was tested against and what this axis has to survive too;
         since round 13, to defeat a walk that reads only the statement kinds
@@ -13463,11 +14362,17 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         vouched a NAME rather than a VALUE; and since round 19, to defeat
         the two ways the NAME can be identical while the VALUE is not — the
         object MUTATED before the call, and the RESOLVER'S OWN parameter
-        rebuilt after it; and since round 20, to defeat the mutation of a
+        rebuilt after it; since round 20, to defeat the mutation of a
         mapping that is no longer THERE to mutate — the boundary now
         projects the session scope into immutable ids before any role
         branch, so SIXTEEN more are spelled against the PROJECTION and
-        against the inputs the gate still receives whole.
+        against the inputs the gate still receives whole; and since round
+        21, to defeat the TWO PLACES CONDITIONS 8-10 DO NOT LOOK, which an
+        independent verification of that refactor found — THE FRAME (the
+        mapping reached with no ``ast.Name`` naming it) and THE DECORATOR
+        LIST (a wrapper outside the body every one of those rules reads) —
+        plus the owner's own two variants in the ruling's VERBATIM spelling
+        rather than in the approximation the previous round constructed.
 
         EVERY NUMBER HERE IS MEASURED off this dict, not remembered:
         :meth:`test_a_new_non_admin_admission_branch_fails_by_name` asserts
@@ -13909,7 +14814,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             # such parameter now. The seam condition 7 owns did NOT go away
             # with it — it moved onto the PROJECTED ID, which is the sharper
             # place for it: the carrier's projection is vouched at the call
-            # site by conditions 1, 2 and 9, and none of them follows the
+            # site by conditions 1, 2 and 8, and none of them follows the
             # value PAST the call into what the resolver then does to its own
             # slot. The resolver's pinned answer for COACH is the bare name
             # ``scoped_team_id``, which a rebinding one line above leaves
@@ -13957,7 +14862,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             "a_mutation_in_a_resolver_test_that_constrains_no_role":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.RESOLVER_FIRST_TEST,
-                              "    if store.__setattr__('_forced', True):\n"
+                              "    if store.clear_all_data():\n"
                               "        pass\n"
                               + self.RESOLVER_FIRST_TEST)),
             # ---- ROUND 19, THE TENTH, and the SECOND time hunting this
@@ -14000,7 +14905,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             "a_binding_the_fold_would_drop_in_the_player_helper":
                 dict(anchor=anchor, replacement=anchor, names="PLAYER",
                      prelude=(self.PLAYER_HELPER_GUARD,
-                              "    _t = store.__setattr__('_forced', True)\n"
+                              "    _t = store.clear_all_data()\n"
                               + self.PLAYER_HELPER_GUARD)),
             # ---- ROUND 20: THE THREE NAMED REGRESSIONS the owner's ruling
             # requires, and the falsifiers for the three rules the refactor
@@ -14125,7 +15030,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             "the_store_mutated_into_a_binding_nothing_reads":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.SUBJECT_FETCH,
-                              "    _t = store.__setattr__('_forced', True)\n"
+                              "    _t = store.clear_all_data()\n"
                               + self.SUBJECT_FETCH)),
             # THE ESCAPE THIS ROUND'S OWN HUNT FOUND, against the rules
             # this round itself wrote. A FIFTH REQUIRED PARAMETER, projected
@@ -14167,39 +15072,294 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             "the_store_subscripted_into_its_own_dict":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.SUBJECT_FETCH,
-                              "    store.__dict__['_forced'] = True\n"
+                              "    store.caches['forced'] = True\n"
                               + self.SUBJECT_FETCH)),
             "the_store_mutated_inside_a_list_display":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.SUBJECT_FETCH,
-                              "    _t = [store.__setattr__('_forced', True)]\n"
+                              "    _t = [store.clear_all_data()]\n"
                               + self.SUBJECT_FETCH)),
             "the_store_mutated_by_an_annotated_assignment":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.SUBJECT_FETCH,
-                              "    _t: object = store.__setattr__(\n"
-                              "        '_forced', True)\n"
+                              "    _t: object = store.clear_all_data(\n"
+                              "        )\n"
                               + self.SUBJECT_FETCH)),
             "a_store_mutation_in_a_test_that_constrains_no_role":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.SUBJECT_FETCH,
-                              "    if store.__setattr__('_forced', True):\n"
+                              "    if store.clear_all_data():\n"
                               "        pass\n" + self.SUBJECT_FETCH)),
             "a_store_mutation_live_through_a_field_that_collapses":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.SUBJECT_FETCH,
-                              "    _t = store.__setattr__('_forced', True)\n"
+                              "    _t = store.clear_all_data()\n"
                               "    if role is None:\n"
                               "        return PrivateGameRead(role=role, "
                               "game=_t, own_team=None,\n"
                               "                               "
                               "admitted=False)\n" + self.SUBJECT_FETCH)),
+            # ---- ROUND 21: THE TWO OWNER-GIVEN VARIANTS, VERBATIM (#427).
+            # The previous round did not have their spellings and CONSTRUCTED
+            # them from a description; the owner has now given both exactly,
+            # and one of the constructed pair turned out to be caught for an
+            # incidental reason. These two are the owner's own text,
+            # character for character, and they are kept SEPARATE from the
+            # constructed approximations above rather than replacing them —
+            # both are real hostile spellings and neither subsumes the other.
+            #
+            # REPRODUCED AT `73faf4d` BEFORE BEING PINNED HERE, which is what
+            # anchors them to a demonstrated escape rather than to a
+            # description: applied to that gate each compiles, each returns
+            # `_audit() == []`, and each, executed, turns a COACH of a team in
+            # NEITHER game into HOME —
+            #
+            #   variant 1: scope {'team_id': 'team_THIRD'} -> {'team_id':
+            #     'team_HOME'}; admitted=True, own_team='team_HOME'
+            #   variant 2: fromkeys sets EVERY key: {'team_id': 'team_HOME',
+            #     'player_id': 'team_HOME', 'official_id': 'team_HOME'};
+            #     admitted=True, own_team='team_HOME'
+            #
+            # — against the unmutated control's admitted=False, own_team=None.
+            #
+            # THE ALIAS RELOCATION. The owner's first variant: the mapping
+            # aliased, mutated through the alias, and the OFFICIAL branch's
+            # read ridden in on the `or` so the binding stays LIVE. Placed
+            # before the COACH/PLAYER branch, as the ruling directs.
+            "the_owners_alias_relocation_variant":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(anchor,
+                              '    alias = scope\n'
+                              '    official_id = (\n'
+                              '        alias.update({"team_id": '
+                              'game.home_team_id})\n'
+                              '        or scope.get("official_id")\n'
+                              '    )\n' + anchor)),
+            # THE LIVE `game` BINDING, in the owner's own spelling — and it
+            # is STRONGER than the approximation above it, which mutated one
+            # key with a dict display. `scope.fromkeys(scope, …)` builds a
+            # mapping over EVERY key the session carries and `update` writes
+            # all of them, so the Coach, the Player AND the Official slot all
+            # become HOME in one statement.
+            "the_owners_live_game_fromkeys_variant":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.SUBJECT_FETCH,
+                              '    game = (\n'
+                              '        scope.update(\n'
+                              '            scope.fromkeys(\n'
+                              '                scope,\n'
+                              '                store.get_game(game_id)'
+                              '.home_team_id,\n'
+                              '            )\n'
+                              '        )\n'
+                              '        or store.get_game(game_id)\n'
+                              '    )\n')),
+            # ---- ROUND 21, CLASS 1: THE MAPPING REACHED WITHOUT NAMING IT.
+            # `_refuse_a_raw_scope_use` walks for `ast.Name` nodes whose `id`
+            # is the mapping parameter, and NONE of these contains one. Every
+            # projection below them is impeccable — read once, above every
+            # role branch, into correctly named scalars — about a value the
+            # session never sent. Measured LIVE against `1998b5a`: the first
+            # of them turns `{'team_id': 'team_THIRD'}` into
+            # `{'team_id': 'team_HOME'}` and answers admitted=True,
+            # own_team='team_HOME'. Condition 12 is what answers them.
+            "the_mapping_reached_through_locals":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.NORMALISED_SCOPE,
+                              '    _s = locals()["scope"]\n'
+                              '    _t = _s.update({"team_id": "team_1"})\n'
+                              + self.NORMALISED_SCOPE)),
+            "the_mapping_reached_through_vars":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.NORMALISED_SCOPE,
+                              '    _t = vars()["scope"].update('
+                              '{"team_id": "team_1"})\n'
+                              + self.NORMALISED_SCOPE)),
+            "the_mapping_reached_through_eval":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.NORMALISED_SCOPE,
+                              '    _t = eval("scope").update('
+                              '{"team_id": "team_1"})\n'
+                              + self.NORMALISED_SCOPE)),
+            # …and the same reach through the FRAME rather than through a
+            # builtin that hands one over, which is why condition 12 has an
+            # attribute clause as well as a free-name one.
+            "the_mapping_reached_through_a_frame":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=("from dataclasses import dataclass",
+                              "import sys\n\nfrom dataclasses import "
+                              "dataclass"),
+                     prelude2=(self.NORMALISED_SCOPE,
+                               '    _t = sys._getframe().f_locals["scope"]'
+                               '.update(\n'
+                               '        {"team_id": "team_1"})\n'
+                               + self.NORMALISED_SCOPE)),
+            # A GENERATOR'S OWN FRAME — no call to a builtin at all, and no
+            # underscore anywhere, which is the one shape the free-name and
+            # private-attribute clauses BOTH miss. It is refused by the
+            # clause derived from the interpreter's own types.
+            "the_frame_reached_through_a_generators_gi_frame":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.NORMALISED_SCOPE,
+                              '    _t = (_x for _x in [scope]).gi_frame'
+                              '.f_locals\n'
+                              + self.NORMALISED_SCOPE)),
+            # THE CALLER'S OWN PROJECTED ID, reached the same way — so the
+            # spelling names NO input of the gate at all, not even through a
+            # builtin's result.
+            "the_projected_id_reached_through_locals":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(anchor,
+                              '    _t = locals()["scope"].update(\n'
+                              '        {"team_id": '
+                              'store.get_game(game_id).home_team_id})\n'
+                              + anchor)),
+            # AND ONE CALL DEEPER: the reach moved into a module-level helper
+            # the carrier merely calls, which is why condition 12 sweeps every
+            # module-level function of the gate's own module rather than only
+            # the three this file names.
+            "the_frame_laundered_through_a_module_level_helper":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=("from dataclasses import dataclass",
+                              "import sys\n\nfrom dataclasses import "
+                              "dataclass"),
+                     prelude2=(self.CARRIER_DEF,
+                               "def peek():\n"
+                               "    return sys._getframe(1).f_locals\n\n\n"
+                               + self.CARRIER_DEF)),
+            # ---- ROUND 22: THE SAME REACH IN A STATEMENT KIND THE SWEEP DID
+            # NOT ENUMERATE. The spelling above is refused because round 21's
+            # sweep read every module-level `def`. It read NOTHING ELSE — so
+            # the identical helper, written as a `class` or bound by an
+            # ASSIGNMENT, went unread while the `def` beside it was read. That
+            # is the hand-enumerated axis this file exists to distrust,
+            # committed by this file, and BOTH of these were live at the
+            # round-21 head with conditions 1-14 in force: `_audit() == []`,
+            # and executed, each answers `admitted=True, own_team='team_HOME'`
+            # to a COACH of `team_THIRD` — a team in NEITHER game — against
+            # the unmutated control's `admitted=False, own_team=None`, with
+            # the session mapping left holding `{'team_id': 'team_HOME'}` it
+            # never sent. Both are spelled DEFINE-AND-USE, so each is the
+            # shape that was measured rather than a definition nothing calls.
+            #
+            # THE `class` HALF is the one an independent verification named,
+            # and its argument is about this file's own consistency:
+            # `PrivateGameRead` is the type the ruling's boundary hands over,
+            # condition 14 pins every keyword passed INTO it, and a `class`
+            # was nonetheless the one module-level construct condition 12
+            # would not open. Condition 12 now reads every statement `tree`
+            # has, so neither this nor a statement kind nobody has thought of
+            # needs to be listed.
+            "the_frame_laundered_through_a_module_level_class":
+                dict(anchor=self.NORMALISED_SCOPE, names="COACH",
+                     replacement='    _t = _Peek.at(1)["scope"].update(\n'
+                                 '        {"team_id": "team_1"})\n'
+                                 + self.NORMALISED_SCOPE,
+                     prelude=("from dataclasses import dataclass",
+                              "import sys\n\nfrom dataclasses import "
+                              "dataclass"),
+                     prelude2=(self.CARRIER_DEF,
+                               "class _Peek:\n"
+                               "    @staticmethod\n"
+                               "    def at(depth):\n"
+                               "        return sys._getframe(depth).f_locals"
+                               "\n\n\n" + self.CARRIER_DEF)),
+            # THE ASSIGNMENT HALF — a `lambda` bound at module level, which is
+            # a `def` in every sense that matters here and in none that
+            # `isinstance(node, ast.FunctionDef)` could see.
+            "the_frame_laundered_through_a_module_level_lambda":
+                dict(anchor=self.NORMALISED_SCOPE, names="COACH",
+                     replacement='    _t = _PEEK(1)["scope"].update(\n'
+                                 '        {"team_id": "team_1"})\n'
+                                 + self.NORMALISED_SCOPE,
+                     prelude=("from dataclasses import dataclass",
+                              "import sys\n\nfrom dataclasses import "
+                              "dataclass"),
+                     prelude2=(self.CARRIER_DEF,
+                               "_PEEK = lambda depth: "
+                               "sys._getframe(depth).f_locals\n\n\n"
+                               + self.CARRIER_DEF)),
+            # ---- ROUND 21, CLASS 2: THE DECORATOR LIST. `_gate_function`
+            # returned the `FunctionDef` and read `decorator_list` nowhere, so
+            # every one of these satisfies conditions 8, 9 and 10 — including
+            # condition 10, which pins the SIGNATURE and which a wrapper
+            # preserves exactly. Measured LIVE against `1998b5a`: the carrier
+            # decorator answers admitted=True, own_team='team_HOME' to a Coach
+            # of a team in neither game.
+            "a_decorator_on_the_carrier":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.CARRIER_DEF,
+                              self.PRIMING_DECORATOR + "@_prime\n"
+                              + self.CARRIER_DEF)),
+            # THE SAME WRAPPER ON THE RESOLVER — the function the PLAYER and
+            # COACH authorities are pinned on.
+            "a_decorator_on_the_resolver":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.RESOLVER_DEF,
+                              self.PRIMING_DECORATOR + "@_prime\n"
+                              + self.RESOLVER_DEF)),
+            # …and on the PLAYER helper, which is followed by the fold and
+            # audited by `_gate_function` for exactly that reason.
+            "a_decorator_on_the_player_helper":
+                dict(anchor=anchor, replacement=anchor, names="PLAYER",
+                     prelude=(self.HELPER_DEF,
+                              self.PRIMING_DECORATOR + "@_prime\n"
+                              + self.HELPER_DEF)),
+            # A WRAPPER THAT SWAPS THE MAPPING RATHER THAN MUTATING IT, so
+            # not one statement of the audited body is touched and the object
+            # the body projects from is not the object the session sent.
+            # ---- ROUND 21, THE FOURTH CLASS: THE RECORD. Found by
+            # hunting this round's OWN new rules, and the first of the three
+            # is LIVE. Every rule in this file reads the KEYWORDS of the
+            # `PrivateGameRead(role=…, game=…, own_team=…, admitted=…)` a
+            # branch returns and resolves what each evaluates to; none asks
+            # what the RECORD does with them, and `_gate_function`'s
+            # one-definition model was never applied to it. MEASURED against
+            # this head with conditions 1-13 in force: `_audit() == []` and a
+            # Coach of a team in NEITHER game receives `admitted=True,
+            # own_team='team_HOME'`.
+            # APPENDED AT MODULE LEVEL, because "Python keeps the LAST
+            # binding" is only true of a binding that comes LAST — see
+            # :data:`FORGING_RECORD`, which round 21 prepended and which
+            # therefore could not import.
+            "the_admission_record_rebound_at_module_level":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     suffix=self.FORGING_RECORD),
+            # THE SAME CLASS THROUGH A DECORATOR, which is where class 2's
+            # argument lands on the record: a decorator is not in the class
+            # body, so nothing else here reads it.
+            "a_decorator_on_the_admission_record":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.RECORD_DEF,
+                              "def _forge(cls):\n"
+                              "    return cls\n\n\n@_forge\n"
+                              + self.RECORD_DEF)),
+            # …and through its ONE derived field. This one admits NOBODY —
+            # measured `admitted=False, own_team=None,
+            # side_ids=('team_HOME', 'team_HOME')` — so it is a COVERAGE
+            # escape, refused because the derivation could not see it, and
+            # its standing is stated rather than inflated.
+            "the_records_side_ids_widened_to_one_side":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.RECORD_SIDE_IDS_ANSWER,
+                              "        return (self.game.home_team_id, "
+                              "self.game.home_team_id)")),
+            "a_decorator_that_swaps_the_mapping":
+                dict(anchor=anchor, replacement=anchor, names="COACH",
+                     prelude=(self.CARRIER_DEF,
+                              'def _swap(fn):\n'
+                              '    def wrapper(role, scope, game_id, store):\n'
+                              '        return fn(role, {"team_id": '
+                              'store.get_game(game_id).home_team_id},\n'
+                              '                  game_id, store)\n'
+                              '    return wrapper\n\n\n@_swap\n'
+                              + self.CARRIER_DEF)),
         }
 
     def test_a_new_non_admin_admission_branch_fails_by_name(self):
         """THE PROOF THAT CONDITION 5 IS DERIVED AND NOT DECORATIVE.
 
-        SIXTY-FOUR spellings, each injected into a COPY of the gate's
+        EIGHTY-TWO spellings, each injected into a COPY of the gate's
         source, each required to produce a NAMED failure from the same audit
         that guards the real gate.
 
@@ -14321,6 +15481,36 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         it for a string literal in the ``game`` slot's resolved value. It is
         in the battery because this round changes exactly that machinery.
 
+        ROUND 21 ADDS SIXTEEN and RE-AIMS SEVEN. The THIRTEEN are the
+        owner's TWO named variants in their verbatim spelling, SEVEN against
+        THE FRAME and FOUR against THE DECORATOR LIST — the two places the
+        independent verification of the refactor found conditions 8-10 do
+        not look. TWO were driven LIVE against this head before the rules
+        existed: the ``locals()`` reach and the carrier decorator each turned
+        a Coach of a team in NEITHER game into ``admitted=True,
+        own_team='team_HOME'``, against the unmutated control's
+        ``admitted=False, own_team=None``.
+
+        AND THREE MORE ARE THE FOURTH CLASS, found by hunting round 21's
+        own new rules rather than handed over by anybody: THE RECORD. Every
+        rule here reads the KEYWORDS a branch hands ``PrivateGameRead`` and
+        none asks what that class DOES with them, so a second module-level
+        binding of the name — the one-definition model applied to the carrier
+        and the resolver but never to the record — admitted everybody with
+        ``_audit() == []``. Closed by condition 14.
+
+        THE SEVEN RE-AIMED are the ``store`` spellings, and the reason is the
+        overlap discipline this file already runs on rather than a retreat.
+        They were written as ``store.__setattr__('_forced', True)`` and
+        ``store.__dict__['_forced'] = True``, and condition 12 refuses a
+        PRIVATE ATTRIBUTE anywhere in a gate — so it answered every one of
+        them and conditions 5 and 6 were left measuring nothing. They now
+        spell the same mutation through the store's OWN PUBLIC API,
+        ``store.clear_all_data()``, which is a real and considerably more
+        destructive mutation of a real input. ``store = dict(store)`` moved
+        to ``store = RosterService(store)`` for the same reason: ``dict`` is
+        a builtin and condition 12 refuses one. Nothing was DELETED.
+
         The count is MEASURED: it is ``len(self._spellings())``, asserted
         below against the number this docstring states, and the loop runs
         every key of it.
@@ -14337,7 +15527,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         # fails HERE, naming both numbers, instead of leaving a remembered
         # figure standing in a docstring nobody re-reads.
         self.assertEqual(
-            64, len(self._spellings()),
+            82, len(self._spellings()),
             "the battery's size has moved and this test's docstring still "
             "states the old one; re-measure the prose rather than the "
             "number")
@@ -14358,6 +15548,61 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                         for f in failures),
                     f"{name!r} was reported, but not in a way that NAMES the "
                     f"branch it moved ({names}): {failures}")
+
+    def test_every_spelling_is_a_module_the_interpreter_accepts(self):
+        """EVERY SPELLING IN THE BATTERY IMPORTS — the difference between a
+        hostile gate and a string that merely parses (#427 round 22).
+
+        WHY THIS EXISTS, AND IT IS A DEFECT THIS FILE HAD. Everything else
+        about the battery is asked of TEXT: :meth:`_audit` parses each
+        injected source and every falsifier reads the refusal it produces. A
+        spelling that ``ast.parse`` accepts and the INTERPRETER rejects
+        therefore looked exactly like a spelling that was caught — the audit
+        reports it, the falsifier passes, and the thing being demonstrated
+        never happened.
+
+        MEASURED: at the round-21 head, ONE of the eighty-two was in exactly
+        that state. ``the_admission_record_rebound_at_module_level`` injected
+        ``class _Always(PrivateGameRead)`` ABOVE the real class, so the
+        module raised ``NameError: name 'PrivateGameRead' is not defined`` on
+        import — while the docstring beside it claimed the spelling had been
+        executed and had turned a Coach of a team in neither game into HOME.
+        The CLASS of defect was real and is still refused; the pinned TEXT
+        could not demonstrate it. It is a module-level append now and it does
+        run — see :data:`FORGING_RECORD`.
+
+        THIS DOES NOT ASK WHAT THE MUTATION DOES, only that the module the
+        battery is talking about is one Python will build. What each one does
+        when called is the business of the live measurements the individual
+        falsifiers cite, and those are not re-run here: this is the cheap
+        guard that keeps a spelling from quietly becoming a no-op, which is
+        the failure mode that actually occurred."""
+        source_file = Path(inspect.getsourcefile(game_side_scope))
+        spellings = self._spellings()
+        self.assertTrue(spellings)
+        for name in sorted(spellings):
+            with self.subTest(spelling=name):
+                module = types.ModuleType(f"_battery_{name}")
+                module.__file__ = str(source_file)
+                module.__name__ = game_side_scope.__name__
+                module.__package__ = game_side_scope.__package__
+                try:
+                    exec(compile(self._mutation_source(name),
+                                 str(source_file), "exec"), module.__dict__)
+                except Exception as error:  # noqa: BLE001 — the point is ANY
+                    self.fail(
+                        f"the spelling {name!r} does not IMPORT: "
+                        f"{type(error).__name__}: {error}. It parses, so "
+                        f"`_audit` reads it and whatever falsifier owns it "
+                        f"goes green — about a module Python would never "
+                        f"build. A spelling that cannot run demonstrates "
+                        f"nothing, and the refusal it earns is a refusal of "
+                        f"text nobody could have shipped")
+                self.assertTrue(
+                    callable(getattr(module, GATE_CARRIER, None)),
+                    f"the spelling {name!r} imports but leaves no callable "
+                    f"{GATE_CARRIER}, so the gate it is a mutation OF is not "
+                    f"there to be mutated")
 
     #: Statement kinds the walk does NOT handle, each wrapped around a body
     #: that admits a Guardian. The point is not that any of these is a
@@ -15155,7 +16400,8 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                  "built partly out of the literal"),
                 # A name that is not a parameter of this gate at all —
                 # round 16's PROVENANCE condition.
-                ("store = dict(store)\n", "which is built out of 'dict'"),
+                ("store = RosterService(store)\n",
+                  "which is built out of 'RosterService'"),
                 # …and the shapes that reach CONDITION 5: every leaf is the
                 # gate's own `store`, no literal anywhere, and the value is
                 # still something the gate BUILT.
@@ -15556,6 +16802,469 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                         remaining,
                         f"{spelling} is no longer answered by {rule}, which "
                         f"this pin says answers it first")
+
+    # -- ROUND 21: THE TWO PLACES CONDITIONS 8-10 DID NOT LOOK -------------
+
+    #: CLASS 2'S SPELLINGS, and the rule that must answer each ALONE.
+    DECORATOR_SPELLINGS = ("a_decorator_on_the_carrier",
+                           "a_decorator_on_the_resolver",
+                           "a_decorator_on_the_player_helper",
+                           "a_decorator_that_swaps_the_mapping")
+
+    #: CLASS 1'S SPELLINGS THAT CONDITION 12 ANSWERS ALONE — measured, not
+    #: assumed: with :func:`_refuse_a_namespace_reach` removed the audit goes
+    #: GREEN for each of these.
+    #: ``(spelling, the text its refusal must carry)``.
+    #:
+    #: THE SECOND ELEMENT IS THE OFFENDING CONSTRUCT AND THE SUBJECT THAT
+    #: HOLDS IT, and it is a pair rather than one shared string because of a
+    #: defect found in round 22: every one of these refusals ends "…without
+    #: this file ever seeing the name `resolve_private_game_read`'s signature
+    #: gives it", so a test that required the string
+    #: ``resolve_private_game_read`` was satisfied by the TAIL OF THE
+    #: SENTENCE and would have passed for a refusal naming the wrong function
+    #: entirely. Each entry now names what the reach was — ``'locals'``,
+    #: ``'f_locals'`` — and WHERE it was found, so a refusal that moves to
+    #: another subject reddens instead of being absorbed.
+    FRAME_ONLY_SPELLINGS = (
+        ("the_mapping_reached_through_locals",
+         "resolve_private_game_read evaluates the FREE NAME 'locals'"),
+        ("the_mapping_reached_through_vars",
+         "resolve_private_game_read evaluates the FREE NAME 'vars'"),
+        ("the_mapping_reached_through_eval",
+         "resolve_private_game_read evaluates the FREE NAME 'eval'"),
+        ("the_mapping_reached_through_a_frame",
+         "resolve_private_game_read reads 'f_locals'"),
+        ("the_frame_laundered_through_a_module_level_helper",
+         "peek reads 'f_locals'"),
+        # ROUND 22 — the same reach in the two module-level statement kinds
+        # round 21's sweep did not enumerate. The subject of each refusal is
+        # what proves the sweep opened the statement rather than the `def`
+        # beside it.
+        ("the_frame_laundered_through_a_module_level_class",
+         "_Peek reads 'f_locals'"),
+        ("the_frame_laundered_through_a_module_level_lambda",
+         "the module-level `Assign` reads 'f_locals'"),
+    )
+
+    #: …and the two it answers TOO but not ALONE, with the rule that also
+    #: answers each. Same discipline conditions 6 and 9 are held to: an
+    #: overlap is MEASURED and named, never hidden behind a weaker falsifier.
+    #: Both of these bind a local nothing reads, which is condition 6 by
+    #: construction, and one of them additionally names ``scope``, which is
+    #: condition 9's.
+    FRAME_ALSO_SPELLINGS = (
+        ("the_projected_id_reached_through_locals", "_refuse_a_mutated_input"),
+        ("the_frame_reached_through_a_generators_gi_frame",
+         "_refuse_a_mutated_input"),
+    )
+
+    #: THE OWNER'S OWN TWO VARIANTS, given verbatim in the ruling and pinned
+    #: by name so the report and the test agree on which two they are.
+    OWNER_NAMED_VARIANTS = ("the_owners_alias_relocation_variant",
+                            "the_owners_live_game_fromkeys_variant")
+
+    def test_a_decorated_gate_is_refused(self):
+        """CONDITION 11 — THE DECORATOR LIST, and the answer to CLASS 2 of
+        the independent verification of ``1998b5a`` (#427 round 21).
+
+        :func:`_gate_function` returned the ``FunctionDef`` and read
+        ``decorator_list`` NOWHERE. A decorator is not a statement of the
+        body, so conditions 8, 9 and 10 are ALL satisfied while a wrapper
+        mutates the session mapping before the audited body runs — and
+        condition 10 is the one that stings, because it pins the carrier's
+        SIGNATURE against its callers and a signature-preserving wrapper
+        agrees with it exactly.
+
+        MEASURED LIVE against this head before the rule existed: the carrier
+        spelling turns a Coach of a team in NEITHER game into
+        ``admitted=True, own_team='team_HOME'``, with the session mapping
+        left reading ``{'team_id': 'team_HOME'}`` — against the unmutated
+        control's ``admitted=False, own_team=None``.
+
+        FOUR SPELLINGS, on all three functions ``_gate_function`` is the door
+        to, and each refused ONLY by this rule."""
+        for spelling in self.DECORATOR_SPELLINGS:
+            with self.subTest(spelling=spelling):
+                self._assert_only_this_rule_catches(
+                    self._mutation_source(spelling),
+                    "_refuse_a_decorated_gate",
+                    lambda node, where: None,
+                    "is DECORATED with")
+
+    def test_a_gate_that_reaches_the_frame_is_refused(self):
+        """CONDITION 12 — THE FRAME, and the answer to CLASS 1 (#427 round
+        21).
+
+        Condition 9 asks WHERE THE NAME ``scope`` MAY APPEAR, which is what
+        makes it sound about the mapping and what leaves this wide open:
+        ``locals()["scope"]`` contains no ``ast.Name`` whose ``id`` is
+        ``scope``, so there is nothing for it to look at, and the projection
+        that follows is impeccable — taken once, above every role branch,
+        into correctly named scalars — about a value the session never sent.
+
+        MEASURED LIVE against this head before the rule existed: the
+        ``locals()`` spelling turns ``{'team_id': 'team_THIRD'}`` into
+        ``{'team_id': 'team_HOME'}`` and answers ``admitted=True,
+        own_team='team_HOME'``.
+
+        SEVEN SPELLINGS THIS RULE ANSWERS ALONE and TWO it answers as well as
+        another — the overlap measured and named rather than glossed, because
+        "refused" on its own would let a rule quietly stop mattering.
+
+        FIVE OF THE SEVEN NAME A LITERAL AND NOT A GATE INPUT, and that is
+        deliberate rather than incidental. A class-1 spelling written with
+        ``store.get_game(game_id).home_team_id`` names ``game_id``, which
+        :func:`_refuse_a_mutated_input` refuses on its own account — so it
+        would be REFUSED while measuring condition 6, and the two spellings
+        for which that is true are in :data:`FRAME_ALSO_SPELLINGS` below with
+        the rule that shares them named. The five here reach the frame and
+        write ``"team_1"``, so nothing but condition 12 has anything to see.
+
+        TWO OF THE SEVEN ARE ROUND 22'S, and they are the correction to this
+        rule's own sweep rather than a new question: round 21 read every
+        module-level ``def`` and nothing else, so the identical helper
+        written as a ``class`` or bound by an ASSIGNMENT was unread. Both
+        were live at that head — ``_audit() == []``, and executed, each
+        answers ``admitted=True, own_team='team_HOME'`` to a COACH of
+        ``team_THIRD``, a team in NEITHER game, against the unmutated
+        control's ``admitted=False, own_team=None``."""
+        for spelling, named in self.FRAME_ONLY_SPELLINGS:
+            with self.subTest(spelling=spelling):
+                self._assert_only_this_rule_catches(
+                    self._mutation_source(spelling),
+                    "_refuse_a_namespace_reach",
+                    lambda fn, tree, where: None, named)
+        for spelling, other in self.FRAME_ALSO_SPELLINGS:
+            with self.subTest(spelling=spelling, also=other):
+                source = self._mutation_source(spelling)
+                self.assertTrue(self._audit(source), spelling)
+                with self._without("_refuse_a_namespace_reach",
+                                   lambda fn, tree, where: None):
+                    remaining = self._audit(source)
+                self.assertTrue(
+                    remaining,
+                    f"{spelling} is answered ONLY by condition 12, so it "
+                    f"belongs in FRAME_ONLY_SPELLINGS")
+                with self._without(other, lambda *a, **k: None):
+                    without_other = self._audit(source)
+                self.assertTrue(
+                    without_other,
+                    f"{spelling} is no longer answered by {other}, which "
+                    f"this pin says also answers it")
+
+    def test_the_gate_builtins_are_the_ones_the_gate_uses(self):
+        """:data:`GATE_BUILTINS` IS MEASURED IN BOTH DIRECTIONS, so the one
+        hand-written half of condition 12 cannot grow silently or go stale.
+
+        The rule refuses every free name the gate's own module does not bind
+        EXCEPT the names in that constant. A constant somebody kept is
+        exactly what this file's method refuses everywhere else, so it is
+        pinned here against the set the REAL audited functions actually
+        need: add a builtin and this test reddens until a spelling justifies
+        it; stop using ``any`` and it reddens until the constant shrinks."""
+        used = set()
+        for module in (game_side_scope, subject_scope):
+            where = Path(inspect.getsourcefile(module))
+            tree = ast.parse(where.read_text())
+            module_names = _module_level_definitions(tree)
+            for node in tree.body:
+                if not isinstance(node, (ast.FunctionDef,
+                                         ast.AsyncFunctionDef)):
+                    continue
+                bound = _names_bound_in(node)
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Name) \
+                            and isinstance(sub.ctx, ast.Load) \
+                            and sub.id not in bound \
+                            and sub.id not in module_names:
+                        used.add(sub.id)
+        self.assertEqual(
+            GATE_BUILTINS, used,
+            "GATE_BUILTINS is not the set of free names the real gate uses. "
+            "It is the ONE allow-list condition 12 carries and it is pinned "
+            "in both directions on purpose: widening it is a decision, and a "
+            "name in it that the gate no longer uses is a hole nothing "
+            "closes")
+
+    def test_the_namespace_attributes_are_the_interpreters_own(self):
+        """CONDITION 12'S ATTRIBUTE CLAUSE IS DERIVED, not listed — and the
+        thing it derives is disjoint from what the gate legitimately reads.
+
+        A hand-written ``{"f_locals", "gi_frame", …}`` would be stale the day
+        a Python grows another frame accessor, which is the failure mode this
+        whole file is organised against. :data:`NAMESPACE_BEARING_ATTRS` is
+        ``dir()`` of the interpreter's OWN frame, generator, coroutine,
+        traceback, function, method, module and type objects, so a new
+        accessor is covered the day it ships.
+
+        BOTH HALVES MATTER. That it CONTAINS the frame accessors is what
+        makes the clause bite; that it is DISJOINT from every attribute the
+        gate module and the followed helper module read is what makes it safe
+        to apply — measured here, not assumed."""
+        for accessor in ("f_locals", "f_globals", "f_back", "gi_frame",
+                         "cr_frame", "tb_frame", "__dict__", "__globals__"):
+            self.assertIn(accessor, NAMESPACE_BEARING_ATTRS, accessor)
+        read = set()
+        for module in (game_side_scope, subject_scope):
+            tree = ast.parse(Path(inspect.getsourcefile(module)).read_text())
+            read.update(node.attr for node in ast.walk(tree)
+                        if isinstance(node, ast.Attribute))
+        self.assertEqual(
+            set(), read & NAMESPACE_BEARING_ATTRS,
+            "the gate reads an attribute the interpreter declares on a "
+            "frame-bearing type, so condition 12's attribute clause and the "
+            "real gate disagree")
+        self.assertEqual(
+            set(), {a for a in read if a.startswith("_")},
+            "the gate reads a private attribute, so condition 12's "
+            "underscore clause and the real gate disagree")
+
+    def test_the_owner_named_variants_are_refused_by_name(self):
+        """THE OWNER'S TWO VARIANTS, VERBATIM, AND THE RULE THAT ANSWERS EACH
+        (#427 round 21).
+
+        The previous round did not have their spellings and constructed them
+        from a description; one of the constructed pair turned out to have
+        been caught for an incidental reason. These are the ruling's own
+        text, character for character.
+
+        REPRODUCED AT ``73faf4d`` FIRST, which is what anchors them to a
+        demonstrated escape rather than to a description. Applied to that
+        gate each compiles, each returns ``_audit() == []``, and each,
+        executed against a Coach of a team in NEITHER game, answers
+        ``admitted=True, own_team='team_HOME'`` — variant 1 rewriting
+        ``{'team_id': 'team_THIRD'}`` to ``{'team_id': 'team_HOME'}``, and
+        variant 2's ``fromkeys`` rewriting EVERY key the session carries —
+        against the unmutated control's ``admitted=False, own_team=None``.
+
+        AT THIS HEAD BOTH FAIL BY NAME, and which rule answers each is
+        MEASURED rather than asserted, because the whole reason the owner
+        gave the spellings is that one of last round's was caught
+        incidentally:
+
+        * VARIANT 2 is refused by condition 9 ALONE — remove
+          :func:`_refuse_a_raw_scope_use` and it goes green.
+        * VARIANT 1 is refused by condition 6 FIRST and by condition 9 TOO,
+          independently: remove either and it is still red; remove BOTH and
+          it goes green. Both halves are driven below."""
+        variant_2 = self._mutation_source(
+            "the_owners_live_game_fromkeys_variant")
+        self._assert_only_this_rule_catches(
+            variant_2, "_refuse_a_raw_scope_use",
+            lambda carrier, base, projected, where: None,
+            "uses the RAW session mapping")
+        variant_1 = self._mutation_source("the_owners_alias_relocation_variant")
+        self.assertTrue(self._audit(variant_1))
+        for rule, replacement, expected in (
+                ("_refuse_a_mutated_input",
+                 lambda fn, where, what: None,
+                 "uses the RAW session mapping"),
+                ("_refuse_a_raw_scope_use",
+                 lambda carrier, base, projected, where: None,
+                 "in a position this derivation does not read")):
+            with self.subTest(rule=rule):
+                with self._without(rule, replacement):
+                    remaining = self._audit(variant_1)
+                self.assertTrue(
+                    any(expected in f for f in remaining),
+                    f"with {rule} removed the owner's first variant is no "
+                    f"longer refused naming {expected!r}: {remaining}")
+        with self._without("_refuse_a_mutated_input",
+                           lambda fn, where, what: None):
+            with self._without("_refuse_a_raw_scope_use",
+                               lambda carrier, base, projected, where: None):
+                blind = self._audit(variant_1)
+        self.assertEqual(
+            [], blind,
+            "the owner's first variant is still reported with BOTH the "
+            "rules this test names removed, so it is being caught by "
+            "something neither of them: " + str(blind))
+
+    def test_every_resolver_caller_is_migrated_and_inventoried(self):
+        """THE RULING'S FIRST AND FOURTH REQUIREMENTS — no compatibility path
+        still accepts the mutable mapping, and every resolver caller is
+        migrated and INVENTORIED (#427 round 21, condition 13).
+
+        THE INVENTORY IS DERIVED. :func:`_resolver_call_sites` walks the
+        package; nothing here lists a caller. A caller added tomorrow is in
+        it the moment it is written, and if it hands the resolver anything
+        but an immutable scalar the audit refuses it BY NAME — which is the
+        difference between "every caller is migrated" and "every caller
+        somebody remembered is migrated".
+
+        WHAT IS MEASURED HERE is that the inventory is non-empty, that it
+        covers the modules the product actually resolves a side in, and that
+        the shapes are the three the rule allows. The falsifier is a caller
+        put back on the mapping."""
+        sites = _resolver_call_sites()
+        self.assertEqual(
+            {"hockey_scheduler/api/service.py",
+             "hockey_scheduler/services/game_side_scope.py"},
+            set(sites),
+            "the set of MODULES calling the resolver has moved; a new "
+            "caller is a new place a side is resolved and it has to be "
+            "decided rather than inherited")
+        self.assertEqual(
+            3, sum(len(calls) for calls in sites.values()),
+            "the number of resolver call sites has moved")
+        # …and the audit itself is what says they are migrated.
+        self.assertEqual([], self._audit())
+        # THE FALSIFIER: a caller handed the mapping again.
+        for spelling, expected in (
+                ('game_scoped_own_team_id(\n'
+                 '                role, scope, scope.get("player_id"), '
+                 'next_game, self.store)',
+                 "is handed 'scope'"),
+                ('game_scoped_own_team_id(\n'
+                 '                Role.PLAYER, {"team_id": player_id}, '
+                 'player_id, next_game,\n'
+                 '                self.store)',
+                 "slot is handed"),
+        ):
+            with self.subTest(spelling=spelling[:40]):
+                with mock.patch.object(
+                        sys.modules[__name__], "_resolver_call_sites",
+                        lambda: {"hockey_scheduler/api/service.py": tuple(
+                            n for n in ast.walk(ast.parse(spelling))
+                            if isinstance(n, ast.Call)
+                            and isinstance(n.func, ast.Name)
+                            and n.func.id == GATE_RESOLVER)}):
+                    with self.assertRaises(AdmissionExtractionError) as caught:
+                        _refuse_a_resolver_caller_that_still_passes_a_mapping(
+                            "gate")
+                self.assertIn(expected, str(caught.exception))
+
+    def test_the_projection_is_single_assignment_and_passed_unchanged(self):
+        """THE RULING'S SECOND AND THIRD REQUIREMENTS, MEASURED (#427 round
+        21).
+
+        * RAW ``scope`` HAS EXACTLY ONE AUDITED PROJECTION USE, no aliases,
+          no later reads. Condition 9 is the rule; what is measured here is
+          the COUNT, so a fourth mention cannot appear without this test
+          naming it even if some future allow-list would tolerate it.
+        * THE PROJECTED IDS ARE SINGLE-ASSIGNMENT AND PASSED UNCHANGED. Each
+          is written exactly once, at the carrier's top level, above every
+          role branch; each reaches the resolver as the BARE NAME it was
+          bound to, in the slot its own key names.
+
+        MEASURED ON THIS HEAD: three projections, and the name ``scope``
+        appears FIVE times in the whole carrier — twice in its normalisation
+        ``scope = scope or {}`` and three times as the base of a
+        projection — and nowhere else."""
+        tree = ast.parse(self._gate_source())
+        carrier = _gate_function(tree, GATE_CARRIER, "gate")
+        base, projected = _projections(carrier, "gate")
+        self.assertEqual("scope", base)
+        self.assertEqual(3, len(projected))
+        mentions = [node for node in ast.walk(carrier)
+                    if isinstance(node, ast.Name) and node.id == base]
+        self.assertEqual(
+            5, len(mentions),
+            f"the raw mapping is named {len(mentions)} times in "
+            f"{GATE_CARRIER} and this head measures five — two in its own "
+            f"normalisation and three projection bases. Condition 9 says "
+            f"WHERE a mention may be; this says HOW MANY there are")
+        # SINGLE ASSIGNMENT, and at the top level: `_projections` has already
+        # refused a projection below a role branch, so what is left to
+        # measure is that nothing writes the name a second time anywhere.
+        for name in projected:
+            writes = [node for node in ast.walk(carrier)
+                      if isinstance(node, ast.Name)
+                      and node.id == name
+                      and isinstance(node.ctx, (ast.Store, ast.Del))]
+            self.assertEqual(
+                1, len(writes),
+                f"{name!r} is written {len(writes)} times in {GATE_CARRIER}; "
+                f"a projected id is assigned once and propagated unchanged")
+        # PASSED UNCHANGED: every projected slot of the delegating call holds
+        # the bare name its own key is projected into.
+        resolver = _gate_function(tree, GATE_RESOLVER, "gate")
+        parameters = _positional_parameters(resolver, "gate")
+        calls = [node for node in ast.walk(carrier)
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name)
+                 and node.func.id == GATE_RESOLVER]
+        self.assertEqual(1, len(calls), "the carrier delegates exactly once")
+        filled = 0
+        for parameter, argument in zip(parameters, calls[0].args):
+            if not parameter.startswith(PROJECTION_PREFIX):
+                continue
+            filled += 1
+            self.assertIsInstance(argument, ast.Name)
+            self.assertEqual(parameter, argument.id)
+            self.assertEqual(parameter[len(PROJECTION_PREFIX):],
+                             projected[argument.id][0])
+        self.assertEqual(2, filled,
+                         "the resolver's projected slots have moved")
+
+    #: THE FOURTH CLASS'S SPELLINGS and the rule that must answer each
+    #: ALONE — measured, not assumed.
+    RECORD_SPELLINGS = (
+        ("the_admission_record_rebound_at_module_level",
+         "and this inventory needs exactly ONE `class`"),
+        ("a_decorator_on_the_admission_record", "is decorated with"),
+        ("the_records_side_ids_widened_to_one_side", "now answers"),
+    )
+
+    def test_a_forged_admission_record_is_refused(self):
+        """CONDITION 14 — THE RECORD, and the FOURTH ESCAPE CLASS this round
+        found by hunting its OWN new rules (#427 round 21).
+
+        Conditions 1-13 all read the KEYWORDS of the
+        ``PrivateGameRead(role=…, game=…, own_team=…, admitted=…)`` a branch
+        returns, and resolve what each of them evaluates to. NOT ONE OF THEM
+        ASKS WHAT THE RECORD DOES WITH THEM — and :func:`_gate_function`'s
+        one-definition model, which exists precisely because Python binds the
+        LAST binding, was applied to the carrier and to the resolver and
+        never to the type every decision is expressed in.
+
+        MEASURED against this head with conditions 1-13 in force:
+        ``PrivateGameRead = _Always`` after the class returned
+        ``_audit() == []``, and executed, a COACH of a team in NEITHER game
+        received ``admitted=True, own_team='team_HOME'`` where the unmutated
+        gate answers ``admitted=False, own_team=None``. The carrier's text is
+        untouched; the record throws the decision away.
+
+        THREE SPELLINGS, each refused ONLY by this rule. Their standings
+        differ and are stated: the rebind is a LIVE admission, the decorator
+        is the same class through the one place a class body does not reach,
+        and the widened ``side_ids`` admits NOBODY — ``admitted=False,
+        own_team=None, side_ids=('team_HOME', 'team_HOME')`` — so it is a
+        coverage escape, refused because the derivation could not see it."""
+        for spelling, expected in self.RECORD_SPELLINGS:
+            with self.subTest(spelling=spelling):
+                self._assert_only_this_rule_catches(
+                    self._mutation_source(spelling),
+                    "_refuse_a_forged_admission_record",
+                    lambda tree, record, where: None,
+                    expected)
+
+    def test_the_record_is_the_frozen_dataclass_the_source_shows(self):
+        """CONDITION 14'S OTHER HALF: the SOURCE and the RUNNING OBJECT agree.
+
+        The text check alone would bless a source that says
+        ``@dataclass(frozen=True)`` about a class the interpreter did not
+        freeze; the object check alone would bless a wrapper that returns a
+        frozen class of its own. Both are asserted, and the record's FIELDS
+        are measured here too — the four this whole axis is about — so a
+        field added, removed or renamed fails by name instead of quietly
+        widening what a decision can carry."""
+        record = game_side_scope.PrivateGameRead
+        self.assertTrue(record.__dataclass_params__.frozen)
+        self.assertEqual(
+            ["role", "game", "own_team", "admitted"],
+            [f.name for f in dataclasses.fields(record)],
+            "the admission record's fields have moved; ADMISSION_FIELDS and "
+            "every rule that reads the four keywords are about these")
+        self.assertEqual(frozenset(ADMISSION_FIELDS),
+                         frozenset(f.name for f in dataclasses.fields(record)))
+        tree = ast.parse(self._gate_source())
+        bindings = _module_bindings_of(tree, record.__name__)
+        self.assertEqual(1, len(bindings))
+        self.assertEqual([RECORD_DECORATOR],
+                         [ast.unparse(d) for d in bindings[0].decorator_list])
+        self.assertEqual([], bindings[0].bases)
 
     def test_a_gate_signature_no_caller_uses_is_refused(self):
         """THE ESCAPE THIS ROUND'S OWN HUNT FOUND, against the rules this

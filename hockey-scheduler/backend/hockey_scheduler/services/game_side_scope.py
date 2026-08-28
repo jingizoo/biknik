@@ -15,8 +15,21 @@ The alternative was a second copy of "which team does this caller act for"
 in the facade. Four rounds of this blocker were spent deleting exactly that
 shape, so the function MOVED rather than being duplicated:
 ``web/scope.py`` imports both names straight back out of here, so every
-existing ``from .scope import game_scoped_own_team_id`` caller is unchanged
-and there is still exactly ONE definition.
+existing ``from .scope import game_scoped_own_team_id`` IMPORT still
+resolves and there is still exactly ONE definition.
+
+THE CALLERS ARE NOT UNCHANGED, AND THIS USED TO SAY THEY WERE. Until #427
+round 20 the sentence above ended "so every existing caller is unchanged",
+which was true of the MOVE and stopped being true of the projection:
+``game_scoped_own_team_id`` no longer takes the session mapping, so its
+ARITY changed and every call site was rewritten to hand it two immutable
+ids. What survives untouched is the IMPORT PATH, not the call. A stale
+"callers are unchanged" in an authorization module is exactly the kind of
+claim a later reader relies on, so it is corrected here rather than left to
+be inferred from the signature. The migrated call sites are inventoried, and
+a new one that hands this function anything but a scalar fails by name —
+see ``tests/test_authenticated_side_noninterference``'s
+``_refuse_a_resolver_caller_that_still_passes_a_mapping``.
 
 NOTHING HERE READS A REQUEST. The inputs are a session-resolved ``role``,
 the session's own ``scope`` binding, the ``game`` the server already
