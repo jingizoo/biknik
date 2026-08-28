@@ -1059,8 +1059,7 @@ class TheGuardCatchesEveryLeakThisBlockerFixed(_GuardHarness,
         """THE ONE THIS ROUND FIXED, restored verbatim: the schedule loop
         called `compute_roster_status(g.id)` with no side at all."""
         leaked = _replace(_sources(), FACADE, """        own_side = game_scoped_own_team_id(
-            role, scope.get("team_id"), scope.get("player_id"), game,
-            self.store)""",
+            role, scoped_team_id, scoped_player_id, game, self.store)""",
                           """        own_side = None""")
         leaked = _replace(leaked, FACADE, """            "roster_status": self.roster.compute_roster_status(
                 game.id, side).status.value,""",

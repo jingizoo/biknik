@@ -81,7 +81,8 @@ from test_substitute_membership_cutover import ADMIN
 from hockey_scheduler.domain import Role
 from hockey_scheduler.services import lineup_visibility
 from hockey_scheduler.services.game_side_scope import (
-    PrivateGameRead, game_scoped_own_team_id, resolve_private_game_read)
+    GameAuthorization, PrivateGameRead, game_scoped_own_team_id,
+    resolve_private_game_read)
 from hockey_scheduler.store import SqlStore
 from hockey_scheduler.web import server as srv
 
@@ -151,8 +152,13 @@ class _FenceHarness(_ProjectionHarness):
                        role, scope.get("team_id"), scope.get("player_id"),
                        game, store)
                    if game is not None else None)
-            return PrivateGameRead(role=role, game=game, own_team=own,
-                                   admitted=True)
+            # THE RECORD CARRIES A FROZEN SNAPSHOT SINCE #427 round 23, so
+            # the pre-fix shape is restored through the snapshot factory —
+            # what this falsifier is about is the two INDEPENDENT
+            # resolutions, not what the record holds.
+            return PrivateGameRead(
+                role=role, authorization=GameAuthorization.of(game),
+                own_team=own, admitted=True)
 
         srv.resolve_private_game_read = two_independent_resolutions
         lineup_visibility.default_side_permitted = lambda role: True

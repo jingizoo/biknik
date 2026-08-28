@@ -36,6 +36,22 @@ the session's own ``scope`` binding, the ``game`` the server already
 selected, and the store. A query string, a body field or a header can
 never reach this resolution, which is the whole property the private-game
 family rests on.
+
+WHAT THE STATIC AUDIT OVER THIS MODULE IS WORTH, AND IT IS THE OWNER'S
+RULING (#427 round 23). ``tests/test_authenticated_side_noninterference``
+derives this module's admission branches and refuses fourteen classes of
+shape. That audit is a MANDATORY STRUCTURAL TRIPWIRE, NOT AUTHORIZATION
+PROOF: STATIC RED BLOCKS, STATIC GREEN NEVER CLOSES A BLOCKER, and the
+authenticated HTTP matrix beside it is authoritative only within its
+DECLARED COVERAGE. Two measurements say why, and both are of green audits
+over a wrong product: a rebinding made from ANOTHER package after import
+changes zero characters of this file, so the audit is empty by
+construction while sixty cells of the private-game family flip tri-store;
+and in round 23 a FACADE surface one file away
+(``ApiService._schedule_roster_status``) still took the session mapping
+whole after this module had stopped, which handed a third team's Coach
+HOME's private roster status with both audits green. Do not read an empty
+audit as evidence that a change to this boundary is safe.
 """
 
 from dataclasses import dataclass
@@ -125,6 +141,85 @@ def game_scoped_own_team_id(role, scoped_team_id, scoped_player_id, game,
 
 
 @dataclass(frozen=True)
+class GameAuthorization:
+    """THE FIVE FACTS ABOUT A ``Game`` A PRIVATE READ IS AUTHORIZED BY,
+    FROZEN AT THE MOMENT THE DECISION IS TAKEN (#427 round 23, the owner's
+    class-3 ruling).
+
+    WHY A SNAPSHOT AND NOT THE ROW. ``Game`` is MUTABLE and stays mutable,
+    and freezing the domain model was never on the table: MEASURED on this
+    tree, ELEVEN production statements write a ``Game`` in place — ``locked``
+    three times, ``published`` twice, and ``is_draft``, ``cancelled``,
+    ``ice_slot_id``, ``start_time``, ``end_time`` and ``rink`` once each,
+    across ``api/service.py``, ``services/roster_service.py`` and
+    ``services/setup_service.py``. :class:`PrivateGameRead` used to hold that
+    live row and answer ``side_ids`` out of it ON EVERY READ, so the two team
+    ids a leaf was served for were re-read from an object anything holding
+    the same row could have changed since admission was decided. The record
+    already half-did this — one fetch, carried rather than recomputed — and
+    this is the completion of it: the row is read ONCE, its five
+    authorization-bearing fields are copied here, and nothing downstream
+    touches the ``Game`` again.
+
+    WHAT THE MEASUREMENT DOES *NOT* SAY, because the honest version is
+    weaker than the dramatic one: NONE of those eleven writes touches any of
+    the five fields below. This freeze is therefore not defending against a
+    mutation the product performs today — it is closing the SHAPE, which is
+    that an authorization decision was carried in a record that re-derived
+    its answer from a mutable object every time it was asked. Nothing
+    structural stopped the twelfth write from being ``home_team_id``.
+
+    EXACTLY THESE FIVE, and they are the owner's ruling verbatim. What each
+    is for, stated rather than left to be discovered:
+
+    * ``home_team_id``/``away_team_id`` are what ADMISSION DECIDES BY — the
+      participation test in :func:`resolve_private_game_read` — and what
+      :attr:`PrivateGameRead.side_ids` answers, which is the pair every
+      leaf of the private-game family projects against.
+    * ``game_id`` is WHICH GAME this decision was taken about, so a record
+      that outlives its call site still says so.
+    * ``league_season_id`` and ``season_id`` are the game's COMPETITION
+      BINDING — the two fields
+      ``RosterService.resolve_membership_context`` validates the PLAYER
+      authority's membership spine against. NOTHING IN-TREE READS THEM
+      TODAY, and that is said here rather than left for a later reader to
+      discover and quietly delete: they are carried because the ruling names
+      them, because a post-capture rebinding of the game's competition is
+      exactly the mutation this record must not follow, and because a
+      snapshot that states only what today's consumers happen to read goes
+      stale the first time a consumer changes.
+
+    NOT A ``Game`` SUBSTITUTE. It deliberately does NOT answer ``id``, so
+    it cannot be passed where a ``Game`` is expected and quietly work: the
+    membership resolution the PLAYER authority runs is a live STORE QUERY
+    keyed on the row, it runs and finishes INSIDE
+    :func:`resolve_private_game_read` before this record exists, and it
+    keeps taking the ``Game`` itself.
+    """
+
+    game_id: Optional[str]
+    home_team_id: Optional[str]
+    away_team_id: Optional[str]
+    league_season_id: Optional[str]
+    season_id: Optional[str]
+
+    @classmethod
+    def of(cls, game):
+        """The snapshot of ``game``, or ``None`` when there is no game.
+
+        ``None`` in, ``None`` out, so the not-found passthrough and the
+        operator short-circuit share one spelling with every other branch
+        instead of each testing for the absent row themselves."""
+        if game is None:
+            return None
+        return cls(game_id=game.id,
+                   home_team_id=game.home_team_id,
+                   away_team_id=game.away_team_id,
+                   league_season_id=game.league_season_id,
+                   season_id=game.season_id)
+
+
+@dataclass(frozen=True)
 class PrivateGameRead:
     """THE ONE resolution a private-game read is decided by — admission AND
     projection — carried, not recomputed (#427 round 2, blocker 1).
@@ -153,10 +248,19 @@ class PrivateGameRead:
     remain for fast denial, but it cannot be the authoritative gate, and the
     authoritative answer is resolved once and carried.
 
-    ``game`` is ``None`` only when the game does not exist; the caller is
-    still ADMITTED so the facade can return its normal ``not_found`` payload
-    rather than a 403 that would confirm the id's absence differently from
-    every other route.
+    IT CARRIES A FROZEN SNAPSHOT AND NOT THE ``Game`` (#427 round 23, the
+    owner's class-3 ruling). This field used to be the live, mutable row and
+    ``side_ids`` re-read it on every access — so the two side ids a leaf was
+    served for came off an object that anything holding the same ``Game``
+    could have changed since the moment admission was decided. It is now a
+    :class:`GameAuthorization`: five scalars, copied out of the row once,
+    frozen. See that class for why the domain model itself is NOT frozen and
+    for what each of the five fields is for.
+
+    ``authorization`` is ``None`` only when the game does not exist; the
+    caller is still ADMITTED so the facade can return its normal
+    ``not_found`` payload rather than a 403 that would confirm the id's
+    absence differently from every other route.
 
     ``own_team`` is the TRUSTED side and is ``None`` for every caller who has
     no side of their own — an unscoped operator, an assigned official, an
@@ -165,18 +269,21 @@ class PrivateGameRead:
     """
 
     role: object
-    game: object
+    authorization: Optional[GameAuthorization]
     own_team: Optional[str]
     admitted: bool
 
     @property
     def side_ids(self) -> Tuple[Optional[str], Optional[str]]:
         """``(home, away)`` of the game THIS decision was taken against —
-        the same fetch, so a side id can never come from a different read of
-        the row than the one that admitted the caller."""
-        if self.game is None:
+        read off the FROZEN snapshot the decision was taken from, so a side
+        id can never come from a different read of the row than the one that
+        admitted the caller, and cannot change under a caller who is still
+        holding the record."""
+        if self.authorization is None:
             return (None, None)
-        return (self.game.home_team_id, self.game.away_team_id)
+        return (self.authorization.home_team_id,
+                self.authorization.away_team_id)
 
 
 def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
@@ -249,27 +356,49 @@ def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
     scoped_team_id = scope.get("team_id")
     scoped_player_id = scope.get("player_id")
     scoped_official_id = scope.get("official_id")
+    # THE SUBJECT, FETCHED ONCE, AND THE SNAPSHOT TAKEN OFF IT IMMEDIATELY
+    # (#427 round 23, the owner's class-3 ruling). The fetch is HOISTED above
+    # the operator short-circuit, which used to do its own
+    # `store.get_game(game_id)` inline: one call either way, on every path,
+    # and now exactly one place where the mutable row is read at all. From
+    # the next line on, every decision this function takes and everything the
+    # record carries is a scalar of `authorization` — the `Game` itself is
+    # handed on ONLY to the PLAYER authority's live membership query, which
+    # completes before this function returns.
+    game = store.get_game(game_id)
+    authorization = GameAuthorization.of(game)
     if role in (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER):
         # Admitted before the game matters, exactly as
         # `can_read_private_game_data` short-circuited: an operator's
-        # admission does not depend on the game existing. The game is still
-        # fetched so `side_ids` is usable.
-        return PrivateGameRead(role=role, game=store.get_game(game_id),
+        # admission does not depend on the game existing. The snapshot is
+        # still carried so `side_ids` is usable.
+        return PrivateGameRead(role=role, authorization=authorization,
                                own_team=None, admitted=True)
-    game = store.get_game(game_id)
     if game is None:
         # Let the facade answer its normal not_found. Byte-for-byte the
         # pre-existing `can_read_private_game_data` behaviour.
-        return PrivateGameRead(role=role, game=None, own_team=None,
+        #
+        # `authorization=None` IS SPELLED AS A LITERAL and not as the
+        # (identical) `authorization`, and the reason is auditability rather
+        # than style: this is the ONE admission every role reaches, and it is
+        # exempt from carrying an authority precisely because it fills
+        # neither side-bearing field. The audit reads that exemption off the
+        # literal `None`; a name it would have to resolve is a name a later
+        # spelling can rebind.
+        return PrivateGameRead(role=role, authorization=None, own_team=None,
                                admitted=True)
     if role in (Role.COACH, Role.PLAYER):
+        # THE PARTICIPATION TEST DECIDES AGAINST THE SNAPSHOT, not against
+        # the row. The two ids it reads and the two ids `side_ids` later
+        # answers are now THE SAME FROZEN PAIR, so a `Game` mutated after
+        # this decision cannot move it and cannot move what it is served for.
         own_team = game_scoped_own_team_id(role, scoped_team_id,
                                            scoped_player_id, game, store)
         admitted = own_team is not None and own_team in (
-            game.home_team_id, game.away_team_id)
+            authorization.home_team_id, authorization.away_team_id)
         # `own_team` is deliberately dropped on refusal: a refused read must
         # not carry a side any downstream code could still answer for.
-        return PrivateGameRead(role=role, game=game,
+        return PrivateGameRead(role=role, authorization=authorization,
                                own_team=own_team if admitted else None,
                                admitted=admitted)
     if role == Role.OFFICIAL:
@@ -298,7 +427,7 @@ def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
         admitted = scoped_official_id is not None and any(
             assignment_grants_official_scope(a, scoped_official_id)
             for a in store.assignments_for_game(game_id))
-        return PrivateGameRead(role=role, game=game, own_team=None,
-                               admitted=admitted)
-    return PrivateGameRead(role=role, game=game, own_team=None,
-                           admitted=False)
+        return PrivateGameRead(role=role, authorization=authorization,
+                               own_team=None, admitted=admitted)
+    return PrivateGameRead(role=role, authorization=authorization,
+                           own_team=None, admitted=False)

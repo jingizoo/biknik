@@ -60,7 +60,10 @@ un-narrowed read into the LIVE code and ``_require_overview_falsifier_breaks``
 fails BY NAME if the assertions still pass without the fix.
 """
 
+import ast
 import contextlib
+import inspect
+import textwrap
 import unittest
 
 from helpers import BACKEND  # noqa: F401
@@ -231,9 +234,13 @@ class _OverviewHarness(_SiblingHarness):
     def _falsified_overview(self, kind):
         """Reintroduce ONE narrowing's ABSENCE into the LIVE code."""
         api = _ApiService
+        # Patches BEYOND the single `_schedule_roster_status` one, for the
+        # falsifiers that need two places restored at once — see the owner's
+        # two variants below.
+        extra = []
         if kind == "home_default_for_everyone":
             # THE DEFECT AS MEASURED: the unscoped read, for every caller.
-            def status(self, game, role, scope):
+            def status(self, game, role, scoped_team_id, scoped_player_id):
                 return {"roster_status": self.roster.compute_roster_status(
                             game.id).status.value,
                         "roster_status_restricted": False,
@@ -245,8 +252,8 @@ class _OverviewHarness(_SiblingHarness):
             # confirmed" — restricted data as an empty operational state.
             real = api._schedule_roster_status
 
-            def status(self, game, role, scope):
-                out = real(self, game, role, scope)
+            def status(self, game, role, scoped_team_id, scoped_player_id):
+                out = real(self, game, role, scoped_team_id, scoped_player_id)
                 if out.get("roster_status_restricted"):
                     out["roster_status"] = None
                 return out
@@ -256,7 +263,7 @@ class _OverviewHarness(_SiblingHarness):
             # so a test that only drives the Coaches cannot cover for it.
             real = api._schedule_roster_status
 
-            def status(self, game, role, scope):
+            def status(self, game, role, scoped_team_id, scoped_player_id):
                 from hockey_scheduler.domain import Role
                 if role == Role.OFFICIAL:
                     return {
@@ -264,7 +271,7 @@ class _OverviewHarness(_SiblingHarness):
                             game.id).status.value,
                         "roster_status_restricted": False,
                         "roster_status_team_id": game.home_team_id}
-                return real(self, game, role, scope)
+                return real(self, game, role, scoped_team_id, scoped_player_id)
             target, attr, patch = api, "_schedule_roster_status", status
         elif kind == "one_side_for_the_whole_response":
             # THE PER-ROW PROPERTY, alone: the caller's side resolved ONCE
@@ -273,12 +280,12 @@ class _OverviewHarness(_SiblingHarness):
             # second game catches it.
             real = api._schedule_roster_status
 
-            def status(self, game, role, scope):
+            def status(self, game, role, scoped_team_id, scoped_player_id):
                 first = getattr(self, "_falsify_first_game", None)
                 if first is None:
                     self._falsify_first_game = game
                     first = game
-                return real(self, first, role, scope)
+                return real(self, first, role, scoped_team_id, scoped_player_id)
             target, attr, patch = api, "_schedule_roster_status", status
         elif kind == "operator_narrowed":
             # THE OTHER DIRECTION, and its own falsifier because narrowing the
@@ -286,21 +293,82 @@ class _OverviewHarness(_SiblingHarness):
             # version of the same fix.
             real = api._schedule_roster_status
 
-            def status(self, game, role, scope):
-                out = real(self, game, role, scope)
+            def status(self, game, role, scoped_team_id, scoped_player_id):
+                out = real(self, game, role, scoped_team_id, scoped_player_id)
                 from hockey_scheduler.domain import Role
                 if role in (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER):
                     return dict(api._ROSTER_STATUS_WITHHELD)
                 return out
             target, attr, patch = api, "_schedule_roster_status", status
+        elif kind in ("owner_variant_mutated_mapping",
+                      "owner_variant_second_mapping"):
+            # THE OWNER'S TWO ROUND-23 VARIANTS, restored into the LIVE code
+            # (#427). Both are statements INSIDE `_schedule_roster_status`,
+            # and both need the one thing the round-23 signature took away:
+            # the session mapping reaching this method at all. So the
+            # falsifier is two patches, and the first restores EXACTLY that
+            # and nothing else — a wrapper that stashes the `scope` the route
+            # handed `get_demo_overview`, which is what the old
+            # `_schedule_roster_status(self, game, role, scope)` received once
+            # per schedule row. The second is the variant itself.
+            #
+            # WHY THIS IS THE HONEST RESTORATION rather than scaffolding: the
+            # ONLY difference between the old signature and the new one is
+            # whether the mapping crosses into this method. Give it the
+            # mapping back and both variants are ordinary statements; take it
+            # away and neither can be written at all, which is what the fix
+            # is.
+            real_overview = api.get_demo_overview
+            real = api._schedule_roster_status
+
+            def overview(self, user_id=None, role=None, scope=None):
+                self._falsify_scope = scope
+                return real_overview(self, user_id, role, scope)
+
+            def status(self, game, role, scoped_team_id, scoped_player_id):
+                from hockey_scheduler.services.game_side_scope import (
+                    game_scoped_own_team_id)
+                from hockey_scheduler.services import lineup_visibility as lv
+                scope = getattr(self, "_falsify_scope", None) or {}
+                if kind == "owner_variant_mutated_mapping":
+                    # VARIANT ONE: mutate it, then project it. The `.get`
+                    # below is character-for-character the projection the
+                    # withdrawn allowance called "taken AT the call site".
+                    scope.update({"team_id": game.home_team_id})
+                else:
+                    # VARIANT TWO: project the right keys off the WRONG
+                    # mapping.
+                    scope = {"team_id": game.home_team_id,
+                             "player_id": scope.get("player_id")}
+                own_side = game_scoped_own_team_id(
+                    role, scope.get("team_id"), scope.get("player_id"), game,
+                    self.store)
+                audience = lv.route_audience(role, own_side, game.home_team_id,
+                                             game.away_team_id)
+                if audience == lv.FULL:
+                    side = game.home_team_id
+                elif audience == lv.OWN_SIDE:
+                    side = own_side
+                else:
+                    return dict(api._ROSTER_STATUS_WITHHELD)
+                return {"roster_status": self.roster.compute_roster_status(
+                            game.id, side).status.value,
+                        "roster_status_restricted": False,
+                        "roster_status_team_id": side}
+            target, attr, patch = api, "_schedule_roster_status", status
+            extra = [(api, "get_demo_overview", overview)]
         else:  # pragma: no cover - a typo in a falsifier name must be loud
             raise AssertionError(f"unknown falsifier {kind!r}")
-        original = target.__dict__[attr]
+        applied = [(target, attr, target.__dict__[attr])] + [
+            (t, a, t.__dict__[a]) for t, a, _ in extra]
         setattr(target, attr, patch)
+        for t, a, replacement in extra:
+            setattr(t, a, replacement)
         try:
             yield
         finally:
-            setattr(target, attr, original)
+            for t, a, original in applied:
+                setattr(t, a, original)
 
     def _require_overview_falsifier_breaks(self, kind, body, label):
         with self._falsified_overview(kind):
@@ -585,3 +653,155 @@ class TheTrustedResolutionIsShared(_OverviewHarness, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 5. THE FACADE PROJECTS BEFORE ANYTHING ELSE RUNS (#427 round 23, the
+#    owner's ruling), AND THE TWO VARIANTS THAT SAY WHY.
+#
+# THE DEFECT. `services/game_side_scope.py` stopped taking the session
+# mapping in round 20 — projected once, above every role branch, into
+# immutable ids. `ApiService._schedule_roster_status`, the Dashboard's
+# per-row entitlement decision ONE FILE AWAY, went on taking `scope` whole
+# and projecting it itself, once per schedule row, with some seventy calls
+# between the mapping arriving in `get_demo_overview` and that projection
+# reading it. BOTH static audits stayed green: neither reads that function.
+# That is the owner's first bullet exactly — static green never closes a
+# blocker — and the two variants below are what it cost.
+# ---------------------------------------------------------------------------
+class TheFacadeProjectsBeforeAnyOtherCall(_OverviewHarness, unittest.TestCase):
+    """`team_id` and `player_id` are projected at the FIRST EXECUTABLE LINES
+    of ``get_demo_overview``, and ``_schedule_roster_status`` accepts
+    SCALARS ONLY.
+
+    THREE THINGS ARE ASSERTED AND THEY ARE NOT THE SAME THING:
+
+    * the SIGNATURE — no mapping crosses into the per-row decision, read off
+      the running function rather than off a docstring;
+    * the POSITION — the projection is the first two statements of the
+      method, before any call, so nothing the method does can sit between
+      the session's value and the decision;
+    * the BEHAVIOUR — a Coach of a third team, playing in NEITHER game, is
+      withheld on every row, tri-store over real authenticated HTTP, with
+      the owner's TWO VARIANTS restored into the live code as executable
+      falsifiers.
+
+    THE VARIANTS ARE THE POINT OF THE POSITION ASSERTION. Neither can be
+    written against the current signature — there is no mapping in that
+    method to mutate or to shadow — so the falsifier restores the mapping
+    (see :meth:`_OverviewHarness._falsified_overview`) and each then hands
+    ``thirdcoach`` HOME's private roster status on every row."""
+
+    #: The two ids the ruling names, in the order the projection takes them.
+    PROJECTED = ("scoped_team_id", "scoped_player_id")
+
+    def test_the_per_row_decision_accepts_scalars_and_not_a_mapping(self):
+        """THE SIGNATURE, read off the running function."""
+        params = list(inspect.signature(
+            _ApiService._schedule_roster_status).parameters)
+        self.assertEqual(
+            ["self", "game", "role", "scoped_team_id", "scoped_player_id"],
+            params,
+            "the per-row entitlement decision's signature has moved. It "
+            "takes SCALARS -- a mapping here is the round-23 bypass, and "
+            "both of the owner's variants are statements that need one")
+
+    def test_the_projection_is_the_first_two_statements_of_the_read(self):
+        """THE POSITION — "before any other call", derived from the source.
+
+        A projection taken LATER is a projection with calls in front of it,
+        and "which of those calls mutates a shared mapping" is not a
+        question a source tree answers. So the requirement is positional and
+        it is checked positionally: the first two executable statements of
+        ``get_demo_overview`` are the two projections, each reading its own
+        key off the session mapping, and NO call precedes them."""
+        tree = ast.parse(textwrap.dedent(
+            inspect.getsource(_ApiService.get_demo_overview)))
+        body = tree.body[0].body
+        self.assertIsInstance(body[0], ast.Expr, "expected the docstring")
+        statements = body[1:3]
+        for statement, name in zip(statements, self.PROJECTED):
+            self.assertIsInstance(statement, ast.Assign)
+            self.assertEqual([name], [t.id for t in statement.targets])
+            key = name[len("scoped_"):]
+            call = statement.value
+            self.assertTrue(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "get"
+                and [c.value for c in call.args] == [key],
+                f"{name} is not a projection of {key!r}: "
+                f"{ast.unparse(statement)!r}")
+        # …AND NOTHING CALLS ANYTHING BEFORE THEM. The projections' own
+        # `.get` reads are the two calls this permits, by identity, so the
+        # rule cannot be satisfied by renaming something into a projection.
+        permitted = {id(s.value) for s in statements}
+        for statement in statements:
+            for node in ast.walk(statement):
+                if isinstance(node, ast.Call) and id(node) not in permitted:
+                    self.fail(f"a call precedes the projection: "
+                              f"{ast.unparse(node)!r}")
+
+    def test_a_third_teams_coach_is_withheld_and_both_variants_break_it(self):
+        """THE BEHAVIOUR, tri-store, with the owner's two variants as the
+        falsifiers.
+
+        ``thirdcoach``'s team plays in NEITHER game and the private-game
+        family answers them 403 on every leaf. Under each variant they
+        receive HOME's ``needs_substitute`` — HOME's private per-side
+        operational state — on every row of their Dashboard, which is
+        asserted POSITIVELY here rather than only inferred from the
+        falsifier breaking, because "the assertion failed" and "the caller
+        got the other side's private state" are two different claims."""
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                who = self._serve(fx)
+                home_value = self._side_status(fx, fx["home"])
+
+                def check():
+                    rows = self._rows(who["thirdcoach"], fx,
+                                      f"{label}/thirdcoach")
+                    for gid in (fx["gid"], fx["gid2"]):
+                        self._assert_withheld(rows[gid],
+                                              f"{label}/thirdcoach/{gid}")
+
+                with self.subTest(backend=label):
+                    check()
+                    # THE VARIANTS, DRIVEN, and what they hand the caller
+                    # stated as a positive fact.
+                    for kind in ("owner_variant_mutated_mapping",
+                                 "owner_variant_second_mapping"):
+                        with self.subTest(variant=kind):
+                            with self._falsified_overview(kind):
+                                rows = self._rows(
+                                    who["thirdcoach"], fx,
+                                    f"{label}/{kind}")
+                                for gid in (fx["gid"], fx["gid2"]):
+                                    row = rows[gid]
+                                    self.assertFalse(
+                                        row["roster_status_restricted"],
+                                        f"[{label}/{kind}/{gid}] the variant "
+                                        "did not reproduce: still withheld")
+                                    self.assertEqual(
+                                        fx["api"].store.get_game(
+                                            gid).home_team_id,
+                                        row["roster_status_team_id"],
+                                        f"[{label}/{kind}/{gid}] the variant "
+                                        "did not hand this caller HOME")
+                                self.assertEqual(
+                                    home_value,
+                                    rows[fx["gid"]]["roster_status"],
+                                    f"[{label}/{kind}] the value served was "
+                                    "not HOME's own private status")
+                for kind in ("owner_variant_mutated_mapping",
+                             "owner_variant_second_mapping"):
+                    self._require_overview_falsifier_breaks(
+                        kind, check, f"[{label}] {kind}")
+                ran.append((label, "overview_facade_projection"))
+            finally:
+                self._close(label, store)
+        self._assert_matrix_ran(ran, ["overview_facade_projection"])

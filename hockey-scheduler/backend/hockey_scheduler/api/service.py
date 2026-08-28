@@ -10440,9 +10440,48 @@ class ApiService:
     _ROSTER_STATUS_WITHHELD = {"roster_status_restricted": True,
                                "roster_status_team_id": None}
 
-    def _schedule_roster_status(self, game, role, scope) -> dict:
+    def _schedule_roster_status(self, game, role, scoped_team_id,
+                                scoped_player_id) -> dict:
         """The Dashboard schedule row's roster-status fields, for the side
         THIS caller is entitled to IN THIS GAME (#205 blocker, round 4).
+
+        IT TAKES SCALARS, NEVER THE SESSION MAPPING (#427 round 23, the
+        owner's ruling, and this is the defect that ruling names). Until this
+        round the signature was ``(game, role, scope)`` and the mapping was
+        projected HERE, inside the loop, once per schedule row. The gate
+        module's own boundary had already stopped taking a mapping — and this
+        facade surface still took one whole, one file away, so every spelling
+        the projection was built to end was available again and BOTH static
+        audits stayed green, because neither of them reads this function.
+
+        MEASURED AT ``6903eeb``, both of the owner's variants, each spelled
+        as two lines of this method's own body and each driven over real
+        authenticated sessions on a real socket, on Memory, SQLite and real
+        PostgreSQL alike. ``thirdcoach`` — a Coach of ``team_3``, which
+        plays in NEITHER game — received, on BOTH schedule rows,
+        ``roster_status_restricted: false`` and the HOME side's own private
+        status: ``needs_substitute``/``team_1`` on the first game and
+        ``awaiting_responses``/``team_2`` on the second (the fixture swaps
+        the sides, so "HOME" is a different team in each row and a home
+        default is right in neither). The unmutated control at the same
+        commit answered them the withheld marker on all six cells. And BOTH
+        static audits were green on both variants — this file's own
+        ``services/side_provenance.py`` guard, 44 tests, and
+        ``EveryAdmissionBranchIsDerivedAndCarriesAnAuthority._audit()``,
+        which returned ``[]``.
+
+        WHAT THE FIX IS. The projection now happens at the FIRST EXECUTABLE
+        LINES of :meth:`get_demo_overview`, before any other call, and what
+        crosses into this method is two immutable ids. Neither variant can
+        be written against this signature: there is no mapping here to
+        mutate and none to shadow. The rule that would have caught them —
+        the resolver-caller inventory — no longer permits a ``.get(...)`` in
+        the argument list at all; see
+        ``tests/test_authenticated_side_noninterference``'s
+        ``test_the_owners_two_facade_variants_are_refused_by_name``, and
+        ``tests/test_overview_schedule_side``'s
+        ``TheFacadeProjectsBeforeAnyOtherCall``, which drives both variants
+        as executable falsifiers.
 
         THE DEFECT THIS CLOSES, and it is the owner's shape verbatim. The
         schedule loop called ``compute_roster_status(g.id)`` with NO team, and
@@ -10514,13 +10553,13 @@ class ApiService:
         ungated Games list, an operator readiness checklist, which now renders
         the marker rather than a guess.
         """
-        # PROJECTED, NOT PASSED (#427 round 20): `game_scoped_own_team_id`
-        # takes immutable ids, never the session mapping — see its own
-        # docstring and `resolve_private_game_read`'s "THE PROJECTION" note.
-        scope = scope or {}
+        # PROJECTED BY THE CALLER, NOT HERE (#427 round 23). The two ids
+        # arrived as the parameters above, taken at the first executable
+        # lines of `get_demo_overview`; this method never sees the mapping
+        # they came out of, so there is nothing here for a later statement to
+        # mutate between the projection and the decision.
         own_side = game_scoped_own_team_id(
-            role, scope.get("team_id"), scope.get("player_id"), game,
-            self.store)
+            role, scoped_team_id, scoped_player_id, game, self.store)
         audience = lineup_visibility.route_audience(
             role, own_side, game.home_team_id, game.away_team_id)
         if audience == lineup_visibility.FULL:
@@ -10611,6 +10650,27 @@ class ApiService:
         (tests exercising other subsystems) keeps using unchanged; only the
         HTTP route's own per-user Dashboard read opts into scoping.
         """
+        # THE PROJECTION, AT THE FIRST EXECUTABLE LINES OF THIS METHOD AND
+        # BEFORE ANY OTHER CALL (#427 round 23, the owner's ruling). The
+        # session mapping is read HERE, ONCE, into two immutable scalar ids,
+        # and the per-row entitlement decision below is taken from those and
+        # from nothing else. `_schedule_roster_status` accepts scalars only.
+        #
+        # WHY "BEFORE ANY OTHER CALL" IS THE RULE AND NOT A PREFERENCE. This
+        # method calls `self.context.resolve_with_league(user_id, role,
+        # scope)` — which is handed the mapping itself — and then, MEASURED
+        # off its own AST, THIRTY-EIGHT further calls in the forty-two
+        # statements between here and the schedule loop. Projecting inside
+        # that loop — which is what it used to do, one file away from a gate
+        # module that had already stopped taking the mapping — left every
+        # one of those calls sitting between
+        # the session's mapping arriving and the entitlement decision reading
+        # it, and "which of these calls mutates a shared mapping" is not a
+        # question a source tree answers. Taking the two ids first removes
+        # the question rather than answering it: after these two lines
+        # nothing this method does can change what the rows are decided by.
+        scoped_team_id = (scope or {}).get("team_id")
+        scoped_player_id = (scope or {}).get("player_id")
         program = league = None
         in_scope_season_ids = None  # None == no Program scoping active (legacy)
         if role is not None:
@@ -10797,7 +10857,8 @@ class ApiService:
             div = divisions.get(g.division_id)
             # WHICH SIDE'S roster status THIS caller may read, decided PER ROW
             # (#205 blocker, round 4). See `_schedule_roster_status`.
-            row_status = self._schedule_roster_status(g, role, scope)
+            row_status = self._schedule_roster_status(
+                g, role, scoped_team_id, scoped_player_id)
             venue_name = None
             slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
             if slot and slot.rink_id in rinks:
