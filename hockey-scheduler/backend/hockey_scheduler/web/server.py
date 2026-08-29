@@ -226,11 +226,9 @@ _REASSIGN_PARENTS = {
 # with a JSON 405 + a correct ``Allow`` header instead of the stdlib's HTML
 # 501.
 #
-# The filter reproduces this table's PRE-EXISTING, narrower-than-the-full-
-# registry scope EXACTLY (proven byte-for-byte via HTTP diffing -- see
-# tests/test_route_registry.py and the #202 wiring step's own proof run, not
-# just reasoned about) rather than silently widening it now that a fuller
-# inventory exists:
+# The registry's structural ``kind`` is the admission boundary. Every concrete
+# route publishes its method contract regardless of path prefix; static shells,
+# broad families, and fallthroughs do not claim endpoint existence:
 #
 #   kind == "route"   excludes kind="static" (the /setup, /mobile, / shells
 #                     and the unconditional static-file tail -- serving a
@@ -248,21 +246,12 @@ _REASSIGN_PARENTS = {
 #                     kind="route" spec and ARE admitted individually, the
 #                     same "ACTUAL write actions only" scope the old
 #                     hand-written game POST pattern documented).
-#   "/api/" prefix    excludes the four ``/calendar/<kind>/<id>.ics`` feeds
-#                     and ``/favicon.ico`` -- live GET routes, but never
-#                     claimed by this table before either. That gap is REAL
-#                     and pre-existing (OPTIONS/PUT on a feed URL 404s
-#                     instead of 405+Allow today) -- left exactly as it is;
-#                     closing it is enforcement, a separate, later step, not
-#                     this wiring change.
-#
 # tests/test_route_registry.py pins this scope from both directions: every
-# admitted pattern still has a matching RouteSpec, and the specific set this
-# table omits (the static shells/tail, the calendar feeds, favicon, the games
-# family) is exactly this set and no more, no less.
+# admitted pattern still has a matching RouteSpec, every concrete non-API GET
+# is admitted, and the specific non-concrete set these tables omit (static
+# shells/tail, API fallthrough, and the games family) is exact.
 _GET_ROUTES = [re.compile(spec.pattern) for spec in REGISTRY
-              if spec.method == "GET" and spec.kind == "route"
-              and spec.pattern.startswith(r"^/api/")]
+              if spec.method == "GET" and spec.kind == "route"]
 _POST_ROUTES = [re.compile(spec.pattern) for spec in REGISTRY
                if spec.method == "POST" and spec.kind == "route"
                and spec.pattern.startswith(r"^/api/")]
@@ -3153,6 +3142,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._method_fallback("DELETE")
+
+    def __getattr__(self, name):
+        """Route every otherwise-unimplemented HTTP verb through our contract.
+
+        ``BaseHTTPRequestHandler`` normally answers a missing ``do_<VERB>``
+        method with an HTML 501 before application routing runs. A declarative
+        route boundary cannot enumerate every extension method (TRACE,
+        PROPFIND, and future tokens), so expose a handler dynamically: known
+        paths receive the same JSON 405 + ``Allow`` as PUT/PATCH/DELETE and
+        unknown paths receive the same JSON 404. Non-handler attributes retain
+        normal ``AttributeError`` behavior.
+        """
+        if name.startswith("do_") and len(name) > 3:
+            method = name[3:]
+            return lambda: self._method_fallback(method)
+        raise AttributeError(
+            f"{type(self).__name__!s} has no attribute {name!r}")
 
     def do_HEAD(self):
         """HEAD contract (#271): a body-suppressed mirror of the authenticated

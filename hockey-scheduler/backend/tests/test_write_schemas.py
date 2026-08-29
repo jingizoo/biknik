@@ -25,6 +25,7 @@ import urllib.request
 from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
@@ -328,6 +329,144 @@ class WriteSchemaHttpTest(unittest.TestCase):
         status, _headers, body = self._req(admin, "DELETE", "/definitely/not/here")
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_unimplemented_verbs_use_the_json_method_contract(self):
+        """Extension verbs cannot bypass routing into stdlib HTML 501s."""
+        anon = self._client()
+        expected_allow = "GET, HEAD, OPTIONS"
+        known_paths = (
+            "/api/players",
+            "/calendar/team/missing.ics",
+        )
+        for method in ("TRACE", "PROPFIND"):
+            for path in known_paths:
+                with self.subTest(method=method, path=path):
+                    status, headers, body = self._req(anon, method, path)
+                    self.assertEqual(status, 405)
+                    self.assertIn("application/json",
+                                  headers.get("Content-Type", ""))
+                    self.assertEqual(headers.get("Allow"), expected_allow)
+                    self.assertEqual(body["error"]["code"],
+                                     "method_not_allowed")
+                    self.assertEqual(body["error"]["details"]["allow"],
+                                     expected_allow)
+
+        # The dynamic verb bridge changes only error format, not existence:
+        # static shells, fallthroughs, and lookalikes remain unknown.
+        for path in (
+            "/setup",
+            "/app.js",
+            "/api/nope",
+            "/api/games/not-a-game/not-an-action",
+            "/calendar/nope/missing.ics",
+        ):
+            with self.subTest(method="TRACE", path=path):
+                status, headers, body = self._req(anon, "TRACE", path)
+                self.assertEqual(status, 404)
+                self.assertIn("application/json",
+                              headers.get("Content-Type", ""))
+                self.assertNotIn("Allow", headers)
+                self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_concrete_non_api_get_routes_publish_the_full_method_contract(self):
+        """Known non-API GETs are not unknown merely because of their prefix."""
+        anon = self._client()
+        paths = (
+            "/favicon.ico",
+            "/calendar/division/missing.ics",
+            "/calendar/official/missing.ics",
+            "/calendar/player/missing.ics",
+            "/calendar/team/missing.ics",
+        )
+        expected_allow = "GET, HEAD, OPTIONS"
+        for path in paths:
+            with self.subTest(path=path, method="OPTIONS"):
+                status, headers, body = self._req(anon, "OPTIONS", path)
+                self.assertEqual(status, 204)
+                self.assertEqual(headers.get("Allow"), expected_allow)
+                self.assertEqual(body, {})
+            for method in ("PUT", "PATCH", "DELETE"):
+                with self.subTest(path=path, method=method):
+                    status, headers, body = self._req(anon, method, path)
+                    self.assertEqual(status, 405)
+                    self.assertEqual(headers.get("Allow"), expected_allow)
+                    self.assertEqual(body["error"]["code"],
+                                     "method_not_allowed")
+                    self.assertEqual(body["error"]["details"]["allow"],
+                                     expected_allow)
+            with self.subTest(path=path, method="POST-malformed"):
+                status, headers, body = self._req(
+                    anon, "POST", path, raw=b"{not valid json")
+                self.assertEqual(status, 405)
+                self.assertEqual(headers.get("Allow"), expected_allow)
+                self.assertEqual(body["error"]["code"], "method_not_allowed")
+
+    def test_non_api_get_method_contract_does_not_admit_similar_unknown_paths(self):
+        anon = self._client()
+        for path in (
+            "/favicon.ico/extra",
+            "/calendar/nope/missing.ics",
+            "/calendar/team/.ics",
+            "/calendar/team/missing.txt",
+        ):
+            with self.subTest(path=path):
+                status, _headers, body = self._req(anon, "PUT", path)
+                self.assertEqual(status, 404)
+                self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_non_api_get_method_contract_ignores_query_string(self):
+        """Routing decisions use the path, not optional feed-client queries."""
+        anon = self._client()
+        path = "/calendar/team/missing.ics?download=1"
+        expected_allow = "GET, HEAD, OPTIONS"
+
+        status, headers, body = self._req(anon, "OPTIONS", path)
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get("Allow"), expected_allow)
+        self.assertEqual(body, {})
+
+        status, headers, body = self._req(anon, "PATCH", path)
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("Allow"), expected_allow)
+        self.assertEqual(body["error"]["code"], "method_not_allowed")
+
+        status, headers, body = self._req(
+            anon, "POST", path, raw=b"{not valid json")
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("Allow"), expected_allow)
+        self.assertEqual(body["error"]["code"], "method_not_allowed")
+
+    def test_head_on_non_api_get_routes_runs_the_real_get(self):
+        anon = self._client()
+        status, _headers, body = self._req(anon, "HEAD", "/favicon.ico")
+        self.assertEqual(status, 204)
+        self.assertEqual(body, {})
+
+        # A route-shaped but nonexistent calendar token mirrors GET's 404;
+        # method discovery must not turn HEAD into a blind synthetic 200.
+        status, _headers, body = self._req(
+            anon, "HEAD", "/calendar/team/definitely-missing.ics")
+        self.assertEqual(status, 404)
+        self.assertEqual(body, {})
+
+        # A valid feed must execute the real bearer-token lookup and preserve
+        # GET's representation headers while suppressing only the body.
+        created = srv.STATE.api.create_calendar_feed_token(
+            "team", self.home, actor_id="user_admin")
+        token = created["token"]
+        with patch.object(
+                srv.STATE.api, "calendar_feed_ics",
+                wraps=srv.STATE.api.calendar_feed_ics) as feed:
+            status, headers, body = self._req(
+                anon, "HEAD", f"/calendar/team/{token}.ics")
+        self.assertEqual(status, 200)
+        self.assertIn("text/calendar", headers.get("Content-Type", ""))
+        self.assertEqual(headers.get("Content-Disposition"),
+                         "inline; filename=calendar.ics")
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+        self.assertGreater(int(headers.get("Content-Length", "0")), 0)
+        self.assertEqual(body, {})
+        feed.assert_called_once_with("team", token)
 
     # -- v1 Player/Official delete moved to v2 (criterion 5) -----------------
     def test_v1_player_delete_is_moved_to_v2(self):
