@@ -62,7 +62,8 @@ from ..services import visibility_policy
 # a side PER SCHEDULE ROW inside this facade, and the facade imports nothing
 # from `web/`. See `services/game_side_scope.py` for why it moved instead of
 # being copied.
-from ..services.game_side_scope import game_scoped_own_team_id
+from ..services.game_side_scope import (GameAuthorization,
+                                        game_scoped_own_team_id)
 from ..services import (
     ACTOR_TYPES,
     AccountService,
@@ -7219,7 +7220,8 @@ class ApiService:
         # no caller can name a side here.
         if next_game is not None:
             my_team_id = game_scoped_own_team_id(
-                Role.PLAYER, None, player_id, next_game, self.store)
+                Role.PLAYER, None, player_id,
+                GameAuthorization.of(next_game), self.store)
             # FAIL-CLOSED, and unreachable by construction rather than a new
             # user-visible state: `find_next_game_for_player` selected this
             # game through the SAME membership authority (`_plays_in` ->
@@ -10559,7 +10561,8 @@ class ApiService:
         # they came out of, so there is nothing here for a later statement to
         # mutate between the projection and the decision.
         own_side = game_scoped_own_team_id(
-            role, scoped_team_id, scoped_player_id, game, self.store)
+            role, scoped_team_id, scoped_player_id,
+            GameAuthorization.of(game), self.store)
         audience = lineup_visibility.route_audience(
             role, own_side, game.home_team_id, game.away_team_id)
         if audience == lineup_visibility.FULL:

@@ -62,7 +62,7 @@ from .roster_service import RosterService
 from .subject_scope import assignment_grants_official_scope
 
 
-def _player_team_for_game(scoped_player_id, game, store):
+def _player_team_for_game(scoped_player_id, authorization, store):
     """Which team a Player-scoped caller acts for, in THIS ``game``
     specifically (#205 blocker 1) — resolved through the SAME game-scoped
     membership resolver the substitute workflow itself uses
@@ -75,9 +75,18 @@ def _player_team_for_game(scoped_player_id, game, store):
     deactivated player's login must not outlive their roster exit — with the
     SAME ``is_active`` check, so this is a strict refinement of that
     function's contract, not a loosening of it. Falls back to the permanent
-    pointer only when ``game`` carries no LeagueSeason binding (exhibitions
+    pointer only when the game carries no LeagueSeason binding (exhibitions
     and unbound legacy games), exactly as ``team_for_game`` itself does —
     byte-for-byte pre-#205 behavior there.
+
+    AND IT TAKES THE FROZEN ``authorization``, NOT THE ``Game`` (#427 round
+    24). The membership query below is the LAST thing in this boundary that
+    still read the mutable row, and it read it AFTER
+    :func:`resolve_private_game_read` had already snapshotted the facts the
+    decision is carried in — so a competition rebinding landing between the
+    two reads moved admission while the record said otherwise. The snapshot
+    answers every field this query needs, ``id`` included, and it is the
+    same subject either way.
 
     TAKES THE PLAYER'S ID, NOT THE SESSION MAPPING (#427 round 20, the
     owner's blocker-2 ruling). It used to take ``scope`` and read
@@ -91,13 +100,13 @@ def _player_team_for_game(scoped_player_id, game, store):
     player = store.get_player(scoped_player_id)
     if player is None or not player.is_active:
         return None
-    return RosterService(store).team_for_game(game, player)
+    return RosterService(store).team_for_game(authorization, player)
 
 
-def game_scoped_own_team_id(role, scoped_team_id, scoped_player_id, game,
-                            store):
-    """The team the caller acts for, resolved specifically against ``game``
-    (#205 blocker 1) — the game-scoped analogue of
+def game_scoped_own_team_id(role, scoped_team_id, scoped_player_id,
+                            authorization, store):
+    """The team the caller acts for, resolved specifically against ONE
+    game (#205 blocker 1) — the game-scoped analogue of
     ``subject_scope.own_team_id``.
 
     IT TAKES TWO IMMUTABLE IDS, NOT THE SESSION MAPPING (#427 round 20, the
@@ -136,7 +145,8 @@ def game_scoped_own_team_id(role, scoped_team_id, scoped_player_id, game,
     if role == Role.COACH:
         return scoped_team_id
     if role == Role.PLAYER:
-        return _player_team_for_game(scoped_player_id, game, store)
+        return _player_team_for_game(scoped_player_id, authorization,
+                                     store)
     return None
 
 
@@ -189,12 +199,20 @@ class GameAuthorization:
       snapshot that states only what today's consumers happen to read goes
       stale the first time a consumer changes.
 
-    NOT A ``Game`` SUBSTITUTE. It deliberately does NOT answer ``id``, so
-    it cannot be passed where a ``Game`` is expected and quietly work: the
-    membership resolution the PLAYER authority runs is a live STORE QUERY
-    keyed on the row, it runs and finishes INSIDE
-    :func:`resolve_private_game_read` before this record exists, and it
-    keeps taking the ``Game`` itself.
+    NOT A ``Game`` SUBSTITUTE, AND THE ONE PLACE IT IS HANDED WHERE A
+    ``Game`` USED TO GO IS DELIBERATE (#427 round 24). This record answers
+    exactly the five fields above plus :attr:`id`, which is ``game_id``
+    under the name a row spells it — and nothing else. It is handed to the
+    PLAYER authority's membership resolution, which used to take the live
+    ``Game``: that query runs and finishes INSIDE
+    :func:`resolve_private_game_read`, so taking the row there was never a
+    lifetime bug, but it did mean the decision READ THE MUTABLE OBJECT
+    AGAIN after the snapshot had been taken, and a competition rebinding
+    between the two reads could move admission while the frozen record
+    stayed put. It now decides from the same frozen facts the rest of the
+    function does. Anything this record does NOT answer still fails loudly
+    where a real ``Game`` is required, which is the property that keeps the
+    substitution honest rather than convenient.
     """
 
     game_id: Optional[str]
@@ -202,6 +220,18 @@ class GameAuthorization:
     away_team_id: Optional[str]
     league_season_id: Optional[str]
     season_id: Optional[str]
+
+    @property
+    def id(self):
+        """``game_id`` under the name a ``Game`` answers it by (#427 round 24).
+
+        The membership resolver this snapshot is now handed reads a game by
+        the SAME five attribute names the snapshot carries, and anything it
+        reaches that wants an id spells it ``.id``. Exposing it here is what
+        lets the PLAYER decision be taken against the FROZEN facts without
+        widening the snapshot or reshaping the resolver: read-only, derived,
+        and adding no fact the snapshot did not already hold."""
+        return self.game_id
 
     @classmethod
     def of(cls, game):
@@ -392,8 +422,8 @@ def resolve_private_game_read(role, scope, game_id, store) -> PrivateGameRead:
         # the row. The two ids it reads and the two ids `side_ids` later
         # answers are now THE SAME FROZEN PAIR, so a `Game` mutated after
         # this decision cannot move it and cannot move what it is served for.
-        own_team = game_scoped_own_team_id(role, scoped_team_id,
-                                           scoped_player_id, game, store)
+        own_team = game_scoped_own_team_id(
+            role, scoped_team_id, scoped_player_id, authorization, store)
         admitted = own_team is not None and own_team in (
             authorization.home_team_id, authorization.away_team_id)
         # `own_team` is deliberately dropped on refusal: a refused read must

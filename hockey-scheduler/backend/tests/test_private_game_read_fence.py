@@ -652,5 +652,86 @@ class TheParkedReadRefusesUnderARealTwoConnectionRace(_ParkedRead,
             store.close()
 
 
+class ThePlayerDecisionIsTakenAgainstTheSnapshot(_FenceHarness,
+                                                unittest.TestCase):
+    """PLAYER admission decides against the FROZEN five-field snapshot, not
+    the mutable ``Game`` row (#427 round 24, owner blocker).
+
+    THE DEFECT THIS CLOSES. ``GameAuthorization`` froze the five facts a
+    private read is authorized by, and ``PrivateGameRead`` stopped holding
+    the row — but the PLAYER branch still handed the LIVE ``Game`` down
+    ``_player_team_for_game`` -> ``RosterService.team_for_game`` ->
+    ``resolve_membership_context``, which reads ``league_season_id`` to pick
+    the membership that decides the side. So the record was frozen while the
+    DECISION was not: a LeagueSeason change committed after capture flipped
+    which membership resolved, and admission moved with it while the frozen
+    record stayed exactly as it was.
+
+    WHAT THIS ASSERTS, and why it is the whole point: the decision is taken
+    against a snapshot, the row is then mutated on the SAME store the
+    decision came from, and the decision is re-derived from that snapshot
+    and must be UNCHANGED. The falsifier is the shape this replaced —
+    resolving against ``store.get_game(...)`` instead — which moves."""
+
+    def test_a_league_season_change_after_capture_cannot_move_admission(self):
+        ran = []
+        for label, store in self._stores():
+            try:
+                self._assert_backend(label, store)
+                store.clear_all_data()
+                fx = self._fixture(store)
+                api = fx["api"]
+                who = fx["people"]["awayside"]["id"]
+                scope = {"player_id": who}
+
+                with self.subTest(backend=label):
+                    before = resolve_private_game_read(
+                        Role.PLAYER, scope, fx["gid"], api.store)
+                    self.assertTrue(
+                        before.admitted,
+                        f"[{label}] fixture: this player is not admitted "
+                        f"before the mutation, so nothing below could show "
+                        f"a mutation FAILING to move them")
+                    frozen = before.authorization
+
+                    # The row moves to a LeagueSeason the membership does not
+                    # name. Committed through the store the decision read.
+                    game = api.store.get_game(fx["gid"])
+                    game.league_season_id = "leagueseason_not_theirs"
+                    api.store.save_game(game)
+                    self.assertNotEqual(
+                        api.store.get_game(fx["gid"]).league_season_id,
+                        frozen.league_season_id,
+                        f"[{label}] the mutation did not commit, so this "
+                        f"test would pass without proving anything")
+
+                    # THE ASSERTION: the decision re-derived from the frozen
+                    # snapshot is the decision that was taken.
+                    after = game_scoped_own_team_id(
+                        Role.PLAYER, None, who, frozen, api.store)
+                    self.assertEqual(
+                        after, before.own_team,
+                        f"[{label}] the PLAYER side moved when the game's "
+                        f"LeagueSeason changed AFTER capture: "
+                        f"{before.own_team!r} -> {after!r}. The decision is "
+                        f"reading the live row, not the snapshot")
+
+                    # THE FALSIFIER: the shape this replaced. Resolving
+                    # against the mutated row must MOVE, or the assertion
+                    # above is passing for a reason other than the freeze.
+                    moved = game_scoped_own_team_id(
+                        Role.PLAYER, None, who,
+                        api.store.get_game(fx["gid"]), api.store)
+                    self.assertNotEqual(
+                        moved, before.own_team,
+                        f"[{label}] resolving against the LIVE row did not "
+                        f"move either, so this fixture cannot tell a frozen "
+                        f"decision from a live one")
+                ran.append((label, "snapshot_frozen"))
+            finally:
+                store.close()
+        self._assert_matrix_ran(ran, ["snapshot_frozen"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
