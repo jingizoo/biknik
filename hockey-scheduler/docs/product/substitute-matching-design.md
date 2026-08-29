@@ -49,7 +49,7 @@ not reopened by the five rulings above.
 | --- | --- | --- |
 | Skill direction | The scale is `1..7`, with **7 strongest**. Skill proximity is symmetric: `abs(candidate_rating - needed_rating)`. | Candidates one point stronger and one point weaker are equally close. A League may change rule priority, not the meaning of `SKILL_MATCH`. |
 | Missing ratings | An unrated candidate is not excluded. When skill matching is enabled, every rated candidate ranks ahead of every unrated candidate; unrated candidates then order by the remaining rules. | A missing future #273 value cannot empty the pool or masquerade as a perfect match. If all candidates are unrated, skill matching has no effect. |
-| Notice anchor | Remaining notice is measured to `game_start`, not `roster_lock_time`, and the comparison is inclusive. | `game_start - decision_at == minimum_notice` is eligible; one unit less is ineligible. |
+| Notice anchor | Remaining notice is measured to `game_start`, not `roster_lock_time`, and the comparison is inclusive. | `game_start - as_of == minimum_notice` is eligible; one unit less is ineligible. A future command boundary captures `as_of` from its authoritative clock under the transaction lock; it is never client-controlled. |
 
 ## Pure ranking contract
 
@@ -66,7 +66,10 @@ The names below describe design records, not implemented APIs.
 - needed `Position` (goalie/skater slot type is derived from it, never supplied
   as a second independent axis);
 - optional absent-player skill rating;
-- explicit `decision_at` and `game_start` timestamps;
+- explicit `as_of` and `game_start` timestamps; the pure core receives
+  `as_of` as a scalar, while a future command boundary must capture it from
+  its authoritative clock under the transaction lock rather than accept it
+  from a client;
 - a stable random seed when the League policy enables random ordering.
 
 `RankingCandidate` contains only projected facts:
@@ -95,7 +98,10 @@ Cross-boundary permission is also resolved before ranking.
 ### Preconditions
 
 - Candidate IDs and membership IDs are unique within one request.
-- Timestamps are timezone-aware and supplied by the caller.
+- Timestamps are timezone-aware and supplied explicitly to the pure core. In a
+  future HTTP integration, the command boundary captures `as_of` from its
+  authoritative clock under the transaction lock; request data cannot provide
+  or override it.
 - Ratings, when present, are integers in `1..7`.
 - The policy contains no duplicate rule and only recognized rule kinds.
 - Needed position is the single source of truth for goalie/skater slot type.
@@ -154,7 +160,7 @@ rank(request, candidates, policy, authorized_override = none):
         if candidate slot type != request slot type:
             rejected += trace(candidate, "position_class_mismatch")
             continue
-        if request.game_start - request.decision_at < candidate.minimum_notice:
+        if request.game_start - request.as_of < candidate.minimum_notice:
             rejected += trace(candidate, "insufficient_notice")
             continue
         eligible += candidate
@@ -182,7 +188,8 @@ This is a contract for a later authorized integration slice, not production
 wiring delivered by this document.
 
 ```text
-project_candidates(game_id, vacancy, authenticated_scope, decision_at):
+project_candidates(game_id, vacancy, authenticated_scope, as_of):
+    require as_of is the authoritative timestamp captured by the calling command
     load the Game and capture its immutable authorization fields once
     require the Game's exact LeagueSeason binding to be coherent
     resolve the requesting side and vacancy without trusting client team ids
@@ -238,11 +245,32 @@ permits a new attempt.
 The transaction, audit, and notification language below specifies required
 future behavior. It does not claim that those mechanisms are implemented here.
 
+Every command that starts from an `offer_id` resolves that offer's immutable
+`vacancy_id` from stored state, never from request data. All commands then take
+locks in one global order: vacancy first, offer/attempt second. Every
+current-time observation and transition timestamp comes from one authoritative
+clock abstraction owned by the command/store boundary. Database-backed stores
+may source it from the database and Memory tests may inject it, but a browser,
+API caller, queue payload, or worker wall clock cannot supply or override it.
+
+The future store contract must combine its authoritative-clock comparison,
+complete eligibility/version check, and conditional state write in one atomic
+primitive. Sampling time or eligibility in application code and writing later
+does not satisfy this contract. For the portable Memory/SQLite/PostgreSQL
+contract, “commit before `expires_at`” means that the transaction's atomic
+terminal transition serializes before the deadline; an aborted transaction is
+not an acceptance, while later storage flush, client acknowledgement, or
+notification delivery is not a second eligibility event. Exactly at that
+serialization point the atomic predicate selects `EXPIRED`. Next-attempt work
+is recorded transactionally and consumed only after the terminal transaction
+commits, never called synchronously while either lock is held.
+
 ```text
-open_or_advance(vacancy_id, decision_at):
+open_or_advance(vacancy_id):
     require authorized workflow actor or system command
-    atomically read the still-open vacancy and current attempt ordinal
-    project currently eligible candidates
+    atomically lock the still-open vacancy, then its current offer/attempt
+    now = read the authoritative clock after locks are held
+    project every eligibility and ranking fact with RankingRequest.as_of = now
     exclude candidates already declined, expired, or invalidated for vacancy
     ranking = pure rank(projected request, candidates, policy)
 
@@ -250,48 +278,82 @@ open_or_advance(vacancy_id, decision_at):
         record vacancy remains unfilled with the ranking fingerprint
         return NO_CANDIDATE
 
-    offered_at = capture server time inside the transaction
+    offered_at = now
     expires_at = min(offered_at + response_window, game_start)
     if expires_at <= offered_at:
         record no usable response window
         return NO_VALID_OFFER_WINDOW
 
-    create OFFERED attempt with candidate, ordinal, policy version,
-        ranking fingerprint, explanation, offered_at, expires_at
-    append server-attributed audit
-    record typed notification intent for a later authorized delivery slice
-    return OFFERED
+    result = one atomic conditional-create primitive that, on success, stores
+        the OFFERED row, candidate, ordinal, policy version, ranking fingerprint,
+        explanation, offered_at, expires_at, validated projection/source
+        versions, one server-attributed audit, and one notification intent;
+        it may serialize successfully only if all of these remain true at its
+        atomic transition point:
+            - vacancy is open and has no current offer
+            - authoritative transition time is before expires_at
+            - selected candidate still passes every hard and competition-boundary gate
+            - the complete projected ID/fact set, policy version, and ranking-relevant
+              source versions equal those used to produce the ranking fingerprint
+    if result says vacancy is no longer open:
+        return the stored terminal vacancy outcome without creating an offer
+    if result says a current offer already exists:
+        return that stored current offer/idempotent outcome
+    if result says deadline, projection, policy, or source version drifted:
+        abort without an OFFERED row and return RETRY_REQUIRED; any later retry
+        must recapture now, projection, ranking, offered_at, and expires_at
+        rather than reuse a prior value
+    return OFFERED after commit
 
-accept(offer_id, authenticated_responder, accepted_at):
+accept(offer_id, authenticated_responder):
+    resolve immutable vacancy_id from the stored offer
+    atomically lock vacancy, then offer
     authorize player or verified guardian for the offered candidate
-    atomically lock offer and vacancy
-    require offer is OFFERED and accepted_at < expires_at
-    revalidate vacancy is open and candidate remains eligible
-    transition offer to ACCEPTED and fill exactly one vacancy
-    invalidate any competing stale attempt
-    append server-attributed audit
+    if offer already has a terminal outcome:
+        return that stored outcome without another roster row, audit, or intent
+    require offer is OFFERED
+    atomically revalidate vacancy and complete candidate eligibility, then:
+        - if the authoritative transition time is before expires_at, commit
+          OFFERED -> ACCEPTED, fill exactly one vacancy, invalidate any
+          competing stale attempt, and append one ACCEPTED audit
+        - otherwise commit OFFERED -> EXPIRED, append one EXPIRED audit, and
+          record one idempotent next-attempt intent
+    return the committed terminal outcome
 
-decline(offer_id, authenticated_responder, declined_at):
+decline(offer_id, authenticated_responder):
+    resolve immutable vacancy_id from the stored offer
+    atomically lock vacancy, then offer
     authorize player or verified guardian for the offered candidate
-    atomically transition OFFERED -> DECLINED exactly once
-    append server-attributed audit
-    enqueue idempotent open_or_advance for the next ordinal
+    if offer already has a terminal outcome:
+        return that stored outcome without another audit or intent
+    require offer is OFFERED
+    atomically read the authoritative transition time and:
+        - before expires_at, commit OFFERED -> DECLINED with one DECLINED audit
+        - at or after expires_at, commit OFFERED -> EXPIRED with one EXPIRED audit
+    record one idempotent next-attempt intent in the same transaction
 
-expire(offer_id, observed_at):
-    atomically require offer is OFFERED and observed_at >= expires_at
-    transition OFFERED -> EXPIRED exactly once
-    append server-attributed audit
-    enqueue idempotent open_or_advance for the next ordinal
+expire(offer_id):
+    resolve immutable vacancy_id from the stored offer
+    atomically lock vacancy, then offer
+    require authorized expiry worker or system command
+    if offer already has a terminal outcome:
+        return that stored outcome without another audit or intent
+    atomically require offer is OFFERED and authoritative transition time is at or
+        after expires_at, then commit OFFERED -> EXPIRED, one EXPIRED audit,
+        and one idempotent next-attempt intent
 
 cancel_or_invalidate(offer_id, reason):
-    atomically transition OFFERED -> CANCELLED or INVALIDATED
+    resolve immutable vacancy_id from the stored offer
+    atomically lock vacancy, then offer
+    transition OFFERED -> CANCELLED or INVALIDATED
     append server-attributed audit
-    advance only if the Game and vacancy remain offerable
+    record a next-attempt intent only if the Game and vacancy remain offerable
 ```
 
-Accept-versus-expire and two accept requests must serialize on the same offer
-and vacancy. Exactly one terminal transition wins; a retry returns the stored
-outcome without a second roster row, audit event, or next-candidate action.
+Accept-versus-expire, decline-versus-expire, and duplicate responder requests
+must serialize on the same vacancy and offer in the global lock order. Exactly
+one terminal transition wins; a retry returns the stored outcome without a
+second roster row, audit event, or next-candidate action.
 
 Each new attempt takes a fresh projection and records a fresh ranking
 fingerprint. That allows eligibility or policy changes to be explained rather
@@ -315,9 +377,9 @@ Those responsibilities stay at a future server-side command boundary:
 
 A future durable override audit should include actor and effective role,
 Game/LeagueSeason/side/vacancy identifiers, selected candidate and membership,
-engine proposal, policy version, ranking fingerprint, reason, server time, and
-correlation/idempotency key. This is an audit contract only; no audit schema or
-write is introduced here.
+engine proposal, policy version, ranking fingerprint, reason, authoritative
+transition time, and correlation/idempotency key. This is an audit contract
+only; no audit schema or write is introduced here.
 
 ## Fixed design test vectors
 
@@ -334,15 +396,20 @@ and defence.
 | V4 symmetric skill | Need rating 4; `a(rating 3)`, `b(rating 5)` | `SKILL_MATCH` | Equal skill distance; with random disabled, canonical ID fallback gives `a, b`. | Settled ruling |
 | V5 unrated last | Need rating 4; `a(rating 1)`, `b(unrated)` | `SKILL_MATCH` | `a, b` even though `a` is not a close match. `b` remains in the pool. | Settled ruling |
 | V6 all unrated | `a(unrated, completed 2)`, `b(unrated, completed 0)` | `SKILL_MATCH, FAIRNESS` | Skill contributes equality; order `b, a` by fairness. | Settled ruling |
-| V7 notice boundary | Decision `18:00`, start `19:00`; `a(minimum 60m)`, `b(minimum 61m)` | Any | `a` eligible by inclusive equality; `b` is rejected by `notice_window`. | Settled ruling |
+| V7 notice boundary | Server-captured `as_of` is `18:00`, start `19:00`; `a(minimum 60m)`, `b(minimum 61m)` | Any | `a` eligible by inclusive equality; `b` is rejected by `notice_window`. The same `as_of` becomes `offered_at` if an offer is created. | Settled ruling |
 | V8 configurable priority | Need rating 4; `a(rating 1, completed 0)`, `b(rating 4, completed 5)` | A: `FAIRNESS, SKILL_MATCH`; B: `SKILL_MATCH, FAIRNESS` | Policy A proposes `a`; policy B proposes `b`. | Decided #287 rule |
 | V9 input permutation | V8 candidates supplied as `[a,b]` and `[b,a]` with the same policy/seed | Either V8 policy | Byte-equivalent ordered IDs, proposal, traces, and explanation. | Determinism contract |
 | V10 override | Engine order `a,b`; validated override selects `b` | Any | `proposed=a`, `selected=b`, no deciding rule credited for the human choice; explanation names override and preserves proposal. | Override design boundary |
-| V11 approved boundary | Game is `ls1`; `a` has eligible membership in `ls1`; `b` only in sibling `ls2` | Any | Under the approved rule, only `a` reaches ranking. | Owner-approved Q4 (2026-08-29) |
+| V11 approved boundary | Game is in League `l1`, LeagueSeason `ls1`, Division `d1`; `a` is in `d1`; `b` is in `d2` of `ls1`; `c` is in another League; `d` is in sibling LeagueSeason `ls2` of `l1`; evaluate with cross-Division policy OFF then ON | Any | OFF: only `a` reaches ranking. ON: `a,b` reach ranking. `c` and `d` are refused in both cases because cross-League substitution remains off and LeagueSeason must match exactly. | Owner-approved Q4 (2026-08-29) |
 | V12 decline advance | Rank `a,b`; offer `a`; authenticated `a` declines | Any | Attempt 1 becomes `DECLINED`; attempt 2 offers `b` with ordinal 2 and a fresh fingerprint. | State-machine design |
-| V13 timeout boundary | Offer at `18:50`, start `19:00`, response window 30m | Any | Approved expiry is `19:00`; accept at `18:59:59` may win, accept at `19:00` cannot; repeated expiry is idempotent. | Owner-approved Q5 (2026-08-29) |
+| V13 timeout boundary | Offer at `18:50`, start `19:00`, response window 30m | Any | Approved expiry is `19:00`; an acceptance terminal transition serialized at `18:59:59` may win. At `19:00`, the accept path commits `EXPIRED` with one EXPIRED audit and one next-attempt intent; repeated expiry is idempotent. | Owner-approved Q5 (2026-08-29) |
 | V14 accept/expire race | One process accepts before expiry while another evaluates timeout | Any | Row locking/conditional transition permits exactly one terminal result, one roster fill at most, and no duplicate advance. | Future concurrency contract |
 | V15 no candidate | Every projected candidate fails goalie/skater or notice gate | Any | No proposal; explanation lists named rejections and vacancy remains unfilled. | Core/state boundary |
+| V16 decline at deadline | One process declines while another evaluates timeout at exactly `expires_at` | Any | The single terminal result is `EXPIRED`, never `DECLINED`; one next-attempt intent is recorded atomically and consumed only after commit. | Owner-approved Q5 / future concurrency contract |
+| V17 League rating authority | In League `l1`, canonical effective rating is 3; coach recommends 6; player self-rates 7; legacy global rating is 5 | `SKILL_MATCH` | Future #273 projection supplies 3 with League-admin/effective-time audit provenance. Recommendation, self-rating, and legacy global value do not replace it. Before #273 exists, production projection supplies unrated instead. | Owner-approved Q3 (2026-08-29) |
+| V18 participation-only fairness | Current LeagueSeason history contains one finalized Game with a recorded occupying/participating roster row, one accepted-but-cancelled Game, one accepted but scheduled-and-unplayed Game, and one no-show | `FAIRNESS` | Completed-substitute count is 1. The acceptance, cancellation, scheduled-but-unplayed Game, and no-show are excluded. | Owner-approved Q1/Q2 (2026-08-29) |
+| V19 no late offer | Authoritative `as_of`/`offered_at` equals or follows `game_start`; response window is positive | Any | `expires_at <= offered_at`; no OFFERED row, offer audit, or notification intent is created and the result is `NO_VALID_OFFER_WINDOW`. A server-attributed audit of that refusal may still be recorded. | Owner-approved Q5 (2026-08-29) |
+| V20 terminal retry | An authorized responder repeats accept or decline after the offer already reached a terminal outcome | Any | The stored terminal outcome is returned with no second roster row, terminal audit, or next-attempt intent. | Idempotency/concurrency contract |
 
 The vectors above record design contracts, including the five owner-approved
 policy rulings. They do not claim that production integration exists.
