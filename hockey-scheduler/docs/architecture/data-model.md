@@ -53,7 +53,7 @@ Game ──< AuditLog
 | preferred_name | str? | optional preferred given name |
 | birthdate | str? | **private** `YYYY-MM-DD`; stripped from default facade payloads, operator opt-in only |
 | registration_number | str? | **private** stable governing-body id; same-team duplicates refused, cross-team duplicates warned |
-| skill_rating | int? | 1–7 coach rating (#287 ruling → #273); `None` = unrated, ranked last but never excluded |
+| skill_rating | int? | existing global/provisional 1–7 value; #287's 2026-08-29 ruling requires the canonical substitute-ranking rating to be League-context, League-admin-owned, and audited in #273; `None` = unrated, ranked last but never excluded |
 
 `position` maps to a **slot type**: `GOALIE` → goalie slot; everything else →
 skater slot.

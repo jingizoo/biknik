@@ -279,12 +279,11 @@ class SubstituteRequest:
 class SubstituteCandidate:
     """One player projected out of whatever the substitute pool turns out to be.
 
-    ``completed_sub_games`` is already computed by the caller; what counts as a
-    completed substitute game (this season? this League? all time?) is the
-    caller's decision.
-    ASSUMPTION (pending owner ruling): the engine does not define that scope and
-    must not — narrowing it here would silently pick a fairness horizon the
-    owner has not chosen.
+    ``completed_sub_games`` is already computed by the caller under the
+    owner-approved fairness contract: finalized Games with recorded
+    participation in the current ``LeagueSeason`` only, reset for a new
+    LeagueSeason. The pure engine consumes that projected scalar and must not
+    query a store or independently reinterpret the approved horizon.
     """
 
     player_id: str

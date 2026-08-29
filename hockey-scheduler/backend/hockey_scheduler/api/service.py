@@ -174,9 +174,10 @@ def _player_dto(player, include_identity: bool = False) -> dict:
     get eligibility summaries, never raw protected values). Operator
     surfaces opt in per call via ``include_identity``, to be MANAGE_SETUP-
     gated at the HTTP layer exactly like ``include_email`` (#268).
-    ``skill_rating`` stays in the default DTO deliberately: it is the
-    coach-facing 1-7 rating #287's substitute ranking consumes, not
-    identity data.
+    ``skill_rating`` stays in the default DTO deliberately: it is the existing
+    coach-facing global/provisional 1-7 value, not identity data. It is not the
+    canonical League-context rating approved for future #287 production
+    ranking; that scoped ownership/audit model remains with #273.
     """
     row = _serialize(player)
     if not include_identity:

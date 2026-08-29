@@ -2613,9 +2613,12 @@ class RosterService:
         A player whose only eligible memberships name OTHER teams, or whose
         own side's participation has ended, resolves ``None``:
         cross-boundary substitution stays CLOSED (fail-closed, the same
-        posture the permanent gate had; #287 open question 4 — who may
-        substitute across League/Division boundaries — is an unruled owner
-        question this cutover does not answer).
+        posture the permanent gate had). The approved #287 design limits
+        future matching candidates to the same LeagueSeason, requires explicit
+        League policy for cross-Division projection, and excludes cross-League
+        candidates. That future matching projection is not wired or authorized
+        at this current-participation boundary, so every other-team membership
+        remains a skip.
 
         For a game with NO LeagueSeason binding the context is the permanent
         ``player.team_id`` pointer, so exhibitions and unbound legacy games

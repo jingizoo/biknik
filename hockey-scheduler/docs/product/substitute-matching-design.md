@@ -1,8 +1,8 @@
 # Substitute Matching Design
 
 > **Status:** bounded, non-production design for #287. This document records
-> settled ranking rules, recommendations that still require an owner decision,
-> and contracts for future slices. It does **not** add or authorize production
+> settled ranking rules, the five owner-approved product rulings, and contracts
+> for future slices. It does **not** add or authorize production
 > code, schema, migrations, persistence, API mutations, notification delivery,
 > service wiring, or runtime state transitions.
 
@@ -26,23 +26,24 @@ not create a temporary eligibility model and does not reinterpret permanent
 
 ## Decision register
 
-### Original #287 product questions
+### Owner-approved #287 product decisions
 
-Every row in this table is explicitly **pending owner decision**. The
-recommended default is a design proposal, not accepted product scope.
+**Owner-confirmed (2026-08-29):** the repository owner approved all five
+recommended defaults below. They are binding inputs for future authorized
+slices; this approval does not itself authorize production code or merge.
 
-| Question | Recommended default | Alternatives | Tradeoff | Status |
+| Question | Approved rule | Alternatives | Tradeoff | Status |
 | --- | --- | --- | --- | --- |
-| Fairness counter reset | Count completed substitute appearances within the current `LeagueSeason`; a new LeagueSeason starts at zero. Historical counts remain visible but do not affect the new season's rank. | Lifetime count; rolling last-N games; rolling time window; League-configurable reset. | Per-LeagueSeason is easy to explain and does not permanently penalize a frequent substitute. Lifetime is simpler to aggregate but lets old service dominate new seasons. Rolling windows react faster but are harder to reproduce and explain. | **Pending owner** |
-| Which games count | Count only a finalized Game in which the substitute has a recorded occupying/participating roster row. Do not count an offer, acceptance, scheduled-but-unplayed Game, cancellation, or no-show as a completed substitute appearance. Track no-shows separately if the product later needs reliability policy. | Count accepted offers; count scheduled roster assignments; count no-shows as appearances; apply a separate no-show penalty. | Actual participation makes the fairness number truthful and avoids charging a player for cancellations. It depends on authoritative Game completion and participation records. Earlier counting is available sooner but can misstate service. | **Pending owner** |
-| Skill-rating ownership | A League administrator owns the canonical 1–7 rating for that League context. Coaches may submit a recommendation, but cannot silently replace the canonical value; self-rating is informational only. Changes require an effective time and actor/reason audit. The data model belongs to #273. | Team-coach-owned rating; player self-rating; multi-rater average; global rating shared across Leagues. | League ownership gives one competition-wide scale and stable comparisons. Coach ownership is operationally easy but may be inconsistent across Teams. Self-rating is inclusive but not authoritative. A composite is richer but requires conflict and weighting policy. | **Pending owner** |
-| Cross-boundary substitution | Default to the same `LeagueSeason`. Permit cross-Division candidates inside that LeagueSeason only when an explicit League policy enables it. Keep cross-League substitution off until a separately authorized rule defines allowed relationships and the responsible approver. | Same Division only; any Division in the LeagueSeason; any League in the Program/Season; affiliate/call-up relationships only; unrestricted privileged override. | Same-LeagueSeason preserves the competition boundary and uses the seasonal membership already established by #205. Narrower scope reduces the pool. Wider scope improves fill rate but adds authorization, fairness, standings, and audit consequences. | **Pending owner** |
-| Late-game offer validity | Compute `expires_at = min(offered_at + response_window, game_start)`. Create no offer when `expires_at <= offered_at`. Treat the response interval as half-open: an acceptance must commit before `expires_at`; at the deadline, expiry wins and the workflow may advance. | Always grant the full response window; use `roster_lock_time`; stop offers at a configurable pre-game cutoff; allow post-start emergency offers. | Clamping prevents an offer from remaining live after the Game starts and produces one deterministic deadline. Very late candidates may have no usable response window. A roster-lock anchor may be too early or absent; emergency post-start behavior needs a separate explicit policy. | **Pending owner** |
+| Fairness counter reset | Count completed substitute appearances within the current `LeagueSeason`; a new LeagueSeason starts at zero. Historical counts remain visible but do not affect the new season's rank. | Lifetime count; rolling last-N games; rolling time window; League-configurable reset. | Per-LeagueSeason is easy to explain and does not permanently penalize a frequent substitute. Lifetime is simpler to aggregate but lets old service dominate new seasons. Rolling windows react faster but are harder to reproduce and explain. | **Resolved 2026-08-29** |
+| Which games count | Count only a finalized Game in which the substitute has a recorded occupying/participating roster row. Do not count an offer, acceptance, scheduled-but-unplayed Game, cancellation, or no-show as a completed substitute appearance. Track no-shows separately if the product later needs reliability policy. | Count accepted offers; count scheduled roster assignments; count no-shows as appearances; apply a separate no-show penalty. | Actual participation makes the fairness number truthful and avoids charging a player for cancellations. It depends on authoritative Game completion and participation records. Earlier counting is available sooner but can misstate service. | **Resolved 2026-08-29** |
+| Skill-rating ownership | A League administrator owns the canonical 1–7 rating for that League context. Coaches may submit a recommendation, but cannot silently replace the canonical value; self-rating is informational only. Changes require an effective time and actor/reason audit. The data model belongs to #273. | Team-coach-owned rating; player self-rating; multi-rater average; global rating shared across Leagues. | League ownership gives one competition-wide scale and stable comparisons. Coach ownership is operationally easy but may be inconsistent across Teams. Self-rating is inclusive but not authoritative. A composite is richer but requires conflict and weighting policy. | **Resolved 2026-08-29** |
+| Cross-boundary substitution | Default to the same `LeagueSeason`. Permit cross-Division candidates inside that LeagueSeason only when an explicit League policy enables it. Keep cross-League substitution off until a separately authorized rule defines allowed relationships and the responsible approver. | Same Division only; any Division in the LeagueSeason; any League in the Program/Season; affiliate/call-up relationships only; unrestricted privileged override. | Same-LeagueSeason preserves the competition boundary and uses the seasonal membership already established by #205. Narrower scope reduces the pool. Wider scope improves fill rate but adds authorization, fairness, standings, and audit consequences. | **Resolved 2026-08-29** |
+| Late-game offer validity | Compute `expires_at = min(offered_at + response_window, game_start)`. Create no offer when `expires_at <= offered_at`. Treat the response interval as half-open: an acceptance must commit before `expires_at`; at the deadline, expiry wins and the workflow may advance. | Always grant the full response window; use `roster_lock_time`; stop offers at a configurable pre-game cutoff; allow post-start emergency offers. | Clamping prevents an offer from remaining live after the Game starts and produces one deterministic deadline. Very late candidates may have no usable response window. A roster-lock anchor may be too early or absent; emergency post-start behavior needs a separate explicit policy. | **Resolved 2026-08-29** |
 
 ### Settled ranking rulings
 
 These three rules were settled by the repository owner on issue #287 and are
-not reopened by the recommendations above.
+not reopened by the five rulings above.
 
 | Topic | Settled rule | Consequence |
 | --- | --- | --- |
@@ -73,7 +74,7 @@ The names below describe design records, not implemented APIs.
 - `player_id` and the exact membership identifier used for eligibility;
 - eligible positions;
 - optional 1–7 skill rating;
-- completed-substitute count under the owner-selected fairness policy;
+- completed-substitute count under the owner-approved fairness policy;
 - minimum notice duration;
 - any boundary classification already authorized by the projection layer.
 
@@ -203,11 +204,13 @@ objects, and mutable membership objects do not cross into the ranking core.
 The projection may reduce the pool; the ranking core cannot grant eligibility
 that the projection refused.
 
-`Player.skill_rating` already supplies an optional 1–7 value. Issue #273 still
-owns the unresolved canonical ownership, League/season scope, privacy, and
-effective-time/audit policy. Until those decisions authorize a projection, the
-integration may project candidates as unrated; this document does not add a
-temporary field or treat the permanent Player value as seasonal authority.
+`Player.skill_rating` already supplies a global optional 1–7 value, but it does
+not satisfy the approved League-context ownership rule. Issue #273 still owns
+the durable model that gives a League administrator canonical authority and
+records scope, privacy, effective time, actor, and reason. Until that contract
+exists, production integration must project candidates as unrated; this
+document does not add a temporary field or treat the permanent Player value as
+seasonal authority.
 
 ## Offer workflow design
 
@@ -247,8 +250,9 @@ open_or_advance(vacancy_id, decision_at):
         record vacancy remains unfilled with the ranking fingerprint
         return NO_CANDIDATE
 
-    expires_at = min(decision_at + response_window, game_start)
-    if expires_at <= decision_at:
+    offered_at = capture server time inside the transaction
+    expires_at = min(offered_at + response_window, game_start)
+    if expires_at <= offered_at:
         record no usable response window
         return NO_VALID_OFFER_WINDOW
 
@@ -326,7 +330,7 @@ and defence.
 | --- | --- | --- | --- | --- |
 | V1 goalie hard gate | Need `G`; `g1(G, rating 3, completed 4)` and `f1(F, rating 4, completed 0)` | `FAIRNESS, SKILL_MATCH` | `g1` is the only ranked candidate; `f1` is rejected by `goalie_separation`. | Settled core invariant |
 | V2 skater position preference | Need `F`; `a(F)`, `b(F/D)`, `c(D)`, otherwise equal | `POSITION_PREFERENCE` | Order `a, b, c`. | Decided #287 rule |
-| V3 seasonal fairness | `a(completed 1)`, `b(completed 3)` | `FAIRNESS` | Order `a, b`. Counts are supplied facts; whether they reset per LeagueSeason remains pending. | Result fixed; counter source pending Q1/Q2 |
+| V3 seasonal fairness | `a(completed 1)`, `b(completed 3)` | `FAIRNESS` | Order `a, b`. Counts are supplied facts derived from finalized participation in the current `LeagueSeason`; a new LeagueSeason resets the count. | Owner-approved Q1/Q2 (2026-08-29) |
 | V4 symmetric skill | Need rating 4; `a(rating 3)`, `b(rating 5)` | `SKILL_MATCH` | Equal skill distance; with random disabled, canonical ID fallback gives `a, b`. | Settled ruling |
 | V5 unrated last | Need rating 4; `a(rating 1)`, `b(unrated)` | `SKILL_MATCH` | `a, b` even though `a` is not a close match. `b` remains in the pool. | Settled ruling |
 | V6 all unrated | `a(unrated, completed 2)`, `b(unrated, completed 0)` | `SKILL_MATCH, FAIRNESS` | Skill contributes equality; order `b, a` by fairness. | Settled ruling |
@@ -334,22 +338,24 @@ and defence.
 | V8 configurable priority | Need rating 4; `a(rating 1, completed 0)`, `b(rating 4, completed 5)` | A: `FAIRNESS, SKILL_MATCH`; B: `SKILL_MATCH, FAIRNESS` | Policy A proposes `a`; policy B proposes `b`. | Decided #287 rule |
 | V9 input permutation | V8 candidates supplied as `[a,b]` and `[b,a]` with the same policy/seed | Either V8 policy | Byte-equivalent ordered IDs, proposal, traces, and explanation. | Determinism contract |
 | V10 override | Engine order `a,b`; validated override selects `b` | Any | `proposed=a`, `selected=b`, no deciding rule credited for the human choice; explanation names override and preserves proposal. | Override design boundary |
-| V11 recommended boundary | Game is `ls1`; `a` has eligible membership in `ls1`; `b` only in sibling `ls2` | Any | Under the recommended default, only `a` reaches ranking. | **Pending Q4 recommendation** |
+| V11 approved boundary | Game is `ls1`; `a` has eligible membership in `ls1`; `b` only in sibling `ls2` | Any | Under the approved rule, only `a` reaches ranking. | Owner-approved Q4 (2026-08-29) |
 | V12 decline advance | Rank `a,b`; offer `a`; authenticated `a` declines | Any | Attempt 1 becomes `DECLINED`; attempt 2 offers `b` with ordinal 2 and a fresh fingerprint. | State-machine design |
-| V13 timeout boundary | Offer at `18:50`, start `19:00`, response window 30m | Any | Recommended expiry is `19:00`; accept at `18:59:59` may win, accept at `19:00` cannot; repeated expiry is idempotent. | **Pending Q5 recommendation** |
+| V13 timeout boundary | Offer at `18:50`, start `19:00`, response window 30m | Any | Approved expiry is `19:00`; accept at `18:59:59` may win, accept at `19:00` cannot; repeated expiry is idempotent. | Owner-approved Q5 (2026-08-29) |
 | V14 accept/expire race | One process accepts before expiry while another evaluates timeout | Any | Row locking/conditional transition permits exactly one terminal result, one roster fill at most, and no duplicate advance. | Future concurrency contract |
 | V15 no candidate | Every projected candidate fails goalie/skater or notice gate | Any | No proposal; explanation lists named rejections and vacancy remains unfilled. | Core/state boundary |
 
-The vectors tagged pending are executable examples of the recommended defaults,
-not proof that the owner has accepted those defaults.
+The vectors above record design contracts, including the five owner-approved
+policy rulings. They do not claim that production integration exists.
 
 ## Preconditions for a later implementation slice
 
 Before any production integration is proposed:
 
-1. The owner must decide all five pending rows in the original-question table.
-2. #273 must settle canonical skill ownership/scope and its privacy/audit rules,
-   or the integration must explicitly operate with every candidate unrated.
+1. Later slices must implement the five approved rulings exactly; an
+   alternative requires a new explicit owner decision.
+2. #273 must implement the approved League-context skill ownership and its
+   privacy/effective-time/audit rules, or production integration must
+   explicitly operate with every candidate unrated.
 3. The exact #205 eligibility resolver and competition-boundary policy must be
    reused rather than copied.
 4. Policy persistence, API contracts, notification delivery, timeout workers,

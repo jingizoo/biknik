@@ -81,9 +81,11 @@ class Player:
     # Stable governing-body registration number (private, same handling as
     # birthdate). The duplicate detector keys on it; it is never a merge key.
     registration_number: Optional[str] = None
-    # Coach's 1-7 skill assessment (owner ruling on #287 assigns the field to
-    # #273). None = unrated, a fully supported state substitute ranking must
-    # degrade on, never exclude.
+    # Existing global/provisional 1-7 skill value. The 2026-08-29 owner ruling
+    # on #287 requires the canonical substitute-ranking rating to be scoped to
+    # its League context, League-admin-owned, and audited in #273. None =
+    # unrated, a fully supported state substitute ranking must degrade on,
+    # never exclude.
     skill_rating: Optional[int] = None
     # NOTE (#273): ``guardian_person_id`` is REMOVED from the model/contract.
     # It was serialized but never read or written by any service; the real,

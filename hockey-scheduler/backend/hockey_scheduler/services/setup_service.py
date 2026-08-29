@@ -8317,8 +8317,11 @@ class SetupService:
 
     @staticmethod
     def _validate_skill_rating(value) -> Optional[int]:
-        """Optional 1-7 skill rating (#287 owner ruling → #273); None/blank =
-        unrated, a fully supported state."""
+        """Existing global/provisional 1-7 value; None/blank = unrated.
+
+        #273 still owns the approved canonical League-context rating and its
+        League-admin/effective-time/audit contract for production ranking.
+        """
         canonical, reason = normalize_skill_rating(value)
         if reason is not None:
             raise ValidationError(

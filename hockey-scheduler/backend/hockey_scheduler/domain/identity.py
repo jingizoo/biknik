@@ -2,9 +2,11 @@
 
 The single source of truth for the durable-identity fields Player gains in
 #273 — structured names, the private birthdate, the governing-body
-registration number, and the 1-7 skill rating (assigned to #273 by the owner's
-ruling on #287) — shared by the service layer's create/edit validators and both
-import paths, exactly like :mod:`.shooting` (#268) and :mod:`.jersey` (#269).
+registration number, and the existing global/provisional 1-7 skill value —
+shared by the service layer's create/edit validators and both import paths,
+exactly like :mod:`.shooting` (#268) and :mod:`.jersey` (#269). The 2026-08-29
+#287 ruling requires a separate canonical League-context, League-admin-owned,
+audited rating model in #273 before production substitute ranking consumes it.
 
 Every function is pure: no I/O, no clock reads. Where a rule needs "today"
 (a birthdate may not be in the future), the caller passes it in explicitly,
@@ -26,8 +28,9 @@ Canonical storage decisions:
   JSON-safe and matches the store's dates-as-ISO-text convention.
 * ``registration_number`` is the governing body's stable athlete id. Trimmed,
   case preserved, no internal whitespace, bounded length. Optional.
-* ``skill_rating`` is an integer 1-7 or None (unrated). Unrated is a fully
-  supported state — #287's ranking must degrade, never exclude.
+* ``skill_rating`` is an existing global/provisional integer 1-7 or None
+  (unrated), not the approved canonical League-context rating. Unrated is a
+  fully supported state — #287's ranking must degrade, never exclude.
 
 All functions return ``(canonical, reason)``; ``reason`` is None on success
 and a stable machine-readable token on failure (the first element is then
@@ -213,7 +216,11 @@ def plan_effective_registration_state(entries) -> dict:
 
 
 def normalize_skill_rating(value) -> Tuple[Optional[int], Optional[str]]:
-    """Canonicalize an optional 1-7 skill rating (#287 owner ruling → #273).
+    """Normalize the existing global/provisional optional 1-7 skill value.
+
+    This validator does not make the Player field the canonical #287 ranking
+    rating; #273 still must add the approved League-context ownership/audit
+    contract before production projection consumes a rating.
 
     None/blank → unset (unrated). An ``int`` (bool is rejected — it is an int
     subclass, and ``True`` silently becoming rating 1 would be a data bug) or
