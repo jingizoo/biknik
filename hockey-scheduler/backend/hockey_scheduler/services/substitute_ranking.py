@@ -3,24 +3,27 @@
 PROTOTYPE SCOPE. This module implements **only** deterministic eligibility,
 ranking and explainable selection as pure functions over plain projected data.
 
-Deliberately NOT here (they land after #205 / SeasonRosterMembership):
+Deliberately NOT here (they belong to later bounded #287 slices):
   * the offer / accept / decline / timeout workflow,
   * any schema, migration, store or HTTP route,
   * any dependency on ``domain.models.Player`` or ``SubstituteEnrollment``.
 
 The engine takes *plain projected data* rather than the persistence-shaped
-domain models on purpose: #205 will reshape those models, and a prototype that
-never imports them survives that reshaping unchanged. Only the pure enums
-``Position`` and ``SlotType`` are reused, because they carry no persistence
-shape and the rest of the codebase already speaks them.
+domain models on purpose: eligibility remains owned by the caller that resolves
+the Game's ``LeagueSeason`` and the player's ``SeasonRosterMembership``.  The
+ranking core consumes only the resulting immutable projection.  Only the pure
+enums ``Position`` and ``SlotType`` are reused, because they carry no
+persistence shape and the rest of the codebase already speaks them.
 
 Non-negotiable properties, and where they are enforced:
 
   DETERMINISTIC  Every comparison key is an ``int``; the composite sort key ends
                  in ``player_id`` so the ordering is total and shuffling the
                  input candidate list cannot change the output. Randomness, when
-                 a League enables it, is a pure function of ``(seed, player_id)``
-                 — never a draw consumed by walking the candidate list.
+                 a League enables it, is a pure function of
+                 ``(seed, request_id, player_id)`` — never a draw consumed by
+                 walking the candidate list. ``request_id`` must be the stable
+                 vacancy/offer-chain id, reused across retries.
   EXPLAINABLE    Every eligible candidate carries one ``RuleTrace`` per enabled
                  rule (naming the rule, its priority and its raw value); every
                  excluded candidate carries every ``Exclusion`` it earned.
@@ -40,9 +43,9 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
-from typing import Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 from ..domain.enums import Position, SlotType
 
@@ -55,6 +58,8 @@ __all__ = [
     "SubstituteRequest",
     "SubstituteCandidate",
     "SelectionOverride",
+    "OverrideRefusalKind",
+    "OverrideRefusal",
     "RuleTrace",
     "Exclusion",
     "CandidateEvaluation",
@@ -69,9 +74,14 @@ __all__ = [
 MIN_SKILL = 1
 MAX_SKILL = 7
 
-# Worst possible skill distance on the 1..7 scale. Used when a skill is unknown
-# (see ASSUMPTION "unknown skill" below).
+# Worst possible REAL skill distance on the 1..7 scale.
 _MAX_SKILL_DISTANCE = MAX_SKILL - MIN_SKILL
+
+# Owner ruling on #287: an unrated candidate ranks after every rated candidate,
+# including one at the maximum real distance.  Keeping this outside the valid
+# distance range prevents the player-id fallback from putting an unrated
+# candidate ahead of a known 1-vs-7 match.
+_UNKNOWN_SKILL_DISTANCE = _MAX_SKILL_DISTANCE + 1
 
 # Bucket size for the seeded random draw. Collisions are harmless: the trailing
 # player_id in the composite key still yields a total order.
@@ -132,13 +142,22 @@ class RuleSetting:
     # the prototype; the conservative reading of "enable and prioritize" is that
     # a rule is on or off and carries a position, nothing more.
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, RuleKind):
+            raise PolicyError(f"rule kind must be RuleKind, got {self.kind!r}")
+        if not isinstance(self.enabled, bool):
+            raise PolicyError(f"rule enabled must be bool, got {self.enabled!r}")
+
 
 @dataclass(frozen=True)
 class LeagueRankingPolicy:
     """Per-League control over which rules apply and in what order.
 
-    ``rules`` order == priority: ``rules[0]`` is the primary sort key. This is
-    what makes rule order DATA rather than something hardcoded in the engine.
+    ``rules`` order == priority within the settled rated/unrated partition:
+    when ``SKILL_MATCH`` is enabled, every rated candidate precedes every
+    unrated candidate; configured rule order then decides within each group.
+    This keeps rule order DATA without allowing another rule to contradict the
+    owner's explicit unrated-last ruling.
     """
 
     league_id: str
@@ -152,6 +171,22 @@ class LeagueRankingPolicy:
     random_seed: Optional[int] = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.league_id, str) or not self.league_id:
+            raise PolicyError("league_id must be a non-empty string")
+        if not isinstance(self.rules, tuple):
+            raise PolicyError("league policy rules must be an immutable tuple")
+        if not isinstance(self.notice_window_enabled, bool):
+            raise PolicyError(
+                "notice_window_enabled must be bool, got "
+                f"{self.notice_window_enabled!r}"
+            )
+        if self.random_seed is not None and (
+            not isinstance(self.random_seed, int)
+            or isinstance(self.random_seed, bool)
+        ):
+            raise PolicyError(
+                f"random_seed must be an integer or None, got {self.random_seed!r}"
+            )
         if not self.rules:
             raise PolicyError("league policy must configure at least one rule")
 
@@ -282,12 +317,25 @@ class SelectionOverride:
     """An authorized manager/captain overriding the engine's proposal.
 
     Modelled only. No authorization logic lives here — whether ``actor_id`` may
-    override is a question for the service/api layer, after #205.
+    override is a question for the later production service/API slice.
     """
 
     player_id: str
     actor_id: str
     reason: str
+
+
+class OverrideRefusalKind(Enum):
+    """Stable reasons an override request was not applied."""
+
+    UNKNOWN_CANDIDATE = "unknown_candidate"
+    INELIGIBLE = "ineligible"
+
+
+@dataclass(frozen=True)
+class OverrideRefusal:
+    kind: OverrideRefusalKind
+    detail: str
 
 
 # --------------------------------------------------------------------------
@@ -351,13 +399,16 @@ class SubstituteRanking:
             empty (a sole eligible candidate, an all-rule tie broken only by
             player id, or an overdetermined win where no ONE rule is
             load-bearing);
-          * with an override: always ``None``. A human chose the selected
+          * with an APPLIED override: ``None``. A human chose the selected
             player, so no rule decided it. Crediting a rule here produced an
             actively false pair — e.g. FAIRNESS named for a selection that
             FAIRNESS ranked last — for any consumer binding
             ``(selected_player_id, deciding_rule)`` together. The proposal's
             own attribution is still available in ``proposal_deciding_rules``
-            and is labelled as the (unselected) proposal in the summary.
+            and is labelled as the (unselected) proposal in the summary;
+          * with a REFUSED override: unchanged from the engine proposal,
+            because ``selected_player_id`` remains the proposed eligible player
+            (or ``None`` when the pool is empty).
 
     ``decision_summary`` restates the same facts in one line, naming EVERY
     load-bearing rule with the winner's value and the specific rival that rule
@@ -375,6 +426,8 @@ class SubstituteRanking:
     proposal_deciding_rules: tuple[RuleKind, ...]
     decision_summary: str
     override: Optional[SelectionOverride] = None
+    override_applied: bool = False
+    override_refusal: Optional[OverrideRefusal] = None
     override_conflicts: tuple[Exclusion, ...] = ()
     selected_player_id: Optional[str] = None
 
@@ -388,10 +441,38 @@ def _validate(
     request: SubstituteRequest,
     candidates: Sequence[SubstituteCandidate],
     policy: LeagueRankingPolicy,
+    override: Optional[SelectionOverride],
 ) -> None:
     """Programmer/config errors only. Never raised for "nobody is eligible"."""
-    if request.absent_skill is not None and not (
-        MIN_SKILL <= request.absent_skill <= MAX_SKILL
+    if not isinstance(request, SubstituteRequest):
+        raise PolicyError(
+            f"request must be SubstituteRequest, got {request!r}"
+        )
+    if not isinstance(policy, LeagueRankingPolicy):
+        raise PolicyError(
+            f"policy must be LeagueRankingPolicy, got {policy!r}"
+        )
+    if not isinstance(request.request_id, str) or not request.request_id:
+        raise PolicyError("request_id must be a non-empty string")
+    if not isinstance(request.needed_position, Position):
+        raise PolicyError(
+            f"needed_position must be Position, got {request.needed_position!r}"
+        )
+    for field_name, value in (
+        ("game_start", request.game_start),
+        ("as_of", request.as_of),
+    ):
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() != timedelta(0)
+        ):
+            raise PolicyError(f"{field_name} must be a timezone-aware UTC datetime")
+
+    if request.absent_skill is not None and (
+        not isinstance(request.absent_skill, int)
+        or isinstance(request.absent_skill, bool)
+        or not (MIN_SKILL <= request.absent_skill <= MAX_SKILL)
     ):
         raise PolicyError(
             f"absent_skill {request.absent_skill} outside {MIN_SKILL}..{MAX_SKILL}"
@@ -399,23 +480,70 @@ def _validate(
 
     seen: set[str] = set()
     for candidate in candidates:
+        if not isinstance(candidate, SubstituteCandidate):
+            raise PolicyError(
+                f"candidates must contain SubstituteCandidate, got {candidate!r}"
+            )
+        if not isinstance(candidate.player_id, str) or not candidate.player_id:
+            raise PolicyError("candidate player_id must be a non-empty string")
         if candidate.player_id in seen:
             raise PolicyError(
                 f"duplicate player_id {candidate.player_id!r} in candidate pool"
             )
         seen.add(candidate.player_id)
-        if candidate.skill is not None and not (
-            MIN_SKILL <= candidate.skill <= MAX_SKILL
+        if not isinstance(candidate.primary_position, Position):
+            raise PolicyError(
+                f"candidate {candidate.player_id} primary_position must be Position"
+            )
+        if not isinstance(candidate.also_plays, frozenset) or any(
+            not isinstance(position, Position) for position in candidate.also_plays
+        ):
+            raise PolicyError(
+                f"candidate {candidate.player_id} also_plays must be a frozenset "
+                "of Position values"
+            )
+        if candidate.skill is not None and (
+            not isinstance(candidate.skill, int)
+            or isinstance(candidate.skill, bool)
+            or not (MIN_SKILL <= candidate.skill <= MAX_SKILL)
         ):
             raise PolicyError(
                 f"candidate {candidate.player_id} skill {candidate.skill} outside "
                 f"{MIN_SKILL}..{MAX_SKILL}"
             )
-        if candidate.min_notice_minutes < 0:
+        if (
+            not isinstance(candidate.completed_sub_games, int)
+            or isinstance(candidate.completed_sub_games, bool)
+            or candidate.completed_sub_games < 0
+        ):
+            raise PolicyError(
+                f"candidate {candidate.player_id} completed_sub_games "
+                f"{candidate.completed_sub_games!r} must be a non-negative integer"
+            )
+        if (
+            not isinstance(candidate.min_notice_minutes, int)
+            or isinstance(candidate.min_notice_minutes, bool)
+            or candidate.min_notice_minutes < 0
+        ):
             raise PolicyError(
                 f"candidate {candidate.player_id} min_notice_minutes "
-                f"{candidate.min_notice_minutes} is negative"
+                f"{candidate.min_notice_minutes!r} must be a non-negative integer"
             )
+
+    if override is not None:
+        if not isinstance(override, SelectionOverride):
+            raise PolicyError(
+                f"override must be SelectionOverride or None, got {override!r}"
+            )
+        for field_name, value in (
+            ("player_id", override.player_id),
+            ("actor_id", override.actor_id),
+            ("reason", override.reason),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise PolicyError(
+                    f"override {field_name} must be a non-empty string"
+                )
 
 
 # --------------------------------------------------------------------------
@@ -506,17 +634,22 @@ def _score_skill_match(
     candidate: SubstituteCandidate,
     policy: LeagueRankingPolicy,
 ) -> tuple[int, str]:
-    if request.absent_skill is None or candidate.skill is None:
-        # ASSUMPTION (pending owner ruling): an unknown skill scores the worst
-        # possible distance rather than a neutral 0. Treating "unknown" as a
-        # perfect match would let missing data win a slot, which is the opposite
-        # of conservative.
-        known = (
-            "absent player skill unknown"
-            if request.absent_skill is None
-            else "candidate skill unknown"
+    if candidate.skill is None:
+        # Owner ruling: an unrated candidate remains eligible but follows every
+        # rated candidate, even when the absent player's rating is also missing.
+        return (
+            _UNKNOWN_SKILL_DISTANCE,
+            "candidate skill unknown "
+            f"(ranked after known distances at {_UNKNOWN_SKILL_DISTANCE})",
         )
-        return _MAX_SKILL_DISTANCE, f"{known} (scored as worst distance {_MAX_SKILL_DISTANCE})"
+    if request.absent_skill is None:
+        # There is no target for proximity, so all RATED candidates tie on this
+        # rule and the remaining enabled rules decide their order.  They still
+        # precede unrated candidates per the owner ruling above.
+        return (
+            0,
+            "absent player skill unknown (rated candidate; neutral distance 0)",
+        )
     distance = abs(candidate.skill - request.absent_skill)
     # Symmetric on purpose: against an absent 4, candidates 3 and 5 tie.
     return distance, f"skill {candidate.skill} vs {request.absent_skill} (distance {distance})"
@@ -542,6 +675,12 @@ def _score_position_preference(
     """
     if request.slot_type is SlotType.GOALIE:
         return 0, "goalie filling a goalie slot"
+    if request.needed_position is Position.SKATER:
+        # SKATER means the source did not provide a forward/defence preference;
+        # it is not an exact position.  Every non-goalie therefore ties on this
+        # rule instead of rewarding another unspecified record over a concrete
+        # position or a genuinely versatile player.
+        return 0, "generic skater slot; no specific position preference"
     if candidate.primary_position is request.needed_position:
         return 0, f"exact position ({request.needed_position.value})"
     if candidate.plays_both:
@@ -607,16 +746,29 @@ def _trace(
     return tuple(traces)
 
 
-def _sort_key(player_id: str, traces: Sequence[RuleTrace]) -> tuple:
-    """Composite key: every enabled rule's value in priority order, then the
-    player_id as the last-resort total-order tiebreak.
+def _sort_key(
+    candidate: SubstituteCandidate,
+    traces: Sequence[RuleTrace],
+    policy: LeagueRankingPolicy,
+) -> tuple:
+    """Composite key with the settled unrated-last partition when applicable.
 
-    Because this is a single lexicographic sort, "League-configured rule ORDER
-    changes the winner" falls out of tuple ordering with no branching in the
-    engine — and the trailing player_id means shuffling the input cannot change
-    the result.
+    If ``SKILL_MATCH`` is enabled, the first integer is ``0`` for a rated
+    candidate and ``1`` for an unrated candidate. Every enabled rule's value in
+    priority order follows, then player_id as the last-resort total-order
+    tiebreak. If ``SKILL_MATCH`` is disabled, no partition key is present.
+
+    The partition is part of the meaning of ``SKILL_MATCH``, not a fifth League
+    rule: removing ``SKILL_MATCH`` removes both its distance and this partition
+    in the counterfactual attribution below. Within either partition, League-
+    configured rule order remains fully load-bearing. The trailing player_id
+    means shuffling the input cannot change the result.
     """
-    return tuple(trace.value for trace in traces) + (player_id,)
+    configured = tuple(trace.value for trace in traces)
+    if RuleKind.SKILL_MATCH in policy.enabled_rules:
+        rating_partition = 1 if candidate.skill is None else 0
+        return (rating_partition,) + configured + (candidate.player_id,)
+    return configured + (candidate.player_id,)
 
 
 # --------------------------------------------------------------------------
@@ -624,15 +776,33 @@ def _sort_key(player_id: str, traces: Sequence[RuleTrace]) -> tuple:
 # --------------------------------------------------------------------------
 
 
-def _without(key: tuple, index: int) -> tuple:
-    """``key`` with the value at ``index`` deleted — the sort key the engine
-    would have produced had that rule not been configured at all.
+def _without_rule(evaluation: CandidateEvaluation, index: int) -> tuple:
+    """The sort key had trace ``index`` not been configured at all.
 
     Deleting rather than neutralising matters: a zero-weighted rule still
     occupies a position and can still tie-break, so it would not answer the
     counterfactual "what if this rule were not in the policy?".
+
+    ``SKILL_MATCH`` contributes both its configured distance and the settled
+    rated/unrated partition. Removing that rule must remove both. Other rule
+    removals retain the partition because ``SKILL_MATCH`` is still enabled.
     """
-    return key[:index] + key[index + 1 :]
+    key = evaluation.sort_key
+    skill_index = next(
+        (
+            trace_index
+            for trace_index, trace in enumerate(evaluation.rule_traces)
+            if trace.rule is RuleKind.SKILL_MATCH
+        ),
+        None,
+    )
+    if skill_index is None:
+        return key[:index] + key[index + 1 :]
+    if index == skill_index:
+        # key = (rating_partition, rule_0, ..., rule_n, player_id)
+        return key[1 : index + 1] + key[index + 2 :]
+    key_index = index + 1
+    return key[:key_index] + key[key_index + 1 :]
 
 
 def _load_bearing_rules(
@@ -659,7 +829,7 @@ def _load_bearing_rules(
     decisions: list[tuple[int, str]] = []
     for index in range(len(winner.rule_traces)):
         reduced_winner = min(
-            ranked, key=lambda evaluation: _without(evaluation.sort_key, index)
+            ranked, key=lambda evaluation: _without_rule(evaluation, index)
         )
         if reduced_winner.player_id != winner.player_id:
             decisions.append((index, reduced_winner.player_id))
@@ -711,16 +881,24 @@ def _proposal_summary(
     )
 
 
-def _override_conflicts(
+def _evaluate_override(
     request: SubstituteRequest,
     candidates: Sequence[SubstituteCandidate],
     policy: LeagueRankingPolicy,
     override: SelectionOverride,
-) -> tuple[tuple[Exclusion, ...], str]:
-    """Gates the overridden player fails, plus the summary HEAD.
+) -> tuple[
+    bool,
+    tuple[Exclusion, ...],
+    Optional[OverrideRefusal],
+    str,
+]:
+    """Decide whether an override target is eligible, plus summary metadata.
 
-    The override is always honoured (CLAUDE.md: "coach override always wins");
-    conflicts are reported, not enforced. Authorization is not this module's job.
+    A manager may override the engine's PROPOSAL, not the eligibility boundary.
+    In particular, #287's goalie/skater separation is a hard gate and the
+    product baseline requires it end to end.  A target outside the projected
+    pool is refused too: this pure core cannot prove that player's eligibility.
+    Actor authorization and durable audit remain service-layer responsibilities.
 
     The fragment is the head of the summary rather than a clause appended after
     the proposal's explanation: the selected player IS the override target, so
@@ -731,25 +909,30 @@ def _override_conflicts(
     by_id = {c.player_id: c for c in candidates}
     candidate = by_id.get(override.player_id)
     if candidate is None:
-        # ASSUMPTION (pending owner ruling): an override naming a player outside
-        # the supplied pool is honoured but its gates CANNOT be evaluated — the
-        # engine has no data on that player and refuses to invent a clean bill
-        # of health. It is reported in the summary rather than smuggled in as a
-        # fabricated Exclusion, because no gate actually fired.
-        return (), (
-            f"{override.player_id} selected: overridden by {override.actor_id} "
-            f"to {override.player_id} ({override.reason}); player is not in the "
-            "candidate pool, gates not evaluated"
+        detail = "player is not in the candidate pool; eligibility was not evaluated"
+        return (
+            False,
+            (),
+            OverrideRefusal(OverrideRefusalKind.UNKNOWN_CANDIDATE, detail),
+            f"override by {override.actor_id} to {override.player_id} refused "
+            f"({override.reason}): {detail}",
         )
     conflicts = _apply_gates(request, candidate, policy)
+    if conflicts:
+        reasons = "; ".join(conflict.detail for conflict in conflicts)
+        detail = f"override target is ineligible: {reasons}"
+        return (
+            False,
+            conflicts,
+            OverrideRefusal(OverrideRefusalKind.INELIGIBLE, detail),
+            f"override by {override.actor_id} to {override.player_id} refused "
+            f"({override.reason}): {detail}",
+        )
     fragment = (
         f"{override.player_id} selected: overridden by {override.actor_id} "
         f"to {override.player_id} ({override.reason})"
     )
-    if conflicts:
-        reasons = "; ".join(c.detail for c in conflicts)
-        fragment += f"; overridden player fails: {reasons}"
-    return conflicts, fragment
+    return True, (), None, fragment
 
 
 # --------------------------------------------------------------------------
@@ -759,7 +942,7 @@ def _override_conflicts(
 
 def rank_substitutes(
     request: SubstituteRequest,
-    candidates: Sequence[SubstituteCandidate],
+    candidates: Iterable[SubstituteCandidate],
     policy: LeagueRankingPolicy,
     override: Optional[SelectionOverride] = None,
 ) -> SubstituteRanking:
@@ -768,12 +951,20 @@ def rank_substitutes(
     An empty eligible pool is a normal result (``proposed_player_id is None``
     plus the full exclusion list), never an exception.
     """
-    _validate(request, candidates, policy)
+    try:
+        # One immutable snapshot prevents one-shot iterables from being consumed
+        # by validation and prevents a mutable/custom sequence from changing
+        # between validation, ranking, and override evaluation.
+        candidate_snapshot = tuple(candidates)
+    except TypeError as error:
+        raise PolicyError("candidates must be an iterable of candidates") from error
+
+    _validate(request, candidate_snapshot, policy, override)
 
     eligible: list[CandidateEvaluation] = []
     excluded: list[CandidateEvaluation] = []
 
-    for candidate in candidates:
+    for candidate in candidate_snapshot:
         exclusions = _apply_gates(request, candidate, policy)
         if exclusions:
             # Excluded candidates get no rule_traces and no rank: they were
@@ -792,7 +983,7 @@ def rank_substitutes(
                 player_id=candidate.player_id,
                 eligible=True,
                 rule_traces=traces,
-                sort_key=_sort_key(candidate.player_id, traces),
+                sort_key=_sort_key(candidate, traces, policy),
             )
         )
 
@@ -818,20 +1009,27 @@ def rank_substitutes(
 
     proposed_player_id = winner.player_id if winner else None
     conflicts: tuple[Exclusion, ...] = ()
+    override_applied = False
+    override_refusal: Optional[OverrideRefusal] = None
     selected_player_id = proposed_player_id
     # No override: the selection IS the proposal, so the highest-priority
     # load-bearing rule decided it (None when no single rule was load-bearing).
     deciding_rule = proposal_deciding_rules[0] if proposal_deciding_rules else None
     if override is not None:
-        conflicts, fragment = _override_conflicts(
-            request, candidates, policy, override
+        override_applied, conflicts, override_refusal, fragment = _evaluate_override(
+            request, candidate_snapshot, policy, override
         )
-        # The override head leads; the proposal is demoted to what it now is —
-        # a recommendation that was not taken. Crediting a rule for a selection
-        # a human made would be false, so the structured field goes to None.
-        summary = f"{fragment} | engine proposal (not selected): {summary}"
-        deciding_rule = None
-        selected_player_id = override.player_id
+        if override_applied:
+            # The override head leads; the proposal is demoted to what it now is
+            # — a recommendation that was not taken. Crediting a rule for a
+            # selection a human made would be false.
+            summary = f"{fragment} | engine proposal (not selected): {summary}"
+            deciding_rule = None
+            selected_player_id = override.player_id
+        else:
+            # Refusal leaves the engine's proposal, attribution, and empty-pool
+            # result intact.  The rejected request remains structured evidence.
+            summary = f"{fragment} | engine selection unchanged: {summary}"
 
     return SubstituteRanking(
         league_id=policy.league_id,
@@ -845,6 +1043,8 @@ def rank_substitutes(
         proposal_deciding_rules=proposal_deciding_rules,
         decision_summary=summary,
         override=override,
+        override_applied=override_applied,
+        override_refusal=override_refusal,
         override_conflicts=conflicts,
         selected_player_id=selected_player_id,
     )

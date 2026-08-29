@@ -12,6 +12,7 @@ from hockey_scheduler.services.substitute_ranking import (
     Exclusion,
     GateKind,
     LeagueRankingPolicy,
+    OverrideRefusalKind,
     PolicyError,
     RuleKind,
     RuleSetting,
@@ -250,16 +251,122 @@ class SkillMatchTest(unittest.TestCase):
         self.assertIn("no rule separated them", result.decision_summary)
 
     def test_unknown_skill_scores_the_worst_distance(self):
-        """ASSUMPTION under test: unknown skill must never beat a known match."""
+        """Owner ruling: an unrated candidate must never beat a rated one."""
         request = make_request(absent_skill=4)
         known = make_candidate("player_known", skill=7)  # distance 3
         unknown = make_candidate("player_unknown", skill=None)
         result = rank_substitutes(request, [unknown, known],
                                   policy_of(RuleKind.SKILL_MATCH))
         self.assertEqual(result.proposed_player_id, "player_known")
-        self.assertEqual(result.ranked[1].rule_traces[0].value, 6)
+        self.assertEqual(result.ranked[1].rule_traces[0].value, 7)
         self.assertIn("candidate skill unknown",
                       result.ranked[1].rule_traces[0].detail)
+
+    def test_unknown_skill_ranks_after_even_the_farthest_known_rating(self):
+        """Owner ruling: unrated candidates follow every rated candidate.
+
+        The maximum real distance on the 1..7 scale is six.  Unknown therefore
+        needs a distinct value beyond six; tying it with the farthest known
+        rating lets the player-id fallback put the unrated candidate first.
+        """
+        request = make_request(absent_skill=1)
+        farthest_known = make_candidate("player_z_rated", skill=7)
+        unknown = make_candidate("player_a_unrated", skill=None)
+
+        result = rank_substitutes(
+            request,
+            [unknown, farthest_known],
+            policy_of(RuleKind.SKILL_MATCH),
+        )
+
+        self.assertEqual(
+            [evaluation.player_id for evaluation in result.ranked],
+            ["player_z_rated", "player_a_unrated"],
+        )
+        self.assertGreater(
+            result.ranked[1].rule_traces[0].value,
+            result.ranked[0].rule_traces[0].value,
+        )
+
+    def test_unrated_stays_last_at_every_rule_priority_with_all_other_rules_hostile(self):
+        checked = 0
+        rule_orders = tuple(itertools.permutations(tuple(RuleKind)))
+        for absent_skill in (None, *range(1, 8)):
+            for rated_skill in range(1, 8):
+                request = make_request(
+                    absent_skill=absent_skill,
+                    needed_position=Position.FORWARD,
+                )
+                # Every other comparison favours the unrated player: fairness,
+                # exact position, seeded draw, and final id. The settled rule is
+                # stronger than configurable priority: whenever SKILL_MATCH is
+                # enabled, the rated/unrated partition comes first.
+                rated = make_candidate(
+                    "player_z_rated",
+                    primary_position=Position.DEFENSE,
+                    skill=rated_skill,
+                    completed_sub_games=99,
+                )
+                unrated = make_candidate(
+                    "player_a_unrated",
+                    primary_position=Position.FORWARD,
+                    skill=None,
+                    completed_sub_games=0,
+                )
+                for order in rule_orders:
+                    result = rank_substitutes(
+                        request,
+                        [unrated, rated],
+                        policy_of(*order, random_seed=3),
+                    )
+                    self.assertEqual(
+                        result.proposed_player_id,
+                        "player_z_rated",
+                        msg=(
+                            f"absent={absent_skill} rated={rated_skill} "
+                            f"order={[kind.name for kind in order]}"
+                        ),
+                    )
+                    checked += 1
+        self.assertEqual(checked, 8 * 7 * len(rule_orders))
+
+    def test_all_rated_or_all_unrated_candidates_keep_configured_rule_order(self):
+        request = make_request(absent_skill=4)
+        for skills in ((4, 7), (None, None)):
+            with self.subTest(skills=skills):
+                fair = make_candidate(
+                    "player_fair",
+                    skill=skills[0],
+                    completed_sub_games=0,
+                )
+                served = make_candidate(
+                    "player_served",
+                    skill=skills[1],
+                    completed_sub_games=5,
+                )
+                result = rank_substitutes(
+                    request,
+                    [served, fair],
+                    policy_of(RuleKind.FAIRNESS, RuleKind.SKILL_MATCH),
+                )
+                self.assertEqual(result.proposed_player_id, "player_fair")
+
+    def test_unrated_candidate_stays_last_when_absent_skill_is_unknown(self):
+        request = make_request(absent_skill=None)
+        rated = make_candidate(
+            "player_z_rated", skill=4, completed_sub_games=99
+        )
+        unrated = make_candidate(
+            "player_a_unrated", skill=None, completed_sub_games=0
+        )
+        result = rank_substitutes(
+            request,
+            [unrated, rated],
+            policy_of(RuleKind.SKILL_MATCH, RuleKind.FAIRNESS),
+        )
+        self.assertEqual(result.proposed_player_id, "player_z_rated")
+        self.assertEqual(result.ranked[0].rule_traces[0].value, 0)
+        self.assertEqual(result.ranked[1].rule_traces[0].value, 7)
 
 
 class PositionPreferenceTest(unittest.TestCase):
@@ -289,6 +396,44 @@ class PositionPreferenceTest(unittest.TestCase):
         self.assertEqual([e.player_id for e in result.ranked],
                          ["player_both", "player_generic"])
         self.assertEqual(result.ranked[1].rule_traces[0].value, 2)
+
+    def test_generic_skater_vacancy_does_not_invent_a_position_preference(self):
+        request = make_request(needed_position=Position.SKATER)
+        pool = [
+            make_candidate("player_d_generic", primary_position=Position.SKATER),
+            make_candidate(
+                "player_c_both",
+                primary_position=Position.DEFENSE,
+                also_plays=[Position.FORWARD],
+            ),
+            make_candidate("player_b_forward", primary_position=Position.FORWARD),
+            make_candidate("player_a_defense", primary_position=Position.DEFENSE),
+        ]
+        result = rank_substitutes(
+            request,
+            pool,
+            policy_of(RuleKind.POSITION_PREFERENCE),
+        )
+        self.assertEqual(
+            [evaluation.player_id for evaluation in result.ranked],
+            [
+                "player_a_defense",
+                "player_b_forward",
+                "player_c_both",
+                "player_d_generic",
+            ],
+        )
+        self.assertEqual(
+            [evaluation.rule_traces[0].value for evaluation in result.ranked],
+            [0, 0, 0, 0],
+        )
+        self.assertTrue(
+            all(
+                evaluation.rule_traces[0].detail
+                == "generic skater slot; no specific position preference"
+                for evaluation in result.ranked
+            )
+        )
 
 
 class LeagueRuleOrderTest(unittest.TestCase):
@@ -359,8 +504,10 @@ class DisabledRuleTest(unittest.TestCase):
         for evaluation in result.ranked:
             kinds = [trace.rule for trace in evaluation.rule_traces]
             self.assertEqual(kinds, [RuleKind.SKILL_MATCH])
-            # Omission, not zero-weighting: the key holds one value + player_id.
-            self.assertEqual(len(evaluation.sort_key), 2)
+            # Omission, not zero-weighting: one settled rated/unrated partition,
+            # one SKILL_MATCH value, and player_id. The disabled FAIRNESS value
+            # is absent.
+            self.assertEqual(len(evaluation.sort_key), 3)
         # FAIRNESS is listed first but disabled, so it does not decide anything.
         self.assertEqual(result.proposed_player_id, "player_skill")
         self.assertEqual(result.deciding_rule, RuleKind.SKILL_MATCH)
@@ -426,6 +573,26 @@ class SeededRandomTest(unittest.TestCase):
                          [e.player_id for e in second.ranked])
         self.assertEqual([e.sort_key for e in first.ranked],
                          [e.sort_key for e in second.ranked])
+
+    def test_random_draw_is_scoped_to_a_stable_request_id(self):
+        policy = policy_of(RuleKind.RANDOM, random_seed=7)
+        first_request = rank_substitutes(
+            make_request(request_id="request_a"), self._pool(), policy
+        )
+        same_request_retry = rank_substitutes(
+            make_request(request_id="request_a"), self._pool(), policy
+        )
+        different_vacancy = rank_substitutes(
+            make_request(request_id="request_b"), self._pool(), policy
+        )
+        self.assertEqual(
+            [evaluation.player_id for evaluation in first_request.ranked],
+            [evaluation.player_id for evaluation in same_request_retry.ranked],
+        )
+        self.assertNotEqual(
+            [evaluation.player_id for evaluation in first_request.ranked],
+            [evaluation.player_id for evaluation in different_vacancy.ranked],
+        )
 
     def test_a_different_seed_changes_the_draw(self):
         request = make_request()
@@ -603,12 +770,14 @@ class OverrideTest(unittest.TestCase):
                                   override=override)
         self.assertEqual(result.proposed_player_id, "player_free")
         self.assertEqual(result.selected_player_id, "player_busy")
+        self.assertTrue(result.override_applied)
+        self.assertIsNone(result.override_refusal)
         self.assertEqual(result.override_conflicts, ())
         self.assertIn("overridden by user_coach to player_busy",
                       result.decision_summary)
         self.assertIn("carpools with the captain", result.decision_summary)
 
-    def test_override_onto_a_gated_player_reports_the_conflict(self):
+    def test_override_onto_a_gated_player_is_refused(self):
         request = make_request()
         pool = [
             make_candidate("player_free"),
@@ -618,11 +787,40 @@ class OverrideTest(unittest.TestCase):
                                      reason="dressed as a skater tonight")
         result = rank_substitutes(request, pool, policy_of(RuleKind.FAIRNESS),
                                   override=override)
-        self.assertEqual(result.selected_player_id, "player_g")
+        self.assertEqual(result.selected_player_id, "player_free")
+        self.assertFalse(result.override_applied)
+        self.assertEqual(result.override_refusal.kind,
+                         OverrideRefusalKind.INELIGIBLE)
         self.assertEqual(result.override_conflicts[0].gate,
                          GateKind.GOALIE_SEPARATION)
-        self.assertIn("overridden player fails: goalie may not fill a skater slot",
+        self.assertIn("override by user_admin to player_g refused",
                       result.decision_summary)
+        self.assertIn("goalie may not fill a skater slot",
+                      result.decision_summary)
+
+    def test_override_cannot_put_a_skater_in_a_goalie_slot(self):
+        request = make_request(needed_position=Position.GOALIE)
+        pool = [
+            make_candidate("player_goalie", primary_position=Position.GOALIE),
+            make_candidate("player_skater", primary_position=Position.FORWARD),
+        ]
+        override = SelectionOverride(
+            player_id="player_skater",
+            actor_id="user_admin",
+            reason="emergency",
+        )
+        result = rank_substitutes(
+            request,
+            pool,
+            policy_of(RuleKind.FAIRNESS),
+            override=override,
+        )
+        self.assertFalse(result.override_applied)
+        self.assertEqual(result.selected_player_id, "player_goalie")
+        self.assertEqual(result.override_refusal.kind,
+                         OverrideRefusalKind.INELIGIBLE)
+        self.assertEqual(result.override_conflicts[0].gate,
+                         GateKind.GOALIE_SEPARATION)
 
     def test_override_naming_an_unknown_player_is_reported_not_silently_clean(self):
         """ASSUMPTION under test: the engine cannot evaluate gates for a player
@@ -632,12 +830,15 @@ class OverrideTest(unittest.TestCase):
                                      reason="showed up at the rink")
         result = rank_substitutes(request, [make_candidate("player_free")],
                                   policy_of(RuleKind.FAIRNESS), override=override)
-        self.assertEqual(result.selected_player_id, "player_ghost")
+        self.assertEqual(result.selected_player_id, "player_free")
+        self.assertFalse(result.override_applied)
+        self.assertEqual(result.override_refusal.kind,
+                         OverrideRefusalKind.UNKNOWN_CANDIDATE)
         self.assertEqual(result.override_conflicts, ())
-        self.assertIn("not in the candidate pool, gates not evaluated",
+        self.assertIn("not in the candidate pool; eligibility was not evaluated",
                       result.decision_summary)
 
-    def test_override_survives_an_empty_eligible_pool(self):
+    def test_ineligible_override_does_not_fill_an_empty_eligible_pool(self):
         request = make_request()
         override = SelectionOverride(player_id="player_g", actor_id="user_admin",
                                      reason="only body available")
@@ -646,8 +847,42 @@ class OverrideTest(unittest.TestCase):
             [make_candidate("player_g", primary_position=Position.GOALIE)],
             policy_of(RuleKind.FAIRNESS), override=override)
         self.assertIsNone(result.proposed_player_id)
-        self.assertEqual(result.selected_player_id, "player_g")
+        self.assertIsNone(result.selected_player_id)
+        self.assertFalse(result.override_applied)
+        self.assertEqual(result.override_refusal.kind,
+                         OverrideRefusalKind.INELIGIBLE)
         self.assertEqual(len(result.override_conflicts), 1)
+
+    def test_notice_failed_override_is_refused_and_keeps_attribution(self):
+        request = make_request(as_of=GAME_START - timedelta(minutes=60))
+        pool = [
+            make_candidate("player_free", completed_sub_games=0),
+            make_candidate("player_busy", completed_sub_games=5),
+            make_candidate("player_late", min_notice_minutes=61),
+        ]
+        baseline = rank_substitutes(
+            request, pool, policy_of(RuleKind.FAIRNESS)
+        )
+        override = SelectionOverride(
+            player_id="player_late",
+            actor_id="user_coach",
+            reason="asked for a late exception",
+        )
+
+        result = rank_substitutes(
+            request,
+            pool,
+            policy_of(RuleKind.FAIRNESS),
+            override=override,
+        )
+
+        self.assertFalse(result.override_applied)
+        self.assertEqual(result.override_refusal.kind,
+                         OverrideRefusalKind.INELIGIBLE)
+        self.assertEqual(result.selected_player_id, baseline.selected_player_id)
+        self.assertEqual(result.deciding_rule, baseline.deciding_rule)
+        self.assertEqual(result.override_conflicts[0].gate,
+                         GateKind.NOTICE_WINDOW)
 
 
 class PolicyValidationTest(unittest.TestCase):
@@ -670,6 +905,43 @@ class PolicyValidationTest(unittest.TestCase):
                        RuleSetting(kind=RuleKind.FAIRNESS, enabled=False)),
             )
 
+    def test_malformed_rule_configuration_is_refused_as_policy_error(self):
+        malformed = (
+            lambda: RuleSetting(kind="bogus"),
+            lambda: RuleSetting(kind=RuleKind.FAIRNESS, enabled="yes"),
+            lambda: LeagueRankingPolicy(
+                league_id="",
+                rules=(RuleSetting(kind=RuleKind.FAIRNESS),),
+            ),
+            lambda: LeagueRankingPolicy(
+                league_id="league_1",
+                rules=[RuleSetting(kind=RuleKind.FAIRNESS)],
+            ),
+            lambda: LeagueRankingPolicy(
+                league_id="league_1",
+                rules=(object(),),
+            ),
+            lambda: LeagueRankingPolicy(
+                league_id="league_1",
+                rules=(RuleSetting(kind=RuleKind.FAIRNESS),),
+                notice_window_enabled="yes",
+            ),
+            lambda: LeagueRankingPolicy(
+                league_id="league_1",
+                rules=(RuleSetting(kind=RuleKind.RANDOM),),
+                random_seed=True,
+            ),
+            lambda: LeagueRankingPolicy(
+                league_id="league_1",
+                rules=(RuleSetting(kind=RuleKind.RANDOM),),
+                random_seed="seed",
+            ),
+        )
+        for build in malformed:
+            with self.subTest(build=build):
+                with self.assertRaises(PolicyError):
+                    build()
+
     def test_duplicate_player_id_in_the_pool_is_refused(self):
         with self.assertRaises(PolicyError):
             rank_substitutes(
@@ -677,6 +949,105 @@ class PolicyValidationTest(unittest.TestCase):
                 [make_candidate("player_a"), make_candidate("player_a")],
                 policy_of(RuleKind.FAIRNESS),
             )
+
+    def test_one_shot_candidate_iterable_is_snapshotted_once(self):
+        pool = (candidate for candidate in [make_candidate("player_a")])
+        result = rank_substitutes(
+            make_request(),
+            pool,
+            policy_of(RuleKind.FAIRNESS),
+        )
+        self.assertEqual(result.proposed_player_id, "player_a")
+        self.assertEqual([item.player_id for item in result.ranked], ["player_a"])
+
+    def test_duplicate_ids_in_one_shot_iterable_are_still_refused(self):
+        pool = (
+            candidate
+            for candidate in (
+                make_candidate("player_a"),
+                make_candidate("player_a"),
+            )
+        )
+        with self.assertRaises(PolicyError):
+            rank_substitutes(
+                make_request(),
+                pool,
+                policy_of(RuleKind.FAIRNESS),
+            )
+
+    def test_malformed_request_and_candidate_shapes_are_refused(self):
+        invalid_calls = (
+            lambda: rank_substitutes(
+                make_request(request_id=""),
+                [make_candidate("player_a")],
+                policy_of(RuleKind.FAIRNESS),
+            ),
+            lambda: rank_substitutes(
+                make_request(needed_position="forward"),
+                [make_candidate("player_a")],
+                policy_of(RuleKind.FAIRNESS),
+            ),
+            lambda: rank_substitutes(
+                make_request(),
+                [make_candidate("")],
+                policy_of(RuleKind.FAIRNESS),
+            ),
+            lambda: rank_substitutes(
+                make_request(),
+                [make_candidate("player_a", primary_position="forward")],
+                policy_of(RuleKind.FAIRNESS),
+            ),
+            lambda: rank_substitutes(
+                make_request(),
+                [SubstituteCandidate(
+                    player_id="player_a",
+                    primary_position=Position.FORWARD,
+                    also_plays=[Position.DEFENSE],
+                )],
+                policy_of(RuleKind.FAIRNESS),
+            ),
+            lambda: rank_substitutes(
+                make_request(),
+                [object()],
+                policy_of(RuleKind.FAIRNESS),
+            ),
+            lambda: rank_substitutes(
+                object(),
+                [make_candidate("player_a")],
+                policy_of(RuleKind.FAIRNESS),
+            ),
+            lambda: rank_substitutes(
+                make_request(),
+                [make_candidate("player_a")],
+                object(),
+            ),
+            lambda: rank_substitutes(
+                make_request(),
+                [make_candidate("player_a")],
+                policy_of(RuleKind.FAIRNESS),
+                override=object(),
+            ),
+        )
+        for call in invalid_calls:
+            with self.subTest(call=call):
+                with self.assertRaises(PolicyError):
+                    call()
+
+    def test_override_requires_non_empty_audit_fields(self):
+        invalid_overrides = (
+            SelectionOverride(player_id="", actor_id="user_admin", reason="why"),
+            SelectionOverride(player_id="player_a", actor_id="", reason="why"),
+            SelectionOverride(player_id="player_a", actor_id="user_admin", reason=" "),
+        )
+        for override in invalid_overrides:
+            with self.subTest(override=override):
+                with self.assertRaises(PolicyError):
+                    rank_substitutes(
+                        make_request(),
+                        [make_candidate("player_a")],
+                        policy_of(RuleKind.FAIRNESS),
+                        override=override,
+                    )
 
     def test_candidate_skill_outside_the_scale_is_refused(self):
         for skill in (0, 8, -1):
@@ -690,11 +1061,66 @@ class PolicyValidationTest(unittest.TestCase):
             rank_substitutes(make_request(absent_skill=9), [make_candidate("p")],
                              policy_of(RuleKind.FAIRNESS))
 
+    def test_boolean_skill_values_are_refused(self):
+        with self.assertRaises(PolicyError):
+            rank_substitutes(
+                make_request(absent_skill=True),
+                [make_candidate("player_a")],
+                policy_of(RuleKind.FAIRNESS),
+            )
+        with self.assertRaises(PolicyError):
+            rank_substitutes(
+                make_request(),
+                [make_candidate("player_a", skill=True)],
+                policy_of(RuleKind.FAIRNESS),
+            )
+
     def test_negative_min_notice_is_refused(self):
         with self.assertRaises(PolicyError):
             rank_substitutes(make_request(),
                              [make_candidate("player_a", min_notice_minutes=-1)],
                              policy_of(RuleKind.FAIRNESS))
+
+    def test_negative_completed_substitute_games_is_refused(self):
+        with self.assertRaises(PolicyError) as caught:
+            rank_substitutes(
+                make_request(),
+                [make_candidate("player_a", completed_sub_games=-1)],
+                policy_of(RuleKind.FAIRNESS),
+            )
+        self.assertIn("completed_sub_games", str(caught.exception))
+
+    def test_counts_require_real_non_negative_integers(self):
+        invalid_values = (True, 1.5, "1")
+        for field_name in ("completed_sub_games", "min_notice_minutes"):
+            for value in invalid_values:
+                with self.subTest(field_name=field_name, value=value):
+                    with self.assertRaises(PolicyError) as caught:
+                        rank_substitutes(
+                            make_request(),
+                            [make_candidate("player_a", **{field_name: value})],
+                            policy_of(RuleKind.FAIRNESS),
+                        )
+                    self.assertIn(field_name, str(caught.exception))
+
+    def test_request_times_must_be_timezone_aware_utc(self):
+        non_utc = timezone(timedelta(hours=5, minutes=30))
+        invalid_cases = (
+            ("game_start", GAME_START.replace(tzinfo=None), AS_OF),
+            ("as_of", GAME_START, AS_OF.replace(tzinfo=None)),
+            ("game_start", GAME_START.astimezone(non_utc), AS_OF),
+            ("as_of", GAME_START, AS_OF.astimezone(non_utc)),
+        )
+        for field_name, game_start, as_of in invalid_cases:
+            with self.subTest(field_name=field_name):
+                with self.assertRaises(PolicyError) as caught:
+                    rank_substitutes(
+                        make_request(game_start=game_start, as_of=as_of),
+                        [make_candidate("player_a")],
+                        policy_of(RuleKind.FAIRNESS),
+                    )
+                self.assertIn(field_name, str(caught.exception))
+                self.assertIn("timezone-aware UTC", str(caught.exception))
 
 
 class PurityTest(unittest.TestCase):
@@ -1053,24 +1479,32 @@ class DecidingRuleInvariantTest(unittest.TestCase):
 
     def test_a_rule_is_never_credited_for_an_overridden_selection(self):
         """(selected_player_id, deciding_rule) is never a false pair."""
+        checked = 0
         for needed, pool in self._pools():
             if len(pool) < 2:
                 continue
             request = make_request(needed_position=needed, absent_skill=4)
-            override = SelectionOverride(player_id=pool[-1].player_id,
-                                         actor_id="user_admin",
-                                         reason="showed up at the rink")
             for kinds in self.RULE_SETS:
+                policy = policy_of(*kinds, random_seed=self.SEED)
+                baseline = rank_substitutes(request, pool, policy)
+                if len(baseline.ranked) < 2:
+                    continue
+                target_id = baseline.ranked[-1].player_id
+                override = SelectionOverride(player_id=target_id,
+                                             actor_id="user_admin",
+                                             reason="showed up at the rink")
                 result = rank_substitutes(
-                    request, pool, policy_of(*kinds, random_seed=self.SEED),
+                    request, pool, policy,
                     override=override)
-                self.assertEqual(result.selected_player_id,
-                                 pool[-1].player_id)
+                self.assertTrue(result.override_applied)
+                self.assertEqual(result.selected_player_id, target_id)
                 self.assertIsNone(result.deciding_rule)
                 self.assertTrue(
                     result.decision_summary.startswith(
-                        f"{pool[-1].player_id} selected:"),
+                        f"{target_id} selected:"),
                     msg=result.decision_summary)
+                checked += 1
+        self.assertGreater(checked, 100)
 
 
 if __name__ == "__main__":
