@@ -16,8 +16,12 @@ with a ``None`` team_id is a ``field_required`` ValidationError even when called
 directly, not the old ``NotFoundError("Team None not found.")``.
 """
 
+import hashlib
+import inspect
+import itertools
 import json
 import os
+import string
 import threading
 import unittest
 import urllib.error
@@ -38,6 +42,20 @@ from hockey_scheduler.web import server as srv
 
 def _clock():
     return datetime(2026, 7, 19, tzinfo=timezone.utc)
+
+
+def _unlisted_extension_method() -> str:
+    """Return a valid mixed-case HTTP token absent from Handler's source."""
+    handler_source = inspect.getsource(srv.Handler)
+    nonce = 0
+    while True:
+        digest = hashlib.sha256(
+            f"{handler_source}\0{nonce}".encode()
+        ).hexdigest()[:20]
+        method = f"MiXeD-{digest}"
+        if method not in handler_source:
+            return method
+        nonce += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -331,25 +349,34 @@ class WriteSchemaHttpTest(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "not_found")
 
     def test_unimplemented_verbs_use_the_json_method_contract(self):
-        """Extension verbs cannot bypass routing into stdlib HTML 501s."""
+        """An unlisted extension verb cannot fall into stdlib's HTML 501."""
         anon = self._client()
+        method = _unlisted_extension_method()
+        self.assertNotIn(method, inspect.getsource(srv.Handler))
         expected_allow = "GET, HEAD, OPTIONS"
         known_paths = (
             "/api/players",
             "/calendar/team/missing.ics",
         )
-        for method in ("TRACE", "PROPFIND"):
-            for path in known_paths:
-                with self.subTest(method=method, path=path):
-                    status, headers, body = self._req(anon, method, path)
-                    self.assertEqual(status, 405)
-                    self.assertIn("application/json",
-                                  headers.get("Content-Type", ""))
-                    self.assertEqual(headers.get("Allow"), expected_allow)
-                    self.assertEqual(body["error"]["code"],
-                                     "method_not_allowed")
-                    self.assertEqual(body["error"]["details"]["allow"],
-                                     expected_allow)
+        for path in known_paths:
+            with self.subTest(method=method, path=path):
+                status, headers, body = self._req(anon, method, path)
+                self.assertEqual(status, 405)
+                self.assertEqual(
+                    headers.get("Content-Type"),
+                    "application/json; charset=utf-8",
+                )
+                self.assertEqual(headers.get("X-Content-Type-Options"),
+                                 "nosniff")
+                self.assertEqual(headers.get("Allow"), expected_allow)
+                self.assertEqual(body["error"]["code"],
+                                 "method_not_allowed")
+                self.assertEqual(
+                    body["error"]["message"],
+                    f"The {method} method is not allowed for {path}.",
+                )
+                self.assertEqual(body["error"]["details"]["allow"],
+                                 expected_allow)
 
         # The dynamic verb bridge changes only error format, not existence:
         # static shells, fallthroughs, and lookalikes remain unknown.
@@ -360,13 +387,56 @@ class WriteSchemaHttpTest(unittest.TestCase):
             "/api/games/not-a-game/not-an-action",
             "/calendar/nope/missing.ics",
         ):
-            with self.subTest(method="TRACE", path=path):
-                status, headers, body = self._req(anon, "TRACE", path)
+            with self.subTest(method=method, path=path):
+                status, headers, body = self._req(anon, method, path)
                 self.assertEqual(status, 404)
-                self.assertIn("application/json",
-                              headers.get("Content-Type", ""))
+                self.assertEqual(
+                    headers.get("Content-Type"),
+                    "application/json; charset=utf-8",
+                )
+                self.assertEqual(headers.get("X-Content-Type-Options"),
+                                 "nosniff")
                 self.assertNotIn("Allow", headers)
                 self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_dynamic_verb_bridge_covers_the_http_token_alphabet(self):
+        """Every derived valid token reaches the generic method bridge."""
+        token_chars = (
+            string.ascii_letters
+            + string.digits
+            + "!#$%&'*+-.^_`|~"
+        )
+        widths = (1, 2)
+        self.assertEqual(len(token_chars), len(set(token_chars)))
+        concrete_methods = {
+            name[3:]
+            for handler_type in srv.Handler.__mro__
+            for name in handler_type.__dict__
+            if name.startswith("do_")
+        }
+        expected = sum(len(token_chars) ** width for width in widths) - sum(
+            1
+            for method in concrete_methods
+            if len(method) in widths
+            and all(char in token_chars for char in method)
+        )
+        handler = object.__new__(srv.Handler)
+        observed = []
+        handler._method_fallback = observed.append
+        checked = 0
+
+        for width in widths:
+            for chars in itertools.product(token_chars, repeat=width):
+                method = "".join(chars)
+                if method in concrete_methods:
+                    continue
+                observed.clear()
+                getattr(handler, f"do_{method}")()
+                self.assertEqual(observed, [method], method)
+                checked += 1
+
+        self.assertGreater(checked, 0)
+        self.assertEqual(checked, expected)
 
     def test_concrete_non_api_get_routes_publish_the_full_method_contract(self):
         """Known non-API GETs are not unknown merely because of their prefix."""

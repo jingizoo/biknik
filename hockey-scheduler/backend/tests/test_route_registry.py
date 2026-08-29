@@ -129,9 +129,9 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
     # mid-migration state -- "landing in independent, reviewed batches",
     # "cannot pin the whole registry" -- which stopped being true two
     # rounds ago and was left stale here, exactly the kind of drift this
-    # finding exists to catch). The CURRENT, actual state: every one of
-    # the 240 REACHABLE specs (241 total minus the one deliberately-
-    # excluded ``get_empty_path``, see below) carries a real auth/
+    # finding exists to catch). The CURRENT, actual state: every REACHABLE
+    # spec other than the deliberately excluded
+    # ``get_empty_path`` (see below) carries a real auth/
     # scope_axis classification, gated per-route against an independently
     # re-derived expected value by ``_EXPECTED_CLASSIFICATION``'s own
     # comprehensive check further down this file (THE CLASSIFICATION
@@ -217,9 +217,9 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
 # module recognises at all -- test_no_spec_is_half_classified_or_reverted     #
 # (above -- named test_classification_slots_are_still_empty before round 6    #
 # finding 4's own rename, once classification stopped landing batch-by-batch) #
-# only pins TEN specific entries by name and checks that a spec               #
-# never carries HALF a classification; every other one of the 240 reachable   #
-# specs, and any auth STRING WHATSOEVER (a typo, 'unclassified', a value      #
+# only pins a small set of entries by name and checks that a spec             #
+# never carries HALF a classification; every other reachable spec, and any    #
+# auth STRING WHATSOEVER (a typo, 'unclassified', a value                     #
 # from a different axis entirely), passed silently. Reviewer-demonstrated:    #
 # get_officials's auth/scope_axis can be mutated none/none -> operator_only/  #
 # season, or reverted to (UNCLASSIFIED, UNCLASSIFIED) outright, and every     #

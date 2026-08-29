@@ -63,8 +63,8 @@ What is NOT here
   diff line, the same discipline ``_AUDIT_WAIVERS`` uses in route_extract.py.
 * ``auth`` and ``scope_axis`` were declared slots for that later work when
   this section was first written; they are NOT ANY MORE (#202 repair round
-  4, finding 4). Every REACHABLE spec now carries a real classification --
-  240 of them, as of this writing -- and ``tests/test_route_registry.py``'s
+  4, finding 4). Every REACHABLE spec now carries a real classification,
+  and ``tests/test_route_registry.py``'s
   ``_VALID_AUTH_VALUES``/``_EXPECTED_CLASSIFICATION`` CI-GATES both fields
   for every reachable spec: an unclassified reachable entry, a value outside
   the declared vocabulary, or a classification that drifts from what
