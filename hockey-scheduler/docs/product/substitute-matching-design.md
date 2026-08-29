@@ -138,7 +138,8 @@ The future production result contract contains:
 A rule is named as the deciding rule only if removing that rule from the
 policy changes the engine's proposed candidate. Overdetermined results say
 that no single rule decided the outcome. An override says that a person made
-the selection and preserves the engine proposal as non-selected context.
+the selection and preserves the engine proposal as context: selected when the
+override confirms that proposal, otherwise explicitly non-selected.
 
 ### Pure ranking pseudocode
 

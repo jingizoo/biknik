@@ -405,7 +405,8 @@ class SubstituteRanking:
             FAIRNESS ranked last — for any consumer binding
             ``(selected_player_id, deciding_rule)`` together. The proposal's
             own attribution is still available in ``proposal_deciding_rules``
-            and is labelled as the (unselected) proposal in the summary;
+            and is labelled as unselected when the override changes the pick,
+            or selected when the override confirms the same proposal;
           * with a REFUSED override: unchanged from the engine proposal,
             because ``selected_player_id`` remains the proposed eligible player
             (or ``None`` when the pool is empty).
@@ -1021,9 +1022,18 @@ def rank_substitutes(
         )
         if override_applied:
             # The override head leads; the proposal is demoted to what it now is
-            # — a recommendation that was not taken. Crediting a rule for a
-            # selection a human made would be false.
-            summary = f"{fragment} | engine proposal (not selected): {summary}"
+            # — a recommendation that was not taken, unless the manager named
+            # the proposal itself.  Crediting a rule for a selection a human
+            # made would still be false, but calling the identical proposal
+            # "not selected" would contradict the structured result.
+            if override.player_id == proposed_player_id:
+                summary = (
+                    f"{override.player_id} selected: override by "
+                    f"{override.actor_id} confirmed the engine proposal "
+                    f"({override.reason}) | engine proposal (selected): {summary}"
+                )
+            else:
+                summary = f"{fragment} | engine proposal (not selected): {summary}"
             deciding_rule = None
             selected_player_id = override.player_id
         else:

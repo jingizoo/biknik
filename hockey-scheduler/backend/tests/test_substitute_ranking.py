@@ -12,6 +12,8 @@ from hockey_scheduler.services.substitute_ranking import (
     Exclusion,
     GateKind,
     LeagueRankingPolicy,
+    MAX_SKILL,
+    MIN_SKILL,
     OverrideRefusalKind,
     PolicyError,
     RuleKind,
@@ -24,6 +26,7 @@ from hockey_scheduler.services.substitute_ranking import (
 
 GAME_START = datetime(2026, 9, 1, 19, 0, tzinfo=timezone.utc)
 AS_OF = GAME_START - timedelta(minutes=600)  # 10 hours of notice
+OUT_OF_RANGE_SKILLS = (MIN_SKILL - 1, MAX_SKILL + 1, MIN_SKILL - 2)
 
 
 def make_request(
@@ -158,6 +161,17 @@ class NoticeWindowTest(unittest.TestCase):
         self.assertEqual(result.proposed_player_id, "player_exact")
         self.assertEqual(result.excluded, ())
 
+    def test_zero_notice_at_puck_drop_is_eligible(self):
+        request = make_request(as_of=GAME_START)
+        result = rank_substitutes(
+            request,
+            [make_candidate("player_zero", min_notice_minutes=0)],
+            policy_of(RuleKind.FAIRNESS),
+        )
+        self.assertEqual(request.minutes_remaining, 0)
+        self.assertEqual(result.proposed_player_id, "player_zero")
+        self.assertEqual(result.excluded, ())
+
     def test_one_minute_short_is_excluded(self):
         request = make_request(as_of=GAME_START - timedelta(minutes=600))
         result = rank_substitutes(
@@ -183,6 +197,32 @@ class NoticeWindowTest(unittest.TestCase):
         self.assertIsNone(result.proposed_player_id)
         self.assertEqual(result.excluded[0].exclusions[0].detail,
                          "needs 60 min notice, 59 min remain")
+
+    def test_game_already_started_excludes_even_zero_notice_candidates(self):
+        """A negative notice window never becomes an eligibility shortcut."""
+        for minutes_underway in (1, 30, 180):
+            with self.subTest(minutes_underway=minutes_underway):
+                request = make_request(
+                    as_of=GAME_START + timedelta(minutes=minutes_underway)
+                )
+                result = rank_substitutes(
+                    request,
+                    [make_candidate("player_zero", min_notice_minutes=0)],
+                    policy_of(RuleKind.FAIRNESS),
+                )
+                self.assertIsNone(result.proposed_player_id)
+                self.assertEqual(
+                    result.excluded[0].exclusions,
+                    (
+                        Exclusion(
+                            gate=GateKind.NOTICE_WINDOW,
+                            detail=(
+                                "needs 0 min notice, "
+                                f"-{minutes_underway} min remain"
+                            ),
+                        ),
+                    ),
+                )
 
     def test_notice_window_can_be_disabled_by_the_league(self):
         request = make_request(as_of=GAME_START - timedelta(minutes=60))
@@ -434,6 +474,75 @@ class PositionPreferenceTest(unittest.TestCase):
                 for evaluation in result.ranked
             )
         )
+
+    def test_every_vacancy_position_has_an_explicit_ranking_oracle(self):
+        """Derive the coverage axis from Position so DEFENSE cannot disappear."""
+        for needed_position in tuple(Position):
+            with self.subTest(needed_position=needed_position):
+                request = make_request(needed_position=needed_position)
+                if needed_position is Position.GOALIE:
+                    pool = [
+                        make_candidate(
+                            "player_goalie", primary_position=Position.GOALIE
+                        )
+                    ]
+                    expected_ids = ["player_goalie"]
+                    expected_values = [0]
+                elif needed_position is Position.SKATER:
+                    pool = [
+                        make_candidate(
+                            "player_forward", primary_position=Position.FORWARD
+                        ),
+                        make_candidate(
+                            "player_defense", primary_position=Position.DEFENSE
+                        ),
+                    ]
+                    expected_ids = ["player_defense", "player_forward"]
+                    expected_values = [0, 0]
+                else:
+                    alternate_position = (
+                        Position.DEFENSE
+                        if needed_position is Position.FORWARD
+                        else Position.FORWARD
+                    )
+                    pool = [
+                        make_candidate(
+                            "player_alternate",
+                            primary_position=alternate_position,
+                        ),
+                        make_candidate(
+                            "player_both",
+                            primary_position=alternate_position,
+                            also_plays=[needed_position],
+                        ),
+                        make_candidate(
+                            "player_exact",
+                            primary_position=needed_position,
+                        ),
+                    ]
+                    expected_ids = [
+                        "player_exact",
+                        "player_both",
+                        "player_alternate",
+                    ]
+                    expected_values = [0, 1, 2]
+
+                result = rank_substitutes(
+                    request,
+                    pool,
+                    policy_of(RuleKind.POSITION_PREFERENCE),
+                )
+                self.assertEqual(
+                    [evaluation.player_id for evaluation in result.ranked],
+                    expected_ids,
+                )
+                self.assertEqual(
+                    [evaluation.rule_traces[0].value for evaluation in result.ranked],
+                    expected_values,
+                )
+                self.assertTrue(
+                    all(evaluation.eligible for evaluation in result.ranked)
+                )
 
 
 class LeagueRuleOrderTest(unittest.TestCase):
@@ -776,6 +885,38 @@ class OverrideTest(unittest.TestCase):
         self.assertIn("overridden by user_coach to player_busy",
                       result.decision_summary)
         self.assertIn("carpools with the captain", result.decision_summary)
+        self.assertIn("engine proposal (not selected): player_free proposed",
+                      result.decision_summary)
+
+    def test_override_confirming_the_proposal_does_not_call_it_unselected(self):
+        request = make_request()
+        pool = [
+            make_candidate("player_a", completed_sub_games=0),
+            make_candidate("player_b", completed_sub_games=5),
+        ]
+        override = SelectionOverride(
+            player_id="player_a",
+            actor_id="coach_1",
+            reason="same pick",
+        )
+
+        result = rank_substitutes(
+            request,
+            pool,
+            policy_of(RuleKind.FAIRNESS),
+            override=override,
+        )
+
+        self.assertEqual(result.proposed_player_id, "player_a")
+        self.assertEqual(result.selected_player_id, "player_a")
+        self.assertTrue(result.override_applied)
+        self.assertIsNone(result.deciding_rule)
+        self.assertTrue(result.decision_summary.startswith("player_a selected:"))
+        self.assertIn("coach_1", result.decision_summary)
+        self.assertIn("same pick", result.decision_summary)
+        self.assertIn("confirmed the engine proposal", result.decision_summary)
+        self.assertIn("engine proposal (selected):", result.decision_summary)
+        self.assertNotIn("not selected", result.decision_summary)
 
     def test_override_onto_a_gated_player_is_refused(self):
         request = make_request()
@@ -914,6 +1055,10 @@ class PolicyValidationTest(unittest.TestCase):
                 rules=(RuleSetting(kind=RuleKind.FAIRNESS),),
             ),
             lambda: LeagueRankingPolicy(
+                league_id=123,
+                rules=(RuleSetting(kind=RuleKind.FAIRNESS),),
+            ),
+            lambda: LeagueRankingPolicy(
                 league_id="league_1",
                 rules=[RuleSetting(kind=RuleKind.FAIRNESS)],
             ),
@@ -983,6 +1128,11 @@ class PolicyValidationTest(unittest.TestCase):
                 policy_of(RuleKind.FAIRNESS),
             ),
             lambda: rank_substitutes(
+                make_request(request_id=123),
+                [make_candidate("player_a")],
+                policy_of(RuleKind.FAIRNESS),
+            ),
+            lambda: rank_substitutes(
                 make_request(needed_position="forward"),
                 [make_candidate("player_a")],
                 policy_of(RuleKind.FAIRNESS),
@@ -1038,6 +1188,9 @@ class PolicyValidationTest(unittest.TestCase):
             SelectionOverride(player_id="", actor_id="user_admin", reason="why"),
             SelectionOverride(player_id="player_a", actor_id="", reason="why"),
             SelectionOverride(player_id="player_a", actor_id="user_admin", reason=" "),
+            SelectionOverride(player_id=123, actor_id="user_admin", reason="why"),
+            SelectionOverride(player_id="player_a", actor_id=123, reason="why"),
+            SelectionOverride(player_id="player_a", actor_id="user_admin", reason=123),
         )
         for override in invalid_overrides:
             with self.subTest(override=override):
@@ -1050,16 +1203,46 @@ class PolicyValidationTest(unittest.TestCase):
                     )
 
     def test_candidate_skill_outside_the_scale_is_refused(self):
-        for skill in (0, 8, -1):
-            with self.assertRaises(PolicyError):
-                rank_substitutes(make_request(),
-                                 [make_candidate("player_a", skill=skill)],
-                                 policy_of(RuleKind.FAIRNESS))
+        for skill in OUT_OF_RANGE_SKILLS:
+            with self.subTest(skill=skill):
+                with self.assertRaises(PolicyError):
+                    rank_substitutes(make_request(),
+                                     [make_candidate("player_a", skill=skill)],
+                                     policy_of(RuleKind.FAIRNESS))
 
     def test_absent_skill_outside_the_scale_is_refused(self):
+        for absent_skill in OUT_OF_RANGE_SKILLS:
+            with self.subTest(absent_skill=absent_skill):
+                with self.assertRaises(PolicyError):
+                    rank_substitutes(
+                        make_request(absent_skill=absent_skill),
+                        [make_candidate("p")],
+                        policy_of(RuleKind.FAIRNESS),
+                    )
+
+    def test_skill_fields_require_real_integers(self):
+        invalid_skill = 4.5
         with self.assertRaises(PolicyError):
-            rank_substitutes(make_request(absent_skill=9), [make_candidate("p")],
-                             policy_of(RuleKind.FAIRNESS))
+            rank_substitutes(
+                make_request(absent_skill=invalid_skill),
+                [make_candidate("player_a")],
+                policy_of(RuleKind.SKILL_MATCH),
+            )
+        with self.assertRaises(PolicyError):
+            rank_substitutes(
+                make_request(),
+                [make_candidate("player_a", skill=invalid_skill)],
+                policy_of(RuleKind.SKILL_MATCH),
+            )
+
+    def test_candidate_player_id_type_errors_are_normalized_to_policy_error(self):
+        with self.assertRaises(PolicyError) as caught:
+            rank_substitutes(
+                make_request(),
+                [make_candidate(123), make_candidate("player_a")],
+                policy_of(RuleKind.FAIRNESS),
+            )
+        self.assertIn("player_id", str(caught.exception))
 
     def test_boolean_skill_values_are_refused(self):
         with self.assertRaises(PolicyError):
@@ -1106,6 +1289,8 @@ class PolicyValidationTest(unittest.TestCase):
     def test_request_times_must_be_timezone_aware_utc(self):
         non_utc = timezone(timedelta(hours=5, minutes=30))
         invalid_cases = (
+            ("game_start", "2026-09-01T19:00:00Z", AS_OF),
+            ("as_of", GAME_START, 0),
             ("game_start", GAME_START.replace(tzinfo=None), AS_OF),
             ("as_of", GAME_START, AS_OF.replace(tzinfo=None)),
             ("game_start", GAME_START.astimezone(non_utc), AS_OF),
