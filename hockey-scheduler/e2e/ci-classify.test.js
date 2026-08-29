@@ -13,13 +13,16 @@ const T = "hockey-scheduler/backend/tests/";
 const E = "hockey-scheduler/e2e/";
 const D = "hockey-scheduler/docs/";
 
-// Expected job sets.
-const NONE = { test: false, postgres: false, frontend_check: false, browser_smoke: false };
-const DB   = { test: true,  postgres: true,  frontend_check: false, browser_smoke: false };
-const WEB  = { test: false, postgres: false, frontend_check: true,  browser_smoke: true  };
-const FULL = { test: true,  postgres: true,  frontend_check: true,  browser_smoke: true  };
+// Expected job sets. The PR-body check is cheap and applies to every Hockey
+// Scheduler PR, even when no heavy job is needed; only a positively recognized
+// sibling-project-only diff may skip it.
+const SIBLING = { test: false, postgres: false, frontend_check: false, browser_smoke: false, pr_body_check: false };
+const BODY    = { test: false, postgres: false, frontend_check: false, browser_smoke: false, pr_body_check: true  };
+const DB      = { test: true,  postgres: true,  frontend_check: false, browser_smoke: false, pr_body_check: true  };
+const WEB     = { test: false, postgres: false, frontend_check: true,  browser_smoke: true,  pr_body_check: true  };
+const FULL    = { test: true,  postgres: true,  frontend_check: true,  browser_smoke: true,  pr_body_check: true  };
 
-const KEYS = ["test", "postgres", "frontend_check", "browser_smoke"];
+const KEYS = ["test", "postgres", "frontend_check", "browser_smoke", "pr_body_check"];
 let passed = 0;
 
 function expect(name, files, eventName, want) {
@@ -69,8 +72,8 @@ console.log("  ok  categorize() ordering");
 passed += 1;
 
 // --- classify(): the reviewer-named cases ----------------------------------
-// 1. docs-only  -> no heavy job
-expect("docs-only", [D + "architecture/season-lifecycle.md", "README.md"], "pull_request", NONE);
+// 1. docs-only -> no heavy job, but the live PR-body gate still runs.
+expect("docs-only", [D + "architecture/season-lifecycle.md", "README.md"], "pull_request", BODY);
 // 2. frontend-only -> frontend + browser
 expect("frontend-only", [B + "web/static/app.js", B + "web/static/styles.css"], "pull_request", WEB);
 // 3. e2e-only (an ORDINARY journey) -> frontend + browser (lighter route kept)
@@ -101,12 +104,12 @@ expect("push-to-main", [D + "x.md"], "push", FULL);
 expect("workflow-dispatch", [B + "web/static/app.js"], "workflow_dispatch", FULL);
 
 // --- sibling monorepo project — skip-safe (no hockey job) -------------------
-expect("sibling-src-only", ["src/Main.java", "src/util/Helper.java"], "pull_request", NONE);
-expect("sibling-terraform-only", ["terraform/main.tf"], "pull_request", NONE);
-expect("sibling-build-gradle", ["build.gradle"], "pull_request", NONE);
-expect("sibling-root-requirements", ["requirements.txt"], "pull_request", NONE);
-expect("sibling-root-docs", ["docs/design.md", "document_xfer.md"], "pull_request", NONE);
-expect("sibling-mixed-dirs", ["src/A.java", "terraform/x.tf", "k8s/deploy.yaml", "README.md"], "pull_request", NONE);
+expect("sibling-src-only", ["src/Main.java", "src/util/Helper.java"], "pull_request", SIBLING);
+expect("sibling-terraform-only", ["terraform/main.tf"], "pull_request", SIBLING);
+expect("sibling-build-gradle", ["build.gradle"], "pull_request", SIBLING);
+expect("sibling-root-requirements", ["requirements.txt"], "pull_request", SIBLING);
+expect("sibling-root-docs", ["docs/design.md", "document_xfer.md"], "pull_request", SIBLING);
+expect("sibling-mixed-dirs", ["src/A.java", "terraform/x.tf", "k8s/deploy.yaml", "README.md"], "pull_request", SIBLING);
 // A sibling change ALONGSIDE a hockey change still runs the hockey job (union).
 expect("sibling+hockey-frontend", ["src/A.java", B + "web/static/app.js"], "pull_request", WEB);
 expect("sibling+hockey-api", ["terraform/x.tf", B + "api/service.py"], "pull_request", FULL);
