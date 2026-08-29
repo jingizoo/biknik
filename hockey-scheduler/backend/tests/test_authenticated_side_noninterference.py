@@ -1873,6 +1873,14 @@ ADMISSION_FIELDS = _record_fields(game_side_scope.PrivateGameRead)
 #: The record's own name, as the gate's source spells it at every return.
 ADMISSION_RECORD = game_side_scope.PrivateGameRead.__name__
 
+#: THE ONE CONSTRUCTED VALUE A DELEGATING BRANCH MAY HAND THE RESOLVER, named
+#: from the production class and its own capture classmethod rather than
+#: spelled here — so renaming either in the product makes the allowance stop
+#: matching (and the gate fail closed) rather than keep vouching for a name
+#: that no longer means what it meant.
+AUTHORITY_SNAPSHOT = game_side_scope.GameAuthorization.__name__
+AUTHORITY_CAPTURE = game_side_scope.GameAuthorization.of.__name__
+
 #: The record fields whose EXPRESSION the classification reads, as opposed to
 #: the ones it reads only as a test against the literal ``None`` (#427 round
 #: 19). :func:`admission_branches` folds these two through :func:`_inlined`
@@ -2486,6 +2494,94 @@ def _refuse_a_second_binding(fn, stmt, bindings, bound):
         f"guessed at")
 
 
+def _captured_subject(value, parameter, carrier_params):
+    """THE ONE CONSTRUCTED ARGUMENT THIS INVENTORY VOUCHES FOR, AND THE
+    NARROWEST STATEMENT OF IT (#427 round 25, the owner's constructor
+    allowance).
+
+    Conditions 3-5 vouch an argument by asking what it is BUILT OUT OF: every
+    leaf a parameter the carrier RECEIVED, no literal, and — condition 4 —
+    something no other slot already hands over. Round 23's ruling then
+    required the participation test to decide against a FROZEN SNAPSHOT
+    rather than the mutable row, and a snapshot is by construction a value
+    the gate CONSTRUCTS. So the resolver's authority slot holds
+    ``GameAuthorization.of(game)``, whose leaves are the class and the local
+    — neither of them a carrier parameter — and conditions 3-5 refused it BY
+    NAME. They were right to: at that point the audit had no account of what
+    a constructed value carries.
+
+    THE ALLOWANCE IS AN UNWRAP, NOT AN EXEMPTION, and that distinction is
+    the whole of its safety. This does not decide that the slot is vouched;
+    it identifies ONE canonical capture and hands its SUBJECT back so that
+    conditions 3, 4 and 5 — unchanged, and still the only things that vouch
+    anything — run against the subject instead of against the wrapper. The
+    capture is transparent to the audit precisely because
+    :meth:`GameAuthorization.of` adds no fact: it copies five fields off the
+    row it is handed and holds nothing else, so what the resolver decides
+    from is exactly what the SUBJECT was, and the question "could this be a
+    game the gate was not asked about" is answered where it was always
+    answered.
+
+    WHAT STAYS REFUSED, each by the condition that already refused it:
+
+    * ANOTHER CONSTRUCTOR — ``Whatever.of(game)``, ``GameAuthorization(...)``,
+      ``GameAuthorization.of(a, b)``, a keyword form, a starred form. None of
+      them match here, so no unwrap happens and conditions 3-5 refuse the
+      wrapper exactly as they did before this function existed.
+    * A FORGED SUBJECT — ``GameAuthorization.of(store.all_games().pop())``
+      via a local. The unwrap hands condition 4 the subject, and condition 4
+      is the rule that MEASURED that spelling live at ``d3f5f1e``: a value
+      computed from arguments the resolver already holds carries no subject.
+    * A REBOUND SUBJECT OR AUTHORITY — either name written twice is
+      :func:`_refuse_a_second_binding`, and either assigned inside a nested
+      block is :data:`UNRESOLVABLE` at :func:`_resolved`. Both fire before
+      this function is reached.
+    * AN ALIAS, AT EITHER LEVEL. What is read here is the slot's DIRECT
+      binding, not :func:`_unfold`'s answer, and the caller reads the
+      subject's direct binding the same way. So ``_a = GameAuthorization
+      .of(game)`` … ``authorization = _a`` does not match (the binding is a
+      ``Name``, not the capture) and ``game = _row`` leaves the subject
+      holding ``_row``, which is not a carrier parameter and dies on
+      condition 3. Unfolding would have accepted both: they hold the same
+      object, but the owner's allowance names a TWO-STATEMENT CHAIN, and a
+      chain this inventory was not asked to admit is one it does not admit.
+      The argument itself must still be the bare name the resolver's own
+      signature gives the slot (conditions 1 and 2), which this function
+      neither sees nor relaxes.
+    * THE RAW MAPPING as the subject — ``GameAuthorization.of(scope)`` — is
+      :func:`_refuse_a_raw_scope_use`, condition 9, which allows ``scope``
+      in two positions and this is neither.
+
+    AND ONLY IN A SLOT THE CARRIER DOES NOT RECEIVE. ``parameter not in
+    carrier_params`` is the derived form of "this slot cannot be a
+    pass-through, so it must be constructed" — it is read off the carrier's
+    own signature rather than by naming the authority slot here, and it
+    keeps the unwrap away from every slot that HAS a straight-through answer
+    (``role`` and ``store`` today). The projected slots never reach this
+    function at all; they return above it."""
+    if parameter in carrier_params:
+        return None
+    # ``value`` is the slot's direct binding and may be absent or
+    # :data:`UNRESOLVABLE`; both simply fail the shape test below, and the
+    # conditions the caller falls through to are what refuse them.
+    if not (isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == AUTHORITY_CAPTURE
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == AUTHORITY_SNAPSHOT):
+        return None
+    if value.keywords or len(value.args) != 1:
+        return None
+    # A BARE NAME, so that the subject is something the binding model has
+    # already walked — written once, not written in a nested block, and
+    # resolvable to the expression it holds. An inline expression here would
+    # be vouchable by conditions 3-5 just as well, and is still refused:
+    # the owner's allowance names the two-statement chain, and a shape this
+    # inventory was not asked to admit is one it does not admit.
+    subject = value.args[0]
+    return subject if isinstance(subject, ast.Name) else None
+
+
 def _refuse_an_unvouched_argument(call, carrier, resolver, bindings, where,
                                   projected=frozenset()):
     """WHAT A DELEGATING BRANCH HANDS THE AUDITED RESOLVER (#427 round 16,
@@ -2640,6 +2736,26 @@ def _refuse_an_unvouched_argument(call, carrier, resolver, bindings, where,
             argument, bindings,
             f"the {parameter!r} argument the branch at line {call.lineno} "
             f"hands {resolver.name}")
+        # THE CONSTRUCTOR ALLOWANCE, and it is an unwrap: a canonical capture
+        # is replaced by ITS SUBJECT, and every condition below then vouches
+        # the subject. :func:`_captured_subject` carries what that admits and
+        # what each other spelling still dies of.
+        captured = _captured_subject(bindings.get(argument.id, None),
+                                     parameter, carrier_params)
+        if captured is not None:
+            where_subject = (
+                f"the subject {AUTHORITY_SNAPSHOT}.{AUTHORITY_CAPTURE} "
+                f"captures for the {parameter!r} argument the branch at "
+                f"line {call.lineno} hands {resolver.name}")
+            held = bindings.get(captured.id, None)
+            if captured.id in carrier_params or held is None \
+                    or held is UNRESOLVABLE:
+                # A RECEIVED SUBJECT, or one this walk must refuse — both are
+                # what :func:`_resolved` already answers, including condition
+                # 5's normalisation form and the nested-block refusal.
+                value = _resolved(captured, bindings, where_subject)
+            else:
+                value = held
         names = sorted({sub.id for sub in ast.walk(value)
                         if isinstance(sub, ast.Name)})
         outside = [n for n in names if n not in carrier_params]
@@ -5594,12 +5710,29 @@ ADMISSION_AUTHORITIES = {
     # what this pin was protecting — and its absence is what
     # `a_binding_the_fold_would_drop_in_the_player_helper` now has no target
     # for: there is no `scope` in that helper to mutate any more.
+    #
+    # RE-DECIDED AGAIN IN ROUND 25, and the judgement is the whole point of
+    # the re-decision rather than the diff. The membership spine's first
+    # argument changed from `game` to `authorization` — the SAME subject,
+    # named by the frozen snapshot instead of by the mutable row. What this
+    # pin is for is unchanged and both halves are still in it: the #270
+    # fail-closed guard, and the fact that the side comes from the
+    # MEMBERSHIP QUERY and never from the permanent `Player.team_id`
+    # pointer. What the change buys is that the query and the participation
+    # test either side of it now read ONE frozen pair of ids: the resolver
+    # used to re-read the live `Game` after the snapshot had been taken, so
+    # a competition rebinding landing between the two reads could move
+    # admission while the record the decision was carried in stayed put.
+    # This is therefore a NARROWING of what the authority depends on, which
+    # is the direction this pin exists to allow — a widening in this slot
+    # would still have to be argued for here.
     "PLAYER": _DeclaredAuthority(
         klass=PLAYER_SCOPED_BY_MEMBERSHIP,
         authority="None if not scoped_player_id else None if "
                   "store.get_player(scoped_player_id) is None "
                   "or not store.get_player(scoped_player_id)"
-                  ".is_active else RosterService(store).team_for_game(game, "
+                  ".is_active else RosterService(store)"
+                  ".team_for_game(authorization, "
                   "store.get_player(scoped_player_id))",
         admits="own_team is not None and own_team in "
                "(authorization.home_team_id, authorization.away_team_id)",
@@ -13169,8 +13302,8 @@ class TheSweptBindingsExerciseTheUnentitledDirection(_SweepHarness,
             # written by a request, so a path that named a `player_id` could
             # not reach the side this resolver answers.
             self.assertEqual(
-                ["role", "scoped_team_id", "scoped_player_id", "game",
-                 "store"],
+                ["role", "scoped_team_id", "scoped_player_id",
+                 "authorization", "store"],
                 list(inspect.signature(
                     game_side_scope.game_scoped_own_team_id).parameters),
                 "the trusted resolver's inputs changed; if a request can now "
@@ -13806,8 +13939,8 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
     #: the DELEGATION model has to replace — the resolver call and the
     #: participation test it takes on the answer.
     DELEGATION = (
-        "        own_team = game_scoped_own_team_id(role, scoped_team_id,\n"
-        "                                           scoped_player_id, game, "
+        "        own_team = game_scoped_own_team_id(\n"
+        "            role, scoped_team_id, scoped_player_id, authorization, "
         "store)\n"
         "        admitted = own_team is not None and own_team in (\n"
         "            authorization.home_team_id, "
@@ -13818,8 +13951,8 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
     #: an argument without touching the participation test that follows it,
     #: which is exactly the shape all three pins are blind to.
     RESOLVER_CALL = (
-        "        own_team = game_scoped_own_team_id(role, scoped_team_id,\n"
-        "                                           scoped_player_id, game, "
+        "        own_team = game_scoped_own_team_id(\n"
+        "            role, scoped_team_id, scoped_player_id, authorization, "
         "store)\n")
 
     #: THE PROJECTION (#427 round 20): the gate's normalisation of the
@@ -13850,7 +13983,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
 
     #: What the PLAYER authority ultimately answers — the membership spine.
     PLAYER_HELPER_ANSWER = ("    return RosterService(store).team_for_game("
-                            "game, player)\n")
+                            "authorization, player)\n")
 
     #: …and the helper's OWN first statement. Round 19's eleventh spelling
     #: mutated the mapping HERE, one call deeper than either class the review
@@ -13879,8 +14012,9 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
     CARRIER_DEF = ("def resolve_private_game_read(role, scope, game_id, "
                    "store) -> PrivateGameRead:")
     RESOLVER_DEF = ("def game_scoped_own_team_id(role, scoped_team_id, "
-                    "scoped_player_id, game,")
-    HELPER_DEF = "def _player_team_for_game(scoped_player_id, game, store):"
+                    "scoped_player_id,")
+    HELPER_DEF = ("def _player_team_for_game(scoped_player_id, "
+                  "authorization, store):")
 
     #: THE ADMISSION RECORD'S OWN `class` LINE and its ONE derived field —
     #: what round 21's FOURTH CLASS is spelled against. Every rule in this
@@ -14289,7 +14423,8 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                           "neutering the follow did not put the pin back on "
                           "the function name, so this half measures nothing")
             self.assertEqual(
-                "_player_team_for_game(scoped_player_id, game, store)",
+                "_player_team_for_game(scoped_player_id, authorization, "
+                "store)",
                 unfollowed["PLAYER"].authority,
                              "neutering the follow did not put the PLAYER "
                              "pin back on the helper's NAME, so the fold "
@@ -14701,7 +14836,8 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
         body, anchor = self.ADMITTING_BODY, self.ANCHOR
         resolver_player = ("    if role == Role.PLAYER:\n"
                            "        return _player_team_for_game("
-                           "scoped_player_id, game, store)")
+                           "scoped_player_id, authorization,\n"
+                           "                                     store)")
         return {
             "plain_equality":
                 dict(replacement=f"    if role == Role.GUARDIAN:\n"
@@ -14927,8 +15063,8 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                 dict(replacement="    if role == Role.GUARDIAN:\n"
                                  "        own_team = "
                                  "game_scoped_own_team_id(role, "
-                                 "scoped_team_id, scoped_player_id, game, "
-                                 "store)\n"
+                                 "scoped_team_id, scoped_player_id, "
+                                 "authorization, store)\n"
                                  "        return PrivateGameRead(role=role, "
                                  "authorization=authorization, "
                                  "own_team=game.home_team_id, "
@@ -14972,7 +15108,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                      prelude=(self.DELEGATION,
                               "        _ = game_scoped_own_team_id(\n"
                               "            role, scoped_team_id, "
-                              "scoped_player_id, game, store)\n"
+                              "scoped_player_id, authorization, store)\n"
                               "        if game is not None:\n"
                               "            own_team = game.home_team_id\n"
                               "        admitted = own_team is not None and "
@@ -14997,19 +15133,19 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                      prelude=(self.RESOLVER_CALL,
                               "        own_team = game_scoped_own_team_id(\n"
                               "            role, game.home_team_id, "
-                              "scoped_player_id, game, store)\n")),
+                              "scoped_player_id, authorization, store)\n")),
             "forged_role_into_the_resolver":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.RESOLVER_CALL,
                               "        own_team = game_scoped_own_team_id(\n"
                               "            Role.COACH, scoped_team_id, "
-                              "scoped_player_id, game, store)\n")),
+                              "scoped_player_id, authorization, store)\n")),
             "forged_role_and_team_id_into_the_resolver":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.RESOLVER_CALL,
                               "        own_team = game_scoped_own_team_id(\n"
                               "            Role.COACH, game.home_team_id, "
-                              "scoped_player_id, game, store)\n")),
+                              "scoped_player_id, authorization, store)\n")),
             # THE CALL SITE'S TEXT NEVER MOVES — one line, above every
             # branch, replacing the gate's own normalisation of the session
             # scope with a scope the gate BUILT.
@@ -15028,7 +15164,7 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                               "        _side_id = game.home_team_id\n"
                               "        own_team = game_scoped_own_team_id(\n"
                               "            role, _side_id, "
-                              "scoped_player_id, game, store)\n")),
+                              "scoped_player_id, authorization, store)\n")),
             # A CALL SHAPE THE VOUCHING DOES NOT MODEL is refused, not read
             # position by position as though it were plain positional.
             "the_resolver_called_by_keyword":
@@ -15036,14 +15172,15 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                      prelude=(self.RESOLVER_CALL,
                               "        own_team = game_scoped_own_team_id(\n"
                               "            role, scoped_team_id, "
-                              "scoped_player_id, game, store=store)\n")),
+                              "scoped_player_id, authorization, "
+                              "store=store)\n")),
             # THE SAME DEFECT ONE CALL DEEPER. The PLAYER authority was
             # pinned as the TEXT `_player_team_for_game(scope, game, store)`
             # and that function's BODY was derived by nothing.
             "the_player_helper_answers_home":
                 dict(anchor=anchor, replacement=anchor, names="PLAYER",
                      prelude=(self.PLAYER_HELPER_ANSWER,
-                              "    return game.home_team_id\n")),
+                              "    return authorization.home_team_id\n")),
             # FOUND BY THIS ROUND'S OWN HUNT, against the three rules it had
             # already written: the gate's one line that selects the SUBJECT,
             # replaced by a value that is a function of `store` alone.
@@ -15154,7 +15291,8 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             "the_resolver_rebuilds_a_projected_id_from_its_own_inputs":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=(self.RESOLVER_FIRST_TEST,
-                              "    scoped_player_id = game.home_team_id\n"
+                              "    scoped_player_id = "
+                              "authorization.home_team_id\n"
                               + self.RESOLVER_FIRST_TEST)),
             # ---- ROUND 19, THE EIGHTH SPELLING, found by hunting THIS
             # ROUND'S OWN RULE. The first draft of `_refuse_a_mutated_input`
@@ -15299,18 +15437,19 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             "a_resolver_slot_no_projection_fills":
                 dict(anchor=anchor, replacement=anchor, names="COACH",
                      prelude=("def game_scoped_own_team_id(role, "
-                              "scoped_team_id, scoped_player_id, game,\n"
-                              "                            store):",
+                              "scoped_team_id, scoped_player_id,\n"
+                              "                            authorization, "
+                              "store):",
                               "def game_scoped_own_team_id(role, "
                               "scoped_team_id, scoped_player_id,\n"
                               "                            scoped_venue_id, "
-                              "game, store):"),
+                              "authorization, store):"),
                      prelude2=(self.RESOLVER_CALL,
                                "        scoped_venue_id = game_id\n"
                                "        own_team = game_scoped_own_team_id(\n"
                                "            role, scoped_team_id, "
                                "scoped_player_id, scoped_venue_id,\n"
-                               "            game, store)\n")),
+                               "            authorization, store)\n")),
             # THE NAMING RULE'S OWN FALSIFIER, and the sharpest of the three:
             # a projection named for one key and reading ANOTHER. The name at
             # every downstream slot is correct, the call site is correct, and
@@ -17076,6 +17215,118 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
             "a projection named for one key and reading another is not "
             "refused by name: " + str(self._audit(crossed)))
 
+    #: THE TWO STATEMENTS THE CONSTRUCTOR ALLOWANCE ADMITS, written once so
+    #: the positive control and every falsifier below edit THE SAME chain,
+    #: and so a drift in the gate fails LOUDLY here rather than silently
+    #: patching nothing.
+    CAPTURE_CHAIN = ("    game = store.get_game(game_id)\n"
+                     "    authorization = GameAuthorization.of(game)\n")
+
+    #: ``label -> what replaces CAPTURE_CHAIN``. Each is a way of putting
+    #: something OTHER than the canonical capture in the authority slot, and
+    #: each must still be refused with the allowance in force.
+    FORGED_CAPTURES = {
+        "a subject computed from the resolver's own arguments":
+            "    game = store.all_games().pop()\n"
+            "    authorization = GameAuthorization.of(game)\n",
+        "a different constructor":
+            "    game = store.get_game(game_id)\n"
+            "    authorization = _Forged.of(game)\n",
+        "the class called directly rather than its capture":
+            "    game = store.get_game(game_id)\n"
+            "    authorization = GameAuthorization(game.game_id, "
+            "game.home_team_id, game.away_team_id, game.league_season_id, "
+            "game.season_id)\n",
+        "an alias standing in for the authority":
+            "    game = store.get_game(game_id)\n"
+            "    _a = GameAuthorization.of(game)\n"
+            "    authorization = _a\n",
+        "an alias standing in for the subject":
+            "    _row = store.get_game(game_id)\n"
+            "    game = _row\n"
+            "    authorization = GameAuthorization.of(game)\n",
+        "a keyword capture":
+            "    game = store.get_game(game_id)\n"
+            "    authorization = GameAuthorization.of(game=game)\n",
+        "a capture handed two subjects":
+            "    game = store.get_game(game_id)\n"
+            "    authorization = GameAuthorization.of(game, game)\n",
+        "a starred capture":
+            "    game = store.get_game(game_id)\n"
+            "    _args = [game]\n"
+            "    authorization = GameAuthorization.of(*_args)\n",
+        "a subject fetched by a literal id":
+            "    game = store.get_game('game_1')\n"
+            "    authorization = GameAuthorization.of(game)\n",
+        "the raw session mapping as the subject":
+            "    game = scope\n"
+            "    authorization = GameAuthorization.of(game)\n",
+        "a capture with no named subject at all":
+            "    authorization = GameAuthorization.of("
+            "store.get_game(game_id))\n"
+            "    game = store.get_game(game_id)\n",
+    }
+
+    def test_only_the_canonical_capture_chain_vouches_a_built_argument(self):
+        """THE CONSTRUCTOR ALLOWANCE, IN BOTH DIRECTIONS (#427 round 25, the
+        owner's ruling).
+
+        Conditions 3-5 vouch an argument by its LEAVES, and round 23's
+        ruling put a value in the authority slot that has no leaf the gate
+        received: a frozen :class:`GameAuthorization` the gate CONSTRUCTS.
+        They refused it by name, and correctly — an argument built out of
+        nothing the gate was handed is one the pins cannot vouch for. The
+        allowance is :func:`_captured_subject`, and it is an UNWRAP rather
+        than an exemption: the canonical capture is replaced by its SUBJECT,
+        and conditions 3, 4 and 5 — unchanged — vouch the subject.
+
+        THE POSITIVE HALF IS FALSIFIABLE, which is the only reason it is
+        worth asserting. "The real gate audits clean" would read green for a
+        gate nothing was checking; so the same source is audited a second
+        time with :func:`_captured_subject` REMOVED, and it must go RED and
+        NAME the authority slot. That is what says the allowance — and not
+        some other rule that happened to answer first — is what admits this
+        gate, and that the slot is still being looked at.
+
+        THE NEGATIVE HALF is every other way of filling that slot. Each is
+        refused, WITH the allowance in force, so the allowance is measured
+        as narrow rather than described as narrow. Their refusals come from
+        several different conditions on purpose — a forged subject dies on
+        condition 4, an alias on condition 3, a literal on the literal rule,
+        the raw mapping on condition 9 — because what is being asserted is
+        that the unwrap hands the subject BACK to the existing derivation
+        intact, not that it grew a private refusal of its own."""
+        source = self._gate_source()
+        self.assertIn(
+            self.CAPTURE_CHAIN, source,
+            "the capture chain this allowance is written for is not in the "
+            "gate any more, so every assertion below would patch nothing "
+            "and prove nothing")
+        self.assertEqual(
+            [], self._audit(),
+            "the real gate's canonical capture chain is not vouched")
+        with self._without("_captured_subject",
+                           lambda value, parameter, carrier_params: None):
+            without = self._audit()
+        self.assertTrue(
+            without,
+            "removing the constructor allowance leaves the real gate green, "
+            "so the allowance is not what admits it and this test measures "
+            "nothing")
+        self.assertTrue(
+            any("'authorization'" in f for f in without),
+            "removing the allowance reddens the gate somewhere OTHER than "
+            "the authority slot: " + str(without))
+        for label, replacement in self.FORGED_CAPTURES.items():
+            with self.subTest(capture=label):
+                forged = source.replace(
+                    self.CAPTURE_CHAIN, replacement, 1)
+                self.assertNotEqual(
+                    source, forged, "the falsifier patched nothing")
+                self.assertTrue(
+                    self._audit(forged),
+                    f"{label} is ADMITTED by the constructor allowance")
+
     def test_a_raw_scope_use_after_the_projection_is_refused(self):
         """CONDITION 9 — NO LATER RAW ``scope``, the third of the three,
         and the one that closes THE OWNER'S THREE NAMED VARIANTS together
@@ -18292,7 +18543,8 @@ class EveryAdmissionBranchIsDerivedAndCarriesAnAuthority(_SweepHarness,
                                      if b.needs_authority)
                           for role in ("PLAYER", "OFFICIAL")}
             self.assertEqual(
-                "_player_team_for_game(scoped_player_id, game, store)",
+                "_player_team_for_game(scoped_player_id, authorization, "
+                "store)",
                 unfollowed["PLAYER"].authority,
                 "neutering the fold did not put the PLAYER pin back on the "
                 "helper's name, so this half measures nothing")
