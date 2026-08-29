@@ -31,6 +31,7 @@ from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import clear_membership_rows_directly
 
 from hockey_scheduler.api.service import ApiService
 from hockey_scheduler.domain import (
@@ -356,6 +357,11 @@ class ContextAuthorizationMatrixTest(unittest.TestCase):
                 self.assertIsNone(api.get_active_context("pl", *pl)["program_id"],
                                   label)
                 # Deleted player row → closed (no live subject to resolve).
+                # (Plumbing: drop the parity stint the #205 cutover's
+                # dual-write auto-opened, or the store-level hard delete
+                # trips the membership FK — the landed guard posture this
+                # test is not about.)
+                clear_membership_rows_directly(store, player)
                 store.delete_player(player)
                 self.assertIsNone(api.get_active_context("pl", *pl)["program_id"],
                                   label)

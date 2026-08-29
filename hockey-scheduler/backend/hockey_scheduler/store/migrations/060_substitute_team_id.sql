@@ -1,0 +1,85 @@
+-- Snapshot the offer's OWNING team on SubstituteEnrollment (#205 blocker 3).
+--
+-- WHAT THIS COLUMN IS. The team that OWNS an outstanding substitute offer:
+-- the side offer_substitute's own _require_team_for_game call validated the
+-- offer against, recorded at that moment. It is not a cache and not a
+-- fallback -- it is THE record of who made the offer, and it is
+-- authoritative for the entire lifetime of that offer. decline_substitute
+-- reads it, and only it, to address the coach notification that tells the
+-- offering team their queue can advance.
+--
+-- DEFECT 1 (the crash this column was introduced for). decline_substitute
+-- re-derived the offer's coach audience with a FRESH team_for_game(game,
+-- player) lookup at decline time instead of reading a value fixed when the
+-- offer was made. If the player's SeasonRosterMembership ended between offer
+-- and decline (the exact "eligibility is live, not frozen" posture #205's own
+-- EligibilityIsLiveNotFrozen suite established for accept_substitute/
+-- offer_substitute), team_for_game returns None, audience_ref=None is fed
+-- into a COACH-audience _push_notification, and delivery.recipient_ref's #60
+-- fail-closed invariant ("a COACH notification needs an audience_ref")
+-- raises -- rolling the whole @_transactional decline back. The player is
+-- left holding a dead offer they can neither decline nor accept.
+-- _back_out_entry (a normal roster player backing out of a confirmed slot,
+-- no substitute involved) had the identical crash for the same reason and is
+-- fixed in the same change, but it has no "offer" to snapshot a value onto
+-- -- see roster_service.py's _back_out_entry for how that sibling is closed.
+--
+-- DEFECT 2 (the wrong-side leak, and why "live-first" is not an option).
+-- A later round inverted the precedence to `team_for_game(...) or
+-- sub.team_id`, i.e. resolve LIVE first and consult the snapshot only when
+-- live resolution came back None, arguing symmetry with
+-- _accept_offered_substitute. That symmetry argument is REJECTED. Accept and
+-- decline have different contracts: acceptance REVALIDATES current
+-- eligibility and seats the player in a slot that must be counted against
+-- whichever side they are genuinely on now, so it rightly resolves live;
+-- decline revalidates nothing and seats nobody -- it is the TERMINAL
+-- RESPONSE to an already-issued offer, and the audience of a response is
+-- whoever OWNS the thing being responded to. Live-first therefore sent an
+-- outstanding offer's response to the WRONG coach after a team move: offer
+-- an exhibition substitute while on HOME (the row snapshots HOME), reassign
+-- the player to AWAY, decline the still-HOME offer -- live resolution
+-- answered AWAY and short-circuited the snapshot, so AWAY's coach was told
+-- about an offer that was never theirs (leaking the opponent's outstanding-
+-- offer state) and HOME's coach, the one who must now offer the next
+-- candidate, heard nothing.
+--
+-- THE RULE. sub.team_id is authoritative for the lifetime of every offer it
+-- is set on. Never substitute a freshly resolved team for it -- not as a
+-- preference, and not as a fallback when it is set.
+--
+-- Additive and portable: a nullable TEXT column, no rebuild, no index, no
+-- backfill. It is NULL for every pre-existing enrolled-but-never-offered row
+-- (there is nothing to snapshot yet -- offer_substitute fills it in when the
+-- offer is made) and for any row already OFFERED by code that predates this
+-- migration.
+--
+-- LEGACY OFFERED ROWS (team_id NULL). This migration deliberately performs
+-- no backfill, because there is no honest value to backfill WITH: nothing
+-- written at offer time records the offer-owner team. The offer-time feed
+-- notification is PLAYER-audience with audience_ref=player_id, the
+-- SUBSTITUTE_OFFERED AuditLog row carries an empty detail, and no
+-- SetupAuditLog row is written at all. Nor can it be reconstructed after the
+-- fact: replaying the permanent player.team_id pointer answers a team that
+-- was never the offer owner on a LeagueSeason-bound game (where eligibility
+-- resolves through SeasonRosterMembership and ignores the pointer entirely),
+-- and membership history cannot be time-travelled either -- backfilled
+-- memberships carry no effective_from and no events by design (see
+-- SeasonRosterMembershipEvent's docstring), and terminal rows do not record
+-- an effective_to. Fabricating one would be exactly the guess this column
+-- exists to eliminate.
+--
+-- So for such a row decline_substitute COMMITS the DECLINED transition and
+-- SUPPRESSES the targeted coach push -- it does NOT fail closed, and it does
+-- NOT fall through to a live lookup. (An earlier version of this header
+-- claimed the opposite -- "still fails closed exactly as before ... rather
+-- than guessing" -- which was wrong twice over: failing closed here means
+-- the #60 invariant raises and rolls the decline BACK, stranding the player
+-- with an undeclinable offer, and "exactly as before" described the very
+-- crash above rather than a safe posture.) The decline is the player's own
+-- terminal act and must never be undone by a notification that has no honest
+-- audience to reach; suppressing the push keeps #60 intact rather than
+-- relaxing it, and no wrong coach is ever told.
+--
+-- Forward-only. Rollback reality: reverting application code does not drop
+-- this column; dropping it is a separate manual database operation.
+ALTER TABLE substitute_enrollments ADD COLUMN team_id TEXT;

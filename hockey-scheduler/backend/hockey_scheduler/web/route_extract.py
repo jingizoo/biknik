@@ -3216,6 +3216,50 @@ _AUDIT_WAIVERS = {
         "sub-resource (board/roster/etc, all already enumerated as "
         "separate leaves under the SAME `m` match), not which route was "
         "chosen",
+    ("_dispatch_get",
+     "resolve_private_game_read(role, scope, gid, api.store)",
+     "assign_rhs", "m"):
+        "#427 round 2, blocker 1 -- THE ONE resolution the private-game "
+        "family's admission AND projection now share (see "
+        "services/game_side_scope.PrivateGameRead). `gid` is captured by "
+        "`m`'s own regex match one waiver above; this resolves, against a "
+        "single fetch of that already-selected game, whether the "
+        "SIGNED-IN caller is admitted at all and WHICH SIDE is theirs. It "
+        "REPLACES three waivers this dict used to carry -- the second "
+        "`api.store.get_game(gid)` re-fetch, its `sub_game is not None` "
+        "guard, and the `game_scoped_own_team_id(...)` call that hung off "
+        "it -- which existed because the dispatch resolved independently "
+        "of the gate; the gap between those two resolutions was the "
+        "disclosure window this round closes. Same 'produces a RESULT, "
+        "not a routing decision' shape as the `can_read_private_game_data` "
+        "waiver immediately above, and for the same reason: the route "
+        "(this sub-resource, this game) was already fully decided upstream "
+        "by `m` and `sub`, and every leaf below returns through its own "
+        "already-enumerated branch whatever this resolves",
+    ("_dispatch_get", "not private_read.admitted", "if_test", "m"):
+        "#427 round 2, blocker 1 -- the AUTHORITATIVE half of the "
+        "private-data gate, read off the single resolution waived "
+        "immediately above rather than recomputed. Structurally identical "
+        "to the `not can_read_private_game_data(...)` preflight two "
+        "waivers up (same 403, same message, same already-selected "
+        "game/sub-resource): it decides whether the signed-in caller may "
+        "view this game's private sub-resource, never which route was "
+        "chosen",
+    ("_dispatch_get", "lineup_visibility.own_side(role, own_team, *side_ids)",
+     "assign_rhs", "sub == 'board'"):
+        "#427 blocker: picks WHICH SIDE of the already-selected game the "
+        "single-sided /board read answers for -- the caller's own team when "
+        "they have one (Coach/Player), else None so the facade keeps its "
+        "existing home default (unscoped operator, assigned official). It "
+        "consumes `own_team`/`side_ids`, both derived from the re-fetched "
+        "game waived above, and produces a RESULT the facade uses to "
+        "PROJECT the response; it never decides which route was chosen -- "
+        "the route (this sub-resource, this game) was already fully decided "
+        "upstream by `m` and `sub`, and BOTH possible values of this call "
+        "return through the very same `api.get_board` leaf. Same 'produces "
+        "a RESULT, not a routing decision' shape as the "
+        "`game_scoped_own_team_id` waiver above, which is the call feeding "
+        "it",
     ("do_GET", "not is_context_scoped_read(path)", "if_test", ""):
         "do_GET's own PHASE A context-gate arrival ticket (#159): BOTH "
         "arms of this if unconditionally call self._dispatch_get() "
@@ -3471,7 +3515,9 @@ _AUDIT_WAIVERS = {
         "the delete callable itself, reached as `mapper`'s own argument -- "
         "same ten-way `kind`-keyed dict selection, same reasoning as the "
         "two entries immediately above",
-    ("do_POST", "fn(gid, player_id, user_id)", "call_argument", "sub"):
+    ("do_POST",
+     "fn(gid, player_id, user_id, authorized_team_id=coach_team)",
+     "call_argument", "sub"):
         "#202 repair round 5, finding 2b -- `fn` is one of three "
         "`api.{accept,decline,add_substitute_to_roster}` functions, "
         "selected by `{...}[op]` keyed on `op` (`sub.group(2)`, captured "
@@ -3481,7 +3527,13 @@ _AUDIT_WAIVERS = {
         "fallback rather than this module's `.get()`-shaped recogniser. "
         "Not a routing decision: `gid`/`player_id` are already-captured "
         "ids handed to the already-selected implementation, the route "
-        "was decided upstream by `sub`'s own regex alternation",
+        "was decided upstream by `sub`'s own regex alternation. #205 adds "
+        "`authorized_team_id=coach_team` -- the COACH'S OWN SCOPED TEAM, "
+        "handed to the service so it can REVALIDATE it under its own "
+        "Season lock before any write. Also an authorization input and "
+        "not a routing test, and threaded through this ONE shared call "
+        "rather than bound into the dict's three values, so the three "
+        "methods reached as VALUES stay a single reviewed site",
     ("do_POST", "coach(gid, user_id)", "call_argument", "coach"):
         "#202 repair round 5, finding 2b -- `coach` is one of "
         "`api.{lock_roster,unlock_roster,cancel_game}`, selected by "
@@ -3594,38 +3646,56 @@ _AUDIT_WAIVERS = {
     # string omits it, and is read from `self.path`'s query component the
     # SAME way as every other entry in this block.
     ("_dispatch_get",
-     "role in (Role.COACH, Role.PLAYER) and own_team and (team_id != "
-     "own_team)", "if_test", "sub == 'availability-summary'"):
-        "get_games_id_availability_summary (#89): own-team scoping for a "
-        "coach/player, operators exempt -- see this sub-group's own "
-        "comment above",
-    ("_dispatch_get", "api.get_availability_summary(gid, team_id)",
+     "api.get_availability_summary(gid, team_id, viewer_role=role, "
+     "viewer_team_id=own_team)",
      "call_argument", "sub == 'availability-summary'"):
-        "the service call consuming the already-waived `team_id` scope "
-        "check immediately above -- not a routing decision",
+        "gid captured off the SAME match; `sub == 'availability-summary'` "
+        "already selects this exact leaf. #427 final blocker round 2 REPLACED "
+        "this leaf's inline own-team `if` (whose own waiver stood here, and "
+        "which named only COACH/PLAYER so an assigned OFFICIAL fell through "
+        "it) with the SAME facade projection its four siblings use: "
+        "`own_team` is the already-waived TRUSTED SIDE and `role` the "
+        "session-resolved caller, so `lineup_visibility.route_audience` can "
+        "keep the hint for an unscoped operator, IGNORE it for a "
+        "Coach/Player in favour of their trusted side, and refuse an "
+        "official. The remaining `qs.get('team_id')` is the CLIENT HINT "
+        "passed in to be adjudicated, never trusted -- and every value of "
+        "all three arguments returns through this one leaf, so they decide "
+        "what this caller may SEE of an already-selected route, not which "
+        "route was chosen. Identical shape and reasoning to the "
+        "`api.get_roster_status` / `api.get_substitutes` waivers below",
     ("_dispatch_get",
-     "role == Role.COACH and own_team and (team_id != own_team)", "if_test",
-     "sub == 'substitute-candidates'"):
-        "get_games_id_substitute_candidates (#112): own-team scoping for a "
-        "coach, operators exempt -- see this sub-group's own comment "
-        "above (a `MANAGE_ROSTER` permission gate runs first, independent "
-        "of this scoping check)",
-    ("_dispatch_get", "api.get_substitute_candidates(gid, team_id)",
+     "api.get_substitute_candidates(gid, team_id, viewer_role=role, "
+     "viewer_team_id=own_team)",
      "call_argument", "sub == 'substitute-candidates'"):
-        "the service call consuming the already-waived `team_id` scope "
-        "check immediately above -- not a routing decision",
+        "gid captured off the SAME match; `sub == 'substitute-candidates'` "
+        "already selects this exact leaf. #427 final blocker round 3 "
+        "REPLACED this leaf's inline own-team `if` (whose own waiver stood "
+        "here, and which answered a HINTED call differently from an "
+        "un-hinted one) and its local `own_team = scope.get('team_id')` "
+        "re-resolution with the SAME facade projection its five siblings "
+        "use: `own_team` is the already-waived TRUSTED SIDE resolved once "
+        "for the whole family and `role` the session-resolved caller, so "
+        "`lineup_visibility.route_audience` can keep the hint for an "
+        "unscoped operator, IGNORE it for a Coach in favour of their "
+        "trusted side, and refuse any other audience. The remaining "
+        "`qs.get('team_id')` is the CLIENT HINT passed in to be "
+        "adjudicated, never trusted -- and every value of all three "
+        "arguments returns through this one leaf, so they decide what this "
+        "caller may SEE of an already-selected route, not which route was "
+        "chosen. The `MANAGE_ROSTER` permission gate above is unchanged and "
+        "independent of all of this. Identical shape and reasoning to the "
+        "`api.get_availability_summary` waiver above",
     ("_dispatch_get",
-     "role == Role.COACH and own_team and (team_id != own_team)", "if_test",
-     "sub == 'substitute-addable'"):
-        "get_games_id_substitute_addable (#114): the same own-team scoping "
-        "as substitute-candidates immediately above, textually identical "
-        "but reached from a DIFFERENT `sub` branch -- the enclosing-if-"
-        "text fingerprint (`substitute-candidates` vs `substitute-"
-        "addable`) is what keeps the two from masquerading as one",
-    ("_dispatch_get", "api.get_addable_substitutes(gid, team_id)",
+     "api.get_addable_substitutes(gid, team_id, viewer_role=role, "
+     "viewer_team_id=own_team)",
      "call_argument", "sub == 'substitute-addable'"):
-        "the service call consuming the already-waived `team_id` scope "
-        "check immediately above -- not a routing decision",
+        "get_games_id_substitute_addable (#114): the same facade projection "
+        "as substitute-candidates immediately above, on the same trusted "
+        "`own_team`, reached from a DIFFERENT `sub` branch -- the "
+        "enclosing-if-text fingerprint (`substitute-candidates` vs "
+        "`substitute-addable`) is what keeps the two from masquerading as "
+        "one",
     # -- #202 repair round 6, finding 1's OTHER new shape: a bare Subscript
     # (no Call anywhere around it) keyed on a tracked name, independently
     # audited the same way an unlisted Call already is (see
@@ -3721,27 +3791,65 @@ _AUDIT_WAIVERS = {
         "gid is captured by the enclosing /api/games/{gid}[/<sub>] match; "
         "`sub is None` (no sub-resource segment) is the bare game-detail "
         "leaf, already a distinct route from every sibling below",
-    ('_dispatch_get', 'api.get_board(gid)', 'call_argument', "sub == 'board'"):
+    ('_dispatch_get',
+     'api.get_board(gid, team_id=board_team, viewer_role=role)',
+     'call_argument', "sub == 'board'"):
         "gid captured off the SAME match as get_game above; `sub == "
-        "'board'` already selects this exact leaf",
-    ('_dispatch_get', 'api.get_lineups(gid)', 'call_argument', "sub == 'lineups'"):
+        "'board'` already selects this exact leaf. #427 blocker added the "
+        "two projection arguments: `board_team` is the already-waived "
+        "TRUSTED SIDE (`lineup_visibility.own_side`, waived above) and "
+        "`role` the session-resolved caller -- together they decide what "
+        "this caller may SEE of the already-selected game, never which "
+        "route was chosen; every value of both returns through this one "
+        "leaf. Same 'service call consuming an already-waived own-team "
+        "scope value' shape as `api.get_availability_summary(gid, "
+        "team_id)` above",
+    ('_dispatch_get',
+     'api.get_lineups(gid, viewer_role=role, viewer_team_id=own_team)',
+     'call_argument', "sub == 'lineups'"):
         "gid captured off the SAME match; `sub == 'lineups'` already "
-        "selects this exact leaf",
+        "selects this exact leaf. #427 blocker added the projection "
+        "arguments: `own_team` is the already-waived trusted side and "
+        "`role` the session-resolved caller, so the facade can project "
+        "each side (own side in full, opponent RESTRICTED, an assigned "
+        "official's submitted-lineup only, an unscoped operator both in "
+        "full) -- same shape and same reasoning as the `api.get_board` "
+        "waiver immediately above",
     ('_dispatch_get', 'api.get_officials_for_game(gid)', 'dict_value', "sub == 'officials'"):
         "gid captured off the SAME match; `sub == 'officials'` already "
         "selects this leaf -- reached as a dict VALUE (`{'officials': "
         "api.get_officials_for_game(gid), ...}.get(sub)`-shaped table one "
         "line up), not a bare call, but the SAME captured-only argument "
         "either way",
-    ('_dispatch_get', 'api.get_roster_status(gid)', 'call_argument', "sub == 'roster-status'"):
+    ('_dispatch_get',
+     'api.get_roster_status(gid, viewer_role=role, viewer_team_id=own_team)',
+     'call_argument', "sub == 'roster-status'"):
         "gid captured off the SAME match; `sub == 'roster-status'` already "
-        "selects this exact leaf",
-    ('_dispatch_get', 'api.get_roster(gid)', 'call_argument', "sub == 'roster'"):
+        "selects this exact leaf. #427 final blocker added the two "
+        "projection arguments: `own_team` is the already-waived TRUSTED SIDE "
+        "and `role` the session-resolved caller, so the facade can answer "
+        "for the caller's own side instead of the hard-coded HOME this leaf "
+        "returned to everybody -- they decide what this caller may SEE of "
+        "the already-selected game, never which route was chosen; every "
+        "value of both returns through this one leaf. Identical shape and "
+        "reasoning to the `api.get_board` waiver above",
+    ('_dispatch_get',
+     'api.get_roster(gid, viewer_role=role, viewer_team_id=own_team)',
+     'call_argument', "sub == 'roster'"):
         "gid captured off the SAME match; `sub == 'roster'` already selects "
-        "this exact leaf",
-    ('_dispatch_get', 'api.get_substitutes(gid)', 'call_argument', "sub == 'substitutes'"):
+        "this exact leaf. #427 final blocker added the same two projection "
+        "arguments as the get_roster_status waiver immediately above -- same "
+        "trusted side, same session-resolved role, same 'what may be seen, "
+        "not which route' reasoning",
+    ('_dispatch_get',
+     'api.get_substitutes(gid, viewer_role=role, viewer_team_id=own_team)',
+     'call_argument', "sub == 'substitutes'"):
         "gid captured off the SAME match; `sub == 'substitutes'` already "
-        "selects this exact leaf",
+        "selects this exact leaf. #427 final blocker added the same two "
+        "projection arguments as the two waivers immediately above -- and "
+        "here `role` also carries the OFFICIAL refusal, which is still a "
+        "decision about what this caller may see of an already-selected "
+        "route, not a selection between routes",
     ('_dispatch_get', 'api.list_reschedule_requests(gid)', 'dict_value', "sub == 'reschedule'"):
         "gid captured off the SAME match; `sub == 'reschedule'` already "
         "selects this leaf -- reached as a dict VALUE, the same shape as "
@@ -3784,24 +3892,24 @@ _AUDIT_WAIVERS = {
         "already returned above); `op == 'accept'` here is a VALUE passed "
         "to the service (True/False), not a further routing test -- oa's "
         "own match already fully decided the route",
-    ('do_POST', "api.set_availability(gid, pid, status_val, body.get('response_source', 'player'), user_id)", 'call_argument', "action == 'availability'"):
+    ('do_POST', "api.set_availability(gid, pid, status_val, body.get('response_source', 'player'), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'availability'"):
         "gid/action captured off the SAME /api/games/{gid}/<action> match "
         "as every other action-dispatch entry below; `action == "
         "'availability'` already selects this leaf, after its own strict "
         "body-schema and enum-membership checks just above",
-    ('do_POST', "api.remind_unresponded(gid, body.get('team_id') or scope.get('team_id'), user_id)", 'call_argument', "action == 'availability/remind'"):
+    ('do_POST', "api.remind_unresponded(gid, body.get('team_id') or scope.get('team_id'), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'availability/remind'"):
         "gid/action captured off the SAME match; `action == "
         "'availability/remind'` already selects this leaf",
-    ('do_POST', "api.auto_build_roster(gid, body.get('team_id'), user_id)", 'call_argument', "action == 'build-roster'"):
+    ('do_POST', "api.auto_build_roster(gid, body.get('team_id'), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'build-roster'"):
         "gid/action captured off the SAME match; `action == 'build-roster'` "
         "already selects this leaf",
-    ('do_POST', "api.select_roster(gid, body.get('player_ids', []), user_id)", 'call_argument', "action == 'roster/select'"):
+    ('do_POST', "api.select_roster(gid, body.get('player_ids', []), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'roster/select'"):
         "gid/action captured off the SAME match; `action == "
         "'roster/select'` already selects this leaf",
-    ('do_POST', 'api.remove_player(gid, pid, user_id)', 'call_argument', "action == 'roster/remove'"):
+    ('do_POST', 'api.remove_player(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'roster/remove'"):
         "gid/action captured off the SAME match; `action == "
         "'roster/remove'` already selects this leaf",
-    ('do_POST', "api.copy_previous_roster(gid, body.get('team_id'), user_id)", 'call_argument', "action == 'roster/copy-previous'"):
+    ('do_POST', "api.copy_previous_roster(gid, body.get('team_id'), user_id, authorized_team_id=coach_team)", 'call_argument', "action == 'roster/copy-previous'"):
         "gid/action captured off the SAME match; `action == 'roster/copy- "
         "previous'` already selects this leaf",
     ('do_POST', "api.assign_official(gid, body.get('official_id'), body.get('role', 'referee'), user_id, override_unavailable=bool(body.get('override_unavailable')))", 'call_argument', "action == 'officials/assign'"):
@@ -3822,19 +3930,19 @@ _AUDIT_WAIVERS = {
     ('do_POST', "api.request_reschedule(gid, body.get('team_id'), body.get('reason', ''), user_id)", 'call_argument', "action == 'reschedule/request'"):
         "gid/action captured off the SAME match; `action == "
         "'reschedule/request'` already selects this leaf",
-    ('do_POST', 'api.enroll_substitute(gid, pid, user_id)', 'call_argument', "action == 'substitutes/enroll'"):
+    ('do_POST', 'api.enroll_substitute(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'substitutes/enroll'"):
         "gid/action captured off the SAME match; `action == "
         "'substitutes/enroll'` already selects this leaf (the "
         "coach/operator side of enrollment -- distinct actor/permission "
         "from the player self-service /api/me/substitute-opportunities/... "
         "route above, same service call)",
-    ('do_POST', 'api.withdraw_substitute(gid, pid, user_id)', 'call_argument', "action == 'substitutes/withdraw'"):
+    ('do_POST', 'api.withdraw_substitute(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'substitutes/withdraw'"):
         "gid/action captured off the SAME match; `action == "
         "'substitutes/withdraw'` already selects this leaf",
-    ('do_POST', 'api.add_substitute_candidate(gid, pid, user_id)', 'call_argument', "action == 'substitutes/add-candidate'"):
+    ('do_POST', 'api.add_substitute_candidate(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'substitutes/add-candidate'"):
         "gid/action captured off the SAME match; `action == "
         "'substitutes/add-candidate'` already selects this leaf",
-    ('do_POST', "api.offer_substitute(gid, player_id, user_id, expires_at=body.get('expires_at'))", 'call_argument', "op == 'offer'"):
+    ('do_POST', "api.offer_substitute(gid, player_id, user_id, expires_at=body.get('expires_at'), authorized_team_id=coach_team)", 'call_argument', "op == 'offer'"):
         "gid captured off the outer action match, player_id/op off the "
         "nested `sub` match on the SAME already-selected `action == "
         "'substitutes/<player_id>/<op>'` shape; `op == 'offer'` already "
@@ -5060,6 +5168,165 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
 
     visit_operand(test)
     return found
+
+
+# --------------------------------------------------------------------------
+# 3. The query-parameter inventory
+# --------------------------------------------------------------------------
+#
+# WHY THIS LIVES HERE (#205 / #427 round 9, D7). The route inventory above is
+# what makes "a new route cannot be a silent gap" true for the behavioural
+# side-sweep: the sweep takes its routes from ``route_registry.REGISTRY``
+# rather than from a hand-written list, so a route the product gains and the
+# sweep does not drive is an ERROR NAMING IT.
+#
+# The QUERY-STRING axis had no such property. The sweep's hint variants were a
+# hand-written 4-tuple, and one of them named ``side`` -- a parameter
+# ``server.py`` does not read at all -- so the variant that was supposed to
+# prove "client input cannot select a side" was probing a name the server
+# ignores. MEASURED: injecting four lines that make the private-game family
+# honour ``?side=away`` hands a HOME Coach and a HOME Player the AWAY side's
+# five private identities with ``restricted: false``, and the primary sweep
+# stayed green, because the only spelling it sent was ``?side=<a team id>``.
+#
+# This function is the authority the hint axis is now closed against, the way
+# the route axis is closed against the registry: every query parameter the
+# server READS is enumerated from the source, so a parameter the product
+# begins reading and the sweep has no probe for fails a named test.
+#
+# FAIL-CLOSED ON A SPELLING THIS DOES NOT UNDERSTAND. A silently skipped call
+# site would reintroduce exactly the blind spot this closes, so every
+# ``parse_qs`` result must be consumed in one of the two shapes below and
+# anything else raises :class:`ExtractionError` naming the line. That is not
+# hypothetical: the falsifier that reproduced the defect spells its read
+# ``parse_qs(urlparse(self.path).query).get("side")`` with ALIASED imports and
+# no intermediate ``qs`` name, so a matcher that keyed on the literal text
+# ``qs.get(`` would have missed the very leak this exists to catch. Both
+# shapes are covered, and a third raises.
+
+#: The stdlib function whose result IS the parsed query string. Tracked
+#: through ``from urllib.parse import parse_qs [as alias]`` so a renamed
+#: import cannot hide a call site.
+_QUERY_PARSE_FUNC = "parse_qs"
+
+
+def _query_parse_aliases(tree: ast.AST) -> set:
+    """Every local name that refers to :data:`_QUERY_PARSE_FUNC`."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == _QUERY_PARSE_FUNC:
+                    names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.endswith("." + _QUERY_PARSE_FUNC):
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+def _is_query_parse_call(node, aliases: set) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in aliases
+    # ``urllib.parse.parse_qs(...)`` -- an attribute call is understood too,
+    # so importing the MODULE rather than the function is not a way past this.
+    return isinstance(func, ast.Attribute) and func.attr == _QUERY_PARSE_FUNC
+
+
+def _literal_get_key(receiver, parents: dict) -> Optional[str]:
+    """``receiver`` is the expression holding a parsed query string. Returns
+    the literal name it is being asked for, i.e. the ``"name"`` in
+    ``<receiver>.get("name")``, or ``None`` when ``receiver`` is not the
+    subject of a ``.get`` call at all.
+
+    A NON-LITERAL key (``qs.get(name)``) raises rather than returning
+    ``None``: a computed parameter name is a set this cannot enumerate, and
+    quietly returning nothing would be the silent gap this exists to close.
+    """
+    attr = parents.get(id(receiver))
+    if not (isinstance(attr, ast.Attribute) and attr.attr == "get"
+            and attr.value is receiver):
+        return None
+    call = parents.get(id(attr))
+    if not (isinstance(call, ast.Call) and call.func is attr and call.args):
+        return None
+    key = call.args[0]
+    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+        return key.value
+    raise ExtractionError(
+        f"line {call.lineno}: a query parameter is read under a NON-LITERAL "
+        f"name ({ast.unparse(key)}), so the set of parameters this server "
+        f"reads cannot be enumerated from the source")
+
+
+def query_parameter_names(source: Optional[str] = None) -> tuple:
+    """Every query-string parameter ``server.py`` (or ``source``) READS.
+
+    Returned sorted, so the value is a stable inventory rather than a
+    walk order. Raises :class:`ExtractionError` on any ``parse_qs`` result
+    this cannot resolve to literal ``.get("name")`` reads -- see the section
+    comment above for why a skip is not an option here.
+    """
+    text = source if source is not None else SERVER_PATH.read_text()
+    tree = ast.parse(text)
+    aliases = _query_parse_aliases(tree)
+    if not aliases:
+        raise ExtractionError(
+            "no `parse_qs` import found, so either this server no longer "
+            "reads the query string at all or it reads it by a spelling "
+            "this inventory does not understand")
+    found, parents = set(), _build_parent_map(tree)
+    for node in ast.walk(tree):
+        if not _is_query_parse_call(node, aliases):
+            continue
+        parent = parents.get(id(node))
+        # SHAPE A: `qs = parse_qs(...)` -- a plain single-Name binding, then
+        # every use of that name in the SAME function must be a literal
+        # `.get("...")`.
+        if isinstance(parent, ast.Assign) and len(parent.targets) == 1 \
+                and isinstance(parent.targets[0], ast.Name):
+            name = parent.targets[0].id
+            fn = _enclosing_function(node, parents)
+            if fn is None:
+                raise ExtractionError(
+                    f"line {node.lineno}: a query string is parsed outside "
+                    f"any function, which this inventory cannot scope")
+            for use in ast.walk(fn):
+                if not (isinstance(use, ast.Name) and use.id == name
+                        and isinstance(use.ctx, ast.Load)):
+                    continue
+                key = _literal_get_key(use, parents)
+                if key is None:
+                    raise ExtractionError(
+                        f"line {use.lineno}: the parsed query string {name!r} "
+                        f"is used in a shape other than `{name}.get"
+                        f"(\"<literal>\")`, so the parameters read through it "
+                        f"cannot be enumerated")
+                found.add(key)
+            continue
+        # SHAPE B: `parse_qs(...).get("name")` -- consumed directly, with no
+        # intermediate name at all.
+        key = _literal_get_key(node, parents)
+        if key is not None:
+            found.add(key)
+            continue
+        raise ExtractionError(
+            f"line {node.lineno}: a parsed query string is consumed in a "
+            f"shape this inventory does not understand "
+            f"({ast.unparse(parent) if parent is not None else '?'})")
+    return tuple(sorted(found))
+
+
+def _enclosing_function(node, parents: dict):
+    cur = parents.get(id(node))
+    while cur is not None:
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return cur
+        cur = parents.get(id(cur))
+    return None
 
 
 ENTRY_POINTS = {"GET": "do_GET", "POST": "do_POST"}

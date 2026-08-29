@@ -285,33 +285,86 @@ REGISTRY = (
     RouteSpec("GET", r"^/api/games/[^/]+/availability-summary$",
               "/api/games/{}/availability-summary",
               "get_games_id_availability_summary", "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: _resolve_role (server.py:2070) then "
-                    "can_read_private_game_data (scope.py:122-152 -- "
+              auth="session+own-side-projection", scope_axis="none",
+              note=("#202: _resolve_role (server.py:2851) then "
+                    "can_read_private_game_data (scope.py:230-259 -- "
                     "operators any, coach/player only their own team via "
-                    "the game, official only if assigned; server.py:2078) "
-                    "gates every sub-branch, then this leaf's own extra "
-                    "narrowing (server.py:2116-2123): a coach/player's "
-                    "team_id query param must match their own team. "
+                    "the game, official only if assigned; server.py:2859) "
+                    "gates every sub-branch. "
+                    "#427 final blocker round 2: this leaf's own extra "
+                    "narrowing used to be spelled inline here and named "
+                    "only COACH and PLAYER, so an assigned OFFICIAL fell "
+                    "straight through it -- and this is the ONLY leaf of "
+                    "the private-game family that reads a side from the "
+                    "QUERY STRING, so the client hint was the sole side "
+                    "selector: measured tri-store over a real session, an "
+                    "official's un-hinted call was 400 while "
+                    "?team_id=<either side> was 200 with that side's whole "
+                    "candidate pool, NAMES and per-player availability "
+                    "included -- the two classes the /lineups projection "
+                    "strips for that same role. It is now projected by the "
+                    "SAME lineup_visibility.route_audience (server.py:2948-"
+                    "2991 -> service.py:4227-4307) its four siblings use, "
+                    "on the SAME trusted server-resolved own side: an "
+                    "unscoped operator keeps the hint (unchanged), a "
+                    "Coach/Player has the hint IGNORED in favour of their "
+                    "trusted side (ignored, not refused -- the siblings "
+                    "answer a hinted call identically to an un-hinted one), "
+                    "and an assigned official is REFUSED 403 rather than "
+                    "handed players: [] with zero counts. "
                     "get_availability_summary is keyed by (game_id, "
                     "team_id) -- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/board$", "/api/games/{}/board",
               "get_games_id_board", "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: _resolve_role (server.py:2070) then "
-                    "can_read_private_game_data (scope.py:122-152; "
-                    "server.py:2078) -- operators any, coach/player only "
-                    "their own team via the game, official only if "
-                    "assigned. get_board (service.py:8052-8064ish) is a "
-                    "per-game UI convenience, game-keyed -- no P/S/L "
-                    "concept, not applicable.")),
+              auth="session+own-side-projection", scope_axis="none",
+              note=("#202: _resolve_role then can_read_private_game_data "
+                    "(scope.py) -- operators any, coach/player only their "
+                    "own team via the game, official only if assigned. "
+                    "#427 blocker: that gate proves the caller belongs to "
+                    "*a* team in this game but does NOT bound WHICH side "
+                    "they may read, and get_board used to hard-code "
+                    "game.home_team_id for everybody -- an AWAY Coach got "
+                    "HOME's private pool. The server now resolves the "
+                    "caller's own game-scoped team "
+                    "(game_scoped_own_team_id, hoisted to serve this whole "
+                    "sub-family) and passes that TRUSTED side plus the "
+                    "session role into the read; a Coach/Player is "
+                    "answered for their own side only, an assigned official "
+                    "gets the submitted-lineup projection "
+                    "(services/lineup_visibility.py). #427 round 2 blocker "
+                    "1: admission and projection are now ONE decision "
+                    "(services/game_side_scope.resolve_private_game_read) "
+                    "taken against a single fetch, carried into this leaf; "
+                    "can_read_private_game_data is a fast-denial preflight "
+                    "only. The HOME default survives for an unscoped "
+                    "operator/official/in-process caller and NOT for a "
+                    "Coach/Player, who are restricted instead -- losing an "
+                    "authority mid-request is a refusal, not a fallback. "
+                    "Still game-keyed -- no P/S/L concept, not "
+                    "applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/lineups$", "/api/games/{}/lineups",
               "get_games_id_lineups", "_dispatch_get",
-              auth="session", scope_axis="none",
+              auth="session+own-side-projection", scope_axis="none",
               note=("#202: same _resolve_role + can_read_private_game_data "
-                    "gate as get_games_id_board (server.py:2070-2078, "
-                    "2085-2086; scope.py:122-152). get_lineups is "
-                    "game-keyed -- no P/S/L concept, not applicable.")),
+                    "gate as get_games_id_board (scope.py). #427 blocker: "
+                    "the same trusted side is passed here too, and each "
+                    "side is PROJECTED per role -- an unscoped operator "
+                    "reads both sides in full (unchanged), a Coach/Player "
+                    "reads their own side in full with the opponent marked "
+                    "restricted (public team metadata kept, private "
+                    "status/players null -- never [], which both screens "
+                    "already render as 'no lineup submitted'), an assigned "
+                    "official reads both sides' submitted lineup but "
+                    "neither side's unselected candidates, availability or "
+                    "substitute state (services/lineup_visibility.py). "
+                    "#427 round 2 blocker 3: 'submitted' means the rows "
+                    "that OCCUPY a slot (RosterEntryStatus.occupies_slot), "
+                    "not the display group -- a seated row whose occupant "
+                    "went unavailable/removed stays in the `selected` group "
+                    "flagged backed_out and is that side's roster HISTORY, "
+                    "which an official does not receive. Same rule on "
+                    "/board and /roster, one helper. Still game-keyed -- no "
+                    "P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/officials$",
               "/api/games/{}/officials", "get_games_id_officials",
               "_dispatch_get",
@@ -332,53 +385,128 @@ REGISTRY = (
                     "P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/roster$", "/api/games/{}/roster",
               "get_games_id_roster", "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: same _resolve_role + can_read_private_game_data "
-                    "gate as get_games_id_board (server.py:2070-2078, "
-                    "2091-2092; scope.py:122-152). get_roster is "
+              auth="session+own-side-projection", scope_axis="none",
+              note=("#202: same _resolve_role + admission boundary as "
+                    "get_games_id_board (server.py:2070-2078, 2091-2092; "
+                    "scope.py:122-152). #427 round 2 blocker 1: that "
+                    "boundary is resolve_private_game_read "
+                    "(services/game_side_scope.py), ONE decision taken "
+                    "against a single fetch and carried into this leaf; "
+                    "can_read_private_game_data is a fast-denial preflight "
+                    "only, not the gate. "
+                    "#427 final blocker: admission proves membership of *a* "
+                    "team and carries no team-level narrowing, so this leaf "
+                    "returned BOTH sides' seated rows -- measured, an AWAY "
+                    "Coach reading HOME's seat, side and seated position. "
+                    "The response is now projected on the SAME "
+                    "server-resolved own side /board and /lineups use "
+                    "(lineup_visibility.route_audience): a Coach/Player gets "
+                    "rows this game DURABLY attributes to their own side, an "
+                    "assigned official the two-side submitted-lineup "
+                    "projection, an unscoped operator the unchanged full "
+                    "read. #427 round 2 blocker 3, the SAME occupancy "
+                    "refinement /lineups states: 'submitted' means the rows "
+                    "that OCCUPY a slot (RosterEntryStatus.occupies_slot), "
+                    "not the display group -- a seated row whose occupant "
+                    "went unavailable/removed stays in the `selected` group "
+                    "flagged backed_out and is that side's roster HISTORY, "
+                    "which an official does not receive. One helper serves "
+                    "/board, /lineups and this leaf. get_roster is still "
                     "game-keyed -- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/roster-status$",
               "/api/games/{}/roster-status", "get_games_id_roster_status",
               "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: same _resolve_role + can_read_private_game_data "
-                    "gate as get_games_id_board (server.py:2070-2078, "
-                    "2089-2090; scope.py:122-152). get_roster_status is "
-                    "game-keyed -- no P/S/L concept, not applicable.")),
+              auth="session+own-side-projection", scope_axis="none",
+              note=("#202: same _resolve_role + admission boundary as "
+                    "get_games_id_board (server.py:2070-2078, 2089-2090; "
+                    "scope.py:122-152) -- resolve_private_game_read "
+                    "(services/game_side_scope.py) since #427 round 2 "
+                    "blocker 1, with can_read_private_game_data a "
+                    "fast-denial preflight only, not the gate. "
+                    "#427 final blocker: this leaf called "
+                    "compute_roster_status(game_id) with NO team and so "
+                    "hard-coded HOME for every caller -- the same defect "
+                    "get_board carried, measured returning team_id=HOME and "
+                    "substitutes_enrolled to an AWAY Coach. It now answers "
+                    "for the server-resolved own side only; an assigned "
+                    "official is REFUSED (403) because no frontend file "
+                    "fetches this route -- the Game Sheet reads /lineups, "
+                    "whose official projection already carries the slot "
+                    "counts with substitute state removed. An unscoped "
+                    "operator keeps the unchanged home-side default. "
+                    "get_roster_status is still game-keyed -- no P/S/L "
+                    "concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/substitute-addable$",
               "/api/games/{}/substitute-addable",
               "get_games_id_substitute_addable", "_dispatch_get",
-              auth="session+MANAGE_ROSTER-or-self", scope_axis="none",
+              auth="session+MANAGE_ROSTER+own-side-projection",
+              scope_axis="none",
               note=("#202: _resolve_role + can_read_private_game_data gate "
                     "the whole games/{id}/... family first (server.py:"
-                    "2070-2078; scope.py:122-152), then this leaf's own "
-                    "narrower check (server.py:2146-2162): "
-                    "can(role, Permission.MANAGE_ROSTER) required (a "
-                    "player must not see this even for their own game), "
-                    "and a coach is further bound to team_id == their own "
-                    "scope['team_id']; operators may query any team. "
+                    "2851-2864; scope.py:230-259), then this leaf's own "
+                    "can(role, Permission.MANAGE_ROSTER) capability gate (a "
+                    "player and an assigned official must not see this even "
+                    "for a game they are in) -- both UNCHANGED. "
+                    "#427 final blocker round 3: what changed is the SIDE. "
+                    "This leaf bound it twice -- a local `own_team = "
+                    "scope.get('team_id')` beside the family's one trusted "
+                    "resolution, and an inline coach check that answered a "
+                    "HINTED call DIFFERENTLY from an un-hinted one (403 for "
+                    "the opponent's id), contradicting the contract round 2 "
+                    "shipped for this very family ('a ?team_id= naming the "
+                    "opponent is ignored ... a hinted request returns "
+                    "exactly what the un-hinted one returns'). It is now "
+                    "projected by the SAME lineup_visibility.route_audience "
+                    "as its six siblings, on the SAME trusted "
+                    "server-resolved own side: hint kept for an unscoped "
+                    "operator, IGNORED for a Coach in favour of their "
+                    "trusted side, refused for any other audience rather "
+                    "than answered with addable: []. "
                     "get_addable_substitutes is (game_id, team_id)-keyed "
                     "-- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/substitute-candidates$",
               "/api/games/{}/substitute-candidates",
               "get_games_id_substitute_candidates", "_dispatch_get",
-              auth="session+MANAGE_ROSTER-or-self", scope_axis="none",
+              auth="session+MANAGE_ROSTER+own-side-projection",
+              scope_axis="none",
               note=("#202: _resolve_role + can_read_private_game_data gate "
                     "the whole games/{id}/... family first (server.py:"
-                    "2070-2078; scope.py:122-152), then this leaf's own "
-                    "narrower check (server.py:2126-2144): "
-                    "can(role, Permission.MANAGE_ROSTER) required, and a "
-                    "coach is further bound to team_id == their own "
-                    "scope['team_id']; operators may query any team. "
+                    "2851-2864; scope.py:230-259), then this leaf's own "
+                    "can(role, Permission.MANAGE_ROSTER) capability gate -- "
+                    "both UNCHANGED. "
+                    "#427 final blocker round 3: the SIDE moves to the "
+                    "facade, exactly as for substitute-addable above and "
+                    "for the same reasons -- one trusted resolution instead "
+                    "of a second local `scope.get('team_id')`, and a client "
+                    "hint that is IGNORED for a Coach rather than answered "
+                    "with a 403 that varies with the side named. The ROWS "
+                    "were already fixed in round 2: this queue and "
+                    "/substitutes now name the SAME set because both key on "
+                    "SubstituteEnrollment.team_id, so a pre-060 NULL-owner "
+                    "row appears in NEITHER (it used to be served here, by "
+                    "LIVE membership, with can_offer: true, to whichever "
+                    "Coach its occupant belongs to today). "
                     "get_substitute_candidates is (game_id, team_id)-keyed "
                     "-- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/games/[^/]+/substitutes$",
               "/api/games/{}/substitutes", "get_games_id_substitutes",
               "_dispatch_get",
-              auth="session", scope_axis="none",
+              auth="session+own-side-projection", scope_axis="none",
               note=("#202: same _resolve_role + can_read_private_game_data "
                     "gate as get_games_id_board (server.py:2070-2078, "
-                    "2093-2094; scope.py:122-152). get_substitutes is "
+                    "2093-2094; scope.py:122-152). "
+                    "#427 final blocker: that gate carries no team-level "
+                    "narrowing, so this leaf returned BOTH sides' substitute "
+                    "workflow -- measured, an AWAY Coach AND an assigned "
+                    "official reading a HOME enrollment's player, status and "
+                    "owning team. A Coach/Player now gets only rows DURABLY "
+                    "OWNED by their own side (enrollment.team_id; a legacy "
+                    "NULL owner is omitted from both, never guessed), and an "
+                    "assigned official is REFUSED (403) -- the enrollment IS "
+                    "the substitute workflow, so there is no official-shaped "
+                    "projection of it, and [] would falsely assert 'no "
+                    "substitutes are enrolled'. An unscoped operator keeps "
+                    "the unchanged full read. get_substitutes is still "
                     "game-keyed -- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/guardians/links$", "/api/guardians/links",
               "get_guardians_links", "_dispatch_get",

@@ -21,8 +21,10 @@ the new Program/Season *projection* on top of that canonical identity.
 
 from ..domain import GameType, Role
 from . import scope_bridge
+from . import season_guard
 from .league_scope import (
     exact_league_season_or_conflict, exact_registration_or_conflict)
+from .subject_scope import assignment_grants_official_scope
 from .subject_scope import own_team_id as _own_team_id
 
 # Roles that see every Program under the current account model (#211): the two
@@ -62,11 +64,21 @@ def _team_season_ids(store, team):
 
 def _official_program_seasons(store, official_id):
     """An Official's authorized (programs, seasons) — those of the games they are
-    assigned to (mirrors web.scope.can_read_private_game_data's official branch)."""
+    assigned to (mirrors web.scope.can_read_private_game_data's official branch).
+
+    Which assignments COUNT is
+    :func:`~.subject_scope.assignment_grants_official_scope`, the one shared
+    product predicate — not a status test spelled out again here. See that
+    function for the drift this closes: a DECLINED assignment stopped admitting
+    the Official to the private-game family while still offering them the
+    target Program and Season in the context switcher.
+    """
     programs, seasons = set(), set()
     if not official_id:
         return programs, seasons
     for a in store.assignments_for_official(official_id):
+        if not assignment_grants_official_scope(a, official_id):
+            continue
         game = store.get_game(a.game_id)
         if game is None or not game.season_id:
             continue
@@ -167,6 +179,11 @@ def _official_league_ids(store, official_id):
     if not official_id:
         return leagues
     for a in store.assignments_for_official(official_id):
+        # Which assignments COUNT is the one shared predicate, identical to
+        # the Program/Season projection above and to the private-game
+        # admission — see `subject_scope.assignment_grants_official_scope`.
+        if not assignment_grants_official_scope(a, official_id):
+            continue
         game = store.get_game(a.game_id)
         if game is None:
             continue
@@ -174,7 +191,7 @@ def _official_league_ids(store, official_id):
         # assignment to one grants no League view.
         if (game.game_type or GameType.REGULAR.value) != GameType.REGULAR.value:
             continue
-        if not game.league_season_id:
+        if not season_guard.game_is_league_season_bound(game):
             continue
         ls = store.get_league_season(game.league_season_id)
         if ls is None:
@@ -182,9 +199,38 @@ def _official_league_ids(store, official_id):
         # The binding must agree with the Game's own columns. They cannot drift
         # through any supported write path, so disagreement means corrupted or
         # legacy data -- fail closed rather than trust either side.
-        if game.season_id and ls.season_id != game.season_id:
+        #
+        # BOTH comparisons are UNCONDITIONAL plain equality. The `game.season_id
+        # and` prefix the Season check used to carry was a falsy-skip: a bound
+        # Game with a NULL `season_id` skipped the check entirely and the
+        # Official was granted the League anyway -- widening a scoped role's
+        # visibility off a Game whose identity does not hold together, which is
+        # precisely what this module exists to prevent. `games.season_id` is
+        # nullable with no FK and no CHECK, so NULL is the reachable corrupted
+        # shape, not an exemption.
+        #
+        # THE LEAGUE CHECK CARRIED THE IDENTICAL DEFECT ONE LINE DOWN and is now
+        # fixed the identical way (#205). While it read `if game.league_id and
+        # ...`, a Game whose own `league_id` was `None` -- or the empty string,
+        # equally schema-permitted on a nullable TEXT column with no CHECK --
+        # was treated as EXEMPT from having to agree with its frozen
+        # `LeagueSeason`, so the Official kept League visibility from precisely
+        # the corrupt, restored, legacy or direct-written rows that cannot prove
+        # anything. Reproduced through public `get_context_options` on Memory,
+        # SQLite and PostgreSQL: the target League stayed on offer for both the
+        # `None` and the `""` shape, while a coherent anchor assignment proved
+        # the surrounding Program/Season authorization was non-vacuous.
+        #
+        # This is the standing rule on this PR, applied a third time: identity
+        # is compared with `is not None` / plain equality and NEVER with
+        # truthiness (`season_guard.game_is_league_season_bound` is the
+        # reference spelling). A bound regular Game whose own League identity is
+        # missing or falsy is internally INCONSISTENT, and an inconsistent
+        # identity must fail closed rather than be waved through -- the write
+        # side already applies plain equality for this exact threat.
+        if ls.season_id != game.season_id:
             continue
-        if game.league_id and ls.league_id != game.league_id:
+        if ls.league_id != game.league_id:
             continue
         if ls.league_id:
             leagues.add(ls.league_id)

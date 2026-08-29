@@ -125,6 +125,32 @@ class SubstituteStatus(str, Enum):
     WITHDRAWN = "withdrawn"
     CANCELLED = "cancelled"
 
+    @property
+    def is_active_enrollment(self) -> bool:
+        """True while this enrollment is still a LIVE CANDIDACY — the row is
+        a body in the substitute pool right now.
+
+        ENROLLED and OFFERED, and exactly those two. The other five are not
+        omissions:
+
+        * ``ACCEPTED`` is not a separate population. Accepting an offer (and
+          a coach's add-to-roster override) writes a ``GameRosterEntry`` with
+          ``roster_role=SUBSTITUTE_ADDED`` and a DURABLE ``team_side``, so an
+          accepted substitute is a SEATED row and is counted, attributed and
+          displayed as one. Treating it as an active enrollment too would
+          double-count the same body.
+        * ``DECLINED``/``EXPIRED``/``WITHDRAWN``/``CANCELLED`` are terminal
+          history.
+
+        Hoisted here because the pair was spelled inline at six sites (five
+        in ``RosterService``, one in ``ApiService``) with no shared name, and
+        #427's lineup split adds a seventh reader — the side-scoped
+        substitute population — whose correctness depends on asking the same
+        question the enroll gate, the withdraw gate, the add-to-roster gate,
+        the outreach queue, the addable pool and game cancellation all ask.
+        One property, so "active" cannot come to mean two different sets."""
+        return self in {SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED}
+
 
 class GameStatus(str, Enum):
     DRAFT = "draft"
@@ -152,6 +178,20 @@ class GameType(str, Enum):
 
 class AuditAction(str, Enum):
     ROSTER_SELECTED = "roster_selected"
+    # ONE row per BATCH seating run (copy-previous / auto-fill), written
+    # inside the batch's own transaction and present even when the batch
+    # seated NOBODY (#427). Deliberately NOT ``ROSTER_SELECTED``: that action
+    # means "these players were seated" and is written by ``select_roster``
+    # on every seating, batch or not. The batch's record is a different
+    # event — it names the candidate pool, the players SELECTED out of it,
+    # and every player SKIPPED with the reason — and a zero-seat run
+    # produces this row and no ``ROSTER_SELECTED`` row at all, so collapsing
+    # the two would make "the batch ran and seated nobody" indistinguishable
+    # from "the batch seated somebody". ``audit_logs.action`` is plain TEXT
+    # with no CHECK constraint (migration 001), so a new value needs no
+    # migration; ``AUDIT_LABEL`` in web/static/app.js carries its display
+    # text.
+    ROSTER_BATCH_SEATED = "roster_batch_seated"
     AVAILABILITY_SET = "availability_set"
     PLAYER_BACKED_OUT = "player_backed_out"
     SUBSTITUTE_ENROLLED = "substitute_enrolled"

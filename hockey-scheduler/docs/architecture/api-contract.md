@@ -102,9 +102,322 @@ The facade supports the three required screen states:
 
 - **Loading** — client concern; the facade is synchronous.
 - **Empty** — `GET /roster` returns `[]` and `roster-status` reports
-  `status = "draft"` with `message = "No players selected yet."`.
+  `status = "draft"` with `message = "No players selected yet."`. This is a
+  claim that the roster **is** empty, and it is therefore never used to
+  express withheld data — see *Private game visibility* below.
 - **Error** — any structured error shape above; the screen shows the
   `error.message`.
+
+## Private game visibility (#427)
+
+`board`, `lineups`, `roster-status`, `roster`, `substitutes`,
+`availability-summary`, `substitute-candidates` and `substitute-addable` —
+every leaf of the `/api/games/{id}/…` dispatch that carries private player
+data — expose one game's **private** state. Passing the session +
+participation gate proves the caller belongs to *a* team in the game; it does
+**not** decide *which side* they may read. The server resolves the caller's
+own side once (`game_scoped_own_team_id`) and every one of these routes is
+projected on it.
+
+**Admission and projection are one decision, taken once.**
+`services.game_side_scope.resolve_private_game_read` decides whether the
+caller is admitted *and* resolves their trusted side, against a **single**
+fetch of the game, and the dispatch carries that one record into every leaf.
+`can_read_private_game_data` remains only as a fast-denial preflight — it is
+literally `resolve_private_game_read(...).admitted`, so the two cannot answer
+differently — and it is no longer the authoritative gate. Previously the
+handler authorised, then independently re-fetched the game and re-resolved
+membership; a membership transferred, ended or deactivated **between** those
+two reads left the second one with no side, which fell through to `/board`'s
+home default and answered the caller **HOME's** private pool, status,
+notifications and audit stream. Losing an authority now produces a refusal,
+not a fallback.
+
+**An official's admission is the ACTIVE assignment, not the row.** An
+`OfficialAssignment` the official has **declined** admits them to nothing:
+`resolve_private_game_read` requires `status.is_active`, which is the
+product's own statement of which assignments hold anything
+(`OfficialAssignmentStatus.is_active` — "Proposed or accepted assignments hold
+the official's time"). This read gate was the last consumer of those rows that
+did not honour it: `assign_official`'s duplicate and overlap checks,
+`setup_service._active_officials`, both game notification fan-outs and the
+official's own calendar feed all key on `is_active`, while `/board`,
+`/lineups` and `/roster` kept answering 200 with the game's submitted sheet
+after the official declined. The behavioural sweep is what found it — a
+declined official was served `player_1` and `player_12` on all three leaves
+with every test green — and
+`tests/test_authenticated_side_noninterference.py::TheGrantIsKeyedByEveryDimensionOfItsRow`
+now requires the primary sweep to go RED if the status test is removed again.
+`GET /api/games/{id}/officials` is unchanged: it *lists* who was assigned,
+declines included, which is a roster of the offer history rather than an
+authority to read anything.
+
+**The home default is audience-bound.** `/board` answers one side and still
+defaults to home — but only for an audience with no side of its own *by
+design*: an unscoped operator, an assigned official (whose default side is
+served through the submitted-lineup projection, so nothing widens), or an
+in-process caller with no role. A Coach or Player who arrives with a missing
+or nonparticipant side is `restricted: true` with `team_id: null` — the
+response does not name the side it declined to answer for.
+
+**A side is never trusted from the query string or the body** — a `?team_id=`
+naming the opponent is *ignored* for a scoped caller, so a hinted request
+returns exactly what the un-hinted one returns. It is deliberately not
+rejected: a 403 raised only for the opponent's id is itself an oracle for
+which team is playing, while an unchanged own-side answer discloses nothing.
+
+**And `?side=` is not a parameter this server has at all**, which is a
+different and stronger fact than "it is ignored" — stated separately because
+the two were run together here, and the sentence that ran them together was
+what a round of verification walked through. Measured from the source rather
+than asserted: `web/server.py` reads exactly SEVEN query-string parameters
+(`team_id`, `season_id`, `scope_type`, `scope_id`, `recipient_ref`,
+`actor_type`, `actor_ref`), enumerated from its own `parse_qs` call sites by
+`web/route_extract.query_parameter_names`. `side` is not among them, so
+`?side=away` reaches no branch — and the behavioural sweep now derives its
+hint variants from that inventory, so a parameter this server BEGINS reading
+enters the sweep instead of being tested under a name nothing consumes.
+
+| Caller | board / lineups | roster-status | roster | substitutes | availability-summary | substitute-candidates / -addable |
+|---|---|---|---|---|---|---|
+| League Admin | both sides, full | full | full | full | any side (hint honoured) | any side (hint honoured) |
+| Arena Manager | both sides, full | full | full | full | any side (hint honoured) | **403** (no `MANAGE_ROSTER`) |
+| Coach | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows | own side only (hint ignored) | own side only (hint ignored) |
+| Player | own side; opponent `restricted` | own side only | own side's durably attributed rows | own side's durably owned rows | own side only (hint ignored) | **403** (no `MANAGE_ROSTER`) |
+| Assigned official | both sides' submitted lineup | **403** | both sides' submitted lineup | **403** | **403** | **403** |
+| Viewer | **403** | **403** | **403** | **403** | **403** | **403** |
+
+**"Submitted lineup" means the rows that OCCUPY a slot**, not the rows a
+screen happens to group under *selected*. `_lineup_rows` keeps a seated
+player in that group after they have gone unavailable or been removed, marked
+`backed_out: true`, so their own coach can still see the row for cleanup —
+that is the side's roster *history*, not its current sheet, and an official
+receives none of it. Occupancy is `RosterEntryStatus.occupies_slot`
+(`selected` / `confirmed` / `offered` / `accepted`), the same predicate slot
+accounting already uses; `backed_out` is invariantly `false` in an official's
+rows. The rule is applied in one place, `_submitted_lineup_rows`, which
+`/board`, `/lineups` and `/roster` all share.
+
+The last two carry a second, independent gate that the other five do not:
+`MANAGE_ROSTER`, a **role capability** ("may this kind of caller manage a
+roster at all"), checked before the side question is asked. That is why a
+Player is refused there but served their own side everywhere else — and, for
+the same reason, why an **Arena Manager is refused there too** although it is
+an unscoped operator admitted to both sides everywhere else in this family.
+`Role.ARENA_MANAGER` holds `MANAGE_ARENA`, `MANAGE_SCHEDULE` and `VIEW`, not
+`MANAGE_ROSTER`, so the two operator roles are NOT interchangeable on these
+two leaves; the row above said they were until the measurement in
+`test_authenticated_side_noninterference
+.TheArenaManagerIsAnOperatorWithoutRosterAuthority` was taken. That test now
+pins the whole ten-leaf matrix for both roles, so this table and the product
+cannot drift apart again silently. The two gates are deliberately not folded
+together — the side rule must not be
+contingent on a permission table that can change without it, so the facade
+refuses an audience with no claim on a private candidate pool even though the
+capability gate makes that unreachable over today's HTTP dispatch.
+
+Two rules govern how withheld data is represented, and both exist because an
+empty collection is an *operational claim about the game* rather than a
+statement about the reader:
+
+- **Never `[]`, never `0`.** A redacted lineup side carries
+  `restricted: true` with `players: null` and `status: null`. A route with no
+  readable projection for the caller answers **403 `forbidden`**.
+- **Nothing is counted that was not sent.** `board.audit_scope` is `full`,
+  `own_side` or `withheld`; `notifications`, `audit` and `audit_count` are all
+  `null` when `withheld`, and `audit_count` otherwise counts the rows actually
+  returned, so it cannot report the size of what was omitted.
+
+An event is retained for a side only when **every player identity it discloses
+is durably attributed to that side, and it discloses at least one**.
+Attribution comes from the stored `GameRosterEntry.team_side` and
+`SubstituteEnrollment.team_id` — never live membership and never
+`Player.team_id`. A legacy row with NULL attribution names no side, so it is
+withheld from **both** rather than guessed onto one.
+
+### Per-side private state outside the `/games/{id}/…` family (#205)
+
+The boundary is the *state*, not the path. Two routes outside that dispatch
+carry a per-side private value:
+
+```http
+GET /api/demo/overview    ->  schedule[].roster_status
+GET /api/me/player-home   ->  next_game.team_status
+```
+
+`roster_status` is the same per-side operational enum `roster-status`
+returns, and it is **not** public — `/api/public/schedule`,
+`/api/public/games/{id}` and this payload's own `public_fixtures` all omit it.
+It used to be computed with no side at all, so `RosterService`'s
+`team_id or game.home_team_id` default served the **home** side's value to
+every reader — including a coach whose team plays in the game as the away
+side, and a coach whose team is not in the game at all.
+
+The schedule is a **cross-game list**, so the side is resolved **per row**
+(`game_scoped_own_team_id` against that row's game) and classified by the same
+`route_audience` the family uses:
+
+| Caller | `schedule[].roster_status` |
+|---|---|
+| League Admin, Arena Manager | home side, unchanged; `roster_status_team_id` now names it |
+| Coach, Player — in that game | **their own side's** value |
+| Coach, Player — not in that game | **omitted** |
+| Assigned official | **omitted** |
+| Guardian, viewer | **omitted** |
+
+A withheld row **omits the `roster_status` key entirely** and carries
+`roster_status_restricted: true` with `roster_status_team_id: null`. The
+marker is not decoration: every consumer of this field asks
+`["roster_confirmed", "locked"].includes(g.roster_status)`, which a missing key
+and a `null` both answer `false` — rendering as "Roster open" / "not
+confirmed", i.e. the withheld state expressed as an *empty operational state*.
+The flag is what lets a screen say "not shown" instead. It is present on every
+row, entitled or not, so a consumer never infers withholding from a missing
+key. `roster_status_team_id` names which side the value describes on entitled
+rows.
+
+An **assigned official is withheld here** even though the family serves them a
+`submitted_lineup` projection, because this route has no per-game assignment
+gate: its schedule lists every game in the active Program/Season/League, so
+honouring that projection would serve an official private state for games they
+were never assigned to — strictly *wider* than the family. There is also no
+honest single-side answer (one enum, a two-sided entitlement), and the value it
+would carry is `needs_substitute`, which `_submitted_lineup_status` neutralises
+by name one route away.
+
+#### `GET /api/me/player-home` — the subject's own *resolved* side
+
+`next_game.team_status` is that same per-side enum again, relabelled for the
+Player Home Page: `needs_substitute` renders as `"sub_search"` and `open_slot`
+as `"short"`. `GET /api/me/guardian/home` carries it too — that route returns
+each verified junior's Player Home payload — so every rule here applies to it
+unchanged.
+
+The subject is **always the signed-in caller** (or their verified junior),
+resolved from the session scope and never from a query parameter, so there is
+no audience to classify and no client hint to ignore. The only question is
+*which side of the game the subject is on*, and the answer is the same
+`game_scoped_own_team_id` resolution the family uses — **never**
+`Player.team_id`, the permanent pointer, which a mid-season transfer leaves
+stale for a particular game in either direction.
+
+Entitlement therefore comes from **authoritative game-scoped membership**, and
+a pointer that has outlived the membership grants nothing:
+
+| pointer / membership for this game | `next_game` |
+|---|---|
+| pointer HOME, membership AWAY | the **away** side |
+| pointer names a team in neither game, membership HOME | the **home** side |
+| pointer HOME, membership moved to another team | **no BOUND game, neither side** (an unbound exhibition the pointer still names is unaffected) |
+| pointer HOME, membership ended or absent | **no BOUND game, neither side** (an unbound exhibition the pointer still names is unaffected) |
+| pointer and membership agree | that side, unchanged |
+| no player binding on the session (including an unscoped operator) | the empty stub |
+
+**Game selection follows the same authority.** `next_game` and `today_count`
+choose *which games* the page is about through the game-scoped membership
+resolution as well, because a player handed the wrong game cannot be rescued
+by resolving the side correctly within it — and the availability POST the
+screen offers is addressed to `next_game.game_id`. For a **mover** this
+changed three things at once, and only the first is a privacy fix:
+
+| | before | now |
+|---|---|---|
+| `next_game.team_status` | the **pointer** team's private per-side enum | the subject's own side's |
+| `next_game.team_name` / `opponent_name` | inverted — the opponent named as their team | the resolved side, named correctly |
+| which games are listed | games the **pointer** team plays; a mover on a new team saw none, a departed player saw their old team's | games the subject's membership actually puts them in |
+
+A game with **no LeagueSeason binding** — an exhibition, or an unbound legacy
+row — has no membership authority, so the permanent pointer remains both the
+side *and* the selector there, unchanged.
+
+### The side rule is machine-enforced (#205)
+
+The four defects above were each found by hand, one round at a time, and each
+was the same shape: a private-state read reaching a side by default or by a
+client hint instead of by the server's resolution. That rule is now a build
+gate — `backend/hockey_scheduler/services/side_provenance.py`, driven by
+`backend/tests/test_side_provenance_guard.py`. It fails on any read of
+roster / availability / substitute / audit state whose side did not come from
+`game_scoped_own_team_id` or an adjudicated decision, on any new
+`x or <game>.home_team_id` default, and on any new leaf of the
+`/api/games/{id}/…` dispatch. Its accepted-site ledger is empty and may only
+shrink; the legitimate cases (unscoped-operator defaults, the live-membership
+discoveries, the create-state side) are documented exemptions whose conditions
+are checked rather than asserted.
+
+### Which side a substitute enrollment belongs to
+
+`SubstituteEnrollment.team_id` — the side the row was **admitted** on — and
+nothing else. This is one rule with three consequences, because attribution
+and liveness are different questions asked of the same row:
+
+- **Served** — `substitutes` and `substitute-candidates` are two views of one
+  resource and name the **same** rows. A NULL-owner row appears in neither.
+  The two are also answered for the same side by the same rule, so they cannot
+  disagree about *whose* rows they are either.
+- **Counted** — `substitutes_enrolled` and `substitutes_available` count only
+  rows this game durably attributes to the side *and* whose occupant is still
+  a live member of it. Attribution is durable so a transfer cannot move an
+  existing row into the opponent's count; liveness is live so a candidacy that
+  has ended drops out of the count immediately, while the row itself stays
+  visible to its owning coach for cleanup.
+- **Actionable** — a **team-scoped** actor cannot transition a row whose
+  admitting side is unknown: `offer`, `accept` and `add-to-roster` answer
+  **403** with `reason: "attribution_missing"`, alongside `withdraw` and
+  `decline`, which already did. This matters because `offer` *writes*
+  `team_id`, so permitting it would mint an admitting side out of today's
+  membership and make the guess durable. An unscoped operator claims no side
+  and is unaffected — they remain the path by which a legacy row is repaired.
+
+### Which side a roster selection may act on
+
+`POST /games/{gameId}/roster/select` is a **batch**, and it answers two
+different questions with two different comparands:
+
+- **May this coach seat this player at all?** The **live** membership context,
+  resolved under the Season lock — selection *creates* state, and the context
+  that authorizes the seat is the one written into the row's durable
+  `team_side`.
+- **Is this an idempotent retry?** The **durable** `team_side` of the row that
+  already exists, and nothing else. Idempotency is a claim about an existing
+  row, so it is **side-owned**: a retry is a no-op only when the occupying
+  row's `team_side` equals the caller's authorized side.
+
+The whole batch is classified **before any write**, so one foreign row cannot
+follow earlier writes:
+
+- an occupying row on **another** side answers **403** with
+  `reason: "team_scope_violation"` and discloses nothing about the row — no
+  id, no `selected_by`, no seated position, no serialized entry;
+- an occupying row with **NULL** attribution (pre-migration-061) fails closed
+  with the existing `reason: "attribution_missing"`;
+- a **missing or non-occupying** row is the only shape the live context may
+  create, revive and **re-attribute** — so a released seat can legitimately be
+  re-taken by the side the player now plays for, with `team_side` rewritten;
+- refusal is **atomic**: zero writes are attempted, not merely rolled back.
+
+`ROSTER_SELECTED` is appended **only when roster state actually changed**. A
+selection in which every requested row was already seated on the caller's own
+side is a true no-op and audits nothing, so the trail cannot claim a selection
+that did not occur. An unscoped operator (`authorized_team_id` unset) keeps the
+prior unconditional behaviour and receives the occupying row whatever side it
+names.
+
+### Which assignments grant an Official scope
+
+One predicate, applied on every surface: an `OfficialAssignment` grants scope
+only when it names **that** Official and its status **is active**
+(`proposed` or `accepted`). A **declined** assignment therefore grants nothing
+anywhere — it is refused admission to the private-game family (`/board`,
+`/lineups`, `/roster`) *and* contributes no Program, Season or League to
+`GET /api/context/options`. The two surfaces cannot disagree, because they call
+the same predicate rather than each spelling the status test out.
+
+An Official's League also requires the assigned Game's own identity to **agree**
+with its frozen `LeagueSeason`: the Game's `season_id` and `league_id` are each
+compared by plain equality, with no exemption for a missing or empty value. A
+bound regular Game whose own League identity is `null` or `""` is internally
+inconsistent, so it grants no League rather than being waved through.
 
 ## Named schedule scenarios (#378)
 

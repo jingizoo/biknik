@@ -4,8 +4,22 @@
 let view = "dashboard";     // dashboard|setup|import|calendar|games|roster|activity|public|readiness|player_home
 let gameView = "coach";     // coach | player (roster)
 let rosterSide = "home";    // home | away — which lineup the roster tab shows (#25)
+// Whether the user CHOSE the side above, as opposed to landing on the
+// default. #427: a scoped Coach must not LAND on the redacted opponent tab,
+// but must still be able to open it deliberately and read why it is closed —
+// so the auto-correction below applies only while this is false.
+let rosterSideChosen = false;
 let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
 let currentGame = null;     // game id whose roster we're viewing
+// The last batch-seating outcome (copy-previous / auto-fill) for THIS game and
+// side (#427). Carries identity — {game_id, team_id, source, seated[],
+// skipped[{player_id,name,reason}], deferred[]} — so the partial-result
+// warning can NAME the players who were not seated instead of reducing the
+// whole outcome to a copied count. Held in module state rather than in a
+// toast because the warning must SURVIVE the re-render the action itself
+// triggers: a toast is cleared by switchTab() and auto-clears after 4s, and a
+// coach who looks away misses the only statement that anything was skipped.
+let rosterBatch = null;
 let pickedPlayer = null;
 let wizard = null;          // {slot_id, league_id, division_id, home_id, away_id} when scheduling
 let iceBuilder = null;      // {form, preview} when the Ice Availability Builder is open (#158)
@@ -990,6 +1004,100 @@ function placementSaveToast(result, successMessage) {
 
 /* ---------- shared ---------- */
 const bannerClass = (s) => s === "open_slot" ? "alert" : s === "needs_substitute" ? "warn" : s === "roster_confirmed" ? "ok" : "neutral";
+
+/* ---------- batch seating: the partial outcome, made visible (#427) -------
+   The owner's ruling: "the operator-facing response must make the partial
+   outcome visible … show the partial-result warning on desktop and 390px
+   rather than reducing it to a copied count."
+
+   ONE code->text map, here and nowhere else. The server's skip reasons are
+   STABLE MACHINE CODES (services/membership_spine.py) precisely so the UI can
+   translate them; a second table somewhere else is how a code ends up meaning
+   two different things on two screens. An UNKNOWN code falls back to the code
+   itself rather than to silence — a reason the server added and the UI has
+   not learned yet must still reach the operator, visibly wrong rather than
+   invisibly absent. */
+// Every SPINE leg collapses to one sentence on purpose: an operator cannot
+// act on "the denormalized season disagrees", and the remedy for all of them
+// is the same Setup remedy. The distinct machine codes are still what the
+// audit row records, so the diagnosis is not lost — only the wording is
+// shared.
+const SETUP_SPINE_TEXT =
+  "this game's league/season setup is inconsistent — check the team in Setup";
+const SKIP_REASON_TEXT = {
+  // discovery-stage: the history itself cannot prove the seat
+  prior_seat_unattributed:
+    "the previous game's roster row predates side tracking, so it can't be "
+    + "proved they played for this team — add them by hand",
+  // the player's own season registration
+  membership_transferred: "transferred to another team",
+  membership_released: "released from the team",
+  membership_inactive: "season registration is inactive",
+  membership_injured: "listed as injured",
+  membership_applicant: "season registration is still pending approval",
+  membership_other_team: "registered to a different team this season",
+  membership_other_league_season: "registered in a different competition",
+  no_eligible_membership: "no season registration on file",
+  player_inactive: "no longer an active player",
+  membership_player_missing: "the player record no longer exists",
+  // the TEAM's participation, not the player's — one message, because the
+  // remedy is the same for all of them and it is a Setup remedy
+  team_not_registered:
+    "the team's registration for this season is not active",
+  team_registration_conflict:
+    "the team has conflicting season registrations — fix them in Setup",
+  membership_team_missing: SETUP_SPINE_TEXT,
+  membership_season_missing: SETUP_SPINE_TEXT,
+  membership_league_season_missing: SETUP_SPINE_TEXT,
+  membership_league_mismatch: SETUP_SPINE_TEXT,
+  membership_program_mismatch: SETUP_SPINE_TEXT,
+  membership_denormalized_season_mismatch: SETUP_SPINE_TEXT,
+  // not an eligibility problem at all — the roster simply filled up
+  roster_target_met: "the roster was already full",
+};
+const skipReasonText = (code) => SKIP_REASON_TEXT[code] || code;
+const namedSkips = (rows) => rows
+  .map((r) => `${r.name || r.player_id} (${skipReasonText(r.reason)})`)
+  .join("; ");
+// The ONE sentence spoken in the live region — deliberately a summary, so the
+// polite announcement stays short while the persistent block below carries
+// every name. Returns "" when there is nothing partial to say.
+function rosterBatchAnnouncement(b) {
+  if (!b || !b.skipped.length) return "";
+  const n = b.skipped.length;
+  const verb = b.source === "auto_build_roster" ? "Auto-fill" : "Copy";
+  return b.seated.length
+    ? `${verb} added ${b.seated.length} player${b.seated.length === 1 ? "" : "s"}; `
+      + `${n} could not be added.`
+    : `${verb} added no players — ${n} candidate${n === 1 ? "" : "s"} `
+      + `${n === 1 ? "is" : "are"} not eligible.`;
+}
+// The PERSISTENT statement, rendered into the same .ros-warn block above the
+// roster toolbar that already carries the open-slot / backed-out warnings —
+// it survives every re-render, which the toast does not.
+//
+// Identity-gated (#365's discipline): a result belongs to the game and side
+// it was produced for, so switching game or lineup tab drops it rather than
+// letting a stale warning describe the wrong bench.
+function rosterBatchWarningHtml() {
+  const b = rosterBatch;
+  if (!b || b.game_id !== currentGame || b.team_id !== rosterTeamId) return "";
+  if (!b.skipped.length) return "";
+  const head = b.seated.length
+    ? `${b.seated.length} of ${b.seated.length + b.skipped.length} `
+      + `player${b.seated.length + b.skipped.length === 1 ? "" : "s"} added.`
+    // ZERO-SEAT: a successful call that seated nobody. It must not read as a
+    // failure, and it must not read as "nothing happened" either.
+    : `No players were added — none of the `
+      + `${b.skipped.length} candidate${b.skipped.length === 1 ? "" : "s"} `
+      + `is currently eligible.`;
+  const items = b.skipped.map((r) =>
+    `<li>${esc(r.name || r.player_id)} — ${esc(skipReasonText(r.reason))}</li>`
+  ).join("");
+  return `<div class="ros-warn ros-partial">
+    <div class="rp-head">⚠ ${esc(head)} Not added:</div>
+    <ul class="rp-list">${items}</ul></div>`;
+}
 // Same ok/warn/alert/neutral → green/orange/red/gray mapping the .banner
 // classes use (styles.css), so a roster status badge never disagrees with the
 // banner shown for the same status elsewhere (#118 Phase 3.2).
@@ -1044,6 +1152,18 @@ const dayOf = (iso) => (iso || "").slice(0, 10);
 // zone and could print a different day than the time beside it.
 const fmtRowDate = (iso) => { const d = dayOf(iso); return d ? fmtDate(d) : ""; };
 
+/* A schedule row whose roster status this reader is not entitled to (#205).
+   The server OMITS `roster_status` entirely for such a row and flags it, so
+   nothing here may fall back to reading the absent key: every consumer below
+   asks `["roster_confirmed","locked"].includes(g.roster_status)`, and a
+   missing key answers that `false` — which would render as "Roster open" /
+   "not confirmed", i.e. the opponent's private state represented as an empty
+   operational state, the exact thing the omission exists to avoid. */
+const ROSTER_STATUS_HIDDEN = "Not shown for your role";
+const rosterStatusKnown = (g) => !g.roster_status_restricted;
+const rosterConfirmed = (g) => rosterStatusKnown(g)
+  && ["roster_confirmed", "locked"].includes(g.roster_status);
+
 // Per-game triage: derive a status badge + a staffing note from the schedule
 // row's real fields (officials assigned/accepted, roster status, result).
 function gameTriage(g) {
@@ -1051,11 +1171,17 @@ function gameTriage(g) {
     return { badge: "final", label: "Final", note: "Result final", noteCls: "ok" };
   const assigned = g.officials_assigned || 0;
   const accepted = g.officials_accepted || 0;
-  const rosterOk = ["roster_confirmed", "locked"].includes(g.roster_status);
+  const rosterOk = rosterConfirmed(g);
   if (assigned === 0)
     return { badge: "needs", label: "Needs staff", note: "No officials assigned", noteCls: "bad" };
   if (accepted < assigned)
     return { badge: "needs", label: "Needs staff", note: "Officials pending acceptance", noteCls: "warn" };
+  // The roster leg is UNKNOWN, not failed — so neither "Roster open" (which
+  // asserts that team has an unconfirmed roster) nor "Ready" (which asserts
+  // it is set) may be claimed. Its own badge says which of the two checks
+  // actually passed and which was withheld.
+  if (!rosterStatusKnown(g))
+    return { badge: "partial", label: "Officials set", note: "Roster status not shown", noteCls: "muted" };
   if (!rosterOk)
     return { badge: "needs", label: "Roster open", note: "Roster not confirmed", noteCls: "warn" };
   return { badge: "ready", label: "Ready", note: "Officials & roster set", noteCls: "ok" };
@@ -2970,8 +3096,11 @@ function renderDashboard(ov, standings) {
 
   // Staffing gaps across all scheduled games.
   const needStaff = games.filter((g) => g.result_status !== "final" && gameTriage(g).badge === "needs");
+  // A row whose roster status is WITHHELD is not counted as "to confirm":
+  // that would assert an unconfirmed roster for a team this reader cannot
+  // see, and would put a number on this tile that no screen can explain.
   const toConfirm = games.filter((g) =>
-    g.result_status !== "final" && !["roster_confirmed", "locked"].includes(g.roster_status));
+    g.result_status !== "final" && rosterStatusKnown(g) && !rosterConfirmed(g));
 
   const pill = (cls, txt) => `<span class="ds-pill ${cls}">${esc(txt)}</span>`;
   const stat = (label, n, sub, pillHtml) => `
@@ -7943,7 +8072,8 @@ function renderWizard(ov) {
 // its own Open-Roster/Publish buttons are never nested inside a button.
 function gamesRow(g) {
   const t = gameTriage(g);
-  const badgeCls = { final: "gray", needs: "blocked", ready: "available" }[t.badge] || "gray";
+  const badgeCls = { final: "gray", needs: "blocked", ready: "available",
+                     partial: "gray" }[t.badge] || "gray";
   const expanded = gamesExpanded.has(g.game_id);
   const head = `<button class="li li-btn games-row" data-games-toggle="${esc(g.game_id)}" aria-expanded="${expanded}">
     <span class="li-time">${fmt(g.start_time)}</span>
@@ -7952,9 +8082,17 @@ function gamesRow(g) {
     <span class="pill ${badgeCls}">${esc(t.label)}</span>
     <span class="games-caret" aria-hidden="true">${expanded ? "▲" : "▼"}</span></button>`;
   if (!expanded) return head;
-  const confirmed = g.roster_status === "roster_confirmed" || g.roster_status === "locked";
-  const ck = (ok, lbl, meta) => `<div class="check ${ok ? "ok" : "todo"}"><span class="ic">${ok ? "✓" : "○"}</span>
+  const confirmed = rosterConfirmed(g);
+  // THREE states, not two (#205): `ok === null` is "withheld", which is
+  // neither done nor to-do. `ck(false, …)` renders ○ + the "todo" class and
+  // would claim this team's roster is not confirmed — a false operational
+  // claim about the other team rather than a true one about the reader.
+  const ck = (ok, lbl, meta) => {
+    const cls = ok === null ? "unknown" : ok ? "ok" : "todo";
+    const ic = ok === null ? "–" : ok ? "✓" : "○";
+    return `<div class="check ${cls}"><span class="ic">${ic}</span>
     <span class="lbl">${lbl}</span>${meta ? `<span class="meta">${meta}</span>` : ""}</div>`;
+  };
   // #277: the schedule review shows the same derived reserved span as the
   // calendar and the scheduler's draft rows (one backend derivation).
   const rsv = g.reserved
@@ -7962,7 +8100,9 @@ function gamesRow(g) {
     : "";
   const detail = `<div class="games-detail">
     ${ck(true, "Ice slot allocated")}${rsv}
-    ${ck(confirmed, "Roster", prettyStatus(g.roster_status))}
+    ${rosterStatusKnown(g)
+       ? ck(confirmed, "Roster", prettyStatus(g.roster_status))
+       : ck(null, "Roster", ROSTER_STATUS_HIDDEN)}
     ${ck((g.officials_assigned || 0) > 0 && (g.officials_accepted || 0) === g.officials_assigned, "Officials",
          g.officials_assigned ? `${g.officials_accepted}/${g.officials_assigned} accepted` : "None assigned")}
     ${ck(false, "Locker rooms", "Follow-up")}
@@ -7992,7 +8132,12 @@ function renderGames(ov) {
   // derived from the data actually present; status uses gameTriage's own label
   // so the filter and the row badge can never disagree.
   const f = gamesFilter;
-  const STATUSES = ["Needs staff", "Roster open", "Ready", "Final"];
+  // "Officials set" is gameTriage's label for a row whose roster status is
+  // withheld (#205). Offered only when such a row is actually present, per
+  // this block's own rule that the options come from the data — for an
+  // operator, who is entitled to every row's status, the list is unchanged.
+  const STATUSES = ["Needs staff", "Roster open", "Ready", "Final"]
+    .concat(all.some((g) => !rosterStatusKnown(g)) ? ["Officials set"] : []);
   const rinkNames = [...new Set(all.map((g) => g.rink_name).filter(Boolean))].sort();
   const shown = all.filter((g) => {
     if (f.division !== "all" && g.division_id !== f.division) return false;
@@ -8049,7 +8194,12 @@ const AVAIL_PILL = { available: "available", unavailable: "blocked",
 const AVAIL_LABEL = { all: "All", available: "Available", unavailable: "Unavailable",
   maybe: "Maybe", no_response: "No response" };
 
-function renderAvailSummary() {
+function renderAvailSummary(side) {
+  // WITHHELD IS NOT ABSENT (#427 final blocker, round 2). A side this caller
+  // does not read in full has no availability rollup for them, and the fetch
+  // is skipped rather than fired at a route that refuses it -- so say that,
+  // instead of silently omitting the card.
+  if (side && !isFullSide(side)) return restrictedNote("availability");
   if (!availSummary) return "";
   const c = availSummary.counts;
   const chip = (key) => {
@@ -8112,23 +8262,118 @@ function rosterGamePicker(ov) {
   </div>`;
 }
 
+/* ---------- Opponent-side redaction (#427) ----------
+   TWO LEVELS OF "RESTRICTED", and they are different states. render()'s own
+   `lineups.error` branch below already shows a whole-screen "Restricted"
+   banner when the caller is outside the GAME entirely and the read 403s
+   (#73/#154). This is the narrower one: the caller is legitimately inside
+   the game and reads their OWN side in full, while the OPPONENT'S side --
+   and only that -- is withheld. Same word because it is the same idea at a
+   different scope; different markup, so neither assertion can be satisfied
+   by the other.
+
+   A side a scoped Coach/Player may not read comes back with
+   `restricted: true` and `players: null` -- deliberately NOT `players: []`,
+   because an empty list already means something else, and something
+   operationally different, on both of these screens ("No lineup submitted."
+   on the Game Sheet, "No players on the roster yet" on the roster view).
+   Rendering redaction as emptiness would tell a coach their opponent had
+   failed to submit a lineup. These two helpers are the ONE place that decides
+   how a redacted side looks, so the roster view and the Game Sheet cannot
+   drift apart about it. */
+function isRestrictedSide(side) {
+  return !!(side && side.restricted);
+}
+/* WHICH SIDES CARRY PRIVATE WORKFLOW STATE, asked of the SERVER'S OWN LABEL
+   rather than guessed from the signed-in role (#427 final blocker, round 2).
+
+   `isRestrictedSide` is not the same question and could not answer this one.
+   An assigned official's `/lineups` sides come back `projection:
+   "submitted_lineup"` with `restricted: false` -- correctly, they ARE being
+   shown that side's submitted lineup -- so every "not restricted" gate read
+   TRUE for them and the Roster tab fetched
+   `/availability-summary?team_id=<the side being shown>` on every render,
+   with the side toggle switching teams. That route now refuses an official,
+   as it should, and a gate that keeps firing it would turn the leak into a
+   guaranteed 403 on every render instead of closing the screen honestly.
+
+   `full` is the ONE projection that carries per-player availability,
+   candidates and substitute workflow, so it is the ONE that may ask for
+   them. Keying on the label rather than on `currentUser.role` means the
+   server decides, once, for every role that exists now or later -- the same
+   reason `isRestrictedSide` exists rather than a role test. */
+function isFullSide(side) {
+  return !!(side && side.projection === "full");
+}
+function restrictedNote(kind) {
+  // `kind` only changes the WORDING; every one of them says the same thing --
+  // WITHHELD, not absent. One function, so the redacted look cannot drift
+  // between the screens that show it.
+  const COPY = {
+    sheet: ["Opponent lineup not shown",
+      "Only your own team's lineup is shown to you. An operator or an assigned official sees both."],
+    roster: ["Opponent lineup not shown",
+      "You manage your own team. The opposing lineup is private to their coach."],
+    // #427 final blocker: /board withholds `notifications`, `audit` and
+    // `audit_count` from a caller with no side of their own (an assigned
+    // official). Rendering that as `[]` would print "No notifications yet."
+    // and "No audit entries." -- claims that this GAME has had no activity,
+    // which is a different and false statement, and exactly the
+    // empty-operational-state mistake the redacted lineup already avoids.
+    activity: ["Game activity not shown",
+      "This game's notification and audit trail is private to the teams playing and the league office."],
+    // #427 final blocker round 2: an assigned official reads the SUBMITTED
+    // lineup, and per-player availability is not part of it. Saying so beats
+    // rendering nothing -- an absent card reads as "there is no availability
+    // data", the same empty-operational-state mistake as `players: []`.
+    availability: ["Availability not shown",
+      "Per-player availability is private to each team's coach and the league office. You are shown the submitted lineup."],
+    // The candidate pool and the substitute workflow, withheld together --
+    // they are one subject (who is NOT in the lineup and might be) and the
+    // submitted-lineup projection carries neither.
+    workflow: ["Candidate and substitute list not shown",
+      "Who else could play, and this team's substitute workflow, are private to their coach and the league office. You are shown the submitted lineup."],
+  };
+  const [title, detail] = COPY[kind] || COPY.roster;
+  return `<div class="restricted-side" data-restricted>
+    <div class="rs-head"><span class="badge gray">\u{1F512} Restricted</span></div>
+    <div class="rs-title">${esc(title)}</div>
+    <div class="rs-note">${esc(detail)}</div></div>`;
+}
+
 function renderRoster(lineups, ov) {
   if (!lineups) return `<div class="empty">Select a game from the Games tab.</div>`;
   if (!(rosterSide in lineups)) rosterSide = "home";
+  // Never LAND a scoped caller on the redacted tab (#427): if the side we
+  // would show is restricted and the other is not, that other one is theirs.
+  // Only while the user has not chosen a side themselves -- opening the
+  // opponent tab deliberately must show them WHY it is closed, not bounce.
+  const otherSide = rosterSide === "home" ? "away" : "home";
+  if (!rosterSideChosen && isRestrictedSide(lineups[rosterSide])
+      && !isRestrictedSide(lineups[otherSide])) {
+    rosterSide = otherSide;
+  }
   const side = lineups[rosterSide];
   rosterTeamId = side.team_id;
   const tab = (key, icon, label) => {
     const l = lineups[key];
-    return `<button class="ls ${rosterSide === key ? "active" : ""}" data-side="${key}">
+    // A restricted side has no private `status` to summarise. Say why the tab
+    // is closed rather than printing a status it does not carry -- and never
+    // read `l.status.status` off a `null`.
+    const sub = isRestrictedSide(l) ? "Restricted" : prettyStatus(l.status.status);
+    return `<button class="ls ${rosterSide === key ? "active" : ""}${isRestrictedSide(l) ? " restricted" : ""}" data-side="${key}">
       <span class="ls-team">${icon} ${esc(l.team_name)}</span>
-      <span class="ls-sub">${label} · ${prettyStatus(l.status.status)}</span></button>`;
+      <span class="ls-sub">${label} \u00b7 ${sub}</span></button>`;
   };
-  return `${rosterGamePicker(ov)}<div class="lineup-switch">${tab("home", "🏠", "Home")}${tab("away", "✈️", "Away")}</div>
-    <div class="segmented">
+  const body = isRestrictedSide(side)
+    ? restrictedNote("roster")
+    : `<div class="segmented">
       <button class="seg ${gameView === "coach" ? "active" : ""}" data-view="coach">Coach</button>
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
     </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side, ov) : playerBody(side)}</div>
-    ${renderAvailSummary()}`;
+    ${renderAvailSummary(side)}`;
+  return `${rosterGamePicker(ov)}<div class="lineup-switch">${tab("home", "\u{1F3E0}", "Home")}${tab("away", "\u2708\uFE0F", "Away")}</div>
+    ${body}`;
 }
 
 /* ---------- Game Sheet (read-only, both lineups) (#48) ---------- */
@@ -8140,6 +8385,20 @@ function fmtDateTime(iso) {
   return `${date} · ${fmt(iso)}`;
 }
 function sheetSide(side, label) {
+  // A RESTRICTED side keeps its public team name and says it is withheld
+  // (#427). It must NOT fall through to the code below, whose "No lineup
+  // submitted." empty state is a claim about the opponent's preparedness
+  // rather than about this reader's access.
+  if (isRestrictedSide(side)) {
+    return `<section class="gs-side gs-side-restricted">
+      <header class="gs-side-head">
+        <div><div class="gs-side-team">${esc(side.team_name)}</div>
+          <div class="gs-side-label">${esc(label)}</div></div>
+        <span class="badge gray">\u{1F512} Restricted</span>
+      </header>
+      ${restrictedNote("sheet")}
+    </section>`;
+  }
   const s = side.status;
   const occupying = side.players
     .filter((p) => p.group === "selected" && !p.backed_out)
@@ -9815,7 +10074,7 @@ function availableGroups(available, s, locked) {
     if (!list.length) return "";
     const need = open > 0 ? `<span class="need">need ${open}</span>` : `<span class="need ok">full</span>`;
     const rows = list.map((p) => playerRow(p,
-      `${posTag(p)}${locked ? "" : `<button class="act primary" data-act="select" data-id="${esc(p.id)}">Add</button>`}`)).join("");
+      `${posTag(p)}${ineligibleBadge(p)}${locked || !isSeatable(p) ? "" : `<button class="act primary" data-act="select" data-id="${esc(p.id)}">Add</button>`}`)).join("");
     return `<div class="avail-group"><div class="avail-head">${label} ${need}</div>${rows}</div>`;
   };
   const body = available.length
@@ -9829,6 +10088,26 @@ function availableGroups(available, s, locked) {
 // /api/games/{gid}/substitute-candidates, with a Send Offer for each enrolled
 // candidate that fits an open slot (offer → the player accepts/declines), plus
 // the existing Add-now coach override. Falls back to nothing until loaded.
+/* ---------- Ineligible-but-visible rows (#427) ----------
+   A row can be DURABLY OWNED by this side and still be unseatable: an
+   enrollment survives its candidate's participation ending, so the owning
+   Coach can still clean it up, while `substitutes_enrolled` (a LIVE count)
+   correctly drops. The service refuses an add/seat on such a row, so a UI
+   that offers the control is offering a rejected action -- and the coach
+   learns that only by pressing it and reading an error.
+
+   `eligible: false` on the row is that state, and these two helpers are the
+   ONE place that renders it: a visible label, and NO `data-act` attribute at
+   all on the disabled control (not merely `disabled`), so neither a click
+   nor the keyboard traversal the e2e journey uses can dispatch a seat. */
+function ineligibleBadge(p) {
+  return p.eligible === false
+    ? '<span class="badge red" data-ineligible>Ineligible</span>' : "";
+}
+function isSeatable(p) {
+  return p.eligible !== false;
+}
+
 const SUB_STATUS_BADGE = {
   enrolled: '<span class="badge blue">Enrolled</span>',
   offered: '<span class="badge orange">Offered</span>',
@@ -9962,6 +10241,19 @@ function coachBody(board, ov) {
   const subs = board.players.filter((p) => p.group === "substitute");
 
   if (!board.players.length) {
+    // WHAT AN EMPTY `players` MEANS DEPENDS ON THE PROJECTION (#427 final
+    // blocker, round 2). On a `full` side it really is the whole population,
+    // so "this team has no players, add them in Setup" is a true and useful
+    // instruction. On a SUBMITTED_LINEUP side it is only the players
+    // SUBMITTED -- the candidate pool was never sent -- so the same sentence
+    // becomes a false claim about another team's roster, made to a reader who
+    // is simply not being shown it. The honest reading there is the Game
+    // Sheet's own: nothing has been submitted yet, and the rest is withheld.
+    if (!isFullSide(board)) {
+      return `<div class="banner neutral"><h2>No lineup submitted</h2>
+        <p>This team has not submitted a lineup for this game yet.</p></div>
+        ${restrictedNote("workflow")}`;
+    }
     return `<div class="banner neutral"><h2>No roster yet</h2>
       <p>The home team has no players. Add players in Setup first (team player
       management is a follow-up: #25).</p></div>`;
@@ -9979,7 +10271,12 @@ function coachBody(board, ov) {
   if (s.open_goalie_slots > 0) warn.push(`Need ${s.open_goalie_slots} more goalie${plural(s.open_goalie_slots)}.`);
   if (s.open_skater_slots > 0) warn.push(`Need ${s.open_skater_slots} more skater${plural(s.open_skater_slots)}.`);
   if (backedOut.length) warn.push(`${backedOut.length} player${plural(backedOut.length)} backed out or removed — re-confirm or refill.`);
-  const warnHtml = warn.length ? `<div class="ros-warn">⚠ ${warn.map(esc).join(" ")}</div>` : "";
+  // The last batch outcome sits in its OWN .ros-warn block, immediately above
+  // the toolbar that produced it (#427). Separate from the slot warnings
+  // because it names players and reasons as a list rather than a run-on
+  // sentence, and because it must be identity-gated to this game and side.
+  const warnHtml = (warn.length ? `<div class="ros-warn">⚠ ${warn.map(esc).join(" ")}</div>` : "")
+    + rosterBatchWarningHtml();
 
   const toolbar = canEdit ? `<div class="ros-toolbar">
     <button class="act ghost" data-act="copy">⧉ Copy previous roster</button>
@@ -10008,12 +10305,38 @@ function coachBody(board, ov) {
   // not computed on the common coach path where outreachPanel replaces it.
   const subPoolCard = () => `<div class="section-title">Substitute pool</div>
     <div class="card">${subs.length ? subs.map((p) => {
-      const canAdd = canEdit && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
-      const ctrl = SUB_STATUS_BADGE[p.sub_status] || SUB_STATUS_BADGE.enrolled;
+      // #427: an INELIGIBLE row is never addable, whatever the slot counts
+      // say -- the service would refuse the seat.
+      const canAdd = canEdit && isSeatable(p)
+        && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
+      const ctrl = `${SUB_STATUS_BADGE[p.sub_status] || SUB_STATUS_BADGE.enrolled}${ineligibleBadge(p)}`;
       const btn = !canEdit ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${esc(p.id)}">Add</button>`
+        : !isSeatable(p) ? `<button class="act ghost" disabled title="This player is no longer eligible for this game — remove the enrolment instead.">Can't add</button>`
         : `<button class="act ghost" disabled>No slot</button>`;
       return playerRow(p, `${posTag(p)}${ctrl}${btn}`);
     }).join("") : `<div class="empty">No substitutes enrolled.</div>`}</div>`;
+
+  // #427: enrolments this side DURABLY OWNS whose candidate can no longer
+  // play. `substitutes_enrolled` is a LIVE count and correctly drops them, and
+  // /substitute-candidates -- the outreach queue that normally replaces the
+  // pool card above -- drops them too, on purpose: they are not offerable.
+  // But the ROW is still ours and still there, and the owning Coach is the
+  // only person who can clear it. Without this block it would be invisible on
+  // the one screen that can act on it. Cleanup ONLY: withdraw, never add or
+  // seat, because the service refuses those (see
+  // ParticipationEndingDoesNotFlipTheDurableSide).
+  //
+  // Only needed on the OUTREACH path: the fallback pool card above already
+  // lists every substitute row this side owns, and already renders a stale
+  // one with its Ineligible badge and a disabled control. Rendering both
+  // would show the same body twice.
+  const staleSubs = subs.filter((p) => !isSeatable(p));
+  const cleanupCard = () => !staleSubs.length ? "" : `<div class="section-title">Needs cleanup (${staleSubs.length})</div>
+    <div class="card">${staleSubs.map((p) => playerRow(p,
+      `${posTag(p)}${ineligibleBadge(p)}${canEdit
+        ? `<button class="act danger ghost" data-act="withdraw" data-id="${esc(p.id)}">Remove enrolment</button>`
+        : ""}`)).join("")}
+      <div class="empty">No longer eligible for this game — these enrolments can only be removed.</div></div>`;
 
   // Footer: lock control for roster managers, else a read-only note by role/scope.
   let footer;
@@ -10036,13 +10359,29 @@ function coachBody(board, ov) {
   }
 
   const total = s.target_goalies + s.target_skaters;
+  // WHAT A NON-FULL SIDE MUST NOT CLAIM (#427 final blocker, round 2). The
+  // two sections below are built from the candidate and substitute
+  // populations, and the SUBMITTED_LINEUP projection carries NEITHER -- it
+  // sends the selected rows and nothing else. Rendered by a screen written
+  // for the full side they collapse to their FULL-shaped empty states:
+  // "Available players (0) / All eligible players are on the roster or in the
+  // sub pool." and "No substitutes enrolled." Both are operational claims
+  // about THIS TEAM's preparedness, both are false, and both are exactly the
+  // failure the ruling names -- restricted data represented as an empty
+  // operational state rather than as withheld. So a side this caller does
+  // not read in full gets the withheld note in their place, from the SAME
+  // one-place helper the redacted opponent and the withheld activity log
+  // already use. The submitted lineup itself is real and stays.
+  const workflow = isFullSide(board)
+    ? `${availableGroups(available, s, !canEdit)}
+    ${subCandidates ? outreachPanel(canEdit) + cleanupCard() : subPoolCard()}`
+    : restrictedNote("workflow");
   return `
     <div class="banner ${bannerClass(s.status)}"><h2>${prettyStatus(s.status)}</h2><p>${esc(s.message)}</p></div>
     ${summary}${warnHtml}${toolbar}
     <div class="section-title">Roster (${onRoster.length}/${total})</div>
     <div class="card">${rosterRows}</div>
-    ${availableGroups(available, s, !canEdit)}
-    ${subCandidates ? outreachPanel(canEdit) : subPoolCard()}
+    ${workflow}
     ${footer}
     ${renderReschedulePanel(canRoster, ov)}
     `;
@@ -10093,7 +10432,9 @@ function playerBody(board) {
 
 /* ---------- Activity ---------- */
 const AUDIT_LABEL = {
-  roster_selected: "Roster selected", availability_set: "Availability updated",
+  roster_selected: "Roster selected",
+  roster_batch_seated: "Roster batch seated",
+  availability_set: "Availability updated",
   player_backed_out: "Player backed out", substitute_enrolled: "Substitute enrolled",
   substitute_withdrawn: "Substitute withdrawn", substitute_offered: "Substitute offered",
   substitute_accepted: "Substitute accepted", substitute_declined: "Substitute declined",
@@ -10182,19 +10523,36 @@ function renderActivity(board, ov) {
       : "Open a game roster to see its game activity.";
     return operatorSection + `<div class="section-title">Game</div><div class="card"><div class="empty">${note}</div></div>`;
   }
-  const names = {}; board.players.forEach((p) => (names[p.id] = p.name));
+  // WHICH activity this caller is being shown, stated by the server (#427
+  // final blocker) rather than inferred from a short list: "full" for an
+  // unscoped operator, "own_side" for a Coach/Player, "withheld" for a caller
+  // entitled to none of it. `audit_count` is counted over what was SENT, so
+  // it is never a count of rows that were withheld.
+  const withheld = board.audit_scope === "withheld";
+  const ownSide = board.audit_scope === "own_side";
+  const names = {}; (board.players || []).forEach((p) => (names[p.id] = p.name));
   const feed = [...(board.notifications || [])].reverse();
   const audit = [...(board.audit || [])].reverse();
   const dotFor = { coach: "var(--blue)", player: "var(--green)", team: "var(--purple)", guardian: "#b07bd6" };
-  const fHtml = feed.length ? feed.map((n) => tlRow(fmt(n.at),
+  // An OWN-SIDE feed that happens to be empty must not claim the game has had
+  // no activity -- it means "none of it was yours".
+  const emptyFeed = ownSide ? "No activity for your team yet." : "No notifications yet.";
+  const emptyAudit = ownSide ? "No audit entries for your team yet." : "No audit entries.";
+  const fHtml = withheld ? restrictedNote("activity") : (feed.length ? feed.map((n) => tlRow(fmt(n.at),
     `${esc(n.message)} <span style="color:var(--muted)">· to ${esc(n.audience)}${n.subject_player_id && names[n.subject_player_id] ? " · " + esc(names[n.subject_player_id]) : ""}</span>`,
-    dotFor[n.audience])).join("") : `<div class="empty">No notifications yet.</div>`;
-  const aHtml = audit.length ? audit.map((a) => tlRow(fmt(a.at),
+    dotFor[n.audience])).join("") : `<div class="empty">${esc(emptyFeed)}</div>`);
+  const aHtml = withheld ? restrictedNote("activity") : (audit.length ? audit.map((a) => tlRow(fmt(a.at),
     `<strong>${esc(AUDIT_LABEL[a.action] || a.action)}</strong>${a.subject_player_id && names[a.subject_player_id] ? " · " + esc(names[a.subject_player_id]) : ""}`,
-    "#94a3b8")).join("") : `<div class="empty">No audit entries.</div>`;
+    "#94a3b8")).join("") : `<div class="empty">${esc(emptyAudit)}</div>`);
+  // No count at all when the collection was withheld -- printing "(null)" or
+  // "(0)" would be the cardinality claim the server deliberately does not make.
+  const auditTitle = withheld ? "Game audit" : `Game audit (${board.audit_count})`;
+  const scopeNote = ownSide
+    ? `<div class="empty" data-activity-scope>Your own team's entries only. An operator sees the whole game's log.</div>`
+    : "";
   return `${operatorSection}
-    <div class="section-title">Game notifications</div><div class="card">${fHtml}</div>
-    <div class="section-title">Game audit (${board.audit_count})</div><div class="card">${aHtml}</div>
+    <div class="section-title">Game notifications</div><div class="card">${scopeNote}${fHtml}</div>
+    <div class="section-title">${esc(auditTitle)}</div><div class="card">${aHtml}</div>
     <div class="section-title">Delivery</div><div class="card">${stub("📨", "Push / email delivery", "Worker + device tokens", 32)}</div>`;
 }
 
@@ -10382,13 +10740,38 @@ async function submitSetup(kind) {
   await render();
 }
 
+// Take ONE batch-seating response and turn it into (a) the persistent
+// warning's state and (b) at most ONE live-region announcement (#427).
+//
+// SPOKEN EXACTLY ONCE. `toast` is set here and the `await render()` that
+// follows every rosterAction() drives updateToast() a single time — the same
+// route announceCardStatus() uses, and the same reason: #toast-root is the
+// ONE sitewide `role="status" aria-live="polite"` region (index.html), so
+// minting a second one per surface would speak the same sentence twice.
+// A response that skipped NOBODY says nothing at all: a fully successful
+// auto-fill or copy is already visible in the roster that just re-rendered.
+function recordRosterBatch(r) {
+  if (!r || r.error || !Array.isArray(r.skipped)) return;
+  rosterBatch = {
+    game_id: currentGame, team_id: r.team_id || rosterTeamId,
+    source: r.source, seated: r.seated || [], skipped: r.skipped,
+    deferred: r.deferred || [],
+  };
+  const said = rosterBatchAnnouncement(rosterBatch);
+  if (said) { toast = said; toastIsError = false; }
+}
+
 async function rosterAction(act, id) {
   toast = "";
   const B = `/api/games/${currentGame}`;
-  if (act === "build") await post(`${B}/build-roster`, { team_id: rosterTeamId });
+  // BOTH batch entry points route through the SAME renderer (#427). "build"
+  // used to DISCARD its response entirely and "copy" reduced its response to
+  // a copied count, so a partial outcome — the whole point of the ruling —
+  // was invisible on one and unstated on the other.
+  if (act === "build") recordRosterBatch(await post(`${B}/build-roster`, { team_id: rosterTeamId }));
   else if (act === "select") await post(`${B}/roster/select`, { player_ids: [id] });
   else if (act === "remove") await post(`${B}/roster/remove`, { player_id: id });
-  else if (act === "copy") { const r = await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }); if (r && !r.error) toast = `Copied ${r.copied} player${r.copied === 1 ? "" : "s"} from the previous game.`; }
+  else if (act === "copy") recordRosterBatch(await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }));
   else if (act === "confirm") await post(`${B}/availability`, { player_id: id, availability_status: "available" });
   else if (act === "backout") await post(`${B}/availability`, { player_id: id, availability_status: "unavailable" });
   else if (act === "enroll") await post(`${B}/substitutes/enroll`, { player_id: id });
@@ -10616,7 +10999,15 @@ async function render() {
     if (renderPass !== myRenderPass) return;  // superseded (#215)
     // Availability rollup for the roster screen's selected side (#89).
     availSummary = null;
-    if (view === "roster" && lineups && lineups[rosterSide] && !lineups.error) {
+    // #427: only a side this caller reads in FULL has an availability rollup
+    // they may read, and asking anyway would be a guaranteed 403 on every
+    // render. Round 2 tightened this from "not restricted" to "full": an
+    // assigned official's sides are `submitted_lineup`, not `restricted`, so
+    // the old test passed for them and this fetch was the live UI path by
+    // which they recovered both sides' candidate pool -- names, per-player
+    // availability and all -- with the side toggle switching teams.
+    if (view === "roster" && lineups && !lineups.error
+        && isFullSide(lineups[rosterSide])) {
       const tid = lineups[rosterSide].team_id;
       const s = await getJSON(
         `/api/games/${currentGame}/availability-summary?team_id=${tid}`);
@@ -10626,8 +11017,12 @@ async function render() {
     // Coach substitute outreach queue for the shown side (#112), operator-only.
     subCandidates = null;
     addableSubs = null;
+    // Same tightening, same reason: the outreach queue and the addable list
+    // are substitute WORKFLOW state, which only a `full` side carries. The
+    // `manage_roster` gate happens to exclude officials today, but this must
+    // not depend on a role check agreeing with the server's projection.
     if (view === "roster" && gameView === "coach" && hasPerm("manage_roster")
-        && lineups && lineups[rosterSide] && !lineups.error) {
+        && lineups && !lineups.error && isFullSide(lineups[rosterSide])) {
       const tid = lineups[rosterSide].team_id;
       const q = await getJSON(
         `/api/games/${currentGame}/substitute-candidates?team_id=${tid}`);
@@ -11736,14 +12131,14 @@ async function render() {
   if (view === "setup") restorePendingCardWriteFocus();
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
-  c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
+  c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; rosterSideChosen = true; toast = ""; render(); });
   // Roster game picker (#154): switching the game resets the per-game view
   // state (side, availability filter, the coach's fetched sub queues) so the
   // new game's roster never renders against the previous game's data.
   const rosterGameSel = c.querySelector("#roster-game");
   if (rosterGameSel) rosterGameSel.onchange = () => {
     currentGame = rosterGameSel.value;
-    rosterSide = "home"; availFilter = "all";
+    rosterSide = "home"; rosterSideChosen = false; availFilter = "all";
     availSummary = null; subCandidates = null; addableSubs = null; rescheduleRequests = null;
     toast = ""; render();
   };
@@ -13284,6 +13679,12 @@ function resetTransientViewState(next) {
   // Same discipline for the guardian surface (#26): leaving "My Players"
   // clears any open junior checkout confirm / opportunity detail.
   if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
+  // A batch-seating outcome describes ONE visit to ONE game's roster (#427).
+  // It is already identity-gated to (currentGame, rosterTeamId) so a game or
+  // lineup switch drops it on its own; this clears it on the way OUT so
+  // coming back to the roster never reopens a warning about work the coach
+  // has since finished elsewhere.
+  if (next !== "roster") rosterBatch = null;
 }
 
 function switchTab(next) {
@@ -14404,6 +14805,7 @@ function resetTransientUiState() {
   // different operator's session could get published by a click the new
   // operator never meant to make.
   rosterSide = "home";
+  rosterSideChosen = false;
   availFilter = "all";
   gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };
   gamesExpanded = new Set();

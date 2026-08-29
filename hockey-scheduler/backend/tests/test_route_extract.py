@@ -1163,9 +1163,51 @@ class WaiverFingerprintTests(unittest.TestCase):
             route_extract_module._AUDIT_WAIVERS.update(saved)))
 
     def test_every_real_waiver_is_hit_exactly_once(self):
-        """The real server.py, unmodified: each of the 116 declared waivers
-        (114 through round 13 -- see below for that count's own breakdown --
-        plus 2 round-2 (#426 external review finding 2) additions, once
+        """The real server.py, unmodified: each of the 117 declared waivers
+        (119 before PR #427's final blocker, then +1 and -3 across its four
+        rounds -- verified commit by commit, because the prose breakdown
+        below had gone stale against the number it explains and a count
+        nobody can re-derive is not a gate:
+
+          ccdb7b4  119 -> 120  net +1: the family's own-side resolution was
+                               hoisted out of the availability-summary leaf
+                               to the whole `m` block, which RE-KEYED two
+                               entries rather than adding them
+                               (`api.store.get_game(gid)`, `sub_game is not
+                               None`), and `/board` gained one genuinely new
+                               site --
+                               `lineup_visibility.own_side(role, own_team,
+                               *side_ids)`;
+          e8953ac  120 -> 119  the availability-summary leaf's inline
+                               `role in (Role.COACH, Role.PLAYER) and
+                               own_team and (team_id != own_team)` if_test
+                               DELETED when that narrowing moved to the
+                               facade;
+          round 3  119 -> 117  the same-shaped `role == Role.COACH ...`
+                               if_test deleted from BOTH the
+                               substitute-candidates and the
+                               substitute-addable leaf, for the same reason
+                               and in favour of the same facade projection.
+
+        The three service-call waivers those deleted `if`s used to feed were
+        not removed but REWORDED IN PLACE: the calls are still there and
+        still carry a client-supplied hint. What changed is that the hint is
+        now adjudicated against the trusted side inside the facade rather
+        than compared to it here, which is a different justification for the
+        same site, not a different site. The pre-#427 119 breaks down as:
+        116 through #426 round 2 -- see below for that count's own
+        breakdown -- plus 3 #205 blocker 1 additions, once the
+        availability-summary sub-scope re-fetched the already-selected
+        game (`gid`, captured by `m`) to resolve the caller's own team
+        against it (`game_scoped_own_team_id`) instead of the permanent
+        `player.team_id` pointer: one for the re-fetch itself
+        (`api.store.get_game(gid)`), one for the `if sub_game is not
+        None:` not-found guard around it, and one for the resolver call
+        whose result feeds `own_team` -- see those three entries, tagged
+        "#205 blocker 1", for the full rationale. The pre-#205 116 breaks
+        down as: 114 through round 13 -- see below for that count's own
+        breakdown -- plus 2 round-2 (#426 external review finding 2)
+        additions, once
         do_POST gained its own two bare-statement audit calls
         (`self._audit_sensitive_post_denial(path, None, user_id)` at the
         resolve_role() 401 refusal, `self._audit_sensitive_post_denial(
@@ -4390,7 +4432,7 @@ class ExecutionControlAndDataFlowTests(unittest.TestCase):
         mechanism's own isolated proof) reaches exactly the SAME two
         functions' `for target in targets:` loop, both already reviewed
         (this dict's own round-7 finding 1 waiver group) -- must still
-        extract cleanly: 239 routes, 116 waivers (see
+        extract cleanly: 239 routes, 117 waivers (see
         WaiverFingerprintTests' own pinned count and docstring for the
         exact accounting)."""
         walker = extract_walker()
@@ -4743,7 +4785,7 @@ class LoopIterableAndReceiverChainDispatchTests(unittest.TestCase):
         target list; see this module's own ``_AUDIT_WAIVERS`` comment for
         that pair), and no dispatch selector reached through a receiver
         chain this round's ``_is_callee`` climb newly exposes -- must
-        still extract cleanly: 239 routes, 116 waivers (see
+        still extract cleanly: 239 routes, 117 waivers (see
         WaiverFingerprintTests' own pinned count and docstring for the
         exact accounting)."""
         walker = extract_walker()
@@ -5129,7 +5171,7 @@ class TransparentCompositionCalleeTests(unittest.TestCase):
         ``_AUDIT_WAIVERS`` entry regardless of position (the remaining 2
         never fit the shape at all and already had their own waivers, see
         ``CapturedArgumentTransferTests`` below for both counts' own
-        breakdown). Must still extract cleanly: 239 routes, 116 waivers
+        breakdown). Must still extract cleanly: 239 routes, 117 waivers
         (see WaiverFingerprintTests' own pinned count and docstring for
         the exact accounting)."""
         walker = extract_walker()
@@ -5508,13 +5550,15 @@ class CapturedArgumentTransferTests(unittest.TestCase):
         """The real server.py, with round 13's per-site waivers live
         (round 9's allowlist gate they replace is retired -- see
         ``_TRUSTED_BINDING_SOURCES``'s own module comment in
-        route_extract.py): still extracts cleanly, 239 routes, 116
-        waivers (77 through round 9 + 37 round-13, finding-1 additions,
-        one per real captured-only call/subscript site the retired
-        allowlist used to cover -- see WaiverFingerprintTests' own pinned
-        count and docstring for the exact accounting, and this module's
-        ``_AUDIT_WAIVERS`` dict, entries tagged "round 13 finding 1", for
-        each one's own review comment)."""
+        route_extract.py): still extracts cleanly, 239 routes, 117
+        waivers (77 through round 9 + 37 round-13, finding-1 additions +
+        3 #205 blocker 1 additions, one per real captured-only call/
+        subscript site the retired allowlist used to cover, plus the
+        three new sites the #205 blocker 1 availability-summary fix
+        introduces -- see WaiverFingerprintTests' own pinned count and
+        docstring for the exact accounting, and this module's
+        ``_AUDIT_WAIVERS`` dict, entries tagged "round 13 finding 1" or
+        "#205 blocker 1", for each one's own review comment)."""
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])

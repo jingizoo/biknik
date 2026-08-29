@@ -169,6 +169,18 @@ class ProductionPublicPrivacyTest(_HttpBase):
         # A logged-in player can read its team's private game data; once the
         # operator deactivates the Player, the SAME session cookie is denied —
         # the private-read gate fails closed AND the scoped account is retired.
+        #
+        # #205 blocker 1: the seed's own game is LeagueSeason-bound, so the
+        # private-read gate now resolves eligibility through a real
+        # ``SeasonRosterMembership`` (``RosterService.team_for_game``), not
+        # the permanent ``player.team_id`` pointer alone — a raw
+        # ``store.add_player`` (no facade parity dual-write) opens no such
+        # membership, so this dedicated player now ALSO needs one, or the
+        # very first (still-active) read this test pins would 403 for the
+        # wrong reason (no membership) rather than the one under test
+        # (deactivation). The #270 ``is_active`` fail-closed check this test
+        # is actually about is untouched -- it still runs before any
+        # membership resolution (see ``_player_team_for_game``).
         from hockey_scheduler.domain import Player, Position, Role
         g = self._game()
         store = srv.STATE.api.store
@@ -177,6 +189,11 @@ class ProductionPublicPrivacyTest(_HttpBase):
         away_player = "dp_test_player"
         store.add_player(Player(id=away_player, team_id=g.away_team_id,
                                 name="Departing Player", position=Position.FORWARD))
+        if g.league_season_id:
+            m = srv.STATE.api.create_season_roster_membership(
+                away_player, g.league_season_id, g.away_team_id,
+                actor_id="admin")
+            self.assertNotIn("error", m, m)
         acct = srv.STATE.api.accounts.create_account(
             username="u_dp", password="scoped-account-pw", role=Role.PLAYER,
             scope={"player_id": away_player, "team_id": g.away_team_id})
@@ -199,6 +216,11 @@ class ProductionPublicPrivacyTest(_HttpBase):
         # active account + live session, once reactivated, keeps that account
         # inactive and the session revoked — the private read stays denied until
         # the operator reactivates the ACCOUNT separately.
+        # #205 blocker 1: same reasoning as
+        # test_deactivated_player_session_loses_private_read above -- this
+        # dedicated player needs a real season membership too, so the FINAL
+        # "fresh login reads the private data" assertion exercises the #270
+        # reactivation behavior under test, not an unrelated membership gap.
         from hockey_scheduler.domain import Player, Position, Role
         g = self._game()
         store = srv.STATE.api.store
@@ -208,6 +230,10 @@ class ProductionPublicPrivacyTest(_HttpBase):
         store.add_player(Player(id=pid, team_id=g.away_team_id,
                                 name="Returning Player",
                                 position=Position.FORWARD))
+        if g.league_season_id:
+            m = srv.STATE.api.create_season_roster_membership(
+                pid, g.league_season_id, g.away_team_id, actor_id="admin")
+            self.assertNotIn("error", m, m)
         acct = srv.STATE.api.accounts.create_account(
             username="u_reacc", password="scoped-account-pw", role=Role.PLAYER,
             scope={"player_id": pid, "team_id": g.away_team_id})

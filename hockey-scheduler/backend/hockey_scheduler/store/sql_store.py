@@ -262,6 +262,9 @@ SPECS = {
                           {"roster_role": _enum(RosterRole),
                            "selection_source": _enum(SelectionSource),
                            "status": _enum(RosterEntryStatus),
+                           # #205 blocker 5 durable attribution (migration
+                           # 061). team_side: plain TEXT, no codec.
+                           "seated_position": _enum(Position),
                            "selected_at": _dt(), "updated_at": _dt()}),
     GameAvailability: Spec(GameAvailability, "game_availability",
                            {"availability_status": _enum(AvailabilityStatus),
@@ -271,7 +274,7 @@ SPECS = {
                                 "status": _enum(SubstituteStatus),
                                 "enrolled_at": _dt(), "offered_at": _dt(),
                                 "offer_expires_at": _dt(), "accepted_at": _dt(),
-                                "declined_at": _dt()}),
+                                "declined_at": _dt()}),  # team_id: plain TEXT, no codec
     AuditLog: Spec(AuditLog, "audit_logs",
                    {"action": _enum(AuditAction), "at": _dt(), "detail": _jsonc()}),
     NotificationEvent: Spec(NotificationEvent, "notification_events",
@@ -1891,6 +1894,14 @@ class SqlStore:
         return self._query(
             SeasonRosterMembership, "league_season_id = ? AND team_id = ?",
             (league_season_id, team_id), order="id")
+    def memberships_for_team(self, team_id):
+        """EVERY membership row naming this Team, at ANY LeagueSeason and in
+        ANY status — see ``InMemoryStore.memberships_for_team`` for why the
+        #427 auto-fill cohort needs it unfiltered. ``order="id"`` matches the
+        rest of this class; the SERVICE imposes the real, cross-backend
+        ordering, and must not inherit this TEXT-column one."""
+        return self._query(SeasonRosterMembership, "team_id = ?",
+                           (team_id,), order="id")
     def active_memberships_for_player_in_season(self, player_id, season_id):
         """Every AUTHORITATIVE (status = 'active') membership at this
         (player, Season) key. Always 0 or 1 here — migration 059's

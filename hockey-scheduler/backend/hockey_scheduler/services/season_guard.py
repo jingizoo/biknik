@@ -14,10 +14,29 @@ check linearizable with ``archive_season`` — a concurrent writer either commit
 before the archive (and becomes frozen history) or blocks on the row until the
 archive commits, then observes ARCHIVED and fails with zero mutation. A plain
 read could observe ``active`` and race past a committing archive.
+
+WHICH Season is the authority for a GAME-owned write — :func:`guard_game_season`
+(PR #427 blocker, owner comment 5379031499). Answering "the Game's own
+``season_id``" was the defect: that column is a NULLABLE, unconstrained
+DENORMALIZATION of the Game's LeagueSeason, and both guard families skipped the
+whole check when it was falsy and locked the WRONG row when it had drifted to a
+sibling Season. The competition boundary is the Game's ``league_season_id``, so
+that is what is resolved, and the Season the LeagueSeason names is what is
+locked, checked and reported. See :func:`guard_game_season` for the precedence.
 """
 
 from ..domain.enums import SeasonStatus
 from ..domain.errors import NotFoundError, ValidationError
+
+# The reason codes :func:`guard_game_season` reports. Both are PRE-EXISTING
+# strings, deliberately reused rather than newly minted: ``season_archived`` is
+# ``require_active_season``'s own refusal, and the other two are the codes
+# ``SetupService._revalidate_game_participation`` has raised for these exact
+# two broken shapes since #331 review round 22. One shape, one code, whichever
+# guard happens to see it first.
+SEASON_ARCHIVED = "season_archived"
+GAME_LEAGUE_SEASON_MISMATCH = "game_league_season_mismatch"
+MISSING_LEAGUE_SEASON = "regular_game_missing_league_season"
 
 
 def season_is_historical(season, now) -> bool:
@@ -92,5 +111,135 @@ def require_active_season(store, season_id: str):
         raise ValidationError(
             f"Season '{season.name}' is archived and read-only. Reopen it "
             "before making changes.",
-            {"reason": "season_archived", "season_id": season_id})
+            {"reason": SEASON_ARCHIVED, "season_id": season_id})
     return season
+
+
+def game_is_league_season_bound(game) -> bool:
+    """The ONE definition of "this Game belongs to a competition" (PR #427).
+
+    ``league_season_id is not None`` — an IDENTITY test, never truthiness.
+    A LeagueSeason id is an opaque string, so ``""`` is not "no competition",
+    it is a corrupted binding; answering the bound-ness question with ``bool``
+    would route exactly that row down the unbound branch and hand it back the
+    legacy permanent-pointer authority the cutover took away. Written once and
+    called, so the resolver, the two write guards and every bound/unbound
+    branch site cannot drift apart on what "bound" means.
+    """
+    return getattr(game, "league_season_id", None) is not None
+
+
+def require_game_league_season(store, game):
+    """The BOUND Game's LeagueSeason row, or refuse.
+
+    One copy of the dangling-binding refusal, shared by
+    :func:`game_season_authority_id` and :func:`guard_game_season` so the
+    locator and the guard can never disagree about whether a binding resolves.
+    Callers must already know the Game is bound.
+    """
+    ls = store.get_league_season(game.league_season_id)
+    if ls is None:
+        raise ValidationError(
+            "This game's league-season no longer exists; it cannot be "
+            "changed until it is repaired.",
+            {"reason": MISSING_LEAGUE_SEASON, "game_id": game.id,
+             "league_season_id": game.league_season_id})
+    return ls
+
+
+def game_season_authority_id(store, game):
+    """The id of the Season that authorizes a mutation on ``game`` — resolved
+    but NOT locked. A pre-lock LOCATOR, for a BATCH that must take several
+    Season locks in one canonical (sorted) order to stay deadlock-free and so
+    cannot let :func:`guard_game_season` lock them one at a time in arrival
+    order. Every caller still runs the full :func:`guard_game_season` per Game
+    afterwards; the re-lock is idempotent, and the archive/mismatch decisions
+    are made there, under the lock, never off this read.
+
+    Raises the same ``regular_game_missing_league_season`` a dangling binding
+    gets from the guard itself: a bound Game whose LeagueSeason does not
+    resolve has no authorizing Season to plan a lock for, and inventing one
+    from ``game.season_id`` here would smuggle back exactly the fallback the
+    guard refuses. ``None`` only for an unbound row naming no Season.
+    """
+    if game is None:
+        return None
+    if game_is_league_season_bound(game):
+        ls = require_game_league_season(store, game)
+        return ls.season_id
+    return game.season_id or None
+
+
+def guard_game_season(store, game):
+    """Row-LOCK and CHECK the Season that authorizes a mutation on ``game``.
+
+    Returns the locked Season (``None`` only for an unbound row that names no
+    Season at all). MUST run inside the caller's ``transaction()`` — the lock
+    is what makes the archive check linearizable, and it is held to commit.
+
+    THE DEFECT THIS REPLACES (owner comment 5379031499). Both guard families
+    used to read ``if game.season_id: require_active_season(store,
+    game.season_id)``. ``games.season_id`` is a nullable, FK-less, CHECK-less
+    denormalization of the Game's LeagueSeason, so that expression was wrong in
+    two directions at once on a bound Game: a NULL skipped the archive guard
+    entirely, and a value that had drifted to a SIBLING Season locked and
+    judged that sibling — the refusal even NAMED the sibling while the resolved
+    context's Season was the real one. Either way an archived competition could
+    still be mutated, and no two writers on the same competition shared a Season
+    row to serialize on.
+
+    THE AUTHORITY IS THE LEAGUESEASON'S SEASON. For a bound Game the
+    LeagueSeason is the competition boundary, so it is resolved here, inside
+    the transaction, and the Season IT names is the row that gets locked,
+    checked and reported. ``game.season_id`` is then only a denormalization to
+    be VERIFIED against that authority, never the authority itself.
+
+    THE PRECEDENCE IS FIXED, and is the owner's 2026-08-23 ruling:
+
+    1. a bound Game whose LeagueSeason does not resolve is broken, not legacy
+       — ``regular_game_missing_league_season``, the same code
+       ``_revalidate_game_participation`` already raises for a dangling
+       binding. There is NO fallback to ``game.season_id`` here: falling back
+       would re-create the very split authority this function exists to close,
+       and would let a Game escape its competition by having its LeagueSeason
+       deleted;
+    2. the canonical Season is locked and its ARCHIVE state judged FIRST, so an
+       archived competition answers ``season_archived`` naming the CANONICAL
+       Season id — never the drifted one the Game happens to carry;
+    3. only once the canonical Season is ACTIVE is ``game.season_id`` compared,
+       UNCONDITIONALLY. NULL and sibling-drift are the same failure — the
+       denormalization disagrees with its authority — and both answer
+       ``game_league_season_mismatch``.
+
+    Inverting 2 and 3 would report a repair-the-row error for a Game whose real
+    problem is that its competition is closed, and would make the mismatch code
+    unreachable for the archived case; that is why the order is stated here
+    rather than left to each caller.
+
+    UNBOUND (an EXHIBITION, which carries ``league_season_id=None`` and a real
+    ``season_id``, or a pre-#283 legacy row) keeps its existing authority: its
+    own ``season_id``, guarded exactly as before. The falsy test survives ONLY
+    on this branch, where it means "a legacy row that names no Season", and it
+    is reached only when the Game was never bound — never as a fallback from a
+    bound Game whose binding failed to resolve.
+    """
+    if game is None:
+        return None
+    if game_is_league_season_bound(game):
+        ls = require_game_league_season(store, game)
+        # (2) THE AUTHORITY: locked and archive-checked before anything else
+        # is judged, and it is the CANONICAL id that gets reported.
+        season = require_active_season(store, ls.season_id)
+        # (3) …and only then is the denormalization verified against it.
+        # Unconditional equality: `None` is a disagreement, not an exemption.
+        if game.season_id != ls.season_id:
+            raise ValidationError(
+                "This game's season does not match its league-season; it "
+                "cannot be changed until it is repaired.",
+                {"reason": GAME_LEAGUE_SEASON_MISMATCH, "game_id": game.id,
+                 "season_id": game.season_id, "league_season_id": ls.id,
+                 "league_season_season_id": ls.season_id})
+        return season
+    if game.season_id:
+        return require_active_season(store, game.season_id)
+    return None

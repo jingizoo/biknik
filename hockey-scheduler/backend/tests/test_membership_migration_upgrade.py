@@ -153,24 +153,45 @@ class Migration059SortsAfterEveryMainMigrationTest(unittest.TestCase):
     At 052 that guarantee is broken in exactly one direction — a fresh
     database would sort it BEFORE 053-058 while an upgrade still ran it
     after them — which is the whole reason for the rename. Pinning it here
-    means a future migration added to this branch can never silently
-    reintroduce the collision either.
+    means one of MAIN's independently-shipped, low-numbered files can never
+    silently reintroduce that same collision underneath 059 again.
+
+    #205 blocker 3 (``060_substitute_team_id``) legitimately sorts AFTER
+    059 — that is not a repeat of the 052 collision at all: it is this same
+    branch's own forward continuation, authored fresh with 059 already on
+    disk, so both install paths (fresh database; upgrade from a database
+    already at 059) apply it last in the same relative position either way
+    — no ordering divergence is possible for a version that postdates 059
+    on the SAME lineage. What must still never happen is one of MAIN's own
+    versions (anything below ``060`` — the 001-058 range this branch does
+    not own) ending up after 059; that is the collision this test exists to
+    catch, so it is asserted explicitly by name below rather than by a
+    blanket "nothing may ever sort after 059" rule that would also reject
+    this slice's own legitimate later migrations.
     """
+
+    # This branch's own legitimate forward continuations of 059 — each is
+    # itself a fresh, uncollided version number authored with every prior
+    # file already on disk, so none of them can reproduce 059's original
+    # divergence (see the class docstring). Extend this set, by name, the
+    # next time a #205 slice adds a migration after 059 — a new version NOT
+    # listed here still fails the test below, so an accidental collision
+    # (or an unreviewed addition) cannot pass silently.
+    _KNOWN_FOLLOWERS = frozenset({"060_substitute_team_id",
+                                  "061_roster_entry_durable_attribution"})
 
     def test_migration_sorts_after_every_other_shipped_migration(self):
         versions = [v for v, _ in _sql_store_module._load_migrations()]
         self.assertIn(_MIGRATION, versions)
         after = [v for v in versions if v > _MIGRATION]
+        unexpected = [v for v in after if v not in self._KNOWN_FOLLOWERS]
         self.assertEqual(
-            after, [],
+            unexpected, [],
             "059_season_roster_membership must sort after every migration "
-            "in migrations/, so its applied position is identical on a "
-            "fresh install and on an upgrade from main. Versions sorting "
-            f"after it: {after}")
-        self.assertEqual(
-            versions[-1], _MIGRATION,
-            "this slice's migration must be the highest-numbered file "
-            f"present; got {versions[-1]!r} last")
+            "MAIN ships (so its applied position is identical on a fresh "
+            "install and on an upgrade from main) and after nothing else "
+            "unaccounted for. Versions sorting after it that are not in "
+            f"_KNOWN_FOLLOWERS: {unexpected}")
         # And specifically past main's own claimed range: the collision
         # that started this was with main's 052_epoch_fence_version, a
         # DIFFERENT filename sharing the same leading number.

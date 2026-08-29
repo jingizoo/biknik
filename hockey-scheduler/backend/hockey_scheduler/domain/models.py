@@ -6,7 +6,7 @@ so the models stay easy to serialize and test.
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 from .enums import (
     AuditAction,
@@ -147,6 +147,49 @@ class GameRosterEntry:
     selected_at: datetime
     updated_at: datetime
     selected_by: Optional[str] = None
+    # ---- DURABLE game-side attribution (#205 blocker 5, migration 061) ----
+    # WHAT THIS ROW OCCUPIES, recorded when the row was created or re-seated,
+    # from the SAME validated GameMembershipContext that authorized the
+    # seating. Round 1 of blocker 5 re-derived both values from the player's
+    # CURRENT eligible membership on every read, so a legitimate membership
+    # status change erased a seated row's attribution without removing or
+    # transitioning the row — the row stayed ACCEPTED and occupying in
+    # storage while vanishing from the governed count, and a second player
+    # then seated past the target. These columns are the record, not a
+    # cache: nothing re-derives them, and only a re-seat rewrites them.
+    #
+    # ``seated_position`` is stored alongside ``team_side`` because the
+    # GOALIE/SKATER bucket had the identical defect (it was read off the
+    # live context too), so a row whose context vanished had no bucket at
+    # all. For a substitute seating it is the ENROLLMENT's position — the
+    # very bucket ``_require_open_slot`` was called with — so the slot the
+    # gate checked and the slot the row is counted in are always one slot.
+    #
+    # Both are NULL for — and only for — rows written before migration 061.
+    # See :meth:`attribution` and migration 061 for the fail-closed rule
+    # that applies to those, which never guesses a side.
+    team_side: Optional[str] = None
+    seated_position: Optional[Position] = None
+
+    @property
+    def seated_slot_type(self) -> Optional[SlotType]:
+        """The durable GOALIE/SKATER bucket, or ``None`` for a pre-061 row."""
+        return (None if self.seated_position is None
+                else self.seated_position.slot_type)
+
+    @property
+    def attribution(self) -> Optional[Tuple[str, SlotType]]:
+        """``(team_side, slot_type)`` this row occupies, or ``None`` when the
+        row carries no durable attribution at all (pre-061).
+
+        ONE accessor, so slot enforcement and reporting can never read the
+        pair from two different places and disagree about what a seated row
+        holds. Treats a half-written pair as unattributed: the two columns
+        are only ever written together, so one of them missing is not a
+        partial answer to be salvaged."""
+        if self.team_side is None or self.seated_position is None:
+            return None
+        return self.team_side, self.seated_position.slot_type
 
 
 @dataclass
@@ -173,6 +216,59 @@ class SubstituteEnrollment:
     offer_expires_at: Optional[datetime] = None
     accepted_at: Optional[datetime] = None
     declined_at: Optional[datetime] = None
+    # #205: THE ENROLLMENT'S OWNING TEAM — the side this row was admitted
+    # on, snapshotted from the SAME GameMembershipContext that authorized
+    # the transition, at the moment that context was genuinely valid (the
+    # pattern `position` above already established: resolve once, store it).
+    #
+    # WRITTEN TWICE, ONE FIELD, TWO PHASES, and each phase's value is the
+    # authority for that phase:
+    #
+    #   ENROLLED — written by `enroll_substitute` from the context its
+    #     eligibility gate accepted (owner ruling, PR #427, comment
+    #     5391127041). This is what makes an ENROLLED row's owner
+    #     answerable at all: before it, `team_id` was NULL until an offer
+    #     was made, so `withdraw_substitute` had NO durable side to
+    #     authorize a Coach against and would have had to re-resolve
+    #     membership live — which is exactly the substitution the ruling
+    #     forbids, because it hands a row to whichever coach the player
+    #     happens to belong to NOW rather than the one who owns the row.
+    #
+    #   OFFERED — REPLACED by `offer_substitute` with the side IT validated
+    #     the offer against. "Once OFFERED, the existing offer-owner
+    #     snapshot remains authoritative for that phase" (same ruling), so
+    #     the offer phase keeps the #205 blocker-3 contract below unchanged.
+    #
+    # #205 blocker 3: FOR AN OFFER, this is THE OFFER'S OWNING TEAM —
+    #
+    # AUTHORITATIVE FOR THE OFFER'S WHOLE LIFETIME. decline_substitute
+    # addresses its coach notification from this value and ONLY this value:
+    # decline is the terminal response to an already-issued offer, so its
+    # audience is whoever OWNS that offer, never a team re-resolved at
+    # decline time (which, after a reassignment or a transfer, is the
+    # OPPONENT — see roster_service.decline_substitute and
+    # 060_substitute_team_id.sql for why accept's live re-resolution is not
+    # a precedent here). It is also durable by construction, so a membership
+    # ending after the offer can no longer make that audience_ref come back
+    # None and crash the decline.
+    #
+    # NULL ONLY FOR LEGACY ROWS — any row enrolled/offered before migration
+    # 060, and any row enrolled before the Part A change above. Migration
+    # 060 is additive with NO backfill and Part A adds none either: there is
+    # no honest historical source to backfill FROM, and `Player.team_id` /
+    # current membership answer a DIFFERENT question than "which side was
+    # this row admitted on" (owner ruling: "Legacy enrollment attribution
+    # must remain honest: do not backfill from `Player.team_id` or current
+    # membership"). The column stays nullable and legacy rows stay NULL.
+    #
+    # A NULL therefore means "this row cannot name its owner", and every
+    # consumer fails closed on it in its own way: decline_substitute commits
+    # and SUPPRESSES its targeted push rather than guessing an audience, and
+    # a COACH acting on such a row is refused `attribution_missing` with
+    # zero writes (RosterService._require_authorized_team). Player
+    # self-service and an unscoped League Admin are unaffected — their
+    # authority never came from this column.
+    team_id: Optional[str] = None
 
     @property
     def slot_type(self) -> SlotType:

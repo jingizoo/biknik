@@ -277,7 +277,16 @@ _VALID_AUTH_VALUES = frozenset({
     "session",
     "session+MANAGE_ARENA",
     "session+MANAGE_ROSTER",
-    "session+MANAGE_ROSTER-or-self",
+    # #427 final blocker round 3 RETIRED "session+MANAGE_ROSTER-or-self" and
+    # replaced it with this. The old label's "-or-self" named an own-team
+    # comparison the leaf made ITSELF, from its own second reading of the
+    # session scope, and answered a mismatching hint with a 403 -- which is
+    # exactly what round 3 removed. Both leaves still require MANAGE_ROSTER
+    # (a role capability: a Player and an assigned Official are refused
+    # outright, unchanged), and the SIDE is now decided by the same
+    # projection the rest of the family uses. Two facts, so two components:
+    # dropping either half would understate the gate.
+    "session+MANAGE_ROSTER+own-side-projection",
     "session+MANAGE_SCHEDULE",
     "session+MANAGE_SCHEDULE+real-account",
     "session+MANAGE_SCHEDULE-or-self",
@@ -287,6 +296,18 @@ _VALID_AUTH_VALUES = frozenset({
     "session+RESPOND_AVAILABILITY",
     "session+guardian-scope",
     "session+guardian-scope+verified-link",
+    # #427 blocker: the private-game gate admits the caller, then the SERVER
+    # resolves their own game-scoped side and the response is PROJECTED to
+    # it -- own side in full for a Coach/Player with the opponent marked
+    # restricted, submitted-lineup only for an assigned official (or a 403
+    # where no official-shaped projection exists), both sides in full for an
+    # unscoped operator. Round 2 added the fifth and last leaf of the family,
+    # the availability rollup, which is also the only one that reads a side
+    # hint -- so this label now additionally means "a client-supplied side is
+    # adjudicated, never trusted". A narrowing of the same shape as
+    # `session+player-scope`: nobody's 403 changes, what changes is which
+    # subject's private data the 200 may contain.
+    "session+own-side-projection",
     "session+player-scope",
 })
 
@@ -308,16 +329,47 @@ _EXPECTED_CLASSIFICATION = {
     ("GET", '/api/context/options'): ('session', 'none'),  # get_context_options
     ("GET", '/api/demo/overview'): ('session', 'cross'),  # get_demo_overview
     ("GET", '/api/games/{}'): ('none', 'none'),  # get_games_id
-    ("GET", '/api/games/{}/availability-summary'): ('session', 'none'),  # get_games_id_availability_summary
-    ("GET", '/api/games/{}/board'): ('session', 'none'),  # get_games_id_board
-    ("GET", '/api/games/{}/lineups'): ('session', 'none'),  # get_games_id_lineups
+    # #427 final blocker round 2: was bare 'session' while this leaf's inline
+    # narrowing named only COACH and PLAYER, so an assigned OFFICIAL fell
+    # through it -- and this is the ONE private-game leaf that reads a side
+    # from the QUERY STRING, so `?team_id=` was the sole side selector for
+    # that role. It is now projected by the SAME route_audience as its four
+    # siblings: hint kept for an operator, IGNORED for a Coach/Player in
+    # favour of the trusted side, 403 for an official.
+    ("GET", '/api/games/{}/availability-summary'):
+        ('session+own-side-projection', 'none'),  # get_games_id_availability_summary
+    # #427 blocker: both were bare 'session' while get_board hard-coded the
+    # HOME side and get_lineups returned both sides' private state to either
+    # Coach. The gate is unchanged; the response is now projected to the
+    # server-resolved own side.
+    ("GET", '/api/games/{}/board'):
+        ('session+own-side-projection', 'none'),  # get_games_id_board
+    ("GET", '/api/games/{}/lineups'):
+        ('session+own-side-projection', 'none'),  # get_games_id_lineups
     ("GET", '/api/games/{}/officials'): ('session', 'none'),  # get_games_id_officials
     ("GET", '/api/games/{}/reschedule'): ('session', 'none'),  # get_games_id_reschedule
-    ("GET", '/api/games/{}/roster'): ('session', 'none'),  # get_games_id_roster
-    ("GET", '/api/games/{}/roster-status'): ('session', 'none'),  # get_games_id_roster_status
-    ("GET", '/api/games/{}/substitute-addable'): ('session+MANAGE_ROSTER-or-self', 'none'),  # get_games_id_substitute_addable
-    ("GET", '/api/games/{}/substitute-candidates'): ('session+MANAGE_ROSTER-or-self', 'none'),  # get_games_id_substitute_candidates
-    ("GET", '/api/games/{}/substitutes'): ('session', 'none'),  # get_games_id_substitutes
+    # #427 final blocker: the three flat-list siblings of the two leaves
+    # above. All three were bare 'session' while /roster returned both sides'
+    # seats, /substitutes both sides' substitute workflow (to officials too),
+    # and /roster-status hard-coded HOME for everybody. The gate is unchanged;
+    # each response is now projected on the server-resolved own side.
+    ("GET", '/api/games/{}/roster'):
+        ('session+own-side-projection', 'none'),  # get_games_id_roster
+    ("GET", '/api/games/{}/roster-status'):
+        ('session+own-side-projection', 'none'),  # get_games_id_roster_status
+    # #427 final blocker round 3: the sixth and seventh leaves of the same
+    # dispatch, and the last two binding a side their own way. The
+    # MANAGE_ROSTER capability gate is unchanged -- what changed is that the
+    # side comes from the family's one trusted resolution and a client hint
+    # is IGNORED for a Coach rather than answered with a 403 that varies with
+    # the side named (which contradicted the contract round 2 shipped for
+    # this very family, in the same commit, naming this very route).
+    ("GET", '/api/games/{}/substitute-addable'):
+        ('session+MANAGE_ROSTER+own-side-projection', 'none'),  # get_games_id_substitute_addable
+    ("GET", '/api/games/{}/substitute-candidates'):
+        ('session+MANAGE_ROSTER+own-side-projection', 'none'),  # get_games_id_substitute_candidates
+    ("GET", '/api/games/{}/substitutes'):
+        ('session+own-side-projection', 'none'),  # get_games_id_substitutes
     ("GET", '/api/guardians/links'): ('operator_only', 'none'),  # get_guardians_links
     ("GET", '/api/health'): ('none', 'none'),  # get_health
     ("GET", '/api/import/hierarchy-codes'): ('operator_only', 'none'),  # get_import_hierarchy_codes

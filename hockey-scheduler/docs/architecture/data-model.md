@@ -116,11 +116,39 @@ One row per player selected for / added to the game.
 | selected_by | str? | actor id |
 | selected_at | datetime | |
 | updated_at | datetime | |
+| team_side | str? | **durable** game-side attribution — the Team id this row was seated against, written at creation/re-seat from the validated `GameMembershipContext` (migration 061) |
+| seated_position | Position? | **durable** — the position this row was seated to occupy; buckets into `GOALIE`/`SKATER` via `seated_slot_type` |
+
+`team_side`/`seated_position` are what the slot engine counts a seated row
+against — never the player's *current* membership, and never the permanent
+`Player.team_id` pointer. They are `NULL` only for rows written before
+migration 061; such a row is charged as occupying on **every** side and in
+**both** buckets (fail closed — it can reduce an open count but never reopen
+one, and it never names a side). See migration 061 for the full rationale.
 
 A roster entry **occupies a slot** when its status is one of `SELECTED`,
 `CONFIRMED`, `OFFERED`, `ACCEPTED`. It frees the slot when `UNAVAILABLE` or
 `REMOVED`. It is **confirmed** (counts as a confirmed body) when `CONFIRMED`
 or `ACCEPTED`.
+
+**Player self-service into `CONFIRMED` asks two questions with two different
+answerers.** The durable row *identifies* the side and bucket in play; the
+player's *current live* membership context *authorizes* the transition. So
+`POST /api/games/{id}/availability` with `available` — the only route the UI
+offers a player — refuses when the live context resolves to a different team
+than `team_side` (`not_eligible`, `details.reason =
+"seated_side_not_live_eligible"`), and refuses when no live context resolves
+at all. One gate,
+`RosterService._authorize_seated_side`, serves both routes into `CONFIRMED`:
+re-confirming a backed-out (`UNAVAILABLE`) row, and confirming a row that
+never backed out. It runs before any store write.
+
+The two routes differ in exactly one respect, deliberately. Re-confirming
+*re-takes* a freed slot, so it additionally requires that slot to still be
+open, and refuses a pre-061 `NULL`-attribution row whose side cannot be
+identified. Confirming a still-occupying row takes nothing — `SELECTED` and
+`CONFIRMED` hold the same slot — so it applies **no** open-slot check (that
+would refuse the last seat's own confirmation) and lets a `NULL` row through.
 
 ## GameAvailability
 

@@ -161,25 +161,60 @@ class AvailabilityUxHttpTest(unittest.TestCase):
             c, "GET", f"/api/games/{self.game_id}/availability-summary?team_id={self.home}")
         self.assertEqual(status, 403)
 
-    def test_scoped_coach_cannot_read_opponent_summary(self):
-        # The #73 gate lets a home coach read this game's private data, but the
-        # team-level scope check must still block reading the *opponent's*
-        # availability (#89 review, blocker 2).
+    # A SCOPED CALLER'S OPPONENT HINT IS IGNORED, NOT REFUSED (#427 final
+    # blocker, round 2). These two used to assert 403, which was the #89
+    # behaviour: `?team_id=<opponent>` was compared against the caller's own
+    # team and rejected. The four sibling private-game routes all IGNORE a
+    # side hint instead -- they answer a hinted call byte-for-byte as an
+    # un-hinted one -- and this leaf now does the same, so the family gives
+    # ONE answer to "what does ?team_id= do here" rather than two.
+    #
+    # THE ASSERTION IS STRONGER, NOT WEAKER. A 403 proves only that this
+    # particular request was turned away; it says nothing about what a 200
+    # may contain, and a status code is exactly the kind of check that keeps
+    # passing while the body drifts. What is required now is that the
+    # response IS the caller's own side -- byte-identical to the un-hinted
+    # one, `team_id` naming their own team, and not one of the opponent's
+    # players anywhere in it. Every old assertion (the caller does not
+    # receive the opponent's availability) still holds; more is required.
+    def _assert_hint_ignored(self, username):
         c = self._client()
-        self._req(c, "POST", "/api/auth/login", {"username": "coach", "password": "demo"})
-        status, _ = self._req(
-            c, "GET", f"/api/games/{self.game_id}/availability-summary?team_id={self.away}")
-        self.assertEqual(status, 403)
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": username, "password": "demo"})
+        status, plain = self._req(
+            c, "GET", f"/api/games/{self.game_id}/availability-summary")
+        self.assertEqual(status, 200, plain)
+        self.assertEqual(plain["team_id"], self.home, plain)
+        status, hinted = self._req(
+            c, "GET",
+            f"/api/games/{self.game_id}/availability-summary?team_id={self.away}")
+        self.assertEqual(status, 200, hinted)
+        self.assertEqual(
+            hinted, plain,
+            f"{username}: ?team_id=<opponent> changed the response -- a "
+            "client hint selected a side")
+        # The facade's OWN un-projected read (`viewer_role=None`), so the
+        # opponent population is derived rather than restated as a literal.
+        away_ids = {r["player_id"]
+                    for r in srv.STATE.api.get_availability_summary(
+                        self.game_id, self.away)["players"]}
+        self.assertTrue(away_ids, "fixture: the opponent owes no answers, so "
+                                  "this assertion could not fail")
+        self.assertFalse(
+            away_ids & {r["player_id"] for r in hinted["players"]},
+            f"{username} received the opponent's availability")
+
+    def test_scoped_coach_cannot_read_opponent_summary(self):
+        # The #73 gate lets a home coach read this game's private data; the
+        # team-level narrowing must still keep the *opponent's* availability
+        # out of the answer (#89 review, blocker 2).
+        self._assert_hint_ignored("coach")
 
     def test_scoped_player_cannot_read_opponent_summary(self):
         # #160: the demo player's scope stores player_id only; its own team is
-        # resolved live, so the opponent-summary block still holds (a stripped
-        # team_id must not silently skip the check).
-        c = self._client()
-        self._req(c, "POST", "/api/auth/login", {"username": "player", "password": "demo"})
-        status, _ = self._req(
-            c, "GET", f"/api/games/{self.game_id}/availability-summary?team_id={self.away}")
-        self.assertEqual(status, 403)
+        # resolved live, so the opponent-summary narrowing still holds (a
+        # stripped team_id must not silently skip it).
+        self._assert_hint_ignored("player")
 
     def test_scoped_player_sees_own_team_summary(self):
         # #160: the same player_id-only account CAN read its own team's summary,

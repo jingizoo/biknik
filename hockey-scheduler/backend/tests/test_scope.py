@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import threading
 import unittest
@@ -6,9 +7,10 @@ import urllib.request
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, end_membership_directly  # noqa: F401  (sys.path)
 
-from hockey_scheduler.domain import Player, Position, Role, Team
+from hockey_scheduler.domain import (
+    MembershipStatus, Player, Position, Role, SeasonRosterMembership, Team)
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.web import server as srv
 from hockey_scheduler.web.scope import can_read_private_game_data, scope_violation
@@ -168,15 +170,57 @@ class ScopeUnitTest(unittest.TestCase):
             {"player_id": self.home_player, "team_id": self.home}))
 
     def test_player_private_read_follows_transfer_out_of_game(self):
-        # Transferring the player to a team not in the game revokes access on the
-        # next read — live resolution, not the stored team_id.
+        # Transferring the player's SEASON MEMBERSHIP to a team not in the
+        # game revokes access on the next read — live resolution, not the
+        # stored team_id.
+        #
+        # BEFORE #205 blocker 1: this test moved only the permanent
+        # ``player.team_id`` pointer via a raw ``store.save_player`` and
+        # expected that alone to revoke access — the gate resolved from the
+        # pointer, so any pointer edit WAS a "transfer". AFTER: the gate
+        # resolves a LeagueSeason-bound game's private-read access through
+        # the same game-scoped ``SeasonRosterMembership`` resolution the
+        # substitute workflow uses (``RosterService.team_for_game``), so a
+        # bare pointer edit no longer means anything for eligibility — only
+        # a recorded membership transfer (ending the old stint, opening a
+        # new ACTIVE one on the destination team) does. This test now
+        # performs that governed transfer instead of the raw pointer edit;
+        # ``test_player_private_read_ignores_permanent_pointer_move_with_
+        # membership_unchanged`` below pins the flip side explicitly: a bare
+        # pointer edit, membership untouched, no longer revokes anything.
+        self.assertTrue(self._reads({"player_id": self.home_player}))
+        self.store.add_team(Team(id="team_third", name="Otters"))
+        game = self.store.get_game(self.game_id)
+        ls_id = game.league_season_id
+        (old_membership,) = [
+            m for m in self.store.memberships_for_player(self.home_player)
+            if m.league_season_id == ls_id]
+        end_membership_directly(self.store, old_membership.id, "transferred")
+        new_membership = dataclasses.replace(
+            old_membership, id=self.store.next_id("srm"),
+            team_id="team_third", status=MembershipStatus.ACTIVE)
+        self.store.add_season_roster_membership(new_membership)
+        self.assertFalse(self._reads(
+            {"player_id": self.home_player, "team_id": self.home}))
+
+    def test_player_private_read_ignores_permanent_pointer_move_with_membership_unchanged(self):
+        # #205 blocker 1: a raw ``player.team_id`` pointer edit that never
+        # touches the SeasonRosterMembership is NOT a governed transfer —
+        # exactly the shape a store-level bulk import or an ad hoc admin edit
+        # produces. For a LeagueSeason-bound game the permanent pointer no
+        # longer controls this gate at all, so moving it alone changes
+        # nothing: the player's untouched ACTIVE membership on the home team
+        # still grants access. (Before this fix, the gate read the pointer
+        # directly and this edit alone WOULD have revoked access — see the
+        # note on ``test_player_private_read_follows_transfer_out_of_game``
+        # above for the before/after.)
         self.assertTrue(self._reads({"player_id": self.home_player}))
         self.store.add_team(Team(id="team_third", name="Otters"))
         moved = self.store.get_player(self.home_player)
         self.store.save_player(Player(
             id=moved.id, team_id="team_third", name=moved.name,
             position=moved.position))
-        self.assertFalse(self._reads(
+        self.assertTrue(self._reads(
             {"player_id": self.home_player, "team_id": self.home}))
 
     def test_player_private_read_denied_when_teamless(self):

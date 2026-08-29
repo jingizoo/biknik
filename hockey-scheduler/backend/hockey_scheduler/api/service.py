@@ -22,6 +22,7 @@ from ..domain import (
     DataAccessLog,
     DeliveryStatus,
     Game,
+    GameStatus,
     GameType,
     IceSlotStatus,
     IceSlotType,
@@ -39,7 +40,6 @@ from ..domain import (
     RosterEntryStatus,
     SeasonStatus,
     SensitiveFieldCategory,
-    SlotType,
     SubstituteStatus,
     can,
     intervals_overlap,
@@ -54,7 +54,16 @@ from ..domain.errors import (
     ScheduleConflictError,
     ValidationError,
 )
+from ..services import season_guard
+from ..services import lineup_visibility
 from ..services import visibility_policy
+# THE SERVER'S TRUSTED SIDE RESOLUTION, imported from `services/` rather than
+# from `web/scope.py` where it used to live: the Dashboard read below resolves
+# a side PER SCHEDULE ROW inside this facade, and the facade imports nothing
+# from `web/`. See `services/game_side_scope.py` for why it moved instead of
+# being copied.
+from ..services.game_side_scope import (GameAuthorization,
+                                        game_scoped_own_team_id)
 from ..services import (
     ACTOR_TYPES,
     AccountService,
@@ -246,6 +255,78 @@ class _SetupMutationRefused(Exception):
     def __init__(self, payload: dict):
         super().__init__("mutation refused")
         self.payload = payload
+
+
+#: THE FLAT-LIST / ROLLUP REFUSALS (#427 final blocker). Each says WHO may
+#: read the resource, so the answer is "you are not entitled to this", never
+#: the operational claim "there is none" an empty list would make. All are
+#: `NotAuthorizedError` -> code "forbidden" -> HTTP 403.
+_PRIVATE_SIDE_REFUSAL = (
+    "You can only view your own team's roster for this game.")
+_SUBSTITUTE_REFUSAL = (
+    "Substitute enrollments are private to each team's coach and the "
+    "league office.")
+_ROSTER_STATUS_REFUSAL = (
+    "Roster status is private to each team's coach and the league office — "
+    "an assigned official reads the submitted lineup instead.")
+_AVAILABILITY_REFUSAL = (
+    "Per-player availability is private to each team's coach and the league "
+    "office — an assigned official reads the submitted lineup instead.")
+#: Round 3's two, for the last two leaves of the same dispatch. Both name a
+#: side's private candidate pool, so both say WHO may read it rather than
+#: answering with an empty pool — `candidates: []` / `addable: []` would
+#: claim this team has nobody left to call.
+_CANDIDATE_REFUSAL = (
+    "The substitute outreach queue is private to each team's coach and the "
+    "league office — an assigned official reads the submitted lineup "
+    "instead.")
+_ADDABLE_REFUSAL = (
+    "A team's addable substitute pool is private to its coach and the league "
+    "office — an assigned official reads the submitted lineup instead.")
+
+#: Key-name suffixes that mark a value as a PLAYER identity in an audit
+#: entry's free-form ``detail`` payload. Every player-bearing key the service
+#: layer writes today ends in one of them — ``subject_player_id``,
+#: ``player_ids``, ``selected_player_ids``, and the ``player_id`` inside each
+#: ``skipped``/``deferred``/``already_seated`` row of ``roster_batch_seated``.
+_PLAYER_ID_KEY_SUFFIXES = ("player_id", "player_ids")
+
+
+def _player_ids_in(value, known: set, key: str = "") -> set:
+    """Every player identity a SERIALIZED event discloses (#427 final
+    blocker) — walked recursively, because ``AuditLog.detail`` is a free-form
+    dict and identities live at several depths inside it.
+
+    TWO INDEPENDENT WAYS to recognise an identity, deliberately, because
+    either alone has a blind spot this projection cannot afford:
+
+    * BY KEY NAME (:data:`_PLAYER_ID_KEY_SUFFIXES`) — catches a player who is
+      named in ``detail`` but whom the game can no longer attribute at all,
+      e.g. a legacy NULL row's occupant. A value-only rule would not know
+      such a string was a person.
+    * BY VALUE, against ``known`` — catches an identity written under some
+      future key name that no suffix rule anticipated. A key-name-only rule
+      would let the day that field ships be the day it leaks.
+
+    A false POSITIVE here (some non-player string that happens to equal a
+    player id) costs one withheld event; a false NEGATIVE is a disclosure.
+    The asymmetry is why both rules run and why their results are unioned.
+
+    ``key`` is threaded through list recursion on purpose, so the strings
+    inside ``detail["player_ids"]`` are judged by the name of the list that
+    holds them rather than by no name at all.
+    """
+    found = set()
+    if isinstance(value, dict):
+        for k, v in value.items():
+            found |= _player_ids_in(v, known, k)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            found |= _player_ids_in(v, known, key)
+    elif isinstance(value, str):
+        if key.endswith(_PLAYER_ID_KEY_SUFFIXES) or value in known:
+            found.add(value)
+    return found
 
 
 def catch(fn: Callable):
@@ -4048,25 +4129,102 @@ class ApiService:
         return _serialize(game)
 
     @catch
-    def get_roster(self, game_id: str) -> List[dict]:
-        self.roster._require_game(game_id)
-        return [_serialize(e) for e in self.store.roster_for_game(game_id)]
+    def get_roster(self, game_id: str, viewer_role=None,
+                   viewer_team_id: Optional[str] = None) -> List[dict]:
+        """A game's roster entries, narrowed to what THIS caller may read
+        (#427 final blocker, owner ruling: "`/roster`: Coach/Player receives
+        strictly own-side durably attributed rows. Officials receive only the
+        two-side submitted/occupying lineup projection").
+
+        THE DEFECT THIS CLOSES. This returned ``roster_for_game`` — every
+        entry of both sides — to anyone the single
+        ``can_read_private_game_data`` gate admitted. Measured at ccdb7b4
+        over a real authenticated session: an AWAY Coach's ``GET /roster``
+        came back ``[{"player_id": "player_1", "team_side": "team_1",
+        "seated_position": "defense"}]`` — the HOME side's seat, its owner and
+        the position it occupies, one path segment around the projection that
+        had just closed ``/lineups``.
+
+        OWN-SIDE ROWS ARE THE DURABLY ATTRIBUTED ONES, tested strictly on
+        ``entry.attribution`` — the same authority and the same strictness
+        :meth:`RosterService.lineup_population` uses for its seated
+        population, and for the same reason: ``_side_data.matched_entries``
+        charges a legacy NULL-attribution row to EVERY side on purpose, so
+        reusing it here would put one player's seat on both Coaches'
+        responses. A NULL-attribution row names no side and is therefore
+        omitted from both, never guessed onto one.
+
+        AN OFFICIAL GETS THE SUBMITTED LINEUP, through the very same
+        :meth:`_submitted_lineup_rows` that projects ``/lineups`` for them —
+        not a second field list that could drift from it — plus the public
+        ``team_id`` of the side each row belongs to, without which a two-side
+        list cannot be read at all. That is a different SHAPE from the entry
+        rows every other caller gets, which is honest: the official is being
+        answered with the lineup, not with the roster table.
+
+        ``viewer_role`` of ``None`` (the facade's own default, and every
+        in-process caller) keeps the unchanged full read.
+        """
+        game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            return [_serialize(e) for e in self.store.roster_for_game(game_id)]
+        if audience == lineup_visibility.SUBMITTED_LINEUP:
+            return self._submitted_lineup_sides(game)
+        if audience == lineup_visibility.OWN_SIDE:
+            return [_serialize(e) for e in self.store.roster_for_game(game_id)
+                    if e.attribution is not None
+                    and e.attribution[0] == viewer_team_id]
+        raise NotAuthorizedError(_PRIVATE_SIDE_REFUSAL)
+
+    def _submitted_lineup_sides(self, game) -> List[dict]:
+        """BOTH sides' submitted lineup, each row tagged with its side.
+
+        The two-side projection an assigned official may read, built by
+        running each side through the SAME :meth:`_lineup_rows` +
+        :meth:`_submitted_lineup_rows` pair ``get_lineups`` runs for that
+        role. One field allow-list, one selected-only filter, two routes —
+        so ``/roster`` and ``/lineups`` cannot disagree about what an
+        official may see, which is exactly how this leak opened in the first
+        place.
+
+        ``team_id`` is added because a FLAT list of both sides is unreadable
+        without it, and it discloses nothing: which two teams are playing is
+        already the public ``GET /api/games/{id}`` fixture record."""
+        rows = []
+        for team_id in (game.home_team_id, game.away_team_id):
+            if not team_id:
+                continue  # a placeholder fixture with a side still unset
+            for row in self._submitted_lineup_rows(
+                    self._lineup_rows(game, team_id)):
+                rows.append({**row, "team_id": team_id})
+        return rows
 
     @catch
     def select_roster(self, game_id: str, player_ids: List[str],
-                      actor_id: Optional[str] = None) -> List[dict]:
-        entries = self.roster.select_roster(game_id, player_ids, actor_id)
+                      actor_id: Optional[str] = None,
+                      authorized_team_id: Optional[str] = None) -> List[dict]:
+        entries = self.roster.select_roster(
+            game_id, player_ids, actor_id,
+            authorized_team_id=authorized_team_id)
         return [_serialize(e) for e in entries]
 
     @catch
     def remove_player(self, game_id: str, player_id: str,
-                      actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.remove_player(game_id, player_id, actor_id))
+                      actor_id: Optional[str] = None,
+                      authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.remove_player(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def copy_previous_roster(self, game_id: str, team_id: Optional[str] = None,
-                             actor_id: Optional[str] = None) -> dict:
-        return self.roster.copy_previous_roster(game_id, team_id, actor_id)
+                             actor_id: Optional[str] = None,
+                             authorized_team_id: Optional[str] = None) -> dict:
+        return self.roster.copy_previous_roster(
+            game_id, team_id, actor_id,
+            authorized_team_id=authorized_team_id)
 
     @catch
     def set_roster_status(self, game_id: str, player_id: str, status: str,
@@ -4079,23 +4237,182 @@ class ApiService:
 
     # -- availability ------------------------------------------------------
     @catch
-    def get_availability(self, game_id: str) -> List[dict]:
-        self.roster._require_game(game_id)
-        return [_serialize(a) for a in self.store.availability_for_game(game_id)]
-
-    @catch
-    def get_availability_summary(self, game_id: str, team_id: str) -> dict:
+    def get_availability_summary(self, game_id: str,
+                                 team_id: Optional[str] = None,
+                                 viewer_role=None,
+                                 viewer_team_id: Optional[str] = None) -> dict:
         """Per-player availability for a team in a game (#89), bucketed into
-        available / unavailable / maybe / no_response, with counts. Private
-        (player names) — callers are gated by the same #73 access check."""
+        available / unavailable / maybe / no_response, with counts — projected
+        onto the audience this caller belongs to (#427 final blocker, round 2).
+
+        THE DEFECT THIS CLOSES, and why it is the same defect as the four
+        siblings'. This is the FIFTH leaf of the private-game family and the
+        ONLY one that reads a side from the QUERY STRING. Its narrowing was
+        spelled inline in ``web/server.py`` and named only COACH and PLAYER::
+
+            team_id = (qs.get("team_id") or [own_team])[0]
+            if role in (Role.COACH, Role.PLAYER) and own_team \\
+                    and team_id != own_team:
+
+        so an assigned OFFICIAL fell straight through it. Measured at ae21c40
+        over a real authenticated session, identically on Memory, SQLite and
+        PostgreSQL: ``GET /availability-summary`` answered an official 400
+        ("That team is not playing in this game.") while
+        ``?team_id=<home>`` answered **200** with the whole HOME candidate
+        pool — ``player_2``, ``player_3``, ``player_4``, ``player_8``,
+        ``player_9`` — carrying NAMES and per-player availability, and
+        ``?team_id=<away>`` did the same for AWAY. One path segment away, that
+        same official's ``/lineups`` carried only the submitted rows with
+        ``availability``/``sub_status``/``eligible`` stripped and
+        ``substitutes_enrolled: null``. So the projection removed exactly the
+        two classes this route handed back.
+
+        THE CLIENT HINT WAS THE SOLE SIDE SELECTOR — 400 without it, 200 with
+        it — which is the standing ruling's "Ignore client side hints"
+        defeated on the one family route that actually reads one. And the
+        SHIPPED UI fired it: ``canReadAnyPrivateGame()`` admits any
+        ``official_id`` to the Roster tab, an official's ``/lineups`` sides
+        are ``submitted_lineup`` rather than ``restricted``, so
+        ``isRestrictedSide`` was false and the tab fetched
+        ``?team_id=<the shown side>`` on every render — with the side toggle
+        switching teams. Confirmed in a real browser, not only by curl.
+
+        SO THE AUDIENCE DECIDES, exactly as it does for ``/roster``,
+        ``/roster-status``, ``/substitutes`` and ``/board``
+        (:func:`services.lineup_visibility.route_audience`):
+
+        ``FULL``
+            Unscoped operator — the hint is kept, byte-for-byte the existing
+            #89 behaviour including the "no hint, no own team" case that
+            resolves ``""`` and raises the ordinary participation
+            ``ValidationError``. Narrowing the operator would be its own
+            regression.
+        ``OWN_SIDE``
+            Coach / Player — the hint is IGNORED ENTIRELY and the TRUSTED
+            server-resolved side is used. Ignored, not refused: the four
+            siblings answer a hinted request identically to an un-hinted one,
+            and a fifth leaf that refused instead would leave "what does a
+            side hint do here" answered two different ways inside one family.
+            It is also strictly less informative — a 403 that appears only
+            for the opponent's id is itself a probe oracle for which team is
+            playing, while an unchanged own-side answer tells the caller
+            nothing they did not already have.
+        ``SUBMITTED_LINEUP`` / ``RESTRICTED``
+            Assigned official, and any caller whose own side did not resolve
+            to one of this game's two teams — **403**, never ``players: []``
+            with zero counts. This rollup IS per-player availability, the
+            thing ``_submitted_lineup_rows`` exists to remove, so there is no
+            official-shaped projection of it; and an empty summary would
+            assert "nobody on this team owes an answer", an operational claim
+            about the game rather than a fact about the reader.
+
+        ``viewer_role`` of ``None`` is the in-process default and resolves
+        ``FULL``, so every non-HTTP caller is unchanged.
+        """
         game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.OWN_SIDE:
+            return self._availability_summary_of(game, viewer_team_id)
+        if audience == lineup_visibility.FULL:
+            return self._availability_summary_of(
+                game, team_id or viewer_team_id or "")
+        raise NotAuthorizedError(_AVAILABILITY_REFUSAL)
+
+    def _availability_candidates(self, game, team_id: str) -> List["Player"]:
+        """WHO owes ``team_id`` an availability answer for ``game`` — the ONE
+        discovery both availability surfaces consume (PR #427 blocker, owner
+        comment 5387094674).
+
+        THE DEFECT THIS REPLACES. Discovery was
+        ``store.players_for_team(team_id)``, whose authority is the PERMANENT
+        ``Player.team_id`` pointer. Reproduced tri-store at head 11835a2, in
+        both mirrored directions at once: a player with pointer THIRD and an
+        active membership on this game's exact LeagueSeason/HOME was absent
+        from the HOME summary and got no reminder, while a player with
+        pointer HOME and an active THIRD membership was listed in the private
+        HOME summary and received the HOME reminder
+        (``current_member_listed=False``, ``departed_member_listed=True``,
+        ``current_member_notified=False``, ``departed_member_notified=True``,
+        one reminder sent, on Memory, SQLite and PostgreSQL alike). #205 moves
+        notifications and current eligibility onto the exact Game-LeagueSeason
+        membership; this was the last surface still answering from the pointer.
+
+        WHICH POPULATION, AND WHY IT IS NOT THE ROSTER'S. The question here is
+        "who is expected to tell this team whether they can play THIS game",
+        asked BEFORE anyone is seated and of people who may never be seated.
+        So a durable ``GameRosterEntry`` neither grants membership of this
+        population nor is required for it:
+
+        * a player can be eligible-and-unresponded while holding NO roster row
+          — that is the ordinary pre-selection case, and the whole point of
+          the summary;
+        * a roster row can be held by someone whose membership has since
+          ENDED. That row keeps its slot and its durable attribution for slot
+          accounting (``RosterService._side_data``, #205 blocker 5 round 2 —
+          re-resolving there erased attribution and admitted overfill), but
+          the person behind it is no longer a participant, so they must not
+          be asked, must not be reminded, and must not appear in a private
+          per-player summary of a team they have left.
+
+        The two surfaces therefore read DIFFERENT populations on purpose:
+        this one reads LIVE ELIGIBILITY, ``_side_data`` reads DURABLE
+        ATTRIBUTION. Neither is a fallback for the other.
+
+        BOUND vs UNBOUND is ``RosterService._players_for_game_team``'s split,
+        reused rather than re-derived so a third copy of the rule cannot
+        drift: for a LeagueSeason-bound game it is the batched
+        ``resolve_membership_contexts_for_game`` resolution — the exact
+        LeagueSeason, an eligible membership status, the membership's
+        denormalized Season agreeing, and the side's whole spine (Team,
+        Team-League, Program, a current ACTIVE registration) holding, all
+        through the shared eligibility classifier — and a bound game NEVER
+        falls back to the pointer. For an UNBOUND game (an exhibition by
+        design, or an unbound legacy row) there is no membership authority to
+        consult at all, so the permanent roster IS the pool: that is an
+        EXPLICITLY SEPARATE legacy path, not a fallback, and it is exactly
+        pre-#205 behaviour. Note the two coincide there by construction —
+        ``team_id`` is checked to be one of this game's two sides first, so
+        every player the pointer pool yields resolves an unbound context on
+        that same side.
+
+        LOCKS. This runs wherever its caller runs. :meth:`remind_unresponded`
+        calls it INSIDE the one transaction that already holds the canonical
+        Season row lock, which is what makes the recipient list linearizable
+        with the governed membership mutations:
+        ``SetupService.set_season_roster_membership_status`` locks the
+        membership row AND, via ``_require_active_season``, that SAME Season
+        row. The read surface calls it unlocked, exactly as before — an
+        availability rollup is a read, and #427's read half deliberately
+        checks identity without taking the write guard's lock.
+        """
         if team_id not in (game.home_team_id, game.away_team_id):
             raise ValidationError("That team is not playing in this game.")
+        return [player for player, _ctx
+                in self.roster._players_for_game_team(game, team_id)]
+
+    def _availability_summary_of(self, game, team_id: str) -> dict:
+        """The summary computed off an ALREADY-RESOLVED Game row.
+
+        Split out of :meth:`get_availability_summary` for PR #427 so
+        :meth:`remind_unresponded` can compute its recipient list from the row
+        it holds under the canonical Season lock, rather than from a second,
+        earlier, unlocked read of the same Game.
+
+        ONE DISCOVERY, TWO CONSUMERS. The player identities come from
+        :meth:`_availability_candidates`, and ``remind_unresponded`` derives
+        its recipients from THIS summary rather than discovering its own — so
+        the private read surface and the notification audience are the same
+        set by construction and cannot drift into disagreeing about who is on
+        this team for this game.
+        """
+        game_id = game.id
+        candidates = self._availability_candidates(game, team_id)
         avail = {a.player_id: a
                  for a in self.store.availability_for_game(game_id)}
         counts = {"available": 0, "unavailable": 0, "maybe": 0, "no_response": 0}
         players = []
-        for p in sorted(self.store.players_for_team(team_id), key=lambda x: x.name):
+        for p in sorted(candidates, key=lambda x: x.name):
             a = avail.get(p.id)
             status = a.availability_status.value if a else "no_response"
             if status == "pending":  # never-responded reads as no_response
@@ -4107,124 +4424,292 @@ class ApiService:
 
     @catch
     def remind_unresponded(self, game_id: str, team_id: str,
-                           actor_id: Optional[str] = None) -> dict:
+                           actor_id: Optional[str] = None,
+                           authorized_team_id: Optional[str] = None) -> dict:
         """Nudge the players who haven't set availability (#89): emit one
         player-targeted AVAILABILITY_REMINDER per no-response player, so the
         reminder actually reaches them (delivery honors each player's channel
         preferences, #81). Returns the number of players reminded — a no-op
-        (emitting nothing) when everyone has already responded."""
-        summary = self.get_availability_summary(game_id, team_id)
-        if isinstance(summary, dict) and summary.get("error"):
-            return summary
-        unresponded = [p for p in summary["players"]
-                       if p["status"] == "no_response"]
-        _rg = self.store.get_game(game_id)
+        (emitting nothing) when everyone has already responded.
+
+        ONE TRANSACTION, AND THE GAME IS RE-FETCHED INSIDE IT (PR #427 ruling
+        4). Every read this method decides on — which Season authorizes it,
+        whether ``team_id`` is even playing in this Game, and WHO is
+        unresponded — now happens under the canonical Season row lock, and the
+        notifications are written in that same transaction.
+
+        THE HOLE THIS CLOSES. The previous shape called
+        ``get_availability_summary`` and ``store.get_game`` OUTSIDE the
+        transaction and then guarded the *stale* row: ``guard_game_season``
+        was handed an object read before any lock existed, so it resolved and
+        locked whatever Season that object's ``league_season_id`` named at
+        that moment. A concurrent writer that rebound the Game to another
+        competition in the window between — the same check/use gap the fifteen
+        RosterService mutation sites close by rebinding to the row the guard
+        returns — left this site locking a Season that no longer authorizes
+        the Game, and it then wrote reminders under it. The recipient list was
+        stale by the same window: players whose team assignment or availability
+        changed after the summary read were reminded (or missed) against a
+        world that had moved on.
+
+        The fix is the roster family's, reused rather than re-derived:
+        ``RosterService._guard_active_season`` locks the canonical Season,
+        re-fetches the Game under that lock, and re-runs the guard when the
+        fresh row's identity columns actually moved — so the row this method
+        goes on to use is the one the held lock actually authorizes. It is
+        deliberately the SAME helper the fifteen bound mutation sites call:
+        emitting a notification is a Season-owned write like any other, and a
+        second hand-written copy of this sequence is exactly what #427
+        collapsed.
+
+        WHO the recipients are is a SEPARATE question from WHICH ROW they are
+        read off, and the round that established the transaction above only
+        answered the second one (owner comment 5387094674). The recipient list
+        was still discovered by ``store.players_for_team`` — the permanent
+        ``Player.team_id`` pointer — so under a correct lock, on the correct
+        row, the reminder went to the player who had LEFT this side and not to
+        the one currently rostered on it. Discovery is now
+        :meth:`_availability_candidates`, the exact game-scoped membership,
+        consumed through the SAME summary the private read surface returns:
+        one discovery, two consumers, so the audience of a notification and
+        the contents of a private response cannot disagree. The transaction
+        and lock structure below is UNCHANGED — and it is what makes this
+        discovery linearizable with the governed membership mutations, which
+        take the very same canonical Season row lock."""
         with self.store.transaction():
-            # #159 — no reminders may be generated for an archived Season's
-            # Game; lock the Season and emit inside one transaction.
-            if _rg is not None and _rg.season_id:
-                self.setup._require_active_season(_rg.season_id)
+            # A LOCATOR read only — `_guard_active_season` returns the row
+            # re-fetched under the Season lock, and everything below uses that
+            # row. #159: no reminders may be generated for an archived
+            # Season's Game. PR #427: WHICH Season is the shared guard's
+            # answer, never `game.season_id` — this site carried the identical
+            # falsy-skip/wrong-row defect as the two service guard families,
+            # so a bound Game with a NULL or drifted `season_id` emitted
+            # reminders against an archived competition, having locked nothing.
+            game = self.roster._guard_active_season(
+                self.roster._require_game(game_id))
+            # Recipients determined from the LOCKED row, inside the same
+            # transaction that writes the notifications. Participation is
+            # re-checked here too: `team_id` must be playing in the Game as it
+            # stands under the lock, not as the caller's earlier read saw it.
+            # THE COACH GATE, under the SAME Season lock the reminders are
+            # written beneath (#205). `scope_violation` already refuses an
+            # explicit foreign `team_id` at the preflight, but the ruling is
+            # that the preflight "cannot be the authoritative write gate" —
+            # so the team this method is about to notify is revalidated here,
+            # inside the transaction and before the first `_push_notification`.
+            #
+            # COMPARAND: the REQUESTED team itself. This command targets a
+            # SIDE rather than a row, and it creates new state (notification
+            # + delivery rows) for that side, so "is this side mine?" is the
+            # whole question and there is no durable row to consult.
+            self.roster._require_authorized_team(
+                authorized_team_id, team_id, "team")
+            summary = self._availability_summary_of(game, team_id)
+            unresponded = [p for p in summary["players"]
+                           if p["status"] == "no_response"]
             for p in unresponded:
                 _push_notification(
                     self.store, self.roster.clock,
                     NotificationKind.AVAILABILITY_REMINDER,
                     NotificationAudience.PLAYER, "Availability reminder",
                     "Please confirm your availability for this game.",
-                    audience_ref=p["player_id"], game_id=game_id)
+                    audience_ref=p["player_id"], game_id=game.id)
         return {"reminded": len(unresponded)}
 
     @catch
     def set_availability(self, game_id: str, player_id: str,
                          availability_status: str, response_source: str = "player",
-                         actor_id: Optional[str] = None) -> dict:
+                         actor_id: Optional[str] = None,
+                         authorized_team_id: Optional[str] = None) -> dict:
         av = self.roster.set_availability(
             game_id, player_id,
             _parse_enum(AvailabilityStatus, availability_status,
                         "availability_status"),
             response_source, actor_id,
+            authorized_team_id=authorized_team_id,
         )
         return _serialize(av)
 
     # -- substitutes -------------------------------------------------------
     @catch
-    def get_substitutes(self, game_id: str) -> List[dict]:
-        self.roster._require_game(game_id)
-        return [_serialize(s) for s in self.store.substitutes_for_game(game_id)]
+    def get_substitutes(self, game_id: str, viewer_role=None,
+                        viewer_team_id: Optional[str] = None) -> List[dict]:
+        """A game's substitute enrollments, narrowed to this caller (#427
+        final blocker, owner ruling: "`/substitutes`: Coach/Player receives
+        strictly own-side durably owned rows; officials are refused. Legacy
+        NULL attribution is omitted, never guessed").
+
+        THE DEFECT THIS CLOSES. This returned ``substitutes_for_game`` —
+        both sides' whole substitute workflow — to every caller the single
+        ``can_read_private_game_data`` gate admitted. Measured at ccdb7b4:
+        an AWAY Coach's ``GET /substitutes`` came back
+        ``[{"player_id": "player_6", "status": "enrolled",
+        "team_id": "team_1"}]``, and an ASSIGNED OFFICIAL's leaked the same
+        row — the very substitute state ``_submitted_lineup_status`` nulls
+        out one route over.
+
+        OFFICIALS ARE REFUSED OUTRIGHT rather than given a narrowed list.
+        There is no official-shaped projection of this resource: the
+        enrollment IS the substitute workflow, which is the thing an official
+        must not recover. A refusal is also the only honest answer available
+        to a flat list — ``[]`` would assert "no substitutes are enrolled in
+        this game", an operational claim about both teams that the caller is
+        not entitled to and that may well be false.
+
+        OWN-SIDE MEANS DURABLY OWNED: ``enrollment.team_id``, the side the row
+        was ADMITTED on, which is the same authority
+        :meth:`RosterService.lineup_population` keys its substitute
+        population on. A legacy pre-060 NULL owner is omitted from BOTH
+        sides — it cannot name its owner, and current membership answers a
+        different question than "which side was this row admitted on".
+        """
+        game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            return [_serialize(s)
+                    for s in self.store.substitutes_for_game(game_id)]
+        if audience == lineup_visibility.OWN_SIDE:
+            return [_serialize(s)
+                    for s in self.store.substitutes_for_game(game_id)
+                    if s.team_id is not None and s.team_id == viewer_team_id]
+        raise NotAuthorizedError(_SUBSTITUTE_REFUSAL)
 
     @catch
     def enroll_substitute(self, game_id: str, player_id: str,
-                          actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.enroll_substitute(game_id, player_id, actor_id))
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.enroll_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def withdraw_substitute(self, game_id: str, player_id: str,
-                            actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.withdraw_substitute(game_id, player_id, actor_id))
+                            actor_id: Optional[str] = None,
+                            authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.withdraw_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def offer_substitute(self, game_id: str, player_id: str,
                          actor_id: Optional[str] = None,
-                         expires_at: Optional[str] = None) -> dict:
+                         expires_at: Optional[str] = None,
+                         authorized_team_id: Optional[str] = None) -> dict:
         return _serialize(self.roster.offer_substitute(
             game_id, player_id, actor_id,
             offer_expires_at=_parse_dt(expires_at, "expires_at"),
+            authorized_team_id=authorized_team_id,
         ))
 
     @catch
     def accept_substitute(self, game_id: str, player_id: str,
-                          actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.accept_substitute(game_id, player_id, actor_id))
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.accept_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def decline_substitute(self, game_id: str, player_id: str,
-                           actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.decline_substitute(game_id, player_id, actor_id))
+                           actor_id: Optional[str] = None,
+                           authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.decline_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def add_substitute_to_roster(self, game_id: str, player_id: str,
-                                 actor_id: Optional[str] = None) -> dict:
+                                 actor_id: Optional[str] = None,
+                                 authorized_team_id: Optional[str] = None) -> dict:
         return _serialize(
-            self.roster.add_substitute_to_roster(game_id, player_id, actor_id)
+            self.roster.add_substitute_to_roster(
+                game_id, player_id, actor_id,
+                authorized_team_id=authorized_team_id)
         )
 
     # -- roster status -----------------------------------------------------
     @catch
-    def get_roster_status(self, game_id: str) -> dict:
-        return self.roster.compute_roster_status(game_id).to_dict()
+    def get_roster_status(self, game_id: str, viewer_role=None,
+                          viewer_team_id: Optional[str] = None) -> dict:
+        """One side's roster status, for the side THIS caller is entitled to
+        (#427 final blocker, owner ruling: "`/roster-status`: Coach/Player
+        receives only the trusted own-side status. Ignore client side hints").
+
+        THE DEFECT THIS CLOSES, and it was the sharpest of the three: this
+        called ``compute_roster_status(game_id)`` with NO team, so it
+        hard-coded the HOME side for every caller — the identical defect
+        ``get_board`` had, still live one route away after ``get_board`` was
+        fixed. Measured at ccdb7b4: an AWAY Coach received
+        ``team_id=team_1`` and ``substitutes_enrolled=1``, a complete private
+        status block for the side that is not theirs, needing no player id at
+        all. ``?team_id=team_2`` was ignored entirely, so the AWAY Coach could
+        not even ask for their own.
+
+        NO CLIENT HINT IS READ, here or in ``web/server.py``. The side comes
+        from ``game_scoped_own_team_id`` and nowhere else, so a Coach cannot
+        name the opponent and a Player cannot name anyone.
+
+        AN OFFICIAL IS REFUSED, on the evidence that the Game Sheet does not
+        need this route: no file under ``web/static/`` fetches
+        ``/roster-status`` at all — the Game Sheet reads ``/lineups``, whose
+        official projection already carries the slot counts an official
+        needs, with the substitute state removed by
+        :meth:`_submitted_lineup_status`. Serving a second, substitute-
+        bearing status block here would hand back on this route precisely the
+        ``substitutes_enrolled`` count that one nulls out, which is the
+        sibling-pivot this blocker exists to close. The ruling permits either
+        projection or refusal "if this endpoint is unnecessary for Game
+        Sheet"; it is unnecessary, so it is refused.
+
+        AN UNSCOPED OPERATOR IS UNCHANGED — still the home-side default, not
+        narrowed and not widened; no hint is honoured for them either, so
+        this route gained no new side-selection surface at all.
+        """
+        game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            return self.roster.compute_roster_status(game_id).to_dict()
+        if audience == lineup_visibility.OWN_SIDE:
+            return self.roster.compute_roster_status(
+                game_id, viewer_team_id).to_dict()
+        raise NotAuthorizedError(_ROSTER_STATUS_REFUSAL)
 
     @catch
     def auto_build_roster(self, game_id: str, team_id: Optional[str] = None,
-                          actor_id: Optional[str] = None) -> dict:
-        """Demo helper: select + confirm a full roster for one side.
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
+        """Select + confirm a roster for one side, up to the game's targets.
 
         Picks the team's goalies and skaters up to the game's targets so a
         newly-scheduled game becomes immediately playable by the roster flow.
         ``team_id`` defaults to the home side (#25); a team not playing in the
-        game is rejected. Raises if the team has no players (empty state).
-        """
-        game = self.roster._require_game(game_id)
-        team_id = team_id or game.home_team_id
-        if team_id not in (game.home_team_id, game.away_team_id):
-            raise ValidationError("That team is not playing in this game.")
-        players = self.store.players_for_team(team_id)
-        if not players:
-            raise ValidationError(
-                "Team has no players yet. Add or import players first."
-            )
-        goalies = [p for p in players if p.slot_type == SlotType.GOALIE]
-        skaters = [p for p in players if p.slot_type == SlotType.SKATER]
-        selected = ([g.id for g in goalies[:game.target_goalies]]
-                    + [s.id for s in skaters[:game.target_skaters]])
-        self.roster.select_roster(game_id, selected, actor_id)
-        for pid in selected:
-            self.roster.set_availability(game_id, pid, AvailabilityStatus.AVAILABLE)
-        status = self.roster.compute_roster_status(game_id, team_id).to_dict()
+        game is rejected. Raises if the team has no candidates at all (empty
+        state).
+
+        THE SEATING ITSELF NOW LIVES IN ``RosterService.auto_build_roster``
+        (PR #427) — see it for the candidate cohort, the one-transaction
+        lock/revalidate/partition/seat order, and why the response has to
+        carry player identity. What is left here is the presentation this
+        endpoint has always added on top: the resulting roster status plus
+        the coach-friendly short-roster classification.
+
+        The response is the batch result MERGED WITH that status, so
+        ``seated``/``skipped``/``deferred``/``already_seated``/
+        ``candidate_count`` are ADDITIVE — every existing caller reading
+        ``status``/``open_*_slots``/``short_roster`` is unaffected."""
+        result = self.roster.auto_build_roster(
+            game_id, team_id, actor_id,
+            authorized_team_id=authorized_team_id)
+        status = self.roster.compute_roster_status(
+            game_id, result["team_id"]).to_dict()
         # Coach-friendly classification of a short roster.
         status["missing_goalies"] = status["open_goalie_slots"]
         status["missing_skaters"] = status["open_skater_slots"]
         status["short_roster"] = (status["open_goalie_slots"] > 0
                                   or status["open_skater_slots"] > 0)
-        return status
+        return {**status, **result}
 
     @catch
     def publish_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
@@ -4280,18 +4765,80 @@ class ApiService:
 
     # -- screen view-model -------------------------------------------------
     @catch
-    def get_board(self, game_id: str) -> dict:
-        """Everything the Game Detail screen needs in one call.
+    def get_board(self, game_id: str, team_id: Optional[str] = None,
+                  viewer_role=None) -> dict:
+        """Everything the Game Detail screen needs, for ONE side, in one call.
 
-        Groups every team player into selected / substitute / available so
+        Groups that side's players into selected / substitute / available so
         the iPhone UI can render Coach and Player views without extra round
-        trips. This is a UI convenience over the contract endpoints; it does
-        not introduce new domain rules.
+        trips.
+
+        WHICH SIDE — THE CALLER'S OWN, RESOLVED BY THE SERVER (#427 blocker,
+        owner ruling comment 5394947899). This used to read
+        ``game.home_team_id`` unconditionally for EVERY caller, while the HTTP
+        gate (``can_read_private_game_data``) admits an AWAY Coach or Player
+        because their team participates in this game. Reproduced tri-store
+        over a real authenticated session: an AWAY Coach received the HOME
+        side's private player pool and a ``status`` block whose ``team_id``
+        named HOME. The docstring called this "a UI convenience over the
+        contract endpoints"; a convenience cannot override the private-data
+        boundary.
+
+        ``team_id`` is the TRUSTED side ``web/server.py`` resolves through
+        ``resolve_private_game_read`` — never a client-supplied value.
+
+        THE HOME DEFAULT IS AUDIENCE-BOUND (#427 round 2, blocker 1). It used
+        to be applied to EVERY caller, and applied BEFORE the projection was
+        chosen, so ``team_id=None`` from a team-scoped caller became a full
+        HOME read rather than a refusal. Measured on the head this corrects: a
+        direct ``Role.COACH`` call with ``team_id=None`` answered
+        ``team_id=team_1, projection=full, restricted=false`` with HOME's
+        identities, and the same shape was reachable over HTTP whenever a
+        Coach/Player lost their side between admission and projection. The
+        default now survives ONLY for an audience with no side of its own BY
+        DESIGN — an unscoped operator, an assigned official, an in-process
+        caller (:func:`services.lineup_visibility.default_side_permitted`).
+        A COACH or PLAYER who arrives with no side, or with a side that is not
+        one of this game's two, is RESTRICTED: no ``status``, no ``players``,
+        no notifications, no audit, and ``team_id: null`` — the response never
+        names a side it is not answering for.
+
+        ``RosterService.lineup_population`` still rejects a team that is not
+        playing in this game, so a bad value fails closed there too.
+
+        ``viewer_role`` selects the projection for a caller with no side of
+        their own: an assigned OFFICIAL gets the submitted-lineup projection
+        (no candidates, no availability, no substitute state), everyone else
+        the full private side. See :mod:`services.lineup_visibility`.
         """
         game = self.roster._require_game(game_id)
-        status = self.roster.compute_roster_status(game_id).to_dict()
-
-        rows = self._lineup_rows(game_id, game.home_team_id)
+        if team_id is None and not lineup_visibility.default_side_permitted(
+                viewer_role):
+            # A TEAM-SCOPED caller with no resolved side. Refused, never
+            # defaulted — see this method's docstring. Over HTTP the shared
+            # `resolve_private_game_read` boundary has already answered 403,
+            # so this is the facade's own fence for a direct caller.
+            projection = lineup_visibility.RESTRICTED
+        else:
+            team_id = team_id or game.home_team_id
+            projection = lineup_visibility.side_projections(
+                viewer_role, team_id, game.home_team_id, game.away_team_id)
+            projection = (projection["home"] if team_id == game.home_team_id
+                          else projection["away"])
+        if projection == lineup_visibility.RESTRICTED:
+            # A team-scoped caller with a missing or nonparticipant side.
+            # `team_id` is cleared as well: a restricted board must not name
+            # the side it declined to answer for, which is exactly what the
+            # HOME default used to do.
+            team_id = None
+            status, rows = None, None
+        else:
+            status = self.roster.compute_roster_status(
+                game_id, team_id).to_dict()
+            rows = self._lineup_rows(game, team_id)
+            if projection == lineup_visibility.SUBMITTED_LINEUP:
+                status = self._submitted_lineup_status(status)
+                rows = self._submitted_lineup_rows(rows)
 
         notifications = [
             {"type": n.type.value, "audience": n.audience, "message": n.message,
@@ -4304,72 +4851,332 @@ class ApiService:
              "detail": a.detail}
             for a in self.store.audit_for_game(game_id)
         ]
+        audience = lineup_visibility.route_audience(
+            viewer_role, team_id, game.home_team_id, game.away_team_id)
+        audit_scope, notifications, audit = self._activity_projection(
+            game_id, audience, team_id, notifications, audit)
         return {
             "game": _serialize(game),
+            # WHICH side this board is about, stated explicitly. It used to be
+            # inferable only from `status.team_id`, which is exactly the field
+            # that named HOME to an AWAY Coach — and which is `null` under a
+            # restricted projection.
+            "team_id": team_id,
+            "projection": projection,
+            "restricted": projection == lineup_visibility.RESTRICTED,
             "status": status,
             "players": rows,
+            # WHICH activity this caller is being shown, stated explicitly for
+            # the same reason `projection` is: a consumer must never have to
+            # infer withholding from a short list. See
+            # :meth:`_activity_projection`.
+            "audit_scope": audit_scope,
             "notifications": notifications,
             "audit": audit,
-            "audit_count": len(audit),
+            # COUNTED OVER WHAT WAS SENT, never over what was withheld — a
+            # count of the full game-wide log would be a covert cardinality
+            # oracle telling a scoped Coach exactly how much opponent activity
+            # they are not being shown (owner ruling: `audit_count` "must not
+            # survive as a covert cardinality oracle over omitted rows").
+            "audit_count": None if audit is None else len(audit),
         }
 
-    def _lineup_rows(self, game_id: str, team_id: str) -> list:
-        """Group a team's players into selected / substitute / available."""
-        roster = {e.player_id: e for e in self.store.roster_for_game(game_id)}
-        avail = {a.player_id: a for a in self.store.availability_for_game(game_id)}
-        subs = {s.player_id: s for s in self.store.substitutes_for_game(game_id)}
+    #: Withheld entirely — the caller is entitled to NONE of this game's
+    #: activity, so all three fields are ``null`` rather than empty. An empty
+    #: list asserts "this game has had no activity", which is a different and
+    #: false operational claim.
+    ACTIVITY_WITHHELD = "withheld"
+
+    def _activity_projection(self, game_id, audience, team_id,
+                             notifications, audit):
+        """WHICH of a game's notification/audit events this caller may read
+        (#427 final blocker, owner ruling comment 5394947899).
+
+        THE DEFECT THIS CLOSES. ``/board``'s ``notifications`` and ``audit``
+        blocks were built from ``notifications_for_game``/``audit_for_game``
+        — GAME-WIDE reads — and were never projected, so the very response
+        whose ``team_id`` correctly named the AWAY Coach's own side still
+        carried HOME's private workflow in the two collections underneath it.
+        Measured at ccdb7b4 over a real authenticated session: an AWAY Coach
+        received ``{'player_6': 'HOME enrolled substitute'}`` in
+        ``notifications`` and the HOME ``roster_selected`` /
+        ``availability_set`` entries in ``audit``.
+
+        THE ATTRIBUTION RULE, in one sentence: an event is RETAINED for side
+        ``S`` only when every player identity it discloses is durably
+        attributed to ``S``, and it discloses at least one.
+
+        Both halves are load-bearing.
+
+        * EVERY identity, not just the subject. ``subject_player_id`` is not
+          the only identity an event carries: ``roster_selected`` has no
+          subject at all and names its players in ``detail.player_ids``, and
+          ``roster_batch_seated`` names four more lists of them. Attributing
+          on the subject alone would have retained the exact
+          ``{"action":"roster_selected","detail":{"player_ids":["player_1"]}}``
+          entry the reviewer measured leaking. See :func:`_player_ids_in` for
+          how identities are recovered from the free-form ``detail``.
+        * AT LEAST ONE, so an event that names nobody is withheld rather than
+          shown to both sides. A game-wide event genuinely cannot be
+          attributed to a side, and the ruling's rule for that case is
+          omission — "never guess a side".
+
+        DURABLY means :meth:`RosterService.durable_game_sides`: the seat's
+        stored ``attribution`` and the enrollment's stored ``team_id``, never
+        live membership and never the permanent pointer. A legacy NULL row,
+        and a player whose durable records disagree, name no side — so every
+        event about them is withheld from BOTH sides.
+
+        WHY THE FILTER CANNOT UNDER-COUNT ITSELF INTO A LEAK: because the
+        retained set contains only events all of whose identities are the
+        caller's OWN side, nothing about the opponent survives — not a row,
+        not a subject, and not a count of either.
+
+        An ASSIGNED OFFICIAL has no side of their own here and is not
+        entitled to either side's workflow state (they receive the submitted
+        lineup, and "an official referees the game, they do not manage
+        anyone's roster"), so all three fields are withheld outright. An
+        UNSCOPED OPERATOR keeps the full game-wide collections, unchanged.
+        """
+        if audience == lineup_visibility.FULL:
+            return lineup_visibility.FULL, notifications, audit
+        if audience != lineup_visibility.OWN_SIDE:
+            return self.ACTIVITY_WITHHELD, None, None
+        sides = self.roster.durable_game_sides(game_id)
+        known = self._game_player_universe(game_id, sides)
+
+        def own(events):
+            kept = []
+            for event in events:
+                disclosed = _player_ids_in(event, known)
+                if disclosed and all(sides.get(pid) == team_id
+                                     for pid in disclosed):
+                    kept.append(event)
+            return kept
+
+        return lineup_visibility.OWN_SIDE, own(notifications), own(audit)
+
+    def _game_player_universe(self, game_id, sides) -> set:
+        """Every player id this game is known to mention anywhere.
+
+        Used as the VALUE half of :func:`_player_ids_in`'s two-way identity
+        recovery, so a player id sitting in ``detail`` under some future key
+        name that no suffix rule anticipates is still recognised as an
+        identity — and, being unattributable or opponent-attributed, still
+        withholds its event. Deliberately wider than ``sides``: a player with
+        NO durable side must still be RECOGNISED, precisely so the event that
+        names them is withheld rather than silently passed through."""
+        known = set(sides)
+        known.update(e.player_id for e in self.store.roster_for_game(game_id))
+        known.update(s.player_id
+                     for s in self.store.substitutes_for_game(game_id))
+        known.update(a.player_id
+                     for a in self.store.availability_for_game(game_id))
+        return known
+
+    _GROUP_OF_SOURCE = {"roster": "selected", "substitute": "substitute",
+                        "candidate": "available"}
+
+    def _lineup_rows(self, game, team_id: str) -> list:
+        """Serialize ONE side's lineup population for the UI.
+
+        A THIN SERIALIZER, deliberately. WHO is on this side, WHICH authority
+        put them there, and WHICH position/jersey values are authoritative are
+        all business rules, and they live in
+        :meth:`RosterService.lineup_population` — the same delegation
+        :meth:`_availability_candidates` already makes to
+        ``_players_for_game_team``, and for the same reason: the two private
+        game surfaces must not each keep their own idea of who is on a team
+        for a game. Read that method for the four populations, the strict
+        side tests, the legacy-NULL omission rule and the ordering.
+
+        This method's only remaining jobs are the group label, the
+        availability join (which is per-``(game, player)``, not per-side, so
+        it has no side authority to get wrong) and the JSON shape.
+
+        ``position``/``jersey_number`` COME OFF THE ROW, never off
+        ``row.player``. On a bound game those are the seated/enrollment/
+        membership values; ``jersey_number`` is ``null`` when no seasonal
+        value exists rather than the permanent pointer's. Only the unbound
+        exhibition branch puts permanent values in these fields, and it does
+        so inside the service, on its own explicit branch.
+        """
+        avail = {a.player_id: a
+                 for a in self.store.availability_for_game(game.id)}
         rows = []
-        for p in self.store.players_for_team(team_id):
-            entry = roster.get(p.id)
-            a = avail.get(p.id)
-            s = subs.get(p.id)
-            backed_out = entry is not None and not entry.status.occupies_slot
-            active_sub = s is not None and s.status in (
-                SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED
-            )
-            if entry is not None:
-                group = "selected"
-            elif active_sub:
-                group = "substitute"
-            else:
-                group = "available"
+        for row in self.roster.lineup_population(game, team_id):
+            entry, sub = row.entry, row.enrollment
+            a = avail.get(row.player.id)
             rows.append({
-                "id": p.id,
-                "name": p.name,
-                "position": p.position.value,
-                "slot_type": p.slot_type.value,
-                "jersey_number": p.jersey_number,
-                "group": group,
+                "id": row.player.id,
+                "name": row.player.name,
+                "position": row.position.value,
+                "slot_type": row.position.slot_type.value,
+                "jersey_number": row.jersey_number,
+                "group": self._GROUP_OF_SOURCE[row.source],
                 "roster_status": entry.status.value if entry else None,
-                "backed_out": backed_out,
+                "backed_out": (entry is not None
+                               and not entry.status.occupies_slot),
                 "availability": a.availability_status.value if a else "pending",
-                "sub_status": s.status.value if s else None,
+                "sub_status": sub.status.value if sub else None,
+                # LIVE eligibility for THIS side, so the UI can show a
+                # durable row that has become unseatable as exactly that —
+                # visible for cleanup, labelled ineligible, and NOT offered
+                # an add/seat control the service would refuse (owner ruling,
+                # comment 5394947899).
+                "eligible": row.eligible,
             })
         return rows
 
-    @catch
-    def get_lineups(self, game_id: str) -> dict:
-        """Both sides' lineups + independent status for a game (#25).
+    #: The submitted-lineup field set an assigned official may read. Built as
+    #: an ALLOW-list, not a deny-list: a future private field added to
+    #: `_lineup_rows` is withheld from officials until someone deliberately
+    #: names it here, rather than leaking the day it ships.
+    #:
+    #: ``backed_out`` is kept in the list although :meth:`_submitted_lineup_rows`
+    #: now makes it INVARIANTLY ``false`` for an official (#427 round 2,
+    #: blocker 3): the field is part of the row shape every other caller
+    #: receives, and dropping it for one audience would make the two shapes
+    #: differ in a second way for no gain. That the value can only be
+    #: ``false`` is asserted, not assumed.
+    _SHEET_PLAYER_FIELDS = ("id", "name", "position", "slot_type",
+                            "jersey_number", "group", "roster_status",
+                            "backed_out")
 
-        Home and away rosters are managed separately; this returns each side's
-        team, roster status, and player groups in one call for the roster UI.
+    @classmethod
+    def _submitted_lineup_rows(cls, rows: list) -> list:
+        """The rows that actually OCCUPY A SLOT on a side's sheet, stripped of
+        workflow state.
+
+        THE DEFECT THIS CLOSES (#427 round 2, blocker 3). This filtered on
+        ``group == "selected"`` alone — the DISPLAY GROUP — and
+        :meth:`_lineup_rows` keeps a seated row in that group after its
+        occupant has gone unavailable or been removed, flagging it
+        ``backed_out: true`` so a coach's own screen can still show it for
+        cleanup. So an official's Game Sheet carried players who are not on
+        it. Exact-head repro: mark the selected player unavailable, then
+        ``get_lineups(..., viewer_role=Role.OFFICIAL)`` still returned that
+        player with ``roster_status: "unavailable", backed_out: true`` — on
+        ``/board``, ``/lineups`` AND ``/roster``, because all three share this
+        one helper. That exceeds the accepted submitted/occupying projection:
+        it is the side's historical roster workflow, not the current sheet.
+
+        OCCUPANCY IS THE EXISTING PREDICATE, NOT A NEW ONE.
+        ``RosterEntryStatus.occupies_slot`` (SELECTED / CONFIRMED / OFFERED /
+        ACCEPTED) is what ``RosterService._side_data`` already counts slots
+        with, and ``_lineup_rows`` has already applied it per row: ``backed_out``
+        IS ``not entry.status.occupies_slot``. Filtering on that field reuses
+        the one answer rather than deriving a second one here that could drift
+        from it. ``group == "selected"`` is retained as well and is exactly
+        equivalent to "this row came from a roster ENTRY" (``_GROUP_OF_SOURCE``
+        maps the seated population and only it to that label), so the two
+        clauses read as what they are: a seated row, still holding its slot.
+
+        Of the surviving rows, only the fields the Game Sheet renders.
+        ``availability`` (a private per-player answer), ``sub_status``
+        (substitute workflow state) and ``eligible`` (live membership state)
+        are all dropped.
+        """
+        return [{k: row[k] for k in cls._SHEET_PLAYER_FIELDS}
+                for row in rows
+                if row["group"] == "selected" and not row["backed_out"]]
+
+    @staticmethod
+    def _submitted_lineup_status(status: dict) -> dict:
+        """The slot counts, with SUBSTITUTE STATE removed.
+
+        Three fields disclose it and all three are neutralised: the
+        ``substitutes_enrolled`` count; the ``needs_substitute`` state, which
+        exists precisely to say a substitute pool is standing by; and the
+        derived ``message``, whose two open-slot forms end "Substitutes are
+        available — coach decision needed." and "No substitutes enrolled."
+
+        The underlying operational fact an official DOES need — this side is
+        short N goalies and M skaters — survives intact, reported through
+        :meth:`RosterService.open_slot_phrase`, which is the same sentence
+        with the substitute clause removed rather than a second wording that
+        could drift from it."""
+        out = dict(status)
+        out["substitutes_enrolled"] = None
+        if out["status"] in (GameStatus.NEEDS_SUBSTITUTE.value,
+                             GameStatus.OPEN_SLOT.value):
+            out["status"] = GameStatus.OPEN_SLOT.value
+            out["action_required"] = False
+            out["message"] = RosterService.open_slot_phrase(
+                out["open_goalie_slots"], out["open_skater_slots"])
+        return out
+
+    @catch
+    def get_lineups(self, game_id: str, viewer_role=None,
+                    viewer_team_id: Optional[str] = None) -> dict:
+        """Both sides' lineups + independent status for a game (#25), each
+        side projected to what THIS caller may read (#427 blocker, owner
+        ruling comment 5394947899).
+
+        THE DEFECT THIS CLOSES. Every authenticated caller who passed the
+        single ``can_read_private_game_data`` gate received BOTH sides in
+        full: the opponent's candidate pool, every candidate's private
+        availability answer, and the opponent's substitute workflow state.
+        That gate proves only that the caller belongs to *a* team in this
+        game; it carries no team-level narrowing at all (the route registry
+        records this route ``scope_axis="none"``). Reproduced tri-store over
+        a real authenticated Coach session.
+
+        THREE PROJECTIONS, chosen by :func:`services.lineup_visibility.
+        side_projections` from the caller's role and the side the SERVER
+        resolved for them (``viewer_team_id``, from
+        ``game_scoped_own_team_id`` — never a client-supplied side):
+
+        * UNSCOPED OPERATOR — both sides in full, unchanged.
+        * COACH / PLAYER — their OWN side in full; the opponent RESTRICTED.
+        * ASSIGNED OFFICIAL — both sides' SUBMITTED LINEUP, which is what the
+          Game Sheet needs, and neither side's unselected candidates,
+          availability or substitute state.
+
+        A RESTRICTED SIDE IS NOT AN EMPTY ROSTER. It keeps its public
+        ``team_id``/``team_name`` and carries ``restricted: true`` with
+        ``status`` and ``players`` set to ``null`` — never ``[]``, which both
+        screens already render as the genuinely different operational claim
+        "no lineup submitted". Every side, restricted or not, carries the
+        ``restricted`` flag and a ``projection`` label, so a consumer never
+        has to infer redaction from a missing key.
+
+        ``officials``, ``result`` and the public ``game`` record are unchanged
+        for every caller: they are the shared, non-side-private facts of the
+        fixture.
         """
         game = self.roster._require_game(game_id)
+        projections = lineup_visibility.side_projections(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
 
-        def side(team_id):
+        def side(team_id, projection):
             team = self.store.get_team(team_id)
-            return {
+            out = {
                 "team_id": team_id,
                 "team_name": team.name if team else team_id,
-                "status": self.roster.compute_roster_status(game_id, team_id).to_dict(),
-                "players": self._lineup_rows(game_id, team_id),
+                "projection": projection,
+                "restricted": projection == lineup_visibility.RESTRICTED,
             }
+            if projection == lineup_visibility.RESTRICTED:
+                out["restricted_reason"] = "opponent_private"
+                out["status"] = None
+                out["players"] = None
+                return out
+            status = self.roster.compute_roster_status(
+                game_id, team_id).to_dict()
+            rows = self._lineup_rows(game, team_id)
+            if projection == lineup_visibility.SUBMITTED_LINEUP:
+                status = self._submitted_lineup_status(status)
+                rows = self._submitted_lineup_rows(rows)
+            out["status"] = status
+            out["players"] = rows
+            return out
 
         result = self.store.result_for_game(game_id)
         return {
             "game": _serialize(game),
-            "home": side(game.home_team_id),
-            "away": side(game.away_team_id),
+            "home": side(game.home_team_id, projections["home"]),
+            "away": side(game.away_team_id, projections["away"]),
             "officials": self._official_rows(game_id),
             "result": _serialize(result) if result is not None else None,
         }
@@ -6304,61 +7111,159 @@ class ApiService:
             return "The roster for this game is locked."
         return None
 
-    def _opportunity_base_dict(self, g, player) -> dict:
+    def _opportunity_base_dict(self, g, player, ctx=None) -> dict:
         """The fields a substitute opportunity carries in both the Home list
         (#107) and the detail view (#110) — kept in one place so the two
-        surfaces can't drift on the shared shape."""
-        team = self.store.get_team(player.team_id) if player.team_id else None
-        opp_id = self._opponent_team_id(g, player.team_id)
+        surfaces can't drift on the shared shape.
+
+        Both the surfaced TEAM and the surfaced POSITION come off ONE
+        :class:`~hockey_scheduler.services.roster_service.GameMembershipContext`
+        — membership-resolved for a LeagueSeason-bound game, permanent
+        pointer for an unbound one — resolved here or handed in by a caller
+        that already has it (#205 review blocker 2: never two independent
+        reads).
+
+        A BOUND game whose context does NOT resolve raises ``NotFoundError``
+        rather than labelling the row from the permanent pointer. It used to
+        fall back (``team_for_game(...) or player.team_id``), which could
+        name a team that is not even in this game and then read a
+        permanent-pointer position beside it. Every caller reaches this with
+        an eligible game (the Home lists are pre-filtered;
+        ``get_substitute_opportunity`` resolves the context itself and 404s
+        first), so the raise is the guard, not a new user-visible state."""
+        if ctx is None:
+            ctx = self.roster.resolve_membership_context(g, player)
+        if ctx is None:
+            raise NotFoundError("Opportunity not found.")
+        team_id = ctx.team_id
+        team = self.store.get_team(team_id) if team_id else None
+        opp_id = self._opponent_team_id(g, team_id)
         opp_team = self.store.get_team(opp_id) if opp_id else None
         return {
             "game_id": g.id,
-            "team_name": team.name if team else player.team_id,
+            "team_name": team.name if team else team_id,
             "opponent_name": opp_team.name if opp_team else None,
             "start_time": g.start_time.isoformat() if g.start_time else None,
             "venue_name": self._venue_name_for_game(g),
             "rink_name": g.rink,
-            "position_needed": player.position.slot_type.value,
+            # #205 review blocker 2: the season-scoped position for THIS
+            # game, off the SAME context that named the team above.
+            "position_needed": ctx.slot_type.value,
         }
 
     @catch
     def get_player_home(self, player_id: str, user_id: Optional[str] = None) -> dict:
         """The signed-in player's home screen (#107): next game, attendance
         status, team roster status, substitute opportunities, and unread
-        notification count — all scoped to this player only."""
+        notification count — all scoped to this player only.
+
+        THE SIDE IS THE SERVER'S RESOLUTION, NOT THE POINTER (#205, round 6).
+        ``next_game.team_id``/``team_name``/``opponent_name``/``team_status``
+        were all derived from ``Player.team_id``, the permanent pointer.
+        ``team_status`` is the player-facing rendering of the SAME per-side
+        enum the private-game family spent five rounds binding to the trusted
+        resolution — ``_PLAYER_TEAM_STATUS`` maps ``needs_substitute`` to
+        ``"sub_search"`` and ``open_slot`` to ``"short"`` — so for a MOVER
+        (pointer and seasonal membership naming different teams) this served
+        the OPPONENT's private per-side state, and served it to the linked
+        guardian too, since :meth:`get_guardian_home` calls this method once
+        per verified junior.
+
+        MEASURED at b1cc02d on Memory, SQLite and real PostgreSQL, over real
+        authenticated sessions, with the two sides made to genuinely DIFFER
+        (HOME ``needs_substitute`` / AWAY ``open_slot``). Mover ``player_6``,
+        pointer ``team_1`` (HOME), membership and ``game_scoped_own_team_id``
+        both ``team_2`` (AWAY)::
+
+            /api/games/{id}/roster-status  ->  team_2  open_slot
+            /api/me/player-home            ->  team_1 "Home" vs "Away",
+                                               team_status "sub_search"
+
+        Identical on all three backends, and identical inside
+        ``/api/me/guardian/home`` for a guardian verified for that junior.
+
+        THE ENTITLEMENT RULE, and it is decided by MEMBERSHIP, never by the
+        pointer: the side is ``game_scoped_own_team_id`` against THIS game —
+        the one resolution ``web/scope.can_read_private_game_data``, the
+        private-game dispatch and the Dashboard schedule row all use, and the
+        one whose own module documents this pointer as stale "in either
+        direction". A pointer that has OUTLIVED the membership grants
+        nothing: the game is not selected (see
+        :meth:`RosterService._plays_in`), so there is no ``next_game`` and
+        neither side's private state is served. The subject is the
+        session-resolved player, never a request field, and there is no side
+        parameter for a caller to name.
+
+        IT IS A CORRECTNESS FIX AS WELL. The same pointer named the Mover's
+        OPPONENT as their team on their own Dashboard — ``app.js`` renders
+        ``${team_name} vs ${opponent_name}`` — and addressed their "I'm In" /
+        "Can't Play" POST to ``next_game.game_id``, the game the pointer
+        chose.
+
+        GAME SELECTION MOVED TO THE SAME AUTHORITY. ``next_game`` and
+        ``today_count`` now choose WHICH games this page is about through
+        :meth:`RosterService._plays_in` (``team_for_game``), because a Mover
+        handed the wrong game cannot be rescued by resolving the side
+        correctly within it. Both halves fall back to the permanent pointer
+        for a game with NO LeagueSeason binding, so exhibitions and unbound
+        legacy rows are byte-for-byte unchanged."""
         player = self.store.get_player(player_id)
         if player is None:
             raise NotFoundError("Player not found.")
-        team = self.store.get_team(player.team_id) if player.team_id else None
 
         next_game = self.roster.find_next_game_for_player(player_id)
         next_game_dto = None
+        # The SERVER's per-game resolution for the SIGNED-IN subject — the
+        # same function every other private per-side read of this game goes
+        # through. The subject comes from `player_id`, which `web/server.py`
+        # takes from the SESSION scope and never from a query parameter, so
+        # no caller can name a side here.
         if next_game is not None:
-            my_team_id = player.team_id
-            opponent_id = self._opponent_team_id(next_game, my_team_id)
-            opponent = self.store.get_team(opponent_id) if opponent_id else None
-            rstatus = self.roster.compute_roster_status(next_game.id, my_team_id)
-            # Only this player's own roster entry + availability are needed —
-            # single-player lookups, not a full _lineup_rows pass over the team.
-            entry = self.store.roster_entry_for_player(next_game.id, player_id)
-            avail = self.store.availability_for_player(next_game.id, player_id)
-            my_row = {
-                "backed_out": entry is not None and not entry.status.occupies_slot,
-                "availability": (avail.availability_status.value
-                                 if avail else "pending"),
-            }
-            next_game_dto = {
-                "game_id": next_game.id, "team_id": my_team_id,
-                "team_name": team.name if team else my_team_id,
-                "opponent_name": opponent.name if opponent else None,
-                "start_time": next_game.start_time.isoformat()
-                             if next_game.start_time else None,
-                "venue_name": self._venue_name_for_game(next_game),
-                "rink_name": next_game.rink,
-                "attendance_status": self._player_attendance_status(my_row),
-                "team_status": self._PLAYER_TEAM_STATUS.get(
-                    rstatus.status.value, "not_responded"),
-            }
+            my_team_id = game_scoped_own_team_id(
+                Role.PLAYER, None, player_id,
+                GameAuthorization.of(next_game), self.store)
+            # FAIL-CLOSED, and unreachable by construction rather than a new
+            # user-visible state: `find_next_game_for_player` selected this
+            # game through the SAME membership authority (`_plays_in` ->
+            # `team_for_game`), so a game it returned always resolves a side.
+            # The guard is what stops a future caller reintroducing the
+            # fallback — the same reasoning `position_for_game` gives for its
+            # own unreachable raise. It matters because an unresolved side
+            # here would reach `_opponent_team_id(g, None)` -> `home_team_id`
+            # and `compute_roster_status(gid, None)` -> the producer's home
+            # default: this very leak, by the back door.
+            if my_team_id is not None:
+                team = self.store.get_team(my_team_id)
+                opponent_id = self._opponent_team_id(next_game, my_team_id)
+                opponent = (self.store.get_team(opponent_id)
+                            if opponent_id else None)
+                rstatus = self.roster.compute_roster_status(
+                    next_game.id, my_team_id)
+                # Only this player's own roster entry + availability are
+                # needed — single-player lookups, not a full _lineup_rows
+                # pass over the team.
+                entry = self.store.roster_entry_for_player(
+                    next_game.id, player_id)
+                avail = self.store.availability_for_player(
+                    next_game.id, player_id)
+                my_row = {
+                    "backed_out": (entry is not None
+                                   and not entry.status.occupies_slot),
+                    "availability": (avail.availability_status.value
+                                     if avail else "pending"),
+                }
+                next_game_dto = {
+                    "game_id": next_game.id, "team_id": my_team_id,
+                    "team_name": team.name if team else my_team_id,
+                    "opponent_name": opponent.name if opponent else None,
+                    "start_time": next_game.start_time.isoformat()
+                                 if next_game.start_time else None,
+                    "venue_name": self._venue_name_for_game(next_game),
+                    "rink_name": next_game.rink,
+                    "attendance_status": self._player_attendance_status(my_row),
+                    "team_status": self._PLAYER_TEAM_STATUS.get(
+                        rstatus.status.value, "not_responded"),
+                }
 
         opportunities = [self._opportunity_base_dict(g, player)
                          for g in self.roster.list_substitute_opportunities(player_id)]
@@ -6448,12 +7353,17 @@ class ApiService:
         if player is None:
             raise NotFoundError("Player not found.")
         game = self.store.get_game(game_id)
-        # Only a player on one of the participating teams may view the
-        # opportunity — don't confirm another team's game to a non-participant.
-        if game is None or player.team_id not in (
-                game.home_team_id, game.away_team_id):
+        # Only a player who RESOLVES to one of the participating teams may
+        # view the opportunity — don't confirm another team's game to a
+        # non-participant. Resolution is membership-based for a
+        # LeagueSeason-bound game and permanent-pointer for an unbound one
+        # (#205 cutover, RosterService.team_for_game).
+        ctx = (self.roster.resolve_membership_context(game, player)
+               if game is not None else None)
+        if game is None or ctx is None:
             raise NotFoundError("Opportunity not found.")
-        rstatus = self.roster.compute_roster_status(game_id, player.team_id)
+        team_id = ctx.team_id
+        rstatus = self.roster.compute_roster_status(game_id, team_id)
         enrollment = self.store.substitute_for_player(game_id, player_id)
         status = enrollment.status if enrollment else None
         can_accept = can_withdraw = can_accept_offer = can_decline_offer = False
@@ -6465,7 +7375,7 @@ class ApiService:
             # predicate so this pre-disable can't drift from accept_substitute;
             # decline only needs a mutable game.
             offer_block = self.roster.substitute_offer_block_reason(
-                player_id, game_id, enrollment, rstatus)
+                player_id, game_id, enrollment, rstatus, ctx=ctx)
             can_accept_offer = offer_block is None
             can_decline_offer = self._mutable_block(game) is None
             blocked = offer_block
@@ -6475,10 +7385,11 @@ class ApiService:
             withdraw_block = self._mutable_block(game)
             can_withdraw, blocked = withdraw_block is None, withdraw_block
         else:
-            reason = self.roster.substitute_block_reason(player_id, game_id, rstatus)
+            reason = self.roster.substitute_block_reason(
+                player_id, game_id, rstatus, ctx=ctx)
             can_accept, blocked = reason is None, reason
         return {
-            **self._opportunity_base_dict(game, player),
+            **self._opportunity_base_dict(game, player, ctx=ctx),
             "roster_status": rstatus.status.value,
             "team_status": self._PLAYER_TEAM_STATUS.get(
                 rstatus.status.value, "not_responded"),
@@ -6492,17 +7403,84 @@ class ApiService:
             "blocked_reason": blocked,
         }
 
+    def _workflow_side(self, game, team_id, viewer_role, viewer_team_id,
+                       refusal: str) -> str:
+        """WHICH SIDE's substitute-workflow pool this caller may read — the
+        shared adjudication behind ``get_substitute_candidates`` and
+        ``get_addable_substitutes`` (#427 final blocker, round 3).
+
+        ONE function rather than two copies precisely because these two
+        routes are the same question asked of two populations: who is already
+        enrolled and could be offered, and who is eligible and could be
+        enrolled. They were the last two leaves of the private-game dispatch
+        binding a side their own way, and a second copy of "which side is the
+        caller's" is what this blocker exists to remove — not something to
+        reintroduce twice while removing it.
+
+        ``FULL``
+            Unscoped operator — the client hint is KEPT, and when it is
+            absent the caller's own resolved side is used before the
+            service-layer home default, byte-for-byte the pre-existing #112 /
+            #114 behaviour. Narrowing an operator would be its own
+            regression: they may read either side anyway.
+        ``OWN_SIDE``
+            Coach (a Player never reaches here — MANAGE_ROSTER refuses them
+            at the route) — the hint is IGNORED and the TRUSTED
+            server-resolved side is used, so a hinted call is byte-identical
+            to an un-hinted one exactly as it is on the other five siblings.
+            THIS IS THE BEHAVIOUR CHANGE: the route used to answer a hinted
+            call **differently** (403 for the opponent's id), which both
+            contradicted the contract round 2 shipped for this very route and
+            made the hint a probe whose answer varied with the side named.
+            Ignoring is also what makes the service layer's silent
+            ``team_id or game.home_team_id`` fallback unreachable for a
+            scoped caller: the trusted side is always passed, so HOME can
+            never be served to an AWAY Coach by default.
+        ``SUBMITTED_LINEUP`` / ``RESTRICTED``
+            Refused — never ``candidates: []`` / ``addable: []``, which
+            asserts "this team has nobody to call", an operational claim
+            about the team rather than a fact about the reader.
+
+            NOT REACHABLE THROUGH TODAY'S DISPATCH, and deliberately kept:
+            the MANAGE_ROSTER capability gate refuses an official and a
+            player before the facade is called. That is a ROLE-PERMISSION
+            table agreeing with the side rule by coincidence, and the whole
+            lesson of this blocker is that the side rule must not be
+            contingent on a check that lives somewhere else and can change
+            without it. ``tests/test_private_game_sibling_routes.py`` drives
+            this branch at the FACADE, so it is proven rather than assumed.
+
+        ``viewer_role`` of ``None`` is the in-process default and resolves
+        ``FULL``, so every non-HTTP caller is unchanged."""
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.OWN_SIDE:
+            return viewer_team_id
+        if audience == lineup_visibility.FULL:
+            return team_id or viewer_team_id or game.home_team_id
+        raise NotAuthorizedError(refusal)
+
     @catch
     def get_substitute_candidates(self, game_id: str,
-                                  team_id: Optional[str] = None) -> dict:
+                                  team_id: Optional[str] = None,
+                                  viewer_role=None,
+                                  viewer_team_id: Optional[str] = None) -> dict:
         """The coach outreach queue for a game/team (#112): open slots by
         position plus the ordered substitute candidates (who can be offered
-        right now). Operator-facing — gated at the route by MANAGE_ROSTER +
-        team scope."""
+        right now) — projected onto the audience this caller belongs to
+        (#427 final blocker, round 3; see :meth:`_workflow_side`).
+
+        THE ROWS THEMSELVES are already durably attributed: round 2 made this
+        queue and ``/substitutes`` name the SAME set by keying both on
+        ``SubstituteEnrollment.team_id`` (see
+        ``RosterService.list_substitute_candidates``). What was still bound
+        the old way is WHICH SIDE the caller is asking about, and that is
+        what moves here."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError("Game not found.")
-        team_id = team_id or game.home_team_id
+        team_id = self._workflow_side(game, team_id, viewer_role,
+                                      viewer_team_id, _CANDIDATE_REFUSAL)
         rstatus = self.roster.compute_roster_status(game_id, team_id)
         return {
             "game_id": game_id, "team_id": team_id,
@@ -6515,16 +7493,25 @@ class ApiService:
 
     @catch
     def get_addable_substitutes(self, game_id: str,
-                                team_id: Optional[str] = None) -> dict:
+                                team_id: Optional[str] = None,
+                                viewer_role=None,
+                                viewer_team_id: Optional[str] = None) -> dict:
         """Active same-team players a coach could add as a substitute
         candidate right now (#114) — the roster the outreach queue's own
         Enroll doesn't cover, since enroll_substitute only ever runs from the
-        player's own self-service action. Operator-facing — gated at the
-        route the same way get_substitute_candidates is."""
+        player's own self-service action. Projected onto the caller's
+        audience by the SAME :meth:`_workflow_side` the outreach queue uses
+        (#427 final blocker, round 3).
+
+        This list is a side's private candidate pool WITH NAMES — the same
+        class of data ``_submitted_lineup_rows`` strips one path segment
+        away — so it is bound by the same rule and refused rather than
+        emptied for an audience that may not read it."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError("Game not found.")
-        team_id = team_id or game.home_team_id
+        team_id = self._workflow_side(game, team_id, viewer_role,
+                                      viewer_team_id, _ADDABLE_REFUSAL)
         rstatus = self.roster.compute_roster_status(game_id, team_id)
         return {
             "game_id": game_id, "team_id": team_id,
@@ -6535,9 +7522,11 @@ class ApiService:
 
     @catch
     def add_substitute_candidate(self, game_id: str, player_id: str,
-                                 actor_id: Optional[str] = None) -> dict:
+                                 actor_id: Optional[str] = None,
+                                 authorized_team_id: Optional[str] = None) -> dict:
         return _serialize(self.roster.add_substitute_candidate(
-            game_id, player_id, actor_id))
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def assign_official(self, game_id: str, official_id: str, role: str,
@@ -7974,9 +8963,42 @@ class ApiService:
     def _guard_active_seasons(self, season_ids) -> None:
         """Row-lock every distinct Season in canonical (sorted) order and
         guard it read-only (#159). Sorted order avoids lock-order deadlocks
-        across a multi-Season batch; MUST run inside a store.transaction()."""
+        across a multi-Season batch; MUST run inside a store.transaction().
+
+        Takes SEASON IDS, and callers holding GAMES must not derive them by
+        reading ``g.season_id`` — that is the denormalized column PR #427's
+        blocker is about, and this helper's ``if s`` filter would silently drop
+        a bound Game whose copy of it is NULL, leaving that Game's archived
+        competition unguarded for the whole batch. Use
+        :meth:`_guard_active_game_seasons` instead."""
         for sid in sorted({s for s in season_ids if s}):
             self.setup._require_active_season(sid)
+
+    def _guard_active_game_seasons(self, games) -> None:
+        """The GAME-shaped form of :meth:`_guard_active_seasons` (PR #427).
+
+        Same contract — every distinct Season row-locked in canonical sorted
+        order, read-only guarded, inside the caller's transaction — but the
+        Season each Game is judged against is the one its LEAGUESEASON names,
+        resolved through the single shared
+        :func:`season_guard.guard_game_season`, so a batch cannot reach a
+        conclusion the equivalent single-Game path would refuse.
+
+        Two passes, and the split is load-bearing. Pass one only RESOLVES each
+        Game's authorizing Season (a plain read) so the distinct ids can be
+        locked in sorted order — the deadlock-avoidance property this helper
+        exists for, which per-Game guarding in arrival order would lose. Pass
+        two then runs the full guard per Game: its ``FOR UPDATE`` is an
+        idempotent re-lock of a row this transaction already holds, and it is
+        where the archive state and the ``game.season_id`` comparison are
+        actually decided — under the lock, never off pass one's read."""
+        games = [g for g in games if g is not None]
+        planned = {season_guard.game_season_authority_id(self.store, g)
+                   for g in games}
+        for sid in sorted(s for s in planned if s):
+            self.setup._require_active_season(sid)
+        for game in sorted(games, key=lambda g: g.id):
+            season_guard.guard_game_season(self.store, game)
 
     @catch
     def commit_draft_schedule(self, division_id: str = None,
@@ -8967,12 +9989,14 @@ class ApiService:
            Seasons of unauthorized candidates would run
            `_require_active_season` against a foreign Season and turn its
            `season_read_only` refusal into an existence oracle;
-        3. the **Season** rows named by that plan (`_guard_active_seasons`,
-           sorted);
+        3. the **Season** rows named by that plan
+           (`_guard_active_game_seasons`, sorted) -- each Game judged against
+           the Season its LeagueSeason names, never against its own
+           denormalized `season_id` column (PR #427);
         4. the **Game** rows (`get_game_for_update`, sorted).
 
         Season BEFORE Game is load-bearing. An earlier revision locked Games
-        first and left `_guard_active_seasons` to the callers afterwards, which
+        first and left the Season guard to the callers afterwards, which
         reversed the order every single-Game path already uses:
         `SetupService.publish_game` and `delete_game` lock the Season through
         `_guard_game_season` and only then touch the Game. A batch discard and
@@ -9022,7 +10046,7 @@ class ApiService:
             # the identity-less path (caught by
             # `test_season_lifecycle...test_reminders_and_draft_batches_blocked`).
             legacy = self._select_draft_targets(drafts, game_ids, all_drafts)
-            self._guard_active_seasons([g.season_id for g in legacy])
+            self._guard_active_game_seasons(legacy)
             return legacy
         # -- step 2: the pre-lock locator, authorized before anything is
         # locked. Selection applies first so an explicit id list plans only
@@ -9030,14 +10054,34 @@ class ApiService:
         planned = [g for g in self._select_draft_targets(
             drafts, game_ids, all_drafts)
             if self._game_in_active_tuple(g, program, season, league)]
-        planned_seasons = {g.season_id for g in planned if g.season_id}
-        # Each planned Game's EXACT Season, kept per row rather than as a set:
-        # a set only answers "is this Season one we locked", which a row that
-        # moved between two Seasons the batch happens to hold would pass.
-        planned_season_of = {g.id: g.season_id for g in planned}
+        # Each planned Game's EXACT identity pair, kept per row rather than as
+        # a set: a set only answers "is this Season one we locked", which a row
+        # that moved between two Seasons the batch happens to hold would pass.
+        # This snapshot answers the DRIFT question below ("did this row move
+        # between the locator read and the lock"); it is NOT the authority for
+        # which Season to guard — see step 3.
+        #
+        # PR #427: BOTH columns are snapshotted, not `season_id` alone.
+        # `league_season_id` is now the column the authority is keyed on —
+        # `season_guard.guard_game_season` resolves the LeagueSeason and locks
+        # the Season IT names — so a rebinding that moves `league_season_id`
+        # to a different competition moves the authorizing Season with it,
+        # and a `season_id`-only comparison cannot see that at all. The two
+        # columns are also independently writable (`games.league_season_id`
+        # and `games.season_id` are both nullable TEXT with no FK and no
+        # CHECK), so the pair is the identity that has to hold still, not
+        # either half of it.
+        planned_identity_of = {
+            g.id: (g.league_season_id, g.season_id) for g in planned}
 
-        # -- step 3: SEASONS first, sorted, matching every other path.
-        self._guard_active_seasons(planned_seasons)
+        # -- step 3: SEASONS first, sorted, matching every other path. PR #427:
+        # the Season each Game is guarded against is the one its LeagueSeason
+        # names, so this passes the GAMES and lets the shared guard resolve
+        # them. Passing `{g.season_id …}` was the batch's copy of the blocker's
+        # defect: a planned draft whose denormalized column was NULL dropped
+        # out of the set entirely and its archived competition went unguarded
+        # for the whole batch, and a drifted one locked a sibling Season.
+        self._guard_active_game_seasons(planned)
 
         # -- step 4: then the Games, sorted, so two concurrent batches take
         # them in one global order and cannot deadlock against each other.
@@ -9048,15 +10092,28 @@ class ApiService:
             # stand under the lock, never as the pre-lock scan saw them.
             if locked is None or not locked.is_draft:
                 continue
-            # The Season comparison runs HERE -- immediately after the lock and
-            # BEFORE authorization. Authorization would otherwise drop the
+            # The IDENTITY comparison runs HERE -- immediately after the lock
+            # and BEFORE authorization. Authorization would otherwise drop the
             # changed row silently: a Game whose Season moved while its other
             # parents still name the old one has a DISAGREEING parent graph, so
             # `_game_in_active_tuple` answers False and `continue`s, and this
             # raise is never reached. The batch would then carry on writing to
             # ice this transaction never locked, and the drift would look
-            # exactly like an ordinary out-of-tuple row.
-            if locked.season_id != planned_season_of[game_id]:
+            # exactly like an ordinary out-of-tuple row. That ordering is the
+            # whole point of this line's position and must not be moved below
+            # the authorization filter.
+            #
+            # PR #427: EITHER column drifting is the race. A rebinding that
+            # changes `league_season_id` while leaving `season_id` alone is
+            # invisible to a `season_id`-only comparison, yet it moves the
+            # authorizing Season — step 3 locked the Season the OLD binding
+            # named, so the batch would go on to write this row under a lock
+            # it does not hold for the row's current competition. Raising
+            # `placement_raced` rolls the whole attempt back; the retry
+            # re-plans from the committed rows, and step 3 then locks the
+            # Season the NEW binding names.
+            if ((locked.league_season_id, locked.season_id)
+                    != planned_identity_of[game_id]):
                 raise ConcurrencyConflictError(
                     "A draft game's season changed while processing the "
                     "request; please retry.",
@@ -9367,6 +10424,164 @@ class ApiService:
             return False
         return True
 
+    #: The Dashboard schedule row's roster-status block when the caller is
+    #: entitled to NO side of that game. The ``roster_status`` key is ABSENT
+    #: — not ``null``, not an enum value — and an explicit marker says so.
+    #:
+    #: WHY A MARKER AND NOT JUST OMISSION. ``roster_status`` is a string enum
+    #: and every consumer of it in ``web/static/app.js`` asks the same kind of
+    #: question: ``["roster_confirmed", "locked"].includes(g.roster_status)``.
+    #: A missing key and a ``null`` both answer that ``false``, which renders
+    #: as the badge "Roster open" and the checklist line "Roster — not
+    #: confirmed": restricted data represented as an EMPTY OPERATIONAL STATE,
+    #: the exact failure the owner's ruling names, and a false claim about the
+    #: other team rather than a true one about the reader. The flag is what
+    #: lets the screen say "not shown" instead of guessing, and it is present
+    #: on EVERY row — entitled or not — so a consumer never has to infer
+    #: withholding from a missing key.
+    _ROSTER_STATUS_WITHHELD = {"roster_status_restricted": True,
+                               "roster_status_team_id": None}
+
+    def _schedule_roster_status(self, game, role, scoped_team_id,
+                                scoped_player_id) -> dict:
+        """The Dashboard schedule row's roster-status fields, for the side
+        THIS caller is entitled to IN THIS GAME (#205 blocker, round 4).
+
+        IT TAKES SCALARS, NEVER THE SESSION MAPPING (#427 round 23, the
+        owner's ruling, and this is the defect that ruling names). Until this
+        round the signature was ``(game, role, scope)`` and the mapping was
+        projected HERE, inside the loop, once per schedule row. The gate
+        module's own boundary had already stopped taking a mapping — and this
+        facade surface still took one whole, one file away, so every spelling
+        the projection was built to end was available again and BOTH static
+        audits stayed green, because neither of them reads this function.
+
+        MEASURED AT ``6903eeb``, both of the owner's variants, each spelled
+        as two lines of this method's own body and each driven over real
+        authenticated sessions on a real socket, on Memory, SQLite and real
+        PostgreSQL alike. ``thirdcoach`` — a Coach of ``team_3``, which
+        plays in NEITHER game — received, on BOTH schedule rows,
+        ``roster_status_restricted: false`` and the HOME side's own private
+        status: ``needs_substitute``/``team_1`` on the first game and
+        ``awaiting_responses``/``team_2`` on the second (the fixture swaps
+        the sides, so "HOME" is a different team in each row and a home
+        default is right in neither). The unmutated control at the same
+        commit answered them the withheld marker on all six cells. And BOTH
+        static audits were green on both variants — this file's own
+        ``services/side_provenance.py`` guard, 44 tests, and
+        ``EveryAdmissionBranchIsDerivedAndCarriesAnAuthority._audit()``,
+        which returned ``[]``.
+
+        WHAT THE FIX IS. The projection now happens at the FIRST EXECUTABLE
+        LINES of :meth:`get_demo_overview`, before any other call, and what
+        crosses into this method is two immutable ids. Neither variant can
+        be written against this signature: there is no mapping here to
+        mutate and none to shadow. The rule that would have caught them —
+        the resolver-caller inventory — no longer permits a ``.get(...)`` in
+        the argument list at all; see
+        ``tests/test_authenticated_side_noninterference``'s
+        ``test_the_owners_two_facade_variants_are_refused_by_name``, and
+        ``tests/test_overview_schedule_side``'s
+        ``TheFacadeProjectsBeforeAnyOtherCall``, which drives both variants
+        as executable falsifiers.
+
+        THE DEFECT THIS CLOSES, and it is the owner's shape verbatim. The
+        schedule loop called ``compute_roster_status(g.id)`` with NO team, and
+        that method applies ``team_id = team_id or game.home_team_id`` — the
+        identical silent home default this blocker spent three rounds removing
+        from ``get_board``, ``/roster-status`` and
+        ``list_substitute_candidates``. There was no participation gate, no
+        side narrowing, no audience test and no ``APP_MODE`` gate: the "demo"
+        in the path is historical, and ``web/static/app.js`` fetches this
+        route unconditionally on every render pass for every role. Reproduced
+        tri-store over real authenticated sessions with the two sides made to
+        DIFFER (HOME ``needs_substitute`` / AWAY ``open_slot``): an AWAY
+        Coach, an AWAY Player, an assigned official, a linked guardian AND a
+        coach of a third team not playing in the game each received
+        ``roster_status: "needs_substitute"`` — HOME's value — while
+        ``/roster-status`` one route away answered them ``team_2``,
+        ``team_2``, 403, 403 and 403 respectively.
+
+        A PER-ROW DECISION, not one side for the response. This is a
+        CROSS-GAME list: a Coach is in some of these games and not others, and
+        their side is HOME in one and AWAY in the next. So the side is
+        resolved per row, from ``game_scoped_own_team_id`` against THAT game,
+        and classified by the SAME ``lineup_visibility.route_audience`` the
+        seven leaves of the private-game family use — so the Dashboard and
+        ``/roster-status`` cannot describe one caller two ways.
+
+        ``FULL`` — an unscoped operator (or an in-process caller with no role,
+            the facade's own default) keeps exactly what they have today: the
+            home-side status, unchanged. Narrowing them would be its own
+            regression. The side is now NAMED rather than left to be inferred.
+
+        ``OWN_SIDE`` — a Coach or Player playing in this game gets THEIR OWN
+            side's status. This is a fix, not only a redaction: an AWAY
+            Coach's Dashboard used to report the opponent's roster as their
+            own, and their own "Rosters to confirm" tile counted the wrong
+            team's.
+
+        EVERYONE ELSE IS WITHHELD — and that includes an ASSIGNED OFFICIAL,
+        for whom ``route_audience`` returns ``SUBMITTED_LINEUP`` on the
+        family's own leaves. Three reasons, and the first is decisive:
+
+        1. THIS ROUTE HAS NO PER-GAME ASSIGNMENT GATE. The family's leaves sit
+           behind ``can_read_private_game_data``, which is what makes
+           ``SUBMITTED_LINEUP`` mean "an official ASSIGNED TO THIS GAME" —
+           :func:`services.lineup_visibility.route_audience` says so in its
+           own comment. The schedule here is scoped to a Program/Season/League
+           and lists every game in it, assigned or not. Honouring the label
+           would serve an official private state for games they were never
+           assigned to: strictly WIDER than the family, which is the same
+           complaint that put this route in scope.
+        2. THERE IS NO HONEST SINGLE-SIDE ANSWER. An official's entitlement is
+           a per-side submitted-lineup projection; this field is ONE enum for
+           the whole game. Picking a side to attach it to is the guess the
+           blocker exists to remove.
+        3. IT WOULD DEFEAT :meth:`_submitted_lineup_status` ONE ROUTE AWAY.
+           The value this field carries at HEAD is ``needs_substitute``, which
+           that method neutralises by name — its own docstring calls it "the
+           needs_substitute state, which exists precisely to say a substitute
+           pool is standing by". Serving it here recovers through a sibling
+           exactly what the projection removes.
+
+        NOTHING RENDERS IT FOR THEM, either, which is why withholding costs no
+        screen: ``gateChrome()`` hides Dashboard, Activity and Scheduler from
+        every role without ``manage_roster``/``manage_schedule`` — an
+        official, a player, a guardian and a viewer all — and the official's
+        own surfaces are My Assignments and the Game Sheet, which reads
+        ``/lineups``, where the projection already governs. The one surface
+        that renders ``roster_status`` and is reachable by them is the
+        ungated Games list, an operator readiness checklist, which now renders
+        the marker rather than a guess.
+        """
+        # PROJECTED BY THE CALLER, NOT HERE (#427 round 23). The two ids
+        # arrived as the parameters above, taken at the first executable
+        # lines of `get_demo_overview`; this method never sees the mapping
+        # they came out of, so there is nothing here for a later statement to
+        # mutate between the projection and the decision.
+        own_side = game_scoped_own_team_id(
+            role, scoped_team_id, scoped_player_id,
+            GameAuthorization.of(game), self.store)
+        audience = lineup_visibility.route_audience(
+            role, own_side, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            side = game.home_team_id
+        elif audience == lineup_visibility.OWN_SIDE:
+            side = own_side
+        else:
+            return dict(self._ROSTER_STATUS_WITHHELD)
+        return {
+            "roster_status": self.roster.compute_roster_status(
+                game.id, side).status.value,
+            "roster_status_restricted": False,
+            # WHICH side this enum describes, stated rather than inferred —
+            # the same correction `get_board` made when it started returning
+            # an explicit `team_id`. For an unscoped operator this names the
+            # home default that has always been silently applied.
+            "roster_status_team_id": side,
+        }
+
     def get_demo_overview(self, user_id=None, role=None, scope=None) -> dict:
         """Assemble the League/Arena/Schedule/Public view for the E2E demo.
 
@@ -9438,6 +10653,32 @@ class ApiService:
         (tests exercising other subsystems) keeps using unchanged; only the
         HTTP route's own per-user Dashboard read opts into scoping.
         """
+        # THE PROJECTION, AT THE FIRST EXECUTABLE LINES OF THIS METHOD AND
+        # BEFORE ANY OTHER CALL (#427 round 23, the owner's ruling). The
+        # session mapping is read HERE, ONCE, into two immutable scalar ids,
+        # and the per-row entitlement decision below is taken from those and
+        # from nothing else. `_schedule_roster_status` accepts scalars only.
+        #
+        # WHY "BEFORE ANY OTHER CALL" IS THE RULE AND NOT A PREFERENCE. This
+        # method calls `self.context.resolve_with_league(user_id, role,
+        # scope)` — which is handed the mapping itself — and then DOZENS
+        # more calls before the schedule loop. No count is given here on
+        # purpose: three independent measurements of "how many" disagreed
+        # (30, 37 and 38 calls; 42 and 43 statements) because the answer
+        # depends entirely on where the slice is cut, and this file's rule
+        # is that a number in a docstring is MEASURED or absent. What is
+        # load-bearing is not the count but the shape — that ANY call at
+        # all sits there. Projecting inside
+        # that loop — which is what it used to do, one file away from a gate
+        # module that had already stopped taking the mapping — left every
+        # one of those calls sitting between
+        # the session's mapping arriving and the entitlement decision reading
+        # it, and "which of these calls mutates a shared mapping" is not a
+        # question a source tree answers. Taking the two ids first removes
+        # the question rather than answering it: after these two lines
+        # nothing this method does can change what the rows are decided by.
+        scoped_team_id = (scope or {}).get("team_id")
+        scoped_player_id = (scope or {}).get("player_id")
         program = league = None
         in_scope_season_ids = None  # None == no Program scoping active (legacy)
         if role is not None:
@@ -9622,7 +10863,10 @@ class ApiService:
             if not _in_scope_game(g):
                 continue
             div = divisions.get(g.division_id)
-            rstatus = self.roster.compute_roster_status(g.id)
+            # WHICH SIDE'S roster status THIS caller may read, decided PER ROW
+            # (#205 blocker, round 4). See `_schedule_roster_status`.
+            row_status = self._schedule_roster_status(
+                g, role, scoped_team_id, scoped_player_id)
             venue_name = None
             slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
             if slot and slot.rink_id in rinks:
@@ -9631,6 +10875,11 @@ class ApiService:
             g_active = self._active_officials(g.id)
             g_result = self.store.result_for_game(g.id)
             schedule.append({
+                # `roster_status` is spread FIRST so a withheld row simply has
+                # no such key at all — see `_schedule_roster_status`. Written
+                # ahead of the literal fields rather than merged after them
+                # so nothing below can be shadowed by it.
+                **row_status,
                 "game_id": g.id,
                 "home_team_id": g.home_team_id,
                 "away_team_id": g.away_team_id,
@@ -9641,7 +10890,6 @@ class ApiService:
                 "ice_slot_id": g.ice_slot_id,
                 "rink_name": g.rink, "venue_name": venue_name,
                 "start_time": g.start_time.isoformat(),
-                "roster_status": rstatus.status.value,
                 "published": g.published,
                 "cancelled": g.cancelled,  # Games view offers Cancel, not Delete (#215)
                 # Officials summary for the Games operations checklist (#30).

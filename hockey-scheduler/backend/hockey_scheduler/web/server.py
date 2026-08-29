@@ -56,9 +56,11 @@ from .auth import (
 from .authz import authorize, required_permission
 from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
+from ..services import lineup_visibility
 from .rate_limit import LoginThrottle, RateLimiter
 from .route_registry import REGISTRY
-from .scope import can_read_private_game_data, own_team_id, scope_violation
+from .scope import (
+    can_read_private_game_data, resolve_private_game_read, scope_violation)
 from .validation import BodyError, check_body, parse_json_object
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
@@ -2859,18 +2861,85 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "forbidden",
                     "message": "You cannot view private data for this game.",
                     "details": {"role": role.value}}}, 403)
+            # ADMISSION AND PROJECTION SHARE ONE BOUNDARY (#427 round 2,
+            # blocker 1). The preflight above is kept for fast denial and is
+            # NOT the authoritative gate: it answers a boolean and discards
+            # both the game it fetched and the side it resolved, so this
+            # dispatch used to fetch and resolve them a SECOND time, and the
+            # gap between the two was a disclosure window. A membership
+            # transferred, ended or deactivated in that gap left `own_team`
+            # empty, which collapsed through `own_side() -> None` into
+            # `get_board`'s HOME default — a caller who had just lost their
+            # authority received HOME's private pool, status block,
+            # notifications and audit stream with `restricted: false`.
+            # Reproduced over a real authenticated session parked between the
+            # two reads (200, `team_id` naming HOME) on Memory, SQLite and
+            # two-connection PostgreSQL.
+            #
+            # So there is ONE resolution now, and everything below reads
+            # admission, the game and the TRUSTED SIDE off that single
+            # record rather than asking the store again. This is the
+            # read-path twin of the write path's rule: a preflight may deny
+            # fast, but the authoritative answer is resolved once and
+            # carried. Nothing here ever consults a client-supplied side.
+            private_read = resolve_private_game_read(
+                role, scope, gid, api.store)
+            if not private_read.admitted:
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": "You cannot view private data for this game.",
+                    "details": {"role": role.value}}}, 403)
+            # `own_team` keeps its `""`-for-absent spelling so every leaf
+            # below is byte-for-byte unchanged; it is empty ONLY for the
+            # audiences that have no side of their own by design (an
+            # unscoped operator, an assigned official) — an admitted
+            # Coach/Player always carries a real, participating side, because
+            # that is precisely what admission now proves.
+            own_team = private_read.own_team or ""
+            side_ids = private_read.side_ids
             if sub == "board":
-                return self._send_api(api.get_board(gid))
+                # A single-sided read: answer for the caller's OWN side.
+                # `own_side` returns None for a caller who has no side of
+                # their own (unscoped operator, assigned official), which
+                # leaves the facade's existing home default in place — those
+                # are exactly the callers who may read either side anyway.
+                board_team = lineup_visibility.own_side(
+                    role, own_team, *side_ids)
+                return self._send_api(api.get_board(
+                    gid, team_id=board_team, viewer_role=role))
             if sub == "lineups":
-                return self._send_api(api.get_lineups(gid))
+                # Two-sided, projected per role by the facade
+                # (`services/lineup_visibility.py`): own side only for a
+                # Coach/Player with the opponent marked RESTRICTED, the
+                # submitted-lineup projection for an assigned official, and
+                # the unchanged full two-side private read for an unscoped
+                # operator.
+                return self._send_api(api.get_lineups(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "officials":
                 return self._send_api({"officials": api.get_officials_for_game(gid)})
+            # THE THREE FLAT-LIST SIBLINGS (#427 final blocker). They sat
+            # behind the SAME single gate as /board and /lineups and carried
+            # the same absent team-level narrowing, so projecting only the two
+            # lineup reads left the identical pivot one path segment away:
+            # /roster-status hard-coded HOME for everybody exactly as
+            # get_board used to, /roster returned both sides' seats, and
+            # /substitutes returned both sides' substitute workflow to either
+            # Coach AND to an assigned official. Each now receives the SAME
+            # trusted `own_team` the two reads above receive — resolved once,
+            # for the whole family, never from the query string or the body —
+            # and the facade projects on it (`lineup_visibility.
+            # route_audience`). An unscoped operator is unchanged on all
+            # three.
             if sub == "roster-status":
-                return self._send_api(api.get_roster_status(gid))
+                return self._send_api(api.get_roster_status(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "roster":
-                return self._send_api(api.get_roster(gid))
+                return self._send_api(api.get_roster(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "substitutes":
-                return self._send_api(api.get_substitutes(gid))
+                return self._send_api(api.get_substitutes(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "reschedule":
                 # A game's own reschedule-request history/current pending
                 # request (#29) — same private-game-data gate as roster/
@@ -2879,34 +2948,93 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(
                     {"requests": api.list_reschedule_requests(gid)})
             if sub == "availability-summary":
-                # Availability rollup for a team (#89). The #73 gate above only
-                # proves the caller belongs to *a* team in this game — it does
-                # not bound *which* team's summary they may read. Add a
-                # team-level scope check (#89 review): a coach/player may read
-                # only their own team; operators (league admin / arena manager)
-                # any team in the game. The team defaults to the caller's own
-                # scope when not specified.
+                # THE FIFTH LEAF OF THE SAME FAMILY (#427 final blocker,
+                # round 2) — and the ONLY one that reads a side from the
+                # QUERY STRING, which is why it was the last one still open.
+                #
+                # Its narrowing used to be spelled inline here and named only
+                # COACH and PLAYER, so an assigned OFFICIAL fell straight
+                # through it: measured tri-store over a real session,
+                # `?team_id=<either side>` answered an official 200 with that
+                # side's whole candidate pool, NAMES and per-player
+                # availability included — precisely the two classes the
+                # `/lineups` projection strips for that exact role one path
+                # segment away. The shipped Roster tab fired it on every
+                # render, and its side toggle switched teams.
+                #
+                # So the decision moves to the facade, where the other four
+                # siblings already make it, keyed on the SAME trusted
+                # `own_team` resolved once above and the SAME
+                # `lineup_visibility.route_audience`: an unscoped operator
+                # keeps the hint unchanged, a Coach/Player has it IGNORED in
+                # favour of their trusted side (ignored, not refused — the
+                # siblings answer a hinted call identically to an un-hinted
+                # one), and an assigned official is refused 403 rather than
+                # handed an empty summary. A side is never trusted from the
+                # query string.
                 from urllib.parse import parse_qs, urlparse
                 qs = parse_qs(urlparse(self.path).query)
-                # Resolve the caller's own team authoritatively (#160): a Coach's
-                # stored team_id, a Player's live team from player_id — never a
-                # stale stored team_id — so the opponent-summary block holds for
-                # a Player whose scope is player_id only.
-                own_team = own_team_id(role, scope, api.store) or ""
+                # BYTE-FOR-BYTE the binding that stood here before, name
+                # included: this is the same client-supplied team the
+                # substitute-candidates and substitute-addable leaves bind
+                # from the identical expression in this same function, and
+                # `_dispatch_get`'s tracked-name set is flat, so spelling it
+                # differently here would say these are different kinds of
+                # value when they are one. What CHANGED is downstream — it is
+                # now a HINT handed to the facade to be adjudicated against
+                # the trusted side, never the side itself. The own-team
+                # default is retained because the facade's FULL branch would
+                # apply it anyway (`team_id or viewer_team_id`), so an
+                # unscoped operator's un-hinted call resolves exactly what it
+                # always has.
                 team_id = (qs.get("team_id") or [own_team])[0]
-                if role in (Role.COACH, Role.PLAYER) and own_team \
-                        and team_id != own_team:
-                    return self._send_json({"error": {
-                        "code": "forbidden",
-                        "message": "You can only view your own team's "
-                                   "availability."}}, 403)
-                return self._send_api(
-                    api.get_availability_summary(gid, team_id))
+                return self._send_api(api.get_availability_summary(
+                    gid, team_id,
+                    viewer_role=role, viewer_team_id=own_team))
             if sub == "substitute-candidates":
-                # Coach outreach queue (#112): manage_roster only — a player
-                # must not see the operator candidate list even for their own
-                # game. A coach is further bound to their own team; operators
-                # (league admin / arena manager) may read any team's queue.
+                # THE SIXTH LEAF OF THE SAME FAMILY (#427 final blocker,
+                # round 3) — the second and last one that reads a side from
+                # the QUERY STRING.
+                #
+                # WHY IT IS HERE AT ALL. Round 2 closed the fifth leaf
+                # (`availability-summary`) and wrote the rule into
+                # `docs/architecture/api-contract.md` in the SAME commit:
+                # "A side is never trusted from the query string or the body
+                # — a `?team_id=` naming the opponent is *ignored* for a
+                # scoped caller, so a hinted request returns exactly what the
+                # un-hinted one returns", over a list of routes that NAMES
+                # `substitute-candidates`. This leaf did not do that. It kept
+                # its own inline narrowing, which answered a hinted call
+                # DIFFERENTLY from an un-hinted one (403 vs 200) — so the
+                # contract that shipped was false for one of the routes it
+                # names, and the family had two hint-reading leaves
+                # adjudicating a hint two different ways. That divergence is
+                # the exact shape this blocker exists to remove.
+                #
+                # WHAT CHANGES, PRECISELY. The MANAGE_ROSTER gate below is a
+                # ROLE-CAPABILITY question ("may this kind of caller manage a
+                # roster at all") and is untouched — a Player and an assigned
+                # Official are refused by it exactly as before, with the same
+                # message. What moves to the facade is the SIDE question,
+                # onto the SAME trusted `own_team` and the SAME
+                # `lineup_visibility.route_audience` the other five siblings
+                # use: an unscoped operator keeps the hint, a Coach has it
+                # IGNORED in favour of their trusted side, and any other
+                # audience is refused rather than served a `candidates: []`
+                # that would claim this team has nobody to call.
+                #
+                # AND THE LOCAL RE-RESOLUTION GOES WITH IT. This leaf used to
+                # rebind `own_team = scope.get("team_id")`, a SECOND answer to
+                # "which side is the caller's" standing beside the one the
+                # dispatch resolves once above. The two agree for a Coach
+                # today and nothing pinned that they must — which is the
+                # drift `game_scoped_own_team_id` was hoisted to end. The one
+                # behaviour this deletes is an operator whose session happens
+                # to carry a `team_id` defaulting to it: an operator role has
+                # NO own side by definition (`game_scoped_own_team_id`
+                # returns None for it), a stray scope value is not an
+                # authority, and their un-hinted default is now the same home
+                # default `/board` and `/roster-status` already give them.
                 from urllib.parse import parse_qs, urlparse
                 if not can(role, Permission.MANAGE_ROSTER):
                     return self._send_json({"error": {
@@ -2914,18 +3042,19 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "Only a coach or operator can view the "
                                    "substitute outreach queue."}}, 403)
                 qs = parse_qs(urlparse(self.path).query)
-                own_team = scope.get("team_id") or ""
                 team_id = (qs.get("team_id") or [own_team])[0] or None
-                if role == Role.COACH and own_team and team_id != own_team:
-                    return self._send_json({"error": {
-                        "code": "forbidden",
-                        "message": "You can only view your own team's queue."}}, 403)
-                return self._send_api(
-                    api.get_substitute_candidates(gid, team_id))
+                return self._send_api(api.get_substitute_candidates(
+                    gid, team_id,
+                    viewer_role=role, viewer_team_id=own_team))
             if sub == "substitute-addable":
-                # Eligible-but-not-yet-enrolled team players a coach could add
-                # as a substitute candidate (#114) — same manage_roster +
-                # own-team gate as substitute-candidates above.
+                # THE SEVENTH LEAF, and the same change for the same reason:
+                # eligible-but-not-yet-enrolled players of one side (#114) are
+                # that side's private candidate pool, named, and this leaf
+                # bound the side the same two ways
+                # `substitute-candidates` did. Same untouched MANAGE_ROSTER
+                # capability gate, same trusted `own_team`, same
+                # `route_audience` — see that leaf's comment above for the
+                # whole reasoning.
                 from urllib.parse import parse_qs, urlparse
                 if not can(role, Permission.MANAGE_ROSTER):
                     return self._send_json({"error": {
@@ -2933,14 +3062,10 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "Only a coach or operator can view "
                                    "addable substitutes."}}, 403)
                 qs = parse_qs(urlparse(self.path).query)
-                own_team = scope.get("team_id") or ""
                 team_id = (qs.get("team_id") or [own_team])[0] or None
-                if role == Role.COACH and own_team and team_id != own_team:
-                    return self._send_json({"error": {
-                        "code": "forbidden",
-                        "message": "You can only view your own team's roster."}}, 403)
-                return self._send_api(
-                    api.get_addable_substitutes(gid, team_id))
+                return self._send_api(api.get_addable_substitutes(
+                    gid, team_id,
+                    viewer_role=role, viewer_team_id=own_team))
         if path.startswith("/api/"):
             # Cross-method 405 (#271): a GET on a known POST-only path → 405 +
             # Allow; a truly unknown /api path → 404.
@@ -4189,6 +4314,33 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/games/([^/]+)/(.+)$", path)
         if m:
             gid, action = m.group(1), m.group(2)
+            # THE AUTHORIZED TEAM, threaded into every Coach-reachable
+            # roster/substitute command below so each one can REVALIDATE it
+            # under its own Season lock, before any write (#205, owner
+            # comments 5373064375 and 5391127041). `scope_violation` above
+            # stays exactly as it is — a cheap PREFLIGHT for fast denial —
+            # but it is no longer the authoritative gate: it takes no locks,
+            # runs outside every transaction, and DISCARDS the team it
+            # resolves.
+            #
+            # ONLY FOR A COACH, and `None` for everyone else. `None` means
+            # "impose no team constraint", which is the correct and only
+            # correct answer for the callers whose authority was established
+            # elsewhere and never came from a team: Player self-service
+            # (`/api/me/substitute-opportunities/...`, `_require_player_
+            # scope`), Guardian (`/api/me/guardian/...`, `_require_guardian_
+            # scope` + `_guardian_link_or_403`) — both of which are handled
+            # EARLIER in do_POST and never reach this block at all — and the
+            # unscoped League Admin/Arena Manager, who by design are "not
+            # resource-scoped here" (web/scope.py) and reach these rows under
+            # their own permissions.
+            #
+            # It costs no new lookup: `scope["team_id"]` is the coach's
+            # permanently-bound team and is already in hand. The service is
+            # deliberately NOT asked to infer it from `actor_id` — the ruling
+            # forbids that, and the coach<->team binding only exists up here.
+            coach_team = (scope or {}).get("team_id") \
+                if role == Role.COACH else None
             if action == "availability":
                 # Strict schema (#271): reject unknown keys so a typo'd status
                 # field can't be silently recorded as the default `pending`, and
@@ -4214,22 +4366,28 @@ class Handler(BaseHTTPRequestHandler):
                     }}, 400)
                 return self._send_api(api.set_availability(
                     gid, pid, status_val,
-                    body.get("response_source", "player"), user_id))
+                    body.get("response_source", "player"), user_id,
+                    authorized_team_id=coach_team))
             if action == "availability/remind":
                 # One-click reminder to players who haven't responded (#89).
                 return self._send_api(api.remind_unresponded(
-                    gid, body.get("team_id") or scope.get("team_id"), user_id))
+                    gid, body.get("team_id") or scope.get("team_id"), user_id,
+                    authorized_team_id=coach_team))
             if action == "build-roster":
                 return self._send_api(api.auto_build_roster(
-                    gid, body.get("team_id"), user_id))
+                    gid, body.get("team_id"), user_id,
+                    authorized_team_id=coach_team))
             if action == "roster/select":
                 return self._send_api(api.select_roster(
-                    gid, body.get("player_ids", []), user_id))
+                    gid, body.get("player_ids", []), user_id,
+                    authorized_team_id=coach_team))
             if action == "roster/remove":
-                return self._send_api(api.remove_player(gid, pid, user_id))
+                return self._send_api(api.remove_player(
+                    gid, pid, user_id, authorized_team_id=coach_team))
             if action == "roster/copy-previous":
                 return self._send_api(api.copy_previous_roster(
-                    gid, body.get("team_id"), user_id))
+                    gid, body.get("team_id"), user_id,
+                    authorized_team_id=coach_team))
             if action == "officials/assign":
                 return self._send_api(api.assign_official(
                     gid, body.get("official_id"), body.get("role", "referee"),
@@ -4264,26 +4422,35 @@ class Handler(BaseHTTPRequestHandler):
                     new_ice_slot_id=body.get("new_ice_slot_id"),
                     note=body.get("note"), actor_id=user_id))
             if action == "substitutes/enroll":
-                return self._send_api(api.enroll_substitute(gid, pid, user_id))
+                return self._send_api(api.enroll_substitute(
+                    gid, pid, user_id, authorized_team_id=coach_team))
             if action == "substitutes/withdraw":
-                return self._send_api(api.withdraw_substitute(gid, pid, user_id))
+                return self._send_api(api.withdraw_substitute(
+                    gid, pid, user_id, authorized_team_id=coach_team))
             if action == "substitutes/add-candidate":
                 # Coach/operator adds an arbitrary eligible team player
                 # directly to the substitute pool (#114) — same enroll, a
                 # different (coach-side) actor and permission than the
                 # player's own self-service substitutes/enroll above.
                 return self._send_api(
-                    api.add_substitute_candidate(gid, pid, user_id))
+                    api.add_substitute_candidate(
+                        gid, pid, user_id, authorized_team_id=coach_team))
             sub = re.match(r"^substitutes/([^/]+)/(offer|accept|decline|add-to-roster)$", action)
             if sub:
                 player_id, op = sub.group(1), sub.group(2)
                 if op == "offer":
                     return self._send_api(api.offer_substitute(
-                        gid, player_id, user_id, expires_at=body.get("expires_at")))
+                        gid, player_id, user_id, expires_at=body.get("expires_at"),
+                        authorized_team_id=coach_team))
                 fn = {"accept": api.accept_substitute,
                       "decline": api.decline_substitute,
                       "add-to-roster": api.add_substitute_to_roster}[op]
-                return self._send_api(fn(gid, player_id, user_id))
+                # Threaded through the SHARED `fn(...)` call, deliberately,
+                # never bound into the dict above: three different methods are
+                # reached as VALUES there, so binding it per-value would be
+                # three call sites to keep in step instead of one.
+                return self._send_api(fn(gid, player_id, user_id,
+                                         authorized_team_id=coach_team))
             coach = {"roster/lock": api.lock_roster,
                      "roster/unlock": api.unlock_roster,
                      "cancel": api.cancel_game}.get(action)

@@ -104,6 +104,14 @@ from .league_scope import (
     team_registration_valid,
     team_season_participation,
 )
+from .membership_spine import (
+    # ONE spine rule, shared with the READ-time resolver (#205 review blocker
+    # 2). This predicate used to be defined right here, private to the
+    # write-time guards below, while ``RosterService`` had no spine check at
+    # all; it now lives in ``membership_spine`` so a read-time refusal and a
+    # write-time refusal can never disagree about what a broken key is.
+    missing_or_unequal as _missing_or_unequal,
+)
 from .notifier import push as _push_notification
 
 
@@ -121,32 +129,6 @@ _UNSET = object()
 
 def _blank(value) -> bool:
     return value is None or not str(value).strip()
-
-
-def _missing_or_unequal(a, b) -> bool:
-    """A scope-spine key is BROKEN when EITHER side is MISSING or the two
-    DISAGREE (#205 review round 3 blocker 3) — the Python twin of
-    ``integrity_checks._MISSING_OR_UNEQUAL``, the SQL predicate migration
-    059's preflight applies to this very invariant.
-
-    The membership spine guards used to be spelled ``if team.league_id and
-    ls.league_id != team.league_id``. The leading conjunct is a FALSY-SKIP:
-    a Team with NO permanent League skipped the coherence check entirely
-    rather than failing it — the exact service-layer analogue of the NULL
-    evasion blocker 1 fixed in the preflight, where ``a != b`` evaluated
-    UNKNOWN (not TRUE) against a NULL and the row was filtered out. The two
-    layers then disagreed: 059 REFUSED to backfill a league-less Team while
-    the live service happily minted and revived memberships on one.
-
-    ``not a`` rather than ``a is None`` deliberately: the guards this
-    replaces were truthiness gates, so an empty-string id was skipped too.
-    Treating both shapes as MISSING is strictly stronger than what shipped
-    and keeps one rule for "this key is not there".
-
-    Both-missing is a violation, not agreement — the same conclusion
-    ``_MISSING_OR_UNEQUAL``'s own docstring reaches about why
-    ``IS DISTINCT FROM`` is the wrong operator for a scope spine."""
-    return not a or not b or a != b
 
 
 def _clean(value) -> str:
@@ -605,13 +587,54 @@ class SetupService:
         through here."""
         return require_active_season(self.store, season_id)
 
-    def _guard_game_season(self, game) -> None:
+    def _guard_game_season(self, game):
         """Guard a Game-owned mutation against its archived Season (#159).
-        Row-locks + checks the Game's Season so no write lands on a Game whose
-        Season is archived. Takes the already-fetched Game (preserving each
-        caller's own not-found semantics); a Season-less legacy Game is a no-op."""
-        if game is not None and game.season_id:
-            require_active_season(self.store, game.season_id)
+        Row-locks + checks the Season that AUTHORIZES this Game so no write
+        lands on a Game whose competition is archived. Takes the
+        already-fetched Game (preserving each caller's own not-found
+        semantics) and returns it RE-FETCHED under that lock; ``None`` in,
+        ``None`` out.
+
+        WHICH Season that is used to be answered here, with ``if
+        game.season_id:`` — the same falsy-skip/wrong-row defect
+        ``RosterService._guard_active_season`` carried, in a second copy that
+        could drift from it. Both now call the ONE shared
+        :func:`season_guard.guard_game_season`, which resolves the Game's
+        LeagueSeason, locks and archive-checks the Season IT names, and only
+        then compares ``game.season_id`` to it (PR #427 blocker 5379031499).
+        See that function for the precedence and for why an unbound EXHIBITION
+        keeps using its own ``season_id``.
+
+        The RE-FETCH is the second half of the owner's correction: the caller's
+        pre-lock read is a locator, and a concurrent ``cancel_game`` /
+        ``move_game`` / ``archive_season`` commits under this very Season lock,
+        so the row a caller goes on to mutate must be the one read AFTER the
+        lock was taken. A caller's ``None`` still passes straight through (its
+        own not-found handling runs next), but a Game that VANISHED between the
+        locator read and the lock is a real ``NotFoundError`` here rather than
+        a stale object the caller would resurrect by saving. It carries
+        ``reason="game_missing"`` — the detail ``_move_game_locked``'s own
+        post-lock re-fetch already used for exactly this outcome, so
+        centralizing the re-fetch neither invents a new code nor drops the one
+        that existed."""
+        if game is None:
+            return None
+        season_guard.guard_game_season(self.store, game)
+        fresh = self.store.get_game(game.id)
+        if fresh is None:
+            raise NotFoundError(f"Game {game.id} not found.",
+                                details={"reason": "game_missing"})
+        # Re-verify the identity on the fresh row, but only when its identity
+        # columns actually moved — same reasoning as
+        # ``RosterService._guard_active_season``: unconditional re-running
+        # would re-lock the same Season on every mutation for nothing, while
+        # skipping it would let a Game whose binding changed between the
+        # locator read and the lock be written under a Season that is no
+        # longer its authority.
+        if (fresh.league_season_id != game.league_season_id
+                or fresh.season_id != game.season_id):
+            season_guard.guard_game_season(self.store, fresh)
+        return fresh
 
     def _policy_scope_lock_plan(self, rink_ids, season_ids) -> dict:
         """#318 review — pre-lock LOCATOR for every policy scope the placement
@@ -1569,6 +1592,7 @@ class SetupService:
                         existing.id, actor_id,
                         {"season_id": season_id, "team_id": team_id,
                          "division_id": existing.division_id, "reactivated": True})
+            self._mirror_memberships_for_registration(existing, actor_id)
             return existing
         reg = SeasonTeamRegistration(
             id=self.store.next_id("streg"), league_season_id=ls.id,
@@ -1578,7 +1602,98 @@ class SetupService:
                     reg.id, actor_id,
                     {"season_id": season_id, "team_id": team_id,
                      "division_id": reg.division_id})
+        self._mirror_memberships_for_registration(reg, actor_id)
         return reg
+
+    # -- permanent-model parity dual-write (#205 substitute cutover) -------
+    #
+    # Substitute eligibility now RESOLVES through SeasonRosterMembership for
+    # every LeagueSeason-bound game, and migration 059 backfilled the stints
+    # the permanent model implied for rows that existed at migration time:
+    # active player x actively-registered team x non-archived Season. These
+    # two hooks are that same rule applied at CREATE time, on the two
+    # service edges that produce a new (player, registered-team, Season)
+    # participation — a player added to a Team (add_player) and a Team
+    # (re)registered into a Season (register_team_for_season). Without
+    # them, every player or registration created after 059 would be
+    # silently ineligible to substitute in bound games until an operator
+    # hand-opened a stint.
+    #
+    # Precedence rule of the transition: the SEASONAL record wins wherever
+    # it has explicitly said something. A player who already holds an open
+    # membership on this LeagueSeason, or an authoritative ACTIVE
+    # membership anywhere else in the Season (a recorded transfer), is left
+    # exactly as recorded — the permanent pointer no longer overrides it.
+    # Deliberately NOT mirrored, and why:
+    #   * imports (store-level bulk player writes) — the "imports over to
+    #     seasonal membership" cutover is its own Release-2 slice;
+    #   * assign_player_team — a mid-season permanent-pointer move must NOT
+    #     silently re-scope seasonal eligibility; that is precisely the
+    #     governed transfer workflow of a later #205 slice;
+    #   * set_player_active reactivation of a pre-059-inactive player —
+    #     059 deliberately minted no stint for parked players, and
+    #     reactivating one is an operator decision whose stint should be
+    #     opened explicitly.
+
+    def _open_parity_membership(self, player, league_season_id: str,
+                                team_id: str, actor_id) -> None:
+        """Open the ACTIVE stint the permanent model implies for one
+        (active player, actively-registered team, LeagueSeason) edge,
+        unless the seasonal record already says otherwise. Reuses
+        create_season_roster_membership wholesale (transaction() is
+        reentrant, #215) so spine checks, uniqueness, the per-membership
+        event and the audit entry are the real ones — an auto-opened stint
+        carries the same rigor and history as an operator-created one. A
+        genuine conflict it does not pre-clear (e.g. a seasonal jersey
+        clash) propagates and rolls back the caller's whole write: fail
+        closed, never a player row the seasonal model rejects."""
+        if self.store.open_memberships_for_player_in_league_season(
+                player.id, league_season_id):
+            return  # this stint already exists (any non-terminal status)
+        ls = self.store.get_league_season(league_season_id)
+        if ls is not None and self.store.active_memberships_for_player_in_season(
+                player.id, ls.season_id):
+            return  # recorded transfer elsewhere in this Season wins
+        self.create_season_roster_membership(
+            player.id, league_season_id, team_id,
+            reason="auto-opened for permanent-model parity (#205 cutover)",
+            actor_id=actor_id)
+
+    def _mirror_memberships_for_registration(self, reg, actor_id) -> None:
+        """Registration edge of the parity dual-write: the Team's ACTIVE
+        players each get their stint for the newly (re)activated
+        registration's Season — the create-time image of 059's
+        player x registration x Season join. Skips nothing silently except
+        what the seasonal record already governs (see above)."""
+        ls = self.store.get_league_season(reg.league_season_id)
+        season = (self.store.get_season(ls.season_id)
+                  if ls is not None else None)
+        if season is None or season.status is not SeasonStatus.ACTIVE:
+            return
+        for player in sorted(self.store.players_for_team(reg.team_id),
+                             key=lambda p: p.id):
+            if player.is_active:
+                self._open_parity_membership(
+                    player, reg.league_season_id, reg.team_id, actor_id)
+
+    def _mirror_memberships_for_new_player(self, player, actor_id) -> None:
+        """Player edge of the parity dual-write: an ACTIVE player added to
+        a Team opens their stint in each non-archived Season the Team is
+        actively registered in. A player created inactive opens nothing —
+        a parked player holds no current participation (059's own
+        deliberate exclusion)."""
+        if not player.is_active:
+            return
+        for reg in self.store.all_season_team_registrations():
+            if not reg.active or reg.team_id != player.team_id:
+                continue
+            ls = self.store.get_league_season(reg.league_season_id)
+            season = (self.store.get_season(ls.season_id)
+                      if ls is not None else None)
+            if season is None or season.status is not SeasonStatus.ACTIVE:
+                continue
+            self._open_parity_membership(
+                player, reg.league_season_id, reg.team_id, actor_id)
 
     def _candidate_registration_league_id(self, team, division_id,
                                           league_id) -> Optional[str]:
@@ -1849,7 +1964,21 @@ class SetupService:
                 "published or moved until it is repaired.",
                 {"reason": "regular_game_missing_league_season",
                  "game_id": game.id, "league_season_id": ls_id})
-        if game.season_id and ls.season_id != game.season_id:
+        # PR #427 blocker: this comparison is UNCONDITIONAL, exactly like the
+        # `league_id` one below. It is the SAME argument #331 review round 24
+        # already made for that line, applied to the column round 23 left
+        # guarded: `game.season_id` is explicitly Optional with a nullable
+        # `games.season_id` column carrying no FK and no CHECK, so `None` is
+        # not "a legacy row to be lenient with", it is precisely the corrupted
+        # shape the guard let through. By this point the game is REGULAR
+        # (exhibitions returned far above) and `ls` is a real LeagueSeason, so
+        # the correct invariant is plain equality — a bound game whose Season
+        # is missing is drift, not a legacy case. Guarding it behind
+        # truthiness meant a store-written NULL evaded the check entirely
+        # while `league_season_id` still named the competition, which is the
+        # authority split the owner's blocker describes. The stored value is
+        # reported as-is (including `None`) so remediation sees the row.
+        if ls.season_id != game.season_id:
             raise ValidationError(
                 "This game's league-season belongs to a different season; "
                 "it cannot be published or moved until it is repaired.",
@@ -6714,14 +6843,12 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
-        # locator). A concurrent move_game relocates the game (new slot/time,
-        # unpublished) under the same Season lock; publishing the stale object
-        # would clobber those fields back. Act on the fresh row.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches under the Season lock it takes (the
+        # pre-lock read was a locator). A concurrent move_game relocates the
+        # game (new slot/time, unpublished) under the same Season lock;
+        # publishing the stale object would clobber those fields back. Act on
+        # the fresh row the guard returns (#427 centralized this).
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         # A game may only be made public while both teams are still valid
         # participants of its competition scope (#180 / #283 Slice E: exact
         # LeagueSeason for a regular game, active Season participation for an
@@ -6950,12 +7077,10 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch under the Season lock; a concurrent move_game may
-        # have unpublished/relocated the game after the locator read.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches under the Season lock it takes; a
+        # concurrent move_game may have unpublished/relocated the game after
+        # the locator read.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot request a reschedule for a cancelled game.")
         if not game.published:
@@ -8010,6 +8135,9 @@ class SetupService:
         if canonical_email is not None:
             # Nonblank only: create/reactivate via the shared set/retire path.
             self._set_email_contact(f"player:{player.id}", canonical_email)
+        # #205 cutover parity dual-write — see
+        # _mirror_memberships_for_new_player above register_team_for_season.
+        self._mirror_memberships_for_new_player(player, actor_id)
         return player
 
     def _resolve_new_player_names(self, name, first_name, last_name):
@@ -10551,13 +10679,11 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch the game under the Season lock so the cancelled /
-        # time-overlap checks below run on its current state, not a locator
-        # snapshot a concurrent move_game may have changed.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches the game under the Season lock it
+        # takes, so the cancelled / time-overlap checks below run on its
+        # current state, not a locator snapshot a concurrent move_game may
+        # have changed.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot assign officials to a cancelled game.")
         # #159 r15 — row-lock the Official: delete_official locks the Official row
@@ -10702,12 +10828,10 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #201 — re-fetch under the Season lock; a concurrent cancel_game commits
-        # under the same lock, so the cancelled gate must see the fresh Game.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #201 — the guard re-fetches under the Season lock it takes; a
+        # concurrent cancel_game commits under the same lock, so the cancelled
+        # gate must see the fresh Game.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot record a result for a cancelled game.")
         hs, as_ = self._require_score(home_score), self._require_score(away_score)
@@ -10737,12 +10861,10 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #201 — re-fetch under the Season lock; a concurrent cancel_game commits
-        # under the same lock, so the cancelled gate must see the fresh Game.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #201 — the guard re-fetches under the Season lock it takes; a
+        # concurrent cancel_game commits under the same lock, so the cancelled
+        # gate must see the fresh Game.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot approve a result for a cancelled game.")
         result = self.store.result_for_game(game_id)
@@ -11544,14 +11666,11 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch under the Season lock; a concurrent publish_game/
-        # move_game commits under the same lock, so decide draft-eligibility and
-        # release the slot from the FRESH row (never delete a just-published game
-        # or free the wrong old slot).
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches under the Season lock it takes; a
+        # concurrent publish_game/move_game commits under the same lock, so
+        # decide draft-eligibility and release the slot from the FRESH row
+        # (never delete a just-published game or free the wrong old slot).
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if not getattr(game, "is_draft", False) or game.published \
                 or game.cancelled \
                 or self.store.result_for_game(game_id) is not None:

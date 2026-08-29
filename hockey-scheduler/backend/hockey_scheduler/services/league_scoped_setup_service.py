@@ -148,6 +148,22 @@ class SetupService(_BaseSetupService):
         with self.store.transaction():
             game = self.store.get_game(game_id)
             if published and game is not None:
+                # PR #427: the Season AUTHORITY is established FIRST, before
+                # any scope check reads `game.season_id`. This override runs
+                # ahead of the base's own guard, so without this line a Game
+                # whose denormalized Season is NULL or drifted reached
+                # `require_slot_belongs_to_season` with that value and was
+                # refused `season_missing`/`venue_access_missing` — a
+                # misleading "grant this Season venue access" remediation for
+                # a row whose real problem is that it disagrees with its own
+                # competition, and, worse, an answer produced with no Season
+                # lock held at all. The guard refuses the drift with the right
+                # reason and, when it passes, has PROVEN `game.season_id ==
+                # league_season.season_id`, so the value handed to the scope
+                # check below is now the canonical one by construction. It
+                # also returns the row re-fetched under that lock; the base's
+                # own guard re-locks the same row idempotently.
+                game = self._guard_game_season(game)
                 # #283 Slice D/E: only a regular game needs league-ice isolation;
                 # both kinds need their slot's venue to serve the game's Season.
                 if game.game_type != "exhibition":
