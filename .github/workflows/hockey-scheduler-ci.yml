@@ -196,9 +196,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with:
-          # The PR-body gate diffs base...head to count changed test files.
-          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -253,7 +250,6 @@ jobs:
           node --check hockey-scheduler/e2e/season-dates.js
           node --check hockey-scheduler/e2e/season-fmt-unit.js
           node --check hockey-scheduler/e2e/calendar-today.js
-          node --check hockey-scheduler/e2e/check-pr-body.js
           node --check hockey-scheduler/e2e/scheduling-policy.js
           node --check hockey-scheduler/e2e/accessibility-foundations.js
           node --check hockey-scheduler/e2e/shell-accessibility-coverage.js
@@ -279,23 +275,6 @@ jobs:
         run: node hockey-scheduler/e2e/season-fmt-unit.js
       - name: Breakpoint contract — approved tokens only (#345)
         run: node hockey-scheduler/e2e/breakpoint-contract.js
-      - name: PR body agrees with this head (#389 review)
-        if: github.event_name == 'pull_request'
-        env:
-          # The body is fetched LIVE by the script, not taken from the event
-          # payload: a payload snapshots the body as of the push, so a body
-          # corrected afterwards would be judged on its old text and a re-run
-          # could never clear it.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          # GITHUB_SHA / HEAD on a pull_request is the MERGE commit, not the
-          # PR head. The base is derived as the merge-base, matching the
-          # `main...HEAD` the body's counts are about.
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          node hockey-scheduler/e2e/check-pr-body.js
-
   browser-smoke:
     needs: changes
     if: needs.changes.outputs.browser_smoke == 'true'

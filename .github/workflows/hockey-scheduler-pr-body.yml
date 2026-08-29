@@ -1,0 +1,61 @@
+name: Hockey Scheduler PR Body CI
+
+# The live PR body is a merge-decision surface for every Hockey Scheduler PR,
+# not a front-end concern. Keep this workflow separate from the long backend
+# matrix so a body edit can re-check the cheap contract without cancelling or
+# rerunning database and browser jobs.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+# This workflow executes JavaScript from the PR checkout. It therefore stays on
+# pull_request (never pull_request_target) and receives read-only credentials.
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: hockey-pr-body-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-body-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # The repository is a monorepo. The PR-body facts are specific to the
+      # Hockey Scheduler project, so positively recognized sibling-only PRs
+      # skip the checker. Hockey docs, backend, front-end, workflow, unknown,
+      # mixed and empty diffs all fail closed to pr_body_check=true.
+      - name: Classify PR scope for the body contract
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_EVENT_NAME: pull_request
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE_SHA" || true
+          FILES="$(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA")" || FILES="__DIFF_ERROR__"
+          printf '%s\n' "$FILES" | node hockey-scheduler/e2e/ci-classify.js
+
+      - name: PR body agrees with this head (#436)
+        if: steps.classify.outputs.pr_body_check == 'true'
+        env:
+          # Fetch the body live so reruns and edited events judge the current
+          # merge-decision text, not the event payload's stale snapshot.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          node --check hockey-scheduler/e2e/check-pr-body.js
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          node hockey-scheduler/e2e/check-pr-body.js

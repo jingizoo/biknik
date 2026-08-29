@@ -11,7 +11,10 @@
 //      advanced with after the fork (two-dot pulls them in and can force a
 //      wrong full matrix);
 // plus C. a guard that the workflow trigger does NOT path-filter (which would
-//      re-introduce the fail-open bypass this PR removes).
+//      re-introduce the fail-open bypass this PR removes); and
+//      D. a falsified workflow contract proving the live PR-body gate is in
+//      its own edited-aware workflow rather than the gated front-end job; and
+//      E. the real CLI writes the routing decision GitHub Actions consumes.
 
 "use strict";
 const assert = require("assert");
@@ -49,9 +52,93 @@ function diffFiles(repo, base, head, noRenames) {
   args.push(`${base}...${head}`);
   return git(repo, args).split("\n").map((s) => s.trim()).filter(Boolean);
 }
-const isFull = (r) => r.test && r.postgres && r.frontend_check && r.browser_smoke;
-const isDB = (r) => r.test && r.postgres && !r.frontend_check && !r.browser_smoke;
-const isNone = (r) => !r.test && !r.postgres && !r.frontend_check && !r.browser_smoke;
+const isFull = (r) => r.test && r.postgres && r.frontend_check
+  && r.browser_smoke && r.pr_body_check;
+const isDB = (r) => r.test && r.postgres && !r.frontend_check
+  && !r.browser_smoke && r.pr_body_check;
+const hasNoHeavyJob = (r) => !r.test && !r.postgres
+  && !r.frontend_check && !r.browser_smoke;
+
+function assertBodyWorkflowContract(mainWorkflow, bodyWorkflow) {
+  const runLines = (stepName) => {
+    const marker = `      - name: ${stepName}\n`;
+    const start = bodyWorkflow.indexOf(marker);
+    assert.ok(start >= 0, `missing workflow step: ${stepName}`);
+    const next = bodyWorkflow.indexOf("\n      - name:", start + marker.length);
+    const block = bodyWorkflow.slice(start, next < 0 ? undefined : next);
+    const run = block.indexOf("\n        run: |\n");
+    assert.ok(run >= 0, `${stepName} must have a multiline run block`);
+    return block.slice(run + "\n        run: |\n".length).split("\n")
+      .map((line) => line.trim()).filter(Boolean);
+  };
+  const onStart = bodyWorkflow.indexOf("\non:");
+  const permissionsStart = bodyWorkflow.indexOf("\npermissions:");
+  const concurrencyStart = bodyWorkflow.indexOf("\nconcurrency:");
+  assert.ok(onStart >= 0 && permissionsStart > onStart,
+    "the PR-body workflow must have an on block before permissions");
+  assert.ok(concurrencyStart > permissionsStart,
+    "the PR-body workflow must declare concurrency after permissions");
+  const triggerBlock = bodyWorkflow.slice(onStart, permissionsStart);
+  const permissionsBlock = bodyWorkflow.slice(permissionsStart, concurrencyStart);
+  assert.ok(
+    /types:\s*\[[^\]]*opened[^\]]*synchronize[^\]]*reopened[^\]]*edited[^\]]*\]/
+      .test(bodyWorkflow),
+    "the PR-body workflow must rerun for edited bodies as well as new heads");
+  assert.ok(!/^\s*paths\s*:/m.test(triggerBlock),
+    "the PR-body workflow trigger must not use paths (a start-time bypass)");
+  assert.ok(!/^\s*paths-ignore\s*:/m.test(triggerBlock),
+    "the PR-body workflow trigger must not use paths-ignore (a start-time bypass)");
+  assert.ok(!/^\s*pull_request_target\s*:/m.test(bodyWorkflow),
+    "PR-controlled JavaScript must never run under pull_request_target");
+  const permissions = permissionsBlock.split("\n").map((line) => line.trim())
+    .filter((line) => /^[a-z-]+:\s*\S+/.test(line));
+  assert.deepStrictEqual(permissions, ["contents: read", "pull-requests: read"],
+    "the PR-body workflow permissions must be exactly the two read grants");
+  assert.ok(/group:\s*hockey-pr-body-/.test(bodyWorkflow),
+    "the PR-body workflow must have concurrency independent from the long CI run");
+  assert.ok(/fetch-depth:\s*0/.test(bodyWorkflow),
+    "the body workflow needs full history for its merge-base diff");
+  assert.ok(/--no-renames/.test(bodyWorkflow),
+    "the body workflow classifier must surface both sides of a rename");
+  assert.ok(/\$BASE_SHA\.\.\.\$HEAD_SHA/.test(bodyWorkflow),
+    "the body workflow classifier must use the PR merge-base diff");
+  assert.ok(/CI_EVENT_NAME:\s*pull_request/.test(bodyWorkflow),
+    "the body workflow must classify the diff as a pull request");
+  const stepIds = bodyWorkflow.split("\n").map((line) => line.trim())
+    .filter((line) => line.startsWith("id:"));
+  assert.deepStrictEqual(stepIds, ["id: classify"],
+    "the producer step ID must remain classify so the condition consumes its output");
+  assert.ok(!/^\s*GITHUB_OUTPUT\s*:/m.test(bodyWorkflow),
+    "the workflow must not override GitHub's protected step-output path");
+  assert.deepStrictEqual(runLines("Classify PR scope for the body contract"), [
+    "set -euo pipefail",
+    "git fetch --no-tags origin \"$BASE_SHA\" || true",
+    "FILES=\"$(git diff --name-only --no-renames \"$BASE_SHA...$HEAD_SHA\")\" || FILES=\"__DIFF_ERROR__\"",
+    "printf '%s\\n' \"$FILES\" | node hockey-scheduler/e2e/ci-classify.js",
+  ], "the classify step must derive and route the exact PR diff, with no bypass commands");
+  const conditions = bodyWorkflow.split("\n")
+    .map((line) => line.trim()).filter((line) => line.startsWith("if:"));
+  assert.deepStrictEqual(
+    conditions,
+    ["if: steps.classify.outputs.pr_body_check == 'true'"],
+    "the only workflow condition must be exactly the pr_body_check output");
+  assert.ok(!/^\s*continue-on-error\s*:/m.test(bodyWorkflow),
+    "the live body workflow must never turn a checker failure into success");
+  assert.ok(/PR_NUMBER:\s*\$\{\{\s*github\.event\.pull_request\.number\s*\}\}/
+    .test(bodyWorkflow), "the checker must receive the live PR number");
+  assert.ok(/PR_HEAD_SHA:\s*\$\{\{\s*github\.event\.pull_request\.head\.sha\s*\}\}/
+    .test(bodyWorkflow), "the checker must receive the exact PR head");
+  assert.deepStrictEqual(runLines("PR body agrees with this head (#436)"), [
+    "set -euo pipefail",
+    "node --check hockey-scheduler/e2e/check-pr-body.js",
+    "git fetch --no-tags origin main:refs/remotes/origin/main",
+    "node hockey-scheduler/e2e/check-pr-body.js",
+  ], "the body step must syntax-check and invoke the checker with no bypass commands");
+  assert.ok(/main:refs\/remotes\/origin\/main/.test(bodyWorkflow),
+    "the checker must fetch the base ref it derives head facts against");
+  assert.ok(!/check-pr-body\.js/.test(mainWorkflow),
+    "frontend-check must not retain a second, classifier-gated body invocation");
+}
 
 let passed = 0;
 const cleanup = [];
@@ -72,8 +159,11 @@ try {
     const withRenames = diffFiles(repo, base, head, false);
     assert.ok(!withRenames.includes(API),
       "sanity: default rename detection hides the deleted API path");
-    assert.ok(isNone(classify(withRenames, "pull_request")),
+    const misclassified = classify(withRenames, "pull_request");
+    assert.ok(hasNoHeavyJob(misclassified),
       "sanity: the rename-detected diff misclassifies as docs-only (the gap)");
+    assert.ok(misclassified.pr_body_check,
+      "even a docs-only Hockey diff still runs the cheap PR-body gate");
 
     // The fix: --no-renames surfaces BOTH sides, so the deleted API surface is
     // seen and the change runs the full matrix (backend_api).
@@ -143,6 +233,166 @@ try {
       "the changes job uses a three-dot merge-base diff");
     passed += 1;
     console.log("  ok  C. workflow trigger does not path-filter; changes job uses merge-base + --no-renames");
+  }
+
+  // --- D. the live PR-body gate must not hide under a heavy job ------------
+  {
+    const mainPath = path.resolve(
+      __dirname, "..", "..", ".github", "workflows", "hockey-scheduler-ci.yml");
+    const bodyPath = path.resolve(
+      __dirname, "..", "..", ".github", "workflows",
+      "hockey-scheduler-pr-body.yml");
+    const mainWorkflow = fs.readFileSync(mainPath, "utf8");
+    const bodyWorkflow = fs.readFileSync(bodyPath, "utf8");
+
+    assertBodyWorkflowContract(mainWorkflow, bodyWorkflow);
+
+    // Falsify the two regressions this contract exists to catch. Each mutation
+    // must make this check itself fail, rather than relying on some unrelated
+    // syntax or classifier assertion to turn the overall suite red.
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow,
+        bodyWorkflow.replace(", edited]", "]")),
+      /edited bodies/,
+      "dropping the body-edited trigger must fail this contract");
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow,
+        bodyWorkflow.replace(
+          "steps.classify.outputs.pr_body_check",
+          "needs.changes.outputs.frontend_check")),
+      /pr_body_check output/,
+      "putting the live-body step back behind frontend_check must fail");
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow + "\nnode hockey-scheduler/e2e/check-pr-body.js\n",
+        bodyWorkflow),
+      /must not retain/,
+      "duplicating the checker in the heavy workflow must fail");
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow,
+        bodyWorkflow.replace(
+          "    types: [opened, synchronize, reopened, edited]",
+          "    types: [opened, synchronize, reopened, edited]\n"
+          + "    paths-ignore:\n      - hockey-scheduler/**")),
+      /must not use paths-ignore/,
+      "a start-time paths-ignore bypass must fail this contract");
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow,
+        bodyWorkflow.replace(
+          "    types: [opened, synchronize, reopened, edited]",
+          "    types: [opened, synchronize, reopened, edited]\n"
+          + "    paths:\n      - docs/**")),
+      /must not use paths/,
+      "a start-time paths bypass must fail this contract");
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow,
+        bodyWorkflow.replace(
+          "steps.classify.outputs.pr_body_check == 'true'",
+          "steps.classify.outputs.pr_body_check == 'true' && false")),
+      /only workflow condition must be exactly/,
+      "a condition that makes the checker step vacuous must fail");
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow,
+        bodyWorkflow.replace(
+          "        if: steps.classify.outputs.pr_body_check == 'true'",
+          "        if: steps.classify.outputs.pr_body_check == 'true'\n"
+          + "        continue-on-error: true")),
+      /never turn a checker failure into success/,
+      "continue-on-error must fail this contract");
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow,
+        bodyWorkflow.replace(
+          "  pr-body-check:\n",
+          "  pr-body-check:\n    if: false\n")),
+      /only workflow condition must be exactly/,
+      "a job-level false condition must fail this contract");
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow,
+        bodyWorkflow.replace("        id: classify", "        id: scope")),
+      /producer step ID must remain classify/,
+      "renaming the output-producing step must fail this contract");
+    assert.throws(
+      () => assertBodyWorkflowContract(
+        mainWorkflow,
+        bodyWorkflow.replace(
+          "printf '%s\\n' \"$FILES\" | node hockey-scheduler/e2e/ci-classify.js",
+          "node hockey-scheduler/e2e/ci-classify.js src/Main.java")),
+      /classify step must derive and route the exact PR diff/,
+      "hard-coding a sibling path instead of classifying the diff must fail");
+
+    passed += 1;
+    console.log("  ok  D. PR-body workflow is edited-aware, read-only, independently gated, and mutation-proved");
+  }
+
+  // --- E. the CLI must publish the output the workflow condition consumes --
+  {
+    const classifier = path.resolve(__dirname, "ci-classify.js");
+    const cases = [
+      {
+        name: "hockey-docs",
+        files: ["hockey-scheduler/docs/product/x.md"],
+        want: { test: "false", postgres: "false", frontend_check: "false",
+          browser_smoke: "false", pr_body_check: "true" },
+      },
+      {
+        name: "sibling-only",
+        files: ["src/Main.java", "README.md"],
+        want: { test: "false", postgres: "false", frontend_check: "false",
+          browser_smoke: "false", pr_body_check: "false" },
+      },
+      {
+        name: "mixed",
+        files: ["src/Main.java", "hockey-scheduler/backend/tests/test_x.py"],
+        want: { test: "true", postgres: "true", frontend_check: "false",
+          browser_smoke: "false", pr_body_check: "true" },
+      },
+    ];
+
+    const runCli = (script, testCase) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ci-output-"));
+      cleanup.push(dir);
+      const output = path.join(dir, "github-output");
+      execFileSync(process.execPath, [script, ...testCase.files], {
+        cwd: path.resolve(__dirname, "..", ".."),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CI_EVENT_NAME: "pull_request",
+          GITHUB_OUTPUT: output,
+        },
+      });
+      return Object.fromEntries(fs.readFileSync(output, "utf8").trim()
+        .split("\n").map((line) => line.split("=")));
+    };
+
+    for (const testCase of cases) {
+      assert.deepStrictEqual(runCli(classifier, testCase), testCase.want,
+        `${testCase.name}: CLI outputs must exactly match the workflow contract`);
+    }
+
+    // Prove the check bites the precise wiring defect: deleting only the
+    // pr_body_check output must fail this section even though classify() still
+    // returns the right in-memory value and every unit case remains green.
+    const mutatedDir = fs.mkdtempSync(path.join(os.tmpdir(), "ci-output-mutant-"));
+    cleanup.push(mutatedDir);
+    const mutated = path.join(mutatedDir, "ci-classify.js");
+    fs.writeFileSync(mutated, fs.readFileSync(classifier, "utf8").replace(
+      "    `pr_body_check=${r.pr_body_check}`,\n", ""));
+    assert.throws(
+      () => assert.deepStrictEqual(runCli(mutated, cases[0]), cases[0].want),
+      /pr_body_check/,
+      "removing only the GitHub output must fail the CLI contract");
+
+    passed += 1;
+    console.log("  ok  E. CLI publishes exact Hockey/sibling/mixed outputs and the missing-output mutant fails");
   }
 
   console.log(`\nci-classify integration: ${passed} checks passed.`);
