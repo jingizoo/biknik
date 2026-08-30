@@ -105,6 +105,13 @@ class ProductionPublicPrivacyTest(_HttpBase):
         self.assertEqual(status, 401)
 
     def test_global_official_directory_is_never_anonymous(self):
+        """Protect the installation-wide pool, not #367's scoped overview.
+
+        ``/api/demo/overview`` has a separate owner-approved contract: it may
+        return Officials joined through the caller's active-context home Club
+        or an in-scope assignment. This test deliberately targets the global
+        ``all_officials()`` read used by the assignment picker.
+        """
         # Use the store-neutral facade so this test exercises identically on
         # Memory, SQLite and PostgreSQL rather than reaching into one store's
         # private dictionary shape.
