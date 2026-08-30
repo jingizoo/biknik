@@ -250,8 +250,13 @@ Every command that starts from an `offer_id` resolves that offer's immutable
 locks in one global order: vacancy first, offer/attempt second. Every
 current-time observation and transition timestamp comes from one authoritative
 clock abstraction owned by the command/store boundary. Database-backed stores
-may source it from the database and Memory tests may inject it, but a browser,
-API caller, queue payload, or worker wall clock cannot supply or override it.
+may source it from the database. A fake clock may be bound only by a test
+fixture constructing an isolated Memory command/store. Future production
+composition must bind its trusted authoritative source independently of
+request, session, queue, and worker data. No externally decoded field or
+externally callable command parameter may supply or override the clock or a
+current-time scalar. Internal projection may receive only the scalar captured
+by that boundary.
 
 The future store contract must combine its authoritative-clock comparison,
 complete eligibility/version check, and conditional state write in one atomic
@@ -264,6 +269,16 @@ notification delivery is not a second eligibility event. Exactly at that
 serialization point the atomic predicate selects `EXPIRED`. Next-attempt work
 is recorded transactionally and consumed only after the terminal transaction
 commits, never called synchronously while either lock is held.
+
+Terminal state and response evidence are separate facts. An offer attempt
+durably records at most one first authenticated response observation: response
+kind (`ACCEPT` or `DECLINE`), server-attributed responder, and
+`response_recorded_at` from the same authoritative clock. The conditional write
+is atomic and idempotent. If the timeout command serializes first, the losing
+authenticated response still records that evidence without changing the
+`EXPIRED` state or creating another terminal audit or next-attempt intent.
+Future reliability policy must use the observation and must not infer silence
+from `EXPIRED` alone.
 
 ```text
 open_or_advance(vacancy_id):
@@ -310,14 +325,21 @@ accept(offer_id, authenticated_responder):
     atomically lock vacancy, then offer
     authorize player or verified guardian for the offered candidate
     if offer already has a terminal outcome:
-        return that stored outcome without another roster row, audit, or intent
+        if outcome is EXPIRED, atomically record the first authenticated ACCEPT
+            response observation using authoritative command time captured
+            after locks are held
+        return that stored outcome without another roster row, terminal audit,
+            intent, or duplicate response observation
     require offer is OFFERED
+    atomically record the first authenticated ACCEPT response observation,
+        using the authoritative transition time
     atomically revalidate vacancy and complete candidate eligibility, then:
         - if the authoritative transition time is before expires_at, commit
           OFFERED -> ACCEPTED, fill exactly one vacancy, invalidate any
           competing stale attempt, and append one ACCEPTED audit
         - otherwise commit OFFERED -> EXPIRED, append one EXPIRED audit, and
-          record one idempotent next-attempt intent
+          record one idempotent next-attempt intent; the separate response
+          observation preserves that the candidate tried to accept
     return the committed terminal outcome
 
 decline(offer_id, authenticated_responder):
@@ -325,11 +347,18 @@ decline(offer_id, authenticated_responder):
     atomically lock vacancy, then offer
     authorize player or verified guardian for the offered candidate
     if offer already has a terminal outcome:
-        return that stored outcome without another audit or intent
+        if outcome is EXPIRED, atomically record the first authenticated DECLINE
+            response observation using authoritative command time captured
+            after locks are held
+        return that stored outcome without another terminal audit, intent, or
+            duplicate response observation
     require offer is OFFERED
+    atomically record the first authenticated DECLINE response observation,
+        using the authoritative transition time
     atomically read the authoritative transition time and:
         - before expires_at, commit OFFERED -> DECLINED with one DECLINED audit
-        - at or after expires_at, commit OFFERED -> EXPIRED with one EXPIRED audit
+        - at or after expires_at, commit OFFERED -> EXPIRED with one EXPIRED audit;
+          the separate response observation preserves that the candidate declined
     record one idempotent next-attempt intent in the same transaction
 
 expire(offer_id):
@@ -340,7 +369,8 @@ expire(offer_id):
         return that stored outcome without another audit or intent
     atomically require offer is OFFERED and authoritative transition time is at or
         after expires_at, then commit OFFERED -> EXPIRED, one EXPIRED audit,
-        and one idempotent next-attempt intent
+        and one idempotent next-attempt intent; do not fabricate a response
+        observation
 
 cancel_or_invalidate(offer_id, reason):
     resolve immutable vacancy_id from the stored offer
@@ -353,7 +383,9 @@ cancel_or_invalidate(offer_id, reason):
 Accept-versus-expire, decline-versus-expire, and duplicate responder requests
 must serialize on the same vacancy and offer in the global lock order. Exactly
 one terminal transition wins; a retry returns the stored outcome without a
-second roster row, audit event, or next-candidate action.
+second roster row, terminal audit, or next-candidate action. A losing first
+authenticated response may add only the one durable observation described
+above; retries cannot replace or duplicate it.
 
 Each new attempt takes a fresh projection and records a fresh ranking
 fingerprint. That allows eligibility or policy changes to be explained rather
@@ -402,14 +434,14 @@ and defence.
 | V10 override | Engine order `a,b`; validated override selects `b` | Any | `proposed=a`, `selected=b`, no deciding rule credited for the human choice; explanation names override and preserves proposal. | Override design boundary |
 | V11 approved boundary | Game is in League `l1`, LeagueSeason `ls1`, Division `d1`; `a` is in `d1`; `b` is in `d2` of `ls1`; `c` is in another League; `d` is in sibling LeagueSeason `ls2` of `l1`; evaluate with cross-Division policy OFF then ON | Any | OFF: only `a` reaches ranking. ON: `a,b` reach ranking. `c` and `d` are refused in both cases because cross-League substitution remains off and LeagueSeason must match exactly. | Owner-approved Q4 (2026-08-29) |
 | V12 decline advance | Rank `a,b`; offer `a`; authenticated `a` declines | Any | Attempt 1 becomes `DECLINED`; attempt 2 offers `b` with ordinal 2 and a fresh fingerprint. | State-machine design |
-| V13 timeout boundary | Offer at `18:50`, start `19:00`, response window 30m | Any | Approved expiry is `19:00`; an acceptance terminal transition serialized at `18:59:59` may win. At `19:00`, the accept path commits `EXPIRED` with one EXPIRED audit and one next-attempt intent; repeated expiry is idempotent. | Owner-approved Q5 (2026-08-29) |
+| V13 timeout boundary | Offer at `18:50`, start `19:00`, response window 30m; accept while timeout evaluates at `19:00` | Any | Approved expiry is `19:00`; an acceptance terminal transition serialized at `18:59:59` may win. At `19:00`, the outcome is `EXPIRED` with one EXPIRED audit and one next-attempt intent, while the separate first-response observation preserves `response_kind=ACCEPT` regardless of whether accept or timeout serialized first. Repeated expiry and accept commands are idempotent. | Owner-approved Q5 (2026-08-29) |
 | V14 accept/expire race | One process accepts before expiry while another evaluates timeout | Any | Row locking/conditional transition permits exactly one terminal result, one roster fill at most, and no duplicate advance. | Future concurrency contract |
 | V15 no candidate | Every projected candidate fails goalie/skater or notice gate | Any | No proposal; explanation lists named rejections and vacancy remains unfilled. | Core/state boundary |
-| V16 decline at deadline | One process declines while another evaluates timeout at exactly `expires_at` | Any | The single terminal result is `EXPIRED`, never `DECLINED`; one next-attempt intent is recorded atomically and consumed only after commit. | Owner-approved Q5 / future concurrency contract |
+| V16 decline at deadline | One process declines while another evaluates timeout at exactly `expires_at` | Any | The single terminal result is `EXPIRED`, never `DECLINED`; one next-attempt intent is recorded atomically and consumed only after commit. In either serialization order the first-response observation preserves `response_kind=DECLINE` exactly once, so future reliability logic can distinguish the response from silence without changing the expiry winner. | Owner-approved Q5 / future concurrency contract |
 | V17 League rating authority | In League `l1`, canonical effective rating is 3; coach recommends 6; player self-rates 7; legacy global rating is 5 | `SKILL_MATCH` | Future #273 projection supplies 3 with League-admin/effective-time audit provenance. Recommendation, self-rating, and legacy global value do not replace it. Before #273 exists, production projection supplies unrated instead. | Owner-approved Q3 (2026-08-29) |
 | V18 participation-only fairness | Current LeagueSeason history contains one finalized Game with a recorded occupying/participating roster row, one accepted-but-cancelled Game, one accepted but scheduled-and-unplayed Game, and one no-show | `FAIRNESS` | Completed-substitute count is 1. The acceptance, cancellation, scheduled-but-unplayed Game, and no-show are excluded. | Owner-approved Q1/Q2 (2026-08-29) |
 | V19 no late offer | Authoritative `as_of`/`offered_at` equals or follows `game_start`; response window is positive | Any | `expires_at <= offered_at`; no OFFERED row, offer audit, or notification intent is created and the result is `NO_VALID_OFFER_WINDOW`. A server-attributed audit of that refusal may still be recorded. | Owner-approved Q5 (2026-08-29) |
-| V20 terminal retry | An authorized responder repeats accept or decline after the offer already reached a terminal outcome | Any | The stored terminal outcome is returned with no second roster row, terminal audit, or next-attempt intent. | Idempotency/concurrency contract |
+| V20 terminal retry | (a) An authorized responder repeats accept or decline after its command reached a terminal outcome; (b) timeout already set `EXPIRED`, then the responder submits its first late response and repeats it | Any | The stored terminal outcome is returned with no second roster row, terminal audit, or next-attempt intent. In (a), the existing response observation is unchanged. In (b), the first authenticated late response creates the one durable observation; the repeat cannot replace or duplicate it. | Idempotency/concurrency contract |
 
 The vectors above record design contracts, including the five owner-approved
 policy rulings. They do not claim that production integration exists.
