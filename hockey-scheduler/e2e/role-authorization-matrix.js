@@ -760,6 +760,18 @@ async function checkViewport(browser, viewport) {
     await installContextFixture(page);
     await reachDashboard(page);
     if (!(await page.$('.tab[data-tab="users"]'))) fail("setup precondition: Users tab not visible for League Admin");
+    // Populate a real operator-only staff directory before the no-reload
+    // identity transition.  The lower role cannot fetch this pool, so the
+    // reset boundary must destroy it rather than merely hide its controls.
+    await page.evaluate(() => switchTab("sheet"));
+    await waitForView(page, "sheet");
+    await waitForRealContent(page);
+    await page.waitForFunction(() => officialsPool.length > 0, null,
+      { timeout: 10000 });
+    const adminOfficialPoolSize = await page.evaluate(() => officialsPool.length);
+    if (adminOfficialPoolSize < 1) {
+      fail("setup precondition: League Admin never loaded the officials pool");
+    }
     await page.evaluate(([u, p]) => signIn(u, p), [accounts.viewer.username, PW]);
     await waitForView(page, "standings");
     const postSwitchTabs = await visibleTabs(page);
@@ -771,8 +783,10 @@ async function checkViewport(browser, viewport) {
       hasUsersTab: !!document.querySelector('.tab[data-tab="users"]')
         && document.querySelector('.tab[data-tab="users"]').offsetParent !== null,
       demoMenuHidden: (document.getElementById("demo-menu") || {}).hidden !== false,
+      officialsPoolSize: officialsPool.length,
     }));
-    if (postSwitchDom.hasSetupCard || postSwitchDom.hasUsersTab || !postSwitchDom.demoMenuHidden) {
+    if (postSwitchDom.hasSetupCard || postSwitchDom.hasUsersTab
+        || !postSwitchDom.demoMenuHidden || postSwitchDom.officialsPoolSize !== 0) {
       fail(`no-reload League Admin -> Viewer switch retained admin UI: ${JSON.stringify(postSwitchDom)}`);
     }
     await logout(page);
@@ -843,6 +857,34 @@ async function checkViewport(browser, viewport) {
     if (!/League admins only/i.test(amUsersBypass)) {
       fail(`Arena Manager: direct-navigating to Users must show the `
         + `"League admins only" guard, got "${amUsersBypass}"`);
+    }
+    // The Official directory follows MANAGE_SCHEDULE, not MANAGE_SETUP:
+    // Arena Manager is the load-bearing role that separates those two
+    // permissions.  Drive a real-session Game Sheet render at both viewports
+    // and require the actual pool plus its assign control, so narrowing the
+    // client gate to League Admin cannot pass behind the server's correct
+    // role matrix.
+    await page.evaluate(() => switchTab("sheet"));
+    await waitForView(page, "sheet");
+    await waitForRealContent(page);
+    await page.waitForSelector(".game-sheet .gs-grid", { timeout: 10000 });
+    const amDirectory = await apiGet(page, "/api/officials");
+    const amSheet = await page.evaluate(() => ({
+      poolIds: officialsPool.map((official) => official.id).sort(),
+      assignControls: document.querySelectorAll(".gs-assign").length,
+      officialSlots: document.querySelectorAll(".gs-off-slot").length,
+    }));
+    const amExpectedPoolIds = ((amDirectory.body || {}).officials || [])
+      .map((official) => official.id).sort();
+    if (amDirectory.status !== 200 || !amExpectedPoolIds.length
+        || JSON.stringify(amSheet.poolIds) !== JSON.stringify(amExpectedPoolIds)) {
+      fail(`Arena Manager [${L}]: Game Sheet did not load the exact `
+        + `MANAGE_SCHEDULE Official pool: response=${JSON.stringify(amDirectory)} `
+        + `sheet=${JSON.stringify(amSheet)}`);
+    }
+    if (amSheet.assignControls !== 1 || amSheet.officialSlots < 1) {
+      fail(`Arena Manager [${L}]: the authorized Official assign surface is `
+        + `missing or vacuous: ${JSON.stringify(amSheet)}`);
     }
     await page.click('.tab[data-tab="dashboard"]');
     await installContextFixture(page);
@@ -1154,23 +1196,40 @@ async function checkViewport(browser, viewport) {
     // authenticated Coach with scope.team_id, already runs at BOTH viewports
     // (desktop 1440x900 and phone 390x844), and is already registered.
     // ============================================================
+    // The installation-wide assignment pool is MANAGE_SCHEDULE-only.  Pin
+    // the server refusal first (and register that exact expected 403 with the
+    // journey's global failure tracker), then observe the real Game Sheet
+    // render and prove it does not make the forbidden request at all.
+    tracker.expect("GET", "/api/officials", 403);
+    const officialsForCoach = await apiGet(page, "/api/officials");
+    if (officialsForCoach.status !== 403
+        || !officialsForCoach.body.error
+        || officialsForCoach.body.error.code !== "forbidden"
+        || officialsForCoach.body.error.details.role !== "coach"
+        || officialsForCoach.body.error.details.required !== "manage_schedule") {
+      fail(`Coach [${L}]: /api/officials did not enforce the exact `
+        + `MANAGE_SCHEDULE refusal: ${JSON.stringify(officialsForCoach)}`);
+    }
+
+    const sheetPoolRequests = [];
+    const observeOfficialPool = (request) => {
+      let requestPath = request.url();
+      try { requestPath = new URL(request.url()).pathname; } catch (_) {}
+      if (request.method() === "GET" && requestPath === "/api/officials") {
+        sheetPoolRequests.push(request.url());
+      }
+    };
+    page.on("request", observeOfficialPool);
     // A real keyboard activation of the real nav tab, the same discipline
     // every other reachability claim in this file uses.
     await tabToAndActivate(page, '.tab[data-tab="sheet"]', "Coach reach Game Sheet");
     await waitForView(page, "sheet");
     await waitForRealContent(page);
     await page.waitForSelector(".game-sheet .gs-grid", { timeout: 10000 });
-
-    // The sheet render fires GET /api/officials for its assign control.
-    // That route carries no operator gate, so a Coach gets 200 -- asserted
-    // rather than assumed, because this file's failure tracker fails the
-    // whole run on any unregistered HTTP >= 400 and a silent 403 here would
-    // surface as an unrelated-looking failure at the end of the journey.
-    const officialsForCoach = await apiGet(page, "/api/officials");
-    if (officialsForCoach.status !== 200) {
-      fail(`Coach [${L}]: the Game Sheet's own /api/officials fetch returned `
-        + `${officialsForCoach.status} -- the sheet cannot render without it `
-        + `and this file's tracker fails on unregistered >= 400 responses`);
+    page.off("request", observeOfficialPool);
+    if (sheetPoolRequests.length) {
+      fail(`Coach [${L}]: Game Sheet requested the private global officials `
+        + `pool ${sheetPoolRequests.length} time(s)`);
     }
 
     const sheet = await page.evaluate(() => {
