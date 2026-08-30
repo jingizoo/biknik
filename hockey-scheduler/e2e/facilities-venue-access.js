@@ -385,10 +385,13 @@ async function waitForCrossing(page, kind, arg) {
       : (!!currentUser && currentUser.username === a);
     if (!moved) return false;
     const el = document.activeElement;
+    const loginScreen = document.getElementById("login-screen");
     window.__vagCross = {
       t: Date.now() - window.__vagFocus.t0,
       active: { id: (el && el.id) || null, tag: (el && el.tagName) || null },
       atArm: el === window.__vagCrossAt,
+      activeVisible: !!(el && el.getClientRects().length),
+      activeInsideLogin: !!(loginScreen && loginScreen.contains(el)),
       skeleton: !!document.querySelector("#content .skeleton"),
       landing: !!document.querySelector('[data-setup-workflow-landing="facilities"]'),
       epoch: uiIdentityEpoch,
@@ -499,10 +502,13 @@ async function stopContextChangeWatch(page) {
 async function crossingOutcome(page) {
   return page.evaluate(() => {
     const el = document.activeElement;
+    const loginScreen = document.getElementById("login-screen");
     return {
       active: { id: (el && el.id) || null, tag: (el && el.tagName) || null },
       atArm: el === window.__vagCrossAt,
       armGone: !(window.__vagCrossAt && document.contains(window.__vagCrossAt)),
+      activeVisible: !!(el && el.getClientRects().length),
+      activeInsideLogin: !!(loginScreen && loginScreen.contains(el)),
       signIn: window.__vagSignInResult,
     };
   });
@@ -1584,17 +1590,30 @@ async function checkViewport(browser, viewport) {
         fail(`[${L}/${step}] the generic poll had already landed before the boundary `
           + `was crossed (${JSON.stringify(before)}), so it was no longer pending`);
       }
-      if (cross.active.tag !== "BUTTON" || cross.active.id) {
-        fail(`[${L}/${step}] at the crossing focus was on `
-          + `${JSON.stringify(cross.active)} rather than still on the nav control — `
-          + `the navigation's generic poll had already landed, so there was no `
-          + `pending poll left to cancel`);
+      if (!cross.activeVisible || cross.activeInsideLogin) {
+        fail(`[${L}/${step}] the replacement identity was adopted with focus on `
+          + `${JSON.stringify(cross.active)} (visible ${cross.activeVisible}, inside `
+          + `login ${cross.activeInsideLogin}) — hiding the checking wall must not `
+          + `leave its credential control focused and hidden`);
       }
-      if (!cross.skeleton || cross.landing) {
+      if (!cross.atArm || cross.active.tag !== "BUTTON" || cross.active.id) {
+        fail(`[${L}/${step}] at the crossing focus was on `
+          + `${JSON.stringify(cross.active)} rather than restored to the surviving `
+          + `Facilities nav control — the temporary checking wall must return focus `
+          + `to its pre-boundary owner when the arriving role still exposes it`);
+      }
+      if (cross.landing) {
         fail(`[${L}/${step}] the destination had already painted at the crossing `
           + `(skeleton ${cross.skeleton}, landing ${cross.landing}) — the poll would `
-          + `have exited on the painted content rather than still be polling`);
+          + `have exited on that content rather than still be polling`);
       }
+      // An identity boundary now blanks every identity-scoped node
+      // synchronously, so the pre-boundary skeleton is intentionally gone by
+      // this observation.  Blank content is not a focus-poll exit: the chain
+      // would keep polling until its heading appears or its #content floor
+      // fires.  The observer armed on the skeleton before the first 50ms tick,
+      // the sub-2s crossing, and the zero landing events above are the proof
+      // that it was pending when resetTransientUiState cancelled its ticket.
       // -- ...and the boundary genuinely moved -----------------------------
       if (!what(arm, cross)) {
         fail(`[${L}/${step}] the boundary did not actually move: armed at `
@@ -1633,6 +1652,10 @@ async function checkViewport(browser, viewport) {
           + `take`);
       }
       const out = await crossingOutcome(page);
+      if (!out.activeVisible || out.activeInsideLogin) {
+        fail(`[${L}/${step}] focus ended on a hidden or login-surface control: `
+          + `${JSON.stringify(out)}`);
+      }
       if (out.active.id === "content") {
         fail(`[${L}/${step}] focus ended on the generic #content region: `
           + `${JSON.stringify(out.active)}`);

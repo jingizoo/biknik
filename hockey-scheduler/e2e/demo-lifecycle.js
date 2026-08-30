@@ -191,8 +191,14 @@ async function checkViewport(browser, viewport) {
   });
   const page = await context.newPage();
   const errors = [];
+  const httpFailures = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  page.on("response", (r) => {
+    if (r.status() >= 400) {
+      httpFailures.push(`${r.status()} ${r.request().method()} ${r.url()}`);
+    }
+  });
 
   const V = viewport.label;
   const getJson = (p) => page.evaluate(
@@ -200,9 +206,25 @@ async function checkViewport(browser, viewport) {
   const leagueCount = async () =>
     ((await getJson("/api/setup/hierarchy")).leagues || []).length;
   const openSetup = async () => {
+    // Every successful demo lifecycle POST replaces the session cookie.  The
+    // app deliberately blanks the old identity's DOM until the canonical
+    // Admin session, role metadata, context, and render have all been adopted.
+    // Inspect the rebuilt Setup surface rather than treating that synchronous
+    // privacy blank as evidence that the lifecycle render has settled.
+    await page.waitForFunction(() => currentUser
+      && currentUser.username === "admin"
+      && !sessionAwaitingRoleMetadata
+      && !canonicalSessionRebuildInFlight
+      && !demoLifecycleInFlight
+      && document.getElementById("login-screen").hidden,
+    null, { timeout: 15000 });
     await page.click('.tab[data-tab="setup"]');
     await enterSetupHierarchy(page);
-    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await page.waitForFunction(() => {
+      const content = document.getElementById("content");
+      return !!(content && content.firstElementChild
+        && !content.querySelector(".skeleton"));
+    }, null, { timeout: 10000 });
   };
   const demoTitle = () => page.$eval("#demo-btn", (b) => b.getAttribute("title"));
   const demoAria = () => page.$eval("#demo-btn", (b) => b.getAttribute("aria-label"));
@@ -258,6 +280,7 @@ async function checkViewport(browser, viewport) {
       r.url() === `${base}/api/demo/load` && r.request().method() === "POST");
     await page.click("[data-demo-load]");
     if ((await loadResp).status() !== 200) throw new Error(`[${V}] card Load returned non-200`);
+    await openSetup();
     await page.waitForSelector(".start-league", { state: "detached", timeout: 10000 });
     if (await leagueCount() === 0) throw new Error(`[${V}] Load did not build the dataset`);
     await waitDemoTitle("Reset demo data").catch(() => {
@@ -295,6 +318,7 @@ async function checkViewport(browser, viewport) {
 
     // (3) Clear from the header menu (typed CLEAR): back to the blank slate.
     await runFromMenu("clear", "CLEAR", "/api/demo/clear");
+    await openSetup();
     await page.waitForSelector(".start-league", { timeout: 10000 });
     if (await leagueCount() !== 0) throw new Error(`[${V}] Clear did not empty the demo`);
     await waitDemoTitle("Load demo data").catch(() => {
@@ -306,10 +330,12 @@ async function checkViewport(browser, viewport) {
       r.url() === `${base}/api/demo/load` && r.request().method() === "POST");
     await page.click("[data-demo-load]");
     if ((await reload).status() !== 200) throw new Error(`[${V}] second Load returned non-200`);
+    await openSetup();
     await page.waitForSelector(".start-league", { state: "detached", timeout: 10000 });
 
     // (4) Reset from the header menu (typed RESET): the canonical dataset.
     await runFromMenu("reset", "RESET", "/api/demo/reset");
+    await openSetup();
     if (await leagueCount() === 0) throw new Error(`[${V}] Reset did not rebuild the dataset`);
     await waitDemoTitle("Reset demo data").catch(() => {
       throw new Error(`[${V}] header is not "Reset demo data" over a populated dataset`);
@@ -336,19 +362,25 @@ async function checkViewport(browser, viewport) {
     // the lifecycle POST was never issued at all.
     //
     // Here that interleaving is FORCED rather than raced, so this leg is
-    // deterministic where the flake was not: exactly ONE /api/demo/overview --
-    // the Load-triggered render's own -- is held until the journey has typed
-    // RESET and seen the button go enabled, then released. In CI nothing holds
-    // it; it is simply the slower of two in-flight renders. Nothing else is
-    // faked: same server, same app.js, same click path.
+    // deterministic where the flake was not. A lifecycle change now performs
+    // one canonical-session render before it refreshes /api/status, then the
+    // final afterDemoLifecycleChange render.  The first must finish before the
+    // header can truthfully offer Reset, so this route lets that canonical
+    // render through and holds exactly the SECOND /api/demo/overview: the
+    // Load-triggered final render that can legitimately race the newer modal
+    // render. It stays held until the journey has typed RESET and seen the
+    // button go enabled, then is released. In CI nothing is faked beyond that
+    // response timing: same server, same app.js, same click path.
     //
     // The fix under test is app.js's `renderPass` token: a superseded render
     // stands down at its DOM boundaries instead of painting. Revert it and
     // this leg fails with the modal reading {disabled:true, value:""}.
     await runFromMenu("clear", "CLEAR", "/api/demo/clear");
+    await openSetup();
     await page.waitForSelector(".start-league", { timeout: 10000 });
 
     let holdOverview = false;
+    let loadOverviewCount = 0;
     let heldPasses = null;
     let releaseOverview = null;
     const overviewHeld = new Promise((r) => { releaseOverview = r; });
@@ -357,7 +389,11 @@ async function checkViewport(browser, viewport) {
     await armRenderPassWatch(page);
     await page.route("**/api/demo/overview", async (route) => {
       if (!holdOverview) return route.continue();
-      holdOverview = false;            // hold exactly one: the Load render's
+      loadOverviewCount += 1;
+      // The first request belongs to the required canonical-session rebuild.
+      // Let it settle so /api/status can refresh demo_empty and expose Reset.
+      if (loadOverviewCount === 1) return route.continue();
+      holdOverview = false;       // hold exactly one: the final Load render
       // Armed here, with the request still held: whichever pass is suspended
       // on it is in flight at this instant and so is in this snapshot.
       heldPasses = await renderPassesInFlight(page);
@@ -380,12 +416,19 @@ async function checkViewport(browser, viewport) {
 
     // Fail here, not at the barrier, if the hold never happened at all.
     await waitUntil(() => heldPasses !== null,
-      `[${V}] /api/demo/overview was never held, so no render pass was superseded`);
+      `[${V}] the second Load /api/demo/overview was never held, so no final `
+        + `lifecycle render pass was superseded`);
+    if (loadOverviewCount !== 2) {
+      throw new Error(`[${V}] expected the lifecycle sequence to reach exactly `
+        + `two /api/demo/overview reads before the modal race, got `
+        + `${loadOverviewCount}`);
+    }
     if (!heldPasses.length) {
       throw new Error(`[${V}] the held /api/demo/overview belonged to no render() `
         + `pass, so this leg is not exercising a superseded render at all`);
     }
 
+    await waitDemoTitle("Reset demo data");
     await page.click("#demo-btn");
     await page.click('[data-demo-action="reset"]');
     await page.waitForSelector(".modal.danger #demo-confirm-input", { timeout: 10000 });
@@ -402,10 +445,15 @@ async function checkViewport(browser, viewport) {
     // without it the completion only arrives after another real read.
     const stillSuspended = (await renderPassesInFlight(page))
       .filter((id) => heldPasses.includes(id));
+    if (!stillSuspended.length) {
+      throw new Error(`[${V}] the targeted lifecycle render was no longer in `
+        + `flight before the held overview was released — this leg did not `
+        + `force the stale-pass/modal interleaving it claims to test`);
+    }
     releaseOverview();
     const stalePassWaitMs = await awaitRenderPassesEnd(page, heldPasses, `[${V}]`);
-    const barrier = `the superseded pass (render #${(stillSuspended.length
-      ? stillSuspended : heldPasses).join(", #")}, suspended on the held overview `
+    const barrier = `the superseded pass (render #${stillSuspended.join(", #")}, `
+      + `suspended on the held overview `
       + `right up to the release) had already ended ${stalePassWaitMs}ms after `
       + `release, so this is what it left behind, not a race`;
 
@@ -442,7 +490,12 @@ async function checkViewport(browser, viewport) {
     }
     await page.unroute("**/api/demo/overview");
 
-    if (errors.length) throw new Error(`[${V}] console/page errors:\n${errors.join("\n")}`);
+    if (errors.length) {
+      throw new Error(`[${V}] console/page errors:\n${errors.join("\n")}`
+        + (httpFailures.length
+          ? `\n--- non-2xx responses seen on this page ---\n${httpFailures.join("\n")}`
+          : ""));
+    }
     console.log(`[${V}] OK — blank → load → clear → reset, header state-aware, `
       + `and a stale render() cannot destroy the confirm modal.`);
   } catch (error) {

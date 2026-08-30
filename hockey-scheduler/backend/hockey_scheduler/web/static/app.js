@@ -45,6 +45,13 @@ let rolePerms = new Set();         // permissions of the current role
 // rebuilt after the catalog arrives.  This is presentation quarantine only;
 // the cookie and canonical identity have already changed on the server.
 let sessionAwaitingRoleMetadata = false;
+// Focus return for the exact successful cookie boundary currently being
+// adopted.  The auth-intent + generation pair prevents a later A→B→A (or an
+// external-tab replacement) from reviving an HTMLElement captured by an older
+// session.  Only a stable global navigation tab is retained: never a private
+// content node or a context control whose label came from the departing
+// identity.
+let sessionBoundaryReturnFocus = null;
 let officialsPool = [];            // [{id,name}] officials for the assign UI (#30)
 let standingsDivision = null;      // selected division for the Standings tab (#31)
 let notifState = { notifications: [], unread: 0 };  // feed for the bell (#32)
@@ -1314,8 +1321,17 @@ function establishSessionMutationBoundary(message = "Session access changed. Che
   // shared generation and invalidate canonical reads before destroying this
   // tab's old identity. This is deliberately synchronous: no old private DOM
   // or permission model survives beside the replacement cookie.
+  const active = document.activeElement;
+  const loginScreen = document.getElementById("login-screen");
+  const returnFocus = active && active.matches && active.matches(".tab")
+    && !(loginScreen && loginScreen.contains(active)) ? active : null;
   publishSessionMutation();
   const authIntent = newAuthIntent();
+  sessionBoundaryReturnFocus = returnFocus ? {
+    element: returnFocus,
+    authIntent,
+    sessionToken: readSessionMutationToken(),
+  } : null;
   const reconcileSeq = ++externalSessionReconcileSeq;
   if (currentUser) setUser(null);
   else quarantineReplacedSessionState();
@@ -5020,6 +5036,13 @@ function blockedModalHtml(m) {
 // Clear per-view interaction state after a demo reset rebuilds the store, so no
 // stale id (a game, a picked player, an open drawer) survives the reseed.
 function clearTransientStateAfterReset() {
+  // The lifecycle operation may have deleted every Program/Season identifier
+  // encoded in the active-context deep link.  Remove that pre-replacement
+  // tuple before the canonical session rebuild calls restoreContextDeepLink;
+  // otherwise Clear/Reset can immediately POST the destroyed ids back to
+  // /api/context and surface a spurious 404 during an otherwise successful
+  // transition.
+  clearSessionContextHash();
   toast = ""; currentGame = null; pickedPlayer = null; wizard = null;
   movingGameId = null; conflict = null; pendingMove = null;
   drawer = null; drawerError = ""; drawerValues = {};
@@ -16600,9 +16623,34 @@ function clearLoginCredentials() {
 }
 function hideLogin() {
   hidePublicGuest();
-  document.body.classList.remove("signed-out");
   const screen = document.getElementById("login-screen");
+  const focusWasInLogin = !!(screen && screen.contains(document.activeElement));
+  document.body.classList.remove("signed-out");
   if (screen) screen.hidden = true;
+  const visibleEnabled = (el) => !!(el && el.isConnected
+    && !el.disabled && el.getClientRects().length);
+  // Never override focus the user moved outside the checking surface while a
+  // canonical read was in flight.  If it is still trapped in the surface we
+  // just hid, return to this exact boundary's prior control when the arriving
+  // role kept it visible; otherwise land on that role's active navigation
+  // control.  This prevents a hidden #login-user from remaining
+  // document.activeElement after adoption.  The ownership check is what makes
+  // retaining the element safe across superseding and ABA session changes.
+  if (focusWasInLogin) {
+    const activeTab = Array.from(document.querySelectorAll(".tab.active"))
+      .find(visibleEnabled);
+    const ownedReturn = sessionBoundaryReturnFocus
+      && sessionBoundaryReturnFocus.authIntent === authIntentSeq
+      && sessionBoundaryReturnFocus.sessionToken === readSessionMutationToken()
+      && visibleEnabled(sessionBoundaryReturnFocus.element)
+      ? sessionBoundaryReturnFocus.element : null;
+    const target = ownedReturn || activeTab;
+    if (target) target.focus();
+    else if (document.activeElement && document.activeElement !== document.body) {
+      document.activeElement.blur();
+    }
+  }
+  sessionBoundaryReturnFocus = null;
 }
 
 // Public portal (#34): the schedule/standings the backend already serves

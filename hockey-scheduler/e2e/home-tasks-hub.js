@@ -380,11 +380,14 @@ async function loginAs(page, username, password) {
 // view's players/hierarchy/per-program/per-season fetches) can still be
 // running well after a LATER action (a click handler's own render(), a
 // toast) has already settled -- waiting on any one specific visible signal
-// doesn't prove every render initiated so far has finished. Logging out
-// while one of those is still resolving invalidates its session mid-flight
+// doesn't prove every render initiated so far has finished. Logging out while
+// one of those is still resolving invalidates its session mid-flight
 // and produces real, but test-harness-only, 401s (Chromium logs them as
 // console resource-load errors indistinguishable from a genuine bug) --
-// wait for the network to actually go quiet first.
+// wait for the network to actually go quiet first. Callers following an
+// in-app identity change must additionally wait for that identity's canonical
+// painted surface (the M assertions below do), because this load-state helper
+// can already be satisfied on a long-lived document.
 async function logout(page) {
   await page.waitForLoadState("networkidle").catch(() => {});
   await apiPost(page, "/api/auth/logout", {});
@@ -4224,9 +4227,19 @@ async function checkRoleScenarios(browser, viewport) {
         "[data-ib-commit]");
     };
     const assertMClearedFor = async (label) => {
+      // The visible username changes before signIn()'s context/deep-link/render
+      // tail finishes. A momentarily-null canonical rebuild flag is not enough
+      // on its own, but the identity boundary synchronously empties #content;
+      // requiring a non-skeleton child as well can only pass after the arriving
+      // identity has painted its own surface.
       await waitFor(page,
-        `(M, ${label}) the post-identity-switch render to settle (no skeleton)`,
-        () => !document.querySelector(".skeleton"), null, 10000);
+        `(M, ${label}) the canonical post-identity-switch render to settle`,
+        () => !sessionAwaitingRoleMetadata
+          && !canonicalSessionRebuildInFlight
+          && document.getElementById("login-screen").hidden
+          && !!document.querySelector("#content > *")
+          && !document.querySelector("#content .skeleton"),
+        null, 10000);
       if (await page.$("[data-ib-commit]") || await page.$(".ib-form")) {
         fail(`(M, ${label}) expected the Ice Builder to be fully closed for `
           + `the newly signed-in identity, not still showing the prior `
@@ -4269,8 +4282,13 @@ async function checkRoleScenarios(browser, viewport) {
     // exercise it.
     const assertMHiddenForLowerPrivilege = async (label) => {
       await waitFor(page,
-        `(M, ${label}) the post-identity-switch render to settle (no skeleton)`,
-        () => !document.querySelector(".skeleton"), null, 10000);
+        `(M, ${label}) the canonical post-identity-switch render to settle`,
+        () => !sessionAwaitingRoleMetadata
+          && !canonicalSessionRebuildInFlight
+          && document.getElementById("login-screen").hidden
+          && !!document.querySelector("#content > *")
+          && !document.querySelector("#content .skeleton"),
+        null, 10000);
       if (await page.$("[data-ib-commit]") || await page.$(".ib-form")) {
         fail(`(M, ${label}) expected no leftover Ice Builder form/preview `
           + `to be reachable by a role without manage_arena`);
