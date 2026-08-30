@@ -768,11 +768,125 @@ async function checkViewport(browser, viewport) {
     await waitForRealContent(page);
     await page.waitForFunction(() => officialsPool.length > 0, null,
       { timeout: 10000 });
-    const adminOfficialPoolSize = await page.evaluate(() => officialsPool.length);
-    if (adminOfficialPoolSize < 1) {
-      fail("setup precondition: League Admin never loaded the officials pool");
+    const privateOfficial = {
+      id: official.body.id,
+      name: `Ozzy Official ${suffix}`,
+    };
+    const adminOfficialPool = await page.evaluate(() =>
+      officialsPool.map((entry) => ({ id: entry.id, name: entry.name })));
+    if (!adminOfficialPool.some((entry) => entry.id === privateOfficial.id
+        && entry.name === privateOfficial.name)) {
+      fail(`setup precondition: League Admin's directory did not contain the `
+        + `distinctive private Official: ${JSON.stringify(adminOfficialPool)}`);
     }
-    await page.evaluate(([u, p]) => signIn(u, p), [accounts.viewer.username, PW]);
+
+    // A simple post-switch assertion only proves a pool that has ALREADY
+    // landed is cleared. Exercise the harder serialization: a privileged
+    // render gets a real 200 directory response, browser delivery is held,
+    // setUser(Viewer) clears the pool, and Viewer context reconciliation is
+    // then held before its first render. Releasing the old response in that
+    // exact window must not let the departing render write the private
+    // directory back.
+    let releaseStaleOfficial;
+    let markStaleOfficialHeld;
+    let markStaleOfficialDelivered;
+    const staleOfficialRelease = new Promise((resolve) => {
+      releaseStaleOfficial = resolve;
+    });
+    const staleOfficialHeld = new Promise((resolve) => {
+      markStaleOfficialHeld = resolve;
+    });
+    const staleOfficialDelivered = new Promise((resolve) => {
+      markStaleOfficialDelivered = resolve;
+    });
+    let heldOfficialBody = null;
+    let officialDirectoryRequests = 0;
+    const holdStaleOfficial = async (route) => {
+      const request = route.request();
+      const requestPath = new URL(request.url()).pathname;
+      if (request.method() !== "GET" || requestPath !== "/api/officials") {
+        await route.continue();
+        return;
+      }
+      officialDirectoryRequests += 1;
+      const response = await route.fetch();
+      heldOfficialBody = await response.json();
+      markStaleOfficialHeld();
+      await staleOfficialRelease;
+      await route.fulfill({ response, json: heldOfficialBody });
+      markStaleOfficialDelivered();
+    };
+
+    let releaseViewerContext;
+    let markViewerContextHeld;
+    const viewerContextRelease = new Promise((resolve) => {
+      releaseViewerContext = resolve;
+    });
+    const viewerContextHeld = new Promise((resolve) => {
+      markViewerContextHeld = resolve;
+    });
+    const holdViewerContext = async (route) => {
+      const response = await route.fetch();
+      markViewerContextHeld();
+      await viewerContextRelease;
+      await route.fulfill({ response });
+    };
+
+    await page.route("**/api/officials", holdStaleOfficial);
+    await page.evaluate(() => {
+      window.__officialPrivacyStaleRender = render();
+    });
+    await staleOfficialHeld;
+    if (!heldOfficialBody || !Array.isArray(heldOfficialBody.officials)
+        || !heldOfficialBody.officials.some((entry) =>
+          entry.id === privateOfficial.id && entry.name === privateOfficial.name)) {
+      fail(`held response was not a non-vacuous private Official directory: `
+        + `${JSON.stringify(heldOfficialBody)}`);
+    }
+
+    await page.route("**/api/context/options", holdViewerContext);
+    await page.evaluate(([u, p]) => {
+      window.__officialPrivacySwitch = signIn(u, p);
+    }, [accounts.viewer.username, PW]);
+    await viewerContextHeld;
+    const afterViewerReset = await page.evaluate(() => ({
+      role: currentRole,
+      username: currentUser && currentUser.username,
+      officials: officialsPool.map((entry) => ({ id: entry.id, name: entry.name })),
+    }));
+    if (afterViewerReset.role !== "viewer"
+        || afterViewerReset.username !== accounts.viewer.username
+        || afterViewerReset.officials.length !== 0) {
+      fail(`identity boundary did not synchronously clear the private Official `
+        + `pool before Viewer context reconciliation: ${JSON.stringify(afterViewerReset)}`);
+    }
+
+    releaseStaleOfficial();
+    await staleOfficialDelivered;
+    // Await the exact old render promise rather than a timer/frame proxy: the
+    // assertion below must run only after that pass either observes the new
+    // identity token and returns or attempts its stale module-state commit.
+    await page.evaluate(async () => {
+      await window.__officialPrivacyStaleRender;
+      delete window.__officialPrivacyStaleRender;
+    });
+    const afterStaleDelivery = await page.evaluate(() => ({
+      role: currentRole,
+      officials: officialsPool.map((entry) => ({ id: entry.id, name: entry.name })),
+    }));
+    if (afterStaleDelivery.role !== "viewer"
+        || afterStaleDelivery.officials.length !== 0) {
+      fail(`departing League Admin render repopulated the private Official `
+        + `directory under Viewer: ${JSON.stringify(afterStaleDelivery)}`);
+    }
+
+    releaseViewerContext();
+    await page.evaluate(async () => {
+      await window.__officialPrivacySwitch;
+      delete window.__officialPrivacySwitch;
+    });
+    await page.unroute("**/api/context/options", holdViewerContext);
+    await page.unroute("**/api/officials", holdStaleOfficial);
     await waitForView(page, "standings");
     const postSwitchTabs = await visibleTabs(page);
     assertVisibleTabs(fail, "no-reload League Admin -> Viewer switch", postSwitchTabs, [
@@ -786,8 +900,11 @@ async function checkViewport(browser, viewport) {
       officialsPoolSize: officialsPool.length,
     }));
     if (postSwitchDom.hasSetupCard || postSwitchDom.hasUsersTab
-        || !postSwitchDom.demoMenuHidden || postSwitchDom.officialsPoolSize !== 0) {
-      fail(`no-reload League Admin -> Viewer switch retained admin UI: ${JSON.stringify(postSwitchDom)}`);
+        || !postSwitchDom.demoMenuHidden || postSwitchDom.officialsPoolSize !== 0
+        || officialDirectoryRequests !== 1) {
+      fail(`no-reload League Admin -> Viewer switch retained admin UI or `
+        + `requested the global directory as Viewer: state=${JSON.stringify(postSwitchDom)} `
+        + `directoryRequests=${officialDirectoryRequests}`);
     }
     await logout(page);
 
