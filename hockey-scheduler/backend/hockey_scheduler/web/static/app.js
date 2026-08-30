@@ -11353,8 +11353,11 @@ async function render() {
       commitSetupWorkflowCards({ sv: sv, ov: ov, players: playersList,
         svOk: svOk, playersOk: playersOk, progress: progress });
     }
-    // The game sheet also needs the officials pool for its assign control (#30).
-    if (view === "sheet") {
+    // The game sheet needs the installation-wide officials pool only for its
+    // operator-only assign control (#30).  Non-operators still see already-
+    // assigned officials through the game-scoped lineups payload and must not
+    // probe the private global directory just to render those rows.
+    if (view === "sheet" && hasPerm("manage_schedule")) {
       const op = await getJSON("/api/officials");
       if (renderPass !== myRenderPass) return;  // superseded (#215)
       officialsPool = (op && op.officials) || [];
@@ -14818,6 +14821,11 @@ function resetTransientUiState() {
   // without a page reload, that role would see the previous operator's
   // fetched player roster.
   playersList = [];
+  // officialsPool is the installation-wide staff directory and is fetched
+  // only for MANAGE_SCHEDULE/MANAGE_USERS surfaces.  Destroy it at the same
+  // identity boundary as playersList so a no-reload operator -> lower-role
+  // switch cannot retain the previous operator's private pool in memory.
+  officialsPool = [];
   // guardianLinksState (#35) isn't currently reachable by a lower-privileged
   // role either — renderUsers() gates its whole body (including the
   // Guardian Links card) on hasPerm("manage_users") before touching this

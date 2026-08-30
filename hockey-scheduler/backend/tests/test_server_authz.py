@@ -7,11 +7,12 @@ import urllib.error
 import urllib.request
 import uuid
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import Role
+from hockey_scheduler.domain import Permission, Role, can
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web.server import STATE, Handler
 
@@ -135,6 +136,35 @@ class ServerAuthzTest(unittest.TestCase):
                                    cookie="hs_sid=bogus-session")
         self.assertEqual(status, 401)
         self.assertEqual(body["error"]["code"], "unauthorized")
+
+    # -- installation-wide Official directory is assignor-only (#202) -----
+    def test_official_directory_role_matrix_is_derived_from_permission(self):
+        expected = {row["id"] for row in STATE.api.get_officials()}
+        self.assertTrue(expected, "the matrix needs a real directory to protect")
+
+        for role in tuple(Role):
+            allowed = can(role, Permission.MANAGE_SCHEDULE)
+            with self.subTest(role=role.value, allowed=allowed):
+                with mock.patch.object(
+                        STATE.api, "get_officials",
+                        wraps=STATE.api.get_officials) as get_officials:
+                    status, body = self._get_h(
+                        "/api/officials", role=role.value)
+
+                if allowed:
+                    self.assertEqual(status, 200, role.value)
+                    self.assertEqual(
+                        {row["id"] for row in body["officials"]}, expected)
+                    get_officials.assert_called_once_with()
+                else:
+                    self.assertEqual(status, 403, role.value)
+                    self.assertEqual(body["error"]["code"], "forbidden")
+                    self.assertEqual(body["error"]["details"], {
+                        "role": role.value,
+                        "required": Permission.MANAGE_SCHEDULE.value,
+                    })
+                    self.assertNotIn("officials", body)
+                    get_officials.assert_not_called()
 
     # -- setup hierarchy tree is operator-only, MANAGE_SETUP (#166 PR C) ----
     def test_viewer_cannot_read_setup_hierarchy(self):
