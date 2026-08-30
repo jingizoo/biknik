@@ -49,10 +49,9 @@ What is NOT here
   separate, later work (#202 enforcement) -- narrower in scope than this step.
 * ``_GET_ROUTES`` / ``_POST_ROUTES`` in ``server.py`` are NO LONGER a second
   hand-maintained table (#202 wiring step): they are now derived directly from
-  ``REGISTRY`` at import time -- every ``kind="route"`` entry whose pattern is
-  scoped to ``/api/`` (see server.py's own comment above their definition for
-  the exact filter and why each exclusion reproduces this table's PRE-EXISTING
-  scope rather than silently widening it). ``RouteSpec.kind`` is therefore
+  ``REGISTRY`` at import time. Every concrete GET ``kind="route"`` is admitted
+  regardless of prefix; POST remains scoped to ``/api/`` because every live
+  POST route is there. ``RouteSpec.kind`` is therefore
   LOAD-BEARING now, in a way the dispatch-vs-registry gate above does not
   check (that gate compares ``(method, template)`` set membership only, never
   ``kind``) -- see ``tests/test_route_registry.py``'s ``KindClassificationTests``
@@ -64,8 +63,8 @@ What is NOT here
   diff line, the same discipline ``_AUDIT_WAIVERS`` uses in route_extract.py.
 * ``auth`` and ``scope_axis`` were declared slots for that later work when
   this section was first written; they are NOT ANY MORE (#202 repair round
-  4, finding 4). Every REACHABLE spec now carries a real classification --
-  238 of them, as of this writing -- and ``tests/test_route_registry.py``'s
+  4, finding 4). Every REACHABLE spec now carries a real classification,
+  and ``tests/test_route_registry.py``'s
   ``_VALID_AUTH_VALUES``/``_EXPECTED_CLASSIFICATION`` CI-GATES both fields
   for every reachable spec: an unclassified reachable entry, a value outside
   the declared vocabulary, or a classification that drifts from what

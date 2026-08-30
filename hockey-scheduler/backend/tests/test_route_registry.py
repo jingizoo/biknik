@@ -17,11 +17,12 @@ hand-maintained table, CROSS-CHECKED here and otherwise left exactly as it is
 
 ``_GET_ROUTES``/``_POST_ROUTES`` were the same kind of hand-maintained table
 through the #202 routespec-inventory step; the #202 WIRING step replaced
-their SOURCE with a live derivation from this registry (every ``kind="route"``
-entry scoped to ``/api/`` -- see server.py's own comment), so what this file
+their SOURCE with a live derivation from this registry (every concrete GET
+``kind="route"`` entry, plus every POST ``kind="route"`` entry under
+``/api/`` -- see server.py's own comment), so what this file
 checks for them now is that the derivation still reproduces their exact
-PRE-EXISTING scope (``MethodTableNarrowingTests`` below), plus two structural
-invariants ``kind`` itself needs now that it is load-bearing
+deliberate current scope and omissions (``MethodTableNarrowingTests`` below),
+plus two structural invariants ``kind`` itself needs now that it is load-bearing
 (``KindClassificationTests``) -- not that a hand-written list happens to agree
 with the parser, which was the old question and no longer applies.
 """
@@ -128,9 +129,9 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
     # mid-migration state -- "landing in independent, reviewed batches",
     # "cannot pin the whole registry" -- which stopped being true two
     # rounds ago and was left stale here, exactly the kind of drift this
-    # finding exists to catch). The CURRENT, actual state: every one of
-    # the 238 REACHABLE specs (239 total minus the one deliberately-
-    # excluded ``get_empty_path``, see below) carries a real auth/
+    # finding exists to catch). The CURRENT, actual state: every REACHABLE
+    # spec other than the deliberately excluded
+    # ``get_empty_path`` (see below) carries a real auth/
     # scope_axis classification, gated per-route against an independently
     # re-derived expected value by ``_EXPECTED_CLASSIFICATION``'s own
     # comprehensive check further down this file (THE CLASSIFICATION
@@ -216,9 +217,9 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
 # module recognises at all -- test_no_spec_is_half_classified_or_reverted     #
 # (above -- named test_classification_slots_are_still_empty before round 6    #
 # finding 4's own rename, once classification stopped landing batch-by-batch) #
-# only pins TEN specific entries by name and checks that a spec               #
-# never carries HALF a classification; every other one of the 238 reachable   #
-# specs, and any auth STRING WHATSOEVER (a typo, 'unclassified', a value      #
+# only pins a small set of entries by name and checks that a spec             #
+# never carries HALF a classification; every other reachable spec, and any    #
+# auth STRING WHATSOEVER (a typo, 'unclassified', a value                     #
 # from a different axis entirely), passed silently. Reviewer-demonstrated:    #
 # get_officials's auth/scope_axis can be mutated none/none -> operator_only/  #
 # season, or reverted to (UNCLASSIFIED, UNCLASSIFIED) outright, and every     #
@@ -903,40 +904,35 @@ class TableCrossCheckTests(unittest.TestCase):
 
 
 class MethodTableNarrowingTests(unittest.TestCase):
-    """The OTHER direction, pinned rather than asserted-correct.
+    """The OTHER direction: which live branches are method-admitted.
 
-    ``_GET_ROUTES``/``_POST_ROUTES`` are deliberately narrower than the full
-    registry -- their own derivation filter (server.py: ``kind == "route"``
-    and the pattern scoped to ``/api/``) excludes some live routes on
-    purpose, so "every route is in the table" is NOT true today and forcing
-    it would be a behaviour change (#202 wiring step: proven byte-for-byte
-    via HTTP diffing that this exact narrowing survived the hand-written
-    table's replacement, not merely reasoned about). What must not happen is
-    a NEW divergence appearing unnoticed — for POST that is severe, because
+    Every concrete GET ``kind="route"`` is now admitted, including the four
+    calendar feeds and ``/favicon.ico`` outside ``/api/``. Static shells,
+    fallthroughs, and broad families remain deliberately narrower than the
+    registry: they are not concrete endpoints whose existence the method
+    contract may claim. What must not happen is a NEW divergence appearing
+    unnoticed — for POST that is severe, because
     ``do_POST`` refuses anything ``_supported_methods`` does not admit BEFORE
     the dispatch chain runs, so a live POST branch whose spec stops being
     admitted (e.g. by a ``kind`` retag -- see ``KindClassificationTests``) is
     unreachable code that answers 404.
 
-    So the current divergence is pinned exactly. Each entry below is a fact
-    about today's derivation filter, not an endorsement.
+    The deliberate non-concrete divergence is pinned exactly below.
     """
 
     maxDiff = None
 
-    #: Live GET routes ``_GET_ROUTES`` does not admit. Consequence: their
-    #: ``_supported_methods`` is empty, so ``OPTIONS`` on them answers 404
-    #: instead of 204+Allow and a PUT/DELETE answers 404 instead of 405+Allow.
-    #: The static shells, /favicon.ico, and the four /calendar feeds are all
-    #: excluded by the ``/api/`` prefix filter (kind="route", but not scoped
-    #: to /api/); the calendar hole is REAL and reported as a finding of the
-    #: #202 routespec-inventory step, not fixed here (no behaviour changes --
-    #: closing it is enforcement, separate later work). ``/{*}``/``/api/{*0}``
-    #: would join this set too on prefix alone, but are ALSO excluded by
-    #: ``kind`` (static/fallthrough, never "route") -- belt and suspenders.
+    #: Live GET branches ``_GET_ROUTES`` does not admit. Every entry is
+    #: deliberately non-concrete: a static shell/tail or API fallthrough.
+    #: Concrete non-API routes are not listed because ``kind="route"`` is the
+    #: admission boundary; path prefix is not.
     GET_NOT_IN_TABLE = {
-        "", "/", "/favicon.ico", "/mobile", "/mobile/", "/setup", "/setup/",
+        "", "/", "/mobile", "/mobile/", "/setup", "/setup/",
         "/api/{*0}", "/{*}",
+    }
+
+    CONCRETE_NON_API_GETS = {
+        "/favicon.ico",
         "/calendar/division/{}.ics", "/calendar/official/{}.ics",
         "/calendar/player/{}.ics", "/calendar/team/{}.ics",
     }
@@ -947,7 +943,7 @@ class MethodTableNarrowingTests(unittest.TestCase):
     #: assign-\w+ WILDCARD templates that used to be here are gone -- they
     #: were never real leaves, and their replacement (the 13 CONCRETE combo
     #: templates _handle_reassign's own schema admits) are all kind="route"
-    #: and /api/-scoped, so the #202 wiring step's derivation admits them
+    #: and /api/-scoped, so the POST derivation admits them
     #: automatically -- proof, independent of this registry, that the
     #: concrete leaves (and not the wildcard) were always the intended
     #: reachable set: whoever wrote the ORIGINAL 405 table by hand had
@@ -974,26 +970,23 @@ class MethodTableNarrowingTests(unittest.TestCase):
         self.assertEqual(self._unadmitted(srv._POST_ROUTES, "POST"),
                          self.POST_NOT_IN_TABLE)
 
-    def test_the_calendar_feed_hole_is_real_and_pinned(self):
-        """The finding above, exercised through the code that has the bug.
-
-        ``_supported_methods`` sees no methods for a live ICS feed path, which
-        is why ``OPTIONS``/``PUT`` on it answer 404 rather than 204/405. Pinned
-        so the day someone widens the ``/api/`` prefix filter (or otherwise
-        starts admitting ``/calendar/...``) in server.py's ``_GET_ROUTES``,
-        this test tells them the hole is closed instead of silently passing.
-        """
-        feed = sample_path("/calendar/team/{}.ics")
-        self.assertFalse(any(rx.match(feed) for rx in srv._GET_ROUTES))
-        self.assertTrue(any(re.compile(spec.pattern).match(feed)
-                            for spec in REGISTRY if spec.method == "GET"))
+    def test_every_concrete_non_api_get_route_is_method_admitted(self):
+        """A real GET route publishes GET/HEAD/OPTIONS whatever its prefix."""
+        for template in self.CONCRETE_NON_API_GETS:
+            path = sample_path(template)
+            with self.subTest(template=template):
+                self.assertTrue(any(rx.match(path) for rx in srv._GET_ROUTES))
+                self.assertTrue(any(re.compile(spec.pattern).match(path)
+                                    for spec in REGISTRY
+                                    if spec.method == "GET"
+                                    and spec.kind == "route"))
 
 
 class KindClassificationTests(unittest.TestCase):
     """#202 wiring step, go-beyond finding: ``kind`` is now LOAD-BEARING.
 
-    server.py's ``_GET_ROUTES``/``_POST_ROUTES`` admit exactly the
-    ``kind == "route"`` specs (scoped to ``/api/``) -- but
+    server.py's ``_GET_ROUTES`` admits every GET ``kind == "route"`` spec;
+    ``_POST_ROUTES`` admits POST route specs under ``/api/`` -- but
     ``RegistryCoversTheDispatchTests`` above only ever compares ``(method,
     template)`` SET MEMBERSHIP between the registry and the live dispatch; it
     never looks at ``kind``. So retagging a genuine concrete leaf from

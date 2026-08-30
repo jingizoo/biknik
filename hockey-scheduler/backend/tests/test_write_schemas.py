@@ -16,8 +16,12 @@ with a ``None`` team_id is a ``field_required`` ValidationError even when called
 directly, not the old ``NotFoundError("Team None not found.")``.
 """
 
+import hashlib
+import inspect
+import itertools
 import json
 import os
+import string
 import threading
 import unittest
 import urllib.error
@@ -25,6 +29,7 @@ import urllib.request
 from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
@@ -37,6 +42,20 @@ from hockey_scheduler.web import server as srv
 
 def _clock():
     return datetime(2026, 7, 19, tzinfo=timezone.utc)
+
+
+def _unlisted_extension_method() -> str:
+    """Return a valid mixed-case HTTP token absent from Handler's source."""
+    handler_source = inspect.getsource(srv.Handler)
+    nonce = 0
+    while True:
+        digest = hashlib.sha256(
+            f"{handler_source}\0{nonce}".encode()
+        ).hexdigest()[:20]
+        method = f"MiXeD-{digest}"
+        if method not in handler_source:
+            return method
+        nonce += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -328,6 +347,196 @@ class WriteSchemaHttpTest(unittest.TestCase):
         status, _headers, body = self._req(admin, "DELETE", "/definitely/not/here")
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_unimplemented_verbs_use_the_json_method_contract(self):
+        """An unlisted extension verb cannot fall into stdlib's HTML 501."""
+        anon = self._client()
+        method = _unlisted_extension_method()
+        self.assertNotIn(method, inspect.getsource(srv.Handler))
+        expected_allow = "GET, HEAD, OPTIONS"
+        known_paths = (
+            "/api/players",
+            "/calendar/team/missing.ics",
+        )
+        for path in known_paths:
+            with self.subTest(method=method, path=path):
+                status, headers, body = self._req(anon, method, path)
+                self.assertEqual(status, 405)
+                self.assertEqual(
+                    headers.get("Content-Type"),
+                    "application/json; charset=utf-8",
+                )
+                self.assertEqual(headers.get("X-Content-Type-Options"),
+                                 "nosniff")
+                self.assertEqual(headers.get("Allow"), expected_allow)
+                self.assertEqual(body["error"]["code"],
+                                 "method_not_allowed")
+                self.assertEqual(
+                    body["error"]["message"],
+                    f"The {method} method is not allowed for {path}.",
+                )
+                self.assertEqual(body["error"]["details"]["allow"],
+                                 expected_allow)
+
+        # The dynamic verb bridge changes only error format, not existence:
+        # static shells, fallthroughs, and lookalikes remain unknown.
+        for path in (
+            "/setup",
+            "/app.js",
+            "/api/nope",
+            "/api/games/not-a-game/not-an-action",
+            "/calendar/nope/missing.ics",
+        ):
+            with self.subTest(method=method, path=path):
+                status, headers, body = self._req(anon, method, path)
+                self.assertEqual(status, 404)
+                self.assertEqual(
+                    headers.get("Content-Type"),
+                    "application/json; charset=utf-8",
+                )
+                self.assertEqual(headers.get("X-Content-Type-Options"),
+                                 "nosniff")
+                self.assertNotIn("Allow", headers)
+                self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_dynamic_verb_bridge_covers_the_http_token_alphabet(self):
+        """Every derived valid token reaches the generic method bridge."""
+        token_chars = (
+            string.ascii_letters
+            + string.digits
+            + "!#$%&'*+-.^_`|~"
+        )
+        widths = (1, 2)
+        self.assertEqual(len(token_chars), len(set(token_chars)))
+        concrete_methods = {
+            name[3:]
+            for handler_type in srv.Handler.__mro__
+            for name in handler_type.__dict__
+            if name.startswith("do_")
+        }
+        expected = sum(len(token_chars) ** width for width in widths) - sum(
+            1
+            for method in concrete_methods
+            if len(method) in widths
+            and all(char in token_chars for char in method)
+        )
+        handler = object.__new__(srv.Handler)
+        observed = []
+        handler._method_fallback = observed.append
+        checked = 0
+
+        for width in widths:
+            for chars in itertools.product(token_chars, repeat=width):
+                method = "".join(chars)
+                if method in concrete_methods:
+                    continue
+                observed.clear()
+                getattr(handler, f"do_{method}")()
+                self.assertEqual(observed, [method], method)
+                checked += 1
+
+        self.assertGreater(checked, 0)
+        self.assertEqual(checked, expected)
+
+    def test_concrete_non_api_get_routes_publish_the_full_method_contract(self):
+        """Known non-API GETs are not unknown merely because of their prefix."""
+        anon = self._client()
+        paths = (
+            "/favicon.ico",
+            "/calendar/division/missing.ics",
+            "/calendar/official/missing.ics",
+            "/calendar/player/missing.ics",
+            "/calendar/team/missing.ics",
+        )
+        expected_allow = "GET, HEAD, OPTIONS"
+        for path in paths:
+            with self.subTest(path=path, method="OPTIONS"):
+                status, headers, body = self._req(anon, "OPTIONS", path)
+                self.assertEqual(status, 204)
+                self.assertEqual(headers.get("Allow"), expected_allow)
+                self.assertEqual(body, {})
+            for method in ("PUT", "PATCH", "DELETE"):
+                with self.subTest(path=path, method=method):
+                    status, headers, body = self._req(anon, method, path)
+                    self.assertEqual(status, 405)
+                    self.assertEqual(headers.get("Allow"), expected_allow)
+                    self.assertEqual(body["error"]["code"],
+                                     "method_not_allowed")
+                    self.assertEqual(body["error"]["details"]["allow"],
+                                     expected_allow)
+            with self.subTest(path=path, method="POST-malformed"):
+                status, headers, body = self._req(
+                    anon, "POST", path, raw=b"{not valid json")
+                self.assertEqual(status, 405)
+                self.assertEqual(headers.get("Allow"), expected_allow)
+                self.assertEqual(body["error"]["code"], "method_not_allowed")
+
+    def test_non_api_get_method_contract_does_not_admit_similar_unknown_paths(self):
+        anon = self._client()
+        for path in (
+            "/favicon.ico/extra",
+            "/calendar/nope/missing.ics",
+            "/calendar/team/.ics",
+            "/calendar/team/missing.txt",
+        ):
+            with self.subTest(path=path):
+                status, _headers, body = self._req(anon, "PUT", path)
+                self.assertEqual(status, 404)
+                self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_non_api_get_method_contract_ignores_query_string(self):
+        """Routing decisions use the path, not optional feed-client queries."""
+        anon = self._client()
+        path = "/calendar/team/missing.ics?download=1"
+        expected_allow = "GET, HEAD, OPTIONS"
+
+        status, headers, body = self._req(anon, "OPTIONS", path)
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get("Allow"), expected_allow)
+        self.assertEqual(body, {})
+
+        status, headers, body = self._req(anon, "PATCH", path)
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("Allow"), expected_allow)
+        self.assertEqual(body["error"]["code"], "method_not_allowed")
+
+        status, headers, body = self._req(
+            anon, "POST", path, raw=b"{not valid json")
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("Allow"), expected_allow)
+        self.assertEqual(body["error"]["code"], "method_not_allowed")
+
+    def test_head_on_non_api_get_routes_runs_the_real_get(self):
+        anon = self._client()
+        status, _headers, body = self._req(anon, "HEAD", "/favicon.ico")
+        self.assertEqual(status, 204)
+        self.assertEqual(body, {})
+
+        # A route-shaped but nonexistent calendar token mirrors GET's 404;
+        # method discovery must not turn HEAD into a blind synthetic 200.
+        status, _headers, body = self._req(
+            anon, "HEAD", "/calendar/team/definitely-missing.ics")
+        self.assertEqual(status, 404)
+        self.assertEqual(body, {})
+
+        # A valid feed must execute the real bearer-token lookup and preserve
+        # GET's representation headers while suppressing only the body.
+        created = srv.STATE.api.create_calendar_feed_token(
+            "team", self.home, actor_id="user_admin")
+        token = created["token"]
+        with patch.object(
+                srv.STATE.api, "calendar_feed_ics",
+                wraps=srv.STATE.api.calendar_feed_ics) as feed:
+            status, headers, body = self._req(
+                anon, "HEAD", f"/calendar/team/{token}.ics")
+        self.assertEqual(status, 200)
+        self.assertIn("text/calendar", headers.get("Content-Type", ""))
+        self.assertEqual(headers.get("Content-Disposition"),
+                         "inline; filename=calendar.ics")
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+        self.assertGreater(int(headers.get("Content-Length", "0")), 0)
+        self.assertEqual(body, {})
+        feed.assert_called_once_with("team", token)
 
     # -- v1 Player/Official delete moved to v2 (criterion 5) -----------------
     def test_v1_player_delete_is_moved_to_v2(self):
