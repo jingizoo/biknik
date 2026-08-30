@@ -294,6 +294,11 @@ body[data-view="games"] .main > .content { max-width: 1480px; }
 .login-persona .lp-role { color: var(--muted); font-size: 12px; }
 .login-guest-link { width: 100%; justify-content: center; margin-top: 14px; }
 body.signed-out .web { display: none; }
+/* Factory reset has already destroyed the session/private state, but its
+   keyboard-trapped success disclosure lives in the ordinary modal host. Show
+   that one inert host until Return to sign-in; currentUser remains null and
+   all role chrome/content were synchronously cleared at the header boundary. */
+body.signed-out.factory-reset-disclosure .web { display: flex; }
 
 /* ---------- public portal (#34) ---------- */
 .public-screen {

@@ -52,46 +52,68 @@ const hierarchyImportTemplates = {
     "FALL26,PLAINFIELD,true\n",
 };
 
-let hierarchyImportState = {
-  sheets: {
+function freshHierarchyImportState() {
+  return {
+    sheets: {
     organizations_csv: "", programs_csv: "", venues_rinks_csv: "",
     competition_csv: "", clubs_csv: "", permanent_teams_csv: "",
     players_csv: "", registrations_csv: "", season_venue_access_csv: "",
-  },
-  report: null,
-  committed: null,
-  validatedKey: null,
-};
+    },
+    report: null,
+    committed: null,
+    validatedKey: null,
+  };
+}
+
+let hierarchyImportState = freshHierarchyImportState();
+
+function freshHierarchyWizardAnswers() {
+  return {
+    operatorType: "both",   // Q1: "competitions" | "venues" | "both"
+    programCodes: [],        // Q2: selected program_code values
+    leagueCodes: [],         // Q3: selected league_code values (filtered by Q2)
+    hasClubs: "yes",          // Q4: "yes" | "no"
+    usesDivisions: "yes",     // Q5: "yes" | "no"
+    venueCodes: [],           // Q6: selected venue_code values
+    venueMode: "one",         // Q7: "one" | "multiple"
+  };
+}
 
 // Q1-Q7 (#260 review, locked) — pure UI-routing state, never persisted, no
 // backend field. programCodes/leagueCodes/venueCodes are transient
 // multi-selects: an empty array means "no filter yet", never "none".
-let hierarchyWizardAnswers = {
-  operatorType: "both",   // Q1: "competitions" | "venues" | "both"
-  programCodes: [],        // Q2: selected program_code values
-  leagueCodes: [],         // Q3: selected league_code values (filtered by Q2)
-  hasClubs: "yes",          // Q4: "yes" | "no"
-  usesDivisions: "yes",     // Q5: "yes" | "no"
-  venueCodes: [],           // Q6: selected venue_code values
-  venueMode: "one",         // Q7: "one" | "multiple"
-};
+let hierarchyWizardAnswers = freshHierarchyWizardAnswers();
+
+function freshHierarchySubordinate() {
+  return {
+    importPlayersNow: true,
+    updatingExisting: false,
+  };
+}
 
 // Subordinate, non-locked controls (#260 review) — not part of Q1-Q7; they
 // live inside the specific sheet section they affect.
-let hierarchySubordinate = {
-  importPlayersNow: true,
-  updatingExisting: false,
-};
+let hierarchySubordinate = freshHierarchySubordinate();
 
 // Existing persisted Program/League/Venue codes for Q2/Q3/Q6 (#260 review),
 // fetched once, read-only. null = not loaded yet.
 let hierarchyExistingCodes = null;
 let hierarchyExistingCodesLoading = false;
 
+registerIdentityResetHook(() => {
+  hierarchyImportState = freshHierarchyImportState();
+  hierarchyWizardAnswers = freshHierarchyWizardAnswers();
+  hierarchySubordinate = freshHierarchySubordinate();
+  hierarchyExistingCodes = null;
+  hierarchyExistingCodesLoading = false;
+});
+
 async function ensureHierarchyExistingCodes() {
   if (hierarchyExistingCodes !== null || hierarchyExistingCodesLoading) return;
+  const myIdentityEpoch = uiIdentityEpoch;
   hierarchyExistingCodesLoading = true;
   const result = await getJSON("/api/import/hierarchy-codes");
+  if (myIdentityEpoch !== uiIdentityEpoch) return;
   hierarchyExistingCodes = (result && !result.error)
     ? result : { programs: [], leagues: [], venues: [] };
   hierarchyExistingCodesLoading = false;

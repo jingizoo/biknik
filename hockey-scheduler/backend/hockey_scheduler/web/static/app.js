@@ -38,6 +38,13 @@ let currentUser = null;            // {username, role, label} or null when signe
 let roleCatalog = [];              // [{id,label,permissions}] from /api/auth/roles
 let accounts = [];                 // [{username,role,label}] demo sign-in options (#50)
 let rolePerms = new Set();         // permissions of the current role
+// A successful credential exchange is not enough to expose the authenticated
+// shell: the role catalog is the client-side source for both chrome gates and
+// permission-derived landing.  When an explicit sign-in beats a still-pending
+// bootstrap, keep the shell behind the login wall until that same session is
+// rebuilt after the catalog arrives.  This is presentation quarantine only;
+// the cookie and canonical identity have already changed on the server.
+let sessionAwaitingRoleMetadata = false;
 let officialsPool = [];            // [{id,name}] officials for the assign UI (#30)
 let standingsDivision = null;      // selected division for the Standings tab (#31)
 let notifState = { notifications: [], unread: 0 };  // feed for the bell (#32)
@@ -51,6 +58,7 @@ let guardianLinkForm = { guardian_user_id: "", player_id: "" };
 // assigned here, so it can never be re-rendered back onto the page.
 let newAccountForm = { username: "", role: "", team_id: "", player_id: "", official_id: "" };
 let newAccountError = "";
+let newAccountPasswordRestoreSeq = 0;
 let notifPrefs = null;             // signed-in user's own channel prefs (#81)
 let feedTokens = [];               // signed-in user's calendar feed tokens (#82)
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
@@ -186,10 +194,16 @@ let importOperationSeq = 0;
 // intra-render behaviour, to buy nothing the per-await check does not already
 // guarantee.
 let renderPass = 0;
+const identityResetHooks = new Set();
+function registerIdentityResetHook(hook) {
+  if (typeof hook !== "function") throw new TypeError("identity reset hook must be a function");
+  identityResetHooks.add(hook);
+}
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
-let schedulerState = {
+function freshSchedulerState() {
+  return {
   division: null, preview: null, drafts: [], summary: null,
   // #375 — the regular-season format, INVERTED to the number the operator
   // actually signs up for: guaranteed games their own team plays. `null`
@@ -222,7 +236,9 @@ let schedulerState = {
   turnaround: 0,
   filters: { division: "all", rink: "all", issue: "all" },  // (#106)
   selected: new Set(),  // game_ids picked for publish/discard (#106)
-};  // (#86)
+  };  // (#86)
+}
+let schedulerState = freshSchedulerState();
 // #328 review round 8 finding 4 -- a terminal commit refusal
 // (pairing_already_scheduled/preview_stale) clears the preview and forces
 // a fresh Generate, but render() replaces #content wholesale, so the
@@ -521,11 +537,20 @@ function networkErrorResult() {
 // The session cookie carries identity; the server resolves the role from it
 // and authorizes each request (#50). No client-asserted role header.
 async function getJSON(p) {
-  try {
-    return await readApiResponse(await fetch(p, { credentials: "same-origin" }));
-  } catch (_) {
-    return networkErrorResult();
+  const sessionToken = readSessionMutationToken();
+  if (!sessionGenerationCurrent(sessionToken)) {
+    throw new IdentitySupersededError();
   }
+  let result;
+  try {
+    result = await readApiResponse(await fetch(p, { credentials: "same-origin" }));
+  } catch (_) {
+    result = networkErrorResult();
+  }
+  if (!sessionGenerationCurrent(sessionToken)) {
+    throw new IdentitySupersededError();
+  }
+  return result;
 }
 
 // ===== THE CONTEXT-SCOPED READ SETTLEMENT BARRIER (#409, CI shard 1) ======
@@ -675,10 +700,9 @@ const contextScopedReadAborts = [];   // {method, url, generation, dispatched,
 //   1. IT IS WRITTEN ONLY WHERE `contextOptions.selected` IS WRITTEN -- the
 //      whole-payload adoption in loadContextOptions() and the POST echo in
 //      sendContextSwitch(), and nowhere else. Both come from ONE server
-//      response, so the tuple and its epoch can never straddle a switch.
-//      It is also deliberately NOT cleared where `contextOptions` survives:
-//      see resetTransientUiState(), where clearing it left a tuple with no
-//      epoch and brought the CI 404 straight back.
+//      response, so the tuple and its epoch can never straddle a switch. An
+//      identity change clears BOTH together after first rewinding any pending
+//      hash; keeping one without the other previously brought the CI 404 back.
 //   2. IT IS READ ONCE PER RENDER PASS, beside the Season id that pass will
 //      ask about, and passed DOWN to getJSONContextScoped -- never read at
 //      fetch time. A render captures its Season id and then awaits many times
@@ -716,13 +740,17 @@ let contextEpoch = null;
 // discard can only be caused by another real change, each of which converges
 // the same way. The in-flight guard collapses a burst of discards from one
 // render pass (every Season's reads of one surface) into ONE options fetch.
-let contextEpochResyncInFlight = false;
+let contextEpochResyncInFlight = null;
 function requestContextEpochResync() {
   if (contextEpochResyncInFlight) return;
-  contextEpochResyncInFlight = true;
+  const myIdentityEpoch = uiIdentityEpoch;
+  const flight = { identityEpoch: myIdentityEpoch };
+  contextEpochResyncInFlight = flight;
   (async () => {
     try {
-      await loadContextOptions();
+      const adopted = await loadContextOptions();
+      if (!adopted || contextEpochResyncInFlight !== flight
+          || myIdentityEpoch !== uiIdentityEpoch) return;
       renderContextSwitcher();
       // The same invalidation an in-app switch performs once its canonical
       // new selection is known: supersede the pass whose reads were
@@ -731,7 +759,9 @@ function requestContextEpochResync() {
       contextRevision += 1;
       render();
     } finally {
-      contextEpochResyncInFlight = false;
+      if (contextEpochResyncInFlight === flight) {
+        contextEpochResyncInFlight = null;
+      }
     }
   })();
 }
@@ -767,6 +797,10 @@ function contextScopedReadSignal() {
 // old 404 is then possible again, so a new call site that forgets this forfeits
 // the protection rather than silently getting a wrong-but-plausible one.
 async function getJSONContextScoped(p, renderedEpoch) {
+  const sessionToken = readSessionMutationToken();
+  if (!sessionGenerationCurrent(sessionToken)) {
+    throw new IdentitySupersededError();
+  }
   const generation = contextScopedReadGeneration;
   const signal = contextScopedReadSignal();
   let markSettled;
@@ -816,6 +850,9 @@ async function getJSONContextScoped(p, renderedEpoch) {
     // was before this existed — only unimproved.
     const response = await fetch(p, { credentials: "same-origin", signal,
       headers: renderedEpoch ? { "X-Context-Epoch": renderedEpoch } : {} });
+    if (!sessionGenerationCurrent(sessionToken)) {
+      throw new IdentitySupersededError();
+    }
     // THE SERVER DISCARDED IT, because the selection moved while this request
     // was in transport. A 204 carries no body, so there is nothing to drain and
     // nothing to parse; classifying it as an abort is not a convenience but the
@@ -862,8 +899,12 @@ async function getJSONContextScoped(p, renderedEpoch) {
     // ordinary-looking value. The generation, not the exception, is what makes
     // it an abort.
     if (generation !== contextScopedReadGeneration) return abortedResult(true);
+    if (!sessionGenerationCurrent(sessionToken)) {
+      throw new IdentitySupersededError();
+    }
     return body;
   } catch (e) {
+    if (e instanceof IdentitySupersededError) throw e;
     if (signal.aborted || (e && e.name === "AbortError")) return abortedResult(true);
     return networkErrorResult();
   } finally {
@@ -895,23 +936,946 @@ async function awaitContextScopedReadSettlement() {
       Array.from(contextScopedReadsInFlight, (entry) => entry.settled));
   }
 }
-async function post(p, b) {
-  // Reset first: an explicit success message the caller sets after a clean
-  // response (the common `if (r && !r.error) toast = "..."` pattern) always
-  // runs after this point, so it inherits the correct "not an error" state
-  // without every one of those call sites needing to say so itself.
-  toastIsError = false;
-  let d;
+
+// A mutating UI command belongs to the authenticated identity that issued it.
+// If that identity changes while the request is in flight, resolving the
+// caller's await would let its old handler write module state, toast text, or
+// DOM under the arriving session. Reject with a private cancellation before
+// returning anything; event handlers deliberately ignore returned promises,
+// so suppress only this known cancellation at the window boundary.
+class IdentitySupersededError extends Error {
+  constructor() {
+    super("The authenticated identity changed while the request was in flight.");
+    this.name = "IdentitySupersededError";
+  }
+}
+window.addEventListener("unhandledrejection", (event) => {
+  if (event.reason instanceof IdentitySupersededError) event.preventDefault();
+});
+
+async function startRawPost(p, b, onResponseHeaders = null, signal = null) {
   try {
     const r = await fetch(p, { method: "POST", credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(b || {}) });
-    d = await readApiResponse(r);
+      body: JSON.stringify(b || {}), signal });
+    // A Set-Cookie response is applied when its headers arrive, before its
+    // body has necessarily drained. Cookie-changing callers use this hook to
+    // establish their privacy boundary at that exact point; waiting for
+    // readApiResponse() would leave the old private DOM authoritative beside
+    // a new shared cookie while a slow body was still streaming.
+    if (onResponseHeaders) onResponseHeaders(r);
+    return { response: r, result: readApiResponse(r) };
   } catch (_) {
-    d = networkErrorResult();
+    return { response: null, result: Promise.resolve(networkErrorResult()) };
   }
+}
+
+async function rawPost(p, b, onResponseHeaders = null) {
+  const started = await startRawPost(p, b, onResponseHeaders);
+  return started.result;
+}
+
+function publishPostError(d) {
   if (d && d.error) { toast = d.error.message; toastIsError = true; }
   return d;
+}
+
+async function post(p, b) {
+  const myIdentityEpoch = uiIdentityEpoch;
+  const sessionToken = readSessionMutationToken();
+  if (!sessionGenerationCurrent(sessionToken)) {
+    throw new IdentitySupersededError();
+  }
+  // Reset before the network wait, preserving the historical transport
+  // contract for loading/error presentation at every existing call site.
+  toastIsError = false;
+  const d = await rawPost(p, b);
+  if (myIdentityEpoch !== uiIdentityEpoch
+      || !sessionGenerationCurrent(sessionToken)) {
+    throw new IdentitySupersededError();
+  }
+  return publishPostError(d);
+}
+
+// Login/logout are the operations that CHANGE the cookie-backed identity, so
+// they cannot use post()'s "identity must remain unchanged" rule. Serialize
+// the COOKIE-MUTATING PHASE instead: at most one response can set the session
+// cookie at a time, and its synchronous currentUser adoption completes before
+// the next mutation is dispatched. Post-login context reads and rendering are
+// deliberately outside this queue. Keeping those cancellable tails inside it
+// would let a held /api/context/options response prevent a later Sign out from
+// even reaching the server, leaving the privileged cookie live behind a UI
+// operation that already asked to end it.
+let authTransitionTail = Promise.resolve();
+// Bootstrap can be superseded by an explicit Sign in/Sign out while one of
+// its public metadata reads is failing.  Waiting only for the cookie-mutation
+// lock is not enough: a successful login adopts its response body and starts
+// its identity-scoped rebuild after releasing that lock.  Track the complete
+// visible action so a recovery bootstrap cannot race ahead, read the old
+// cookie, or overwrite the action's final sign-in error.
+let explicitAuthActionTail = Promise.resolve();
+function trackExplicitAuthAction(action) {
+  const settled = Promise.resolve(action).catch(() => {});
+  explicitAuthActionTail = settled;
+  return action;
+}
+async function awaitExplicitAuthActionDrain() {
+  // A second click may replace the tracked tail while the first is settling.
+  // Drain until the reference itself is stable so recovery always follows the
+  // last explicit action, not merely whichever one was current at entry.
+  while (true) {
+    const tail = explicitAuthActionTail;
+    await tail;
+    if (tail === explicitAuthActionTail) return;
+  }
+}
+// A user can act before bootstrap's /api/auth/me read settles, including via
+// the already-wired Sign out control in the static shell. Identity epoch alone
+// cannot detect that race when both bootstrap's starting model and Sign out's
+  // local result are null. Every cookie-changing user intent therefore takes a
+// ticket synchronously, before it waits for the auth queue. Bootstrap and all
+// post-mutation reconciliation refuse work whose ticket has been superseded.
+let authIntentSeq = 0;
+function newAuthIntent() { return ++authIntentSeq; }
+let localAuthIntentSeq = 0;
+// Demo auto-login is a passive convenience, not a user choice.  A newer
+// explicit Sign in/Sign out must be able to cancel it before response headers
+// apply a Set-Cookie. Once headers have arrived, the origin lock's ordering is
+// authoritative and the immutable ownership snapshot below guards only the
+// delayed body/UI tail.
+let passiveAutoLoginAttempt = null;
+function cancelPendingPassiveAutoLogin() {
+  const attempt = passiveAutoLoginAttempt;
+  if (attempt && !attempt.headersSeen
+      && !attempt.controller.signal.aborted) attempt.controller.abort();
+}
+function captureAuthOwnership(passive = false) {
+  return {
+    authIntent: authIntentSeq,
+    localIntent: localAuthIntentSeq,
+    identityEpoch: uiIdentityEpoch,
+    sessionToken: readSessionMutationToken(),
+    passive,
+  };
+}
+function newLocalAuthIntent() {
+  // Synchronous by design: an explicit click that wins before passive-login
+  // headers must prevent that older response from installing its cookie.
+  cancelPendingPassiveAutoLogin();
+  localAuthIntentSeq += 1;
+  // A click must supersede an older CLICK/bootstrap before it can dispatch,
+  // but it is not yet an authorization verdict. In particular, a refused
+  // login must not cancel a canonical resume /auth/me response that proves
+  // the old session was remotely revoked. authIntent advances only when a
+  // mutation actually succeeds (or a canonical reconciliation takes over).
+  return captureAuthOwnership();
+}
+// Destructive lifecycle/revoke clicks are bound to the identity that exposed
+// them, but they are NOT explicit identity choices. Keep their ordering lane
+// separate: clicking Reset on the old shell while a Viewer login response is
+// held must cancel Reset after the login boundary, not suppress adoption of
+// the valid Viewer cookie.
+let identityBoundIntentSeq = 0;
+function newIdentityBoundIntent() {
+  identityBoundIntentSeq += 1;
+  return {
+    authIntent: authIntentSeq,
+    localIntent: identityBoundIntentSeq,
+    explicitAuthIntent: localAuthIntentSeq,
+    identityEpoch: uiIdentityEpoch,
+    sessionToken: readSessionMutationToken(),
+  };
+}
+const SESSION_MUTATION_LOCK_NAME = "hockey-scheduler-session-mutation-v1";
+function runOriginSessionTransition(operation) {
+  // Web Locks is origin-wide, so it closes the ordering gap the per-document
+  // promise tail cannot: two tabs must not apply Set-Cookie responses in one
+  // order but publish/adopt their bodies in another. localhost/HTTPS expose
+  // this API in every browser target the app ships; the fallback preserves the
+  // existing single-tab contract for older embedded engines.
+  if (navigator.locks && typeof navigator.locks.request === "function") {
+    return navigator.locks.request(SESSION_MUTATION_LOCK_NAME,
+      { mode: "exclusive" }, operation);
+  }
+  return operation();
+}
+function runAuthTransition(operation) {
+  const lockedOperation = () => runOriginSessionTransition(operation);
+  const result = authTransitionTail.then(lockedOperation, lockedOperation);
+  authTransitionTail = result.catch(() => {});
+  return result;
+}
+async function authPost(p, b) {
+  toastIsError = false;
+  return publishPostError(await rawPost(p, b));
+}
+
+const SESSION_COOKIE_MUTATING_PATHS = new Set([
+  "/api/auth/login",
+  "/api/auth/logout",
+  "/api/demo/load",
+  "/api/demo/reset",
+  "/api/demo/clear",
+  "/api/admin/factory-reset/execute",
+]);
+
+// A session cookie is shared by every tab for this origin; JavaScript state is
+// not. Without an origin-wide generation notice, one tab can replace/logout
+// the cookie while another keeps an already-painted Admin tree and continues
+// settling reads under its obsolete identity model. localStorage's `storage`
+// event is the browser-native cross-tab signal. The persisted token also lets
+// focus/visibility recover an event a suspended tab did not observe.
+const SESSION_MUTATION_STORAGE_KEY = "hs_session_mutation_v1";
+function readSessionMutationToken() {
+  try { return localStorage.getItem(SESSION_MUTATION_STORAGE_KEY) || ""; }
+  catch (_) { return ""; }
+}
+let observedSessionMutationToken = readSessionMutationToken();
+let externalSessionReconcileSeq = 0;
+
+// `/api/auth/me` is the canonical role/scope authority, but several recovery
+// lanes may read it concurrently under the SAME cookie generation (focus,
+// failed-mutation reconciliation, lifecycle/revoke recovery, bootstrap). A
+// delayed response can therefore carry an older account scope even when every
+// auth-intent, identity-epoch, and storage-token guard still matches.
+//
+// Give every read a dispatch ticket, but advance accepted authority ONLY for a
+// classifiable user/anonymous verdict. Dispatching R2 terminally aborts a
+// still-pending R1. If R2 then cannot be classified, it has deliberately
+// discarded the only read that might expose a server-side authority change;
+// keep no painted private model in that uncertainty window and verify again
+// from quarantine. A newer accepted ticket likewise terminally invalidates
+// every older dependent read: matching the same username/role/scope after a
+// server-side A→B→A change does not prove that an older context response was
+// served under the ending authority.
+let canonicalAuthorityReadSeq = 0;
+let canonicalAuthorityActiveRead = null;
+let acceptedCanonicalAuthorityVerdict = {
+  ticket: 0, signature: null, anonymous: false,
+};
+function beginCanonicalAuthorityRead(requiresQuarantineRecovery = false) {
+  // One canonical read lane per document. Once R2 dispatches, R1 is terminally
+  // obsolete even if it reaches the server later and therefore happens to
+  // carry a newer snapshot. Abort is paired with the ticket check below:
+  // readApiResponse() deliberately converts body-read failures to {}, so the
+  // signal alone is not a sufficient stale-result guard.
+  const displacedPending = !!(canonicalAuthorityActiveRead
+    && canonicalAuthorityActiveRead.pending
+    && !canonicalAuthorityActiveRead.controller.signal.aborted);
+  const displacedNeedsRecovery = !!(displacedPending
+    && canonicalAuthorityActiveRead.requiresQuarantineRecovery);
+  if (displacedPending) canonicalAuthorityActiveRead.controller.abort();
+  const controller = new AbortController();
+  const read = {
+    ticket: ++canonicalAuthorityReadSeq,
+    acceptedTicketAtStart: acceptedCanonicalAuthorityVerdict.ticket,
+    controller,
+    displacedPending,
+    displacedNeedsRecovery,
+    pending: true,
+    requiresQuarantineRecovery,
+  };
+  canonicalAuthorityActiveRead = read;
+  return read;
+}
+function settleCanonicalAuthorityRead(read) {
+  read.pending = false;
+  if (canonicalAuthorityActiveRead === read) {
+    canonicalAuthorityActiveRead = null;
+  }
+}
+function canonicalAuthorityReadCurrent(read) {
+  return read.ticket === canonicalAuthorityReadSeq
+    && !read.controller.signal.aborted;
+}
+function classifyCanonicalAuthority(response, payload) {
+  if (response && response.status === 401) {
+    return { user: null, signature: null, anonymous: true };
+  }
+  if (!response || !response.ok || !payload
+      || typeof payload !== "object" || Array.isArray(payload)
+      || !Object.prototype.hasOwnProperty.call(payload, "user")
+      || payload.error) return null;
+  if (payload.user === null) {
+    return { user: null, signature: null, anonymous: true };
+  }
+  const user = payload.user;
+  if (!user || typeof user !== "object" || Array.isArray(user)
+      || typeof user.username !== "string" || !user.username
+      || typeof user.role !== "string" || !user.role
+      || !user.scope || typeof user.scope !== "object"
+      || Array.isArray(user.scope)) return null;
+  return {
+    user,
+    signature: sessionIdentitySignature(user),
+    anonymous: false,
+  };
+}
+function claimCanonicalAuthorityVerdict(read, authority) {
+  if (!authority || !canonicalAuthorityReadCurrent(read)
+      || read.ticket <= acceptedCanonicalAuthorityVerdict.ticket) return null;
+  acceptedCanonicalAuthorityVerdict = {
+    ticket: read.ticket,
+    signature: authority.signature,
+    anonymous: authority.anonymous,
+  };
+  return acceptedCanonicalAuthorityVerdict;
+}
+function canonicalAuthorityRebuildCurrent(claim) {
+  return acceptedCanonicalAuthorityVerdict.ticket === claim.ticket;
+}
+function canonicalAuthorityFallbackCurrent(read) {
+  return canonicalAuthorityReadCurrent(read)
+    && acceptedCanonicalAuthorityVerdict.ticket
+    === read.acceptedTicketAtStart;
+}
+function quarantineAfterDisplacedCanonicalFailure(read) {
+  // A later R3 may already have superseded this failed R2. Only the current
+  // read may act, and only when it actually displaced an unresolved reader
+  // while a private identity (or its context/render tail) was live.
+  if (!read.displacedPending || !canonicalAuthorityFallbackCurrent(read)
+      || (!currentUser && !canonicalSessionRebuildInFlight
+        && !read.requiresQuarantineRecovery
+        && !read.displacedNeedsRecovery)) return false;
+  ++externalSessionReconcileSeq;
+  newAuthIntent();
+  if (currentUser) setUser(null);
+  else if (canonicalSessionRebuildInFlight) quarantineReplacedSessionState();
+  clearSessionContextHash();
+  renderRoleSwitch();
+  showLogin("Session access could not be verified. Checking again…");
+  // Ordinary focus recovery ignores a signed-out model. Use the explicit
+  // quarantine lane so this privacy boundary has a liveness path even when no
+  // later browser event occurs. The fresh R3 remains cancellable by any newer
+  // session mutation or canonical verdict.
+  revalidateSessionOnResume(true);
+  return true;
+}
+function publishSessionMutation() {
+  const token = (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function")
+    ? globalThis.crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  // storage events do not fire in the document that performed the write, so a
+  // successful persisted write is adopted locally too. Do NOT advance the
+  // observed generation when storage is unavailable: readSessionMutationToken
+  // would still return the old value and the stricter live===observed contract
+  // would reject this tab's own successful mutation forever. In that legacy
+  // fallback there is no cross-tab signal, but same-tab epoch/auth guards still
+  // apply and focus reconciliation remains available.
+  try {
+    localStorage.setItem(SESSION_MUTATION_STORAGE_KEY, token);
+    observedSessionMutationToken = token;
+  } catch (_) {}
+}
+
+function sessionGenerationCurrent(expectedToken) {
+  const liveToken = readSessionMutationToken();
+  // `live` is the origin's newest published cookie generation; `observed` is
+  // the generation whose identity this tab has actually adopted. A delayed
+  // storage event can make those differ before any callback runs. Capturing
+  // the already-new live value must not let an OLD painted Admin action
+  // dispatch under the peer tab's NEW cookie.
+  if (liveToken === observedSessionMutationToken) {
+    return expectedToken === liveToken;
+  }
+  // A peer mutation may have advanced persisted origin state before this tab
+  // receives its storage event. Start reconciliation from the live token now;
+  // an obsolete tail must never render under the newer shared cookie merely
+  // because event delivery lagged behind localStorage visibility.
+  if (liveToken) {
+    reconcileExternalSessionMutation(liveToken);
+  } else if (currentUser) {
+    // A missing persisted generation is not evidence of which cookie is
+    // live. Refuse the operation and ask the canonical endpoint; never guess
+    // that the currently painted identity is still authoritative.
+    revalidateSessionOnResume();
+  }
+  return false;
+}
+
+function reconcileLiveSessionBeforeExplicitAuth() {
+  const liveToken = readSessionMutationToken();
+  // Login and logout are canonical identity choices, so they must still
+  // dispatch under whichever shared cookie won the preceding origin-lock
+  // slot. They are not allowed to leave the OLD private tree painted while a
+  // newer peer generation is already visible, though. Storage events can be
+  // delayed behind localStorage itself; start the same synchronous quarantine
+  // here without using the ordinary generation preflight's false verdict to
+  // cancel the explicit operation. An empty token is storage eviction, not a
+  // cookie verdict, and therefore does not establish a boundary by itself.
+  if (liveToken && liveToken !== observedSessionMutationToken) {
+    reconcileExternalSessionMutation(liveToken);
+  }
+}
+
+function establishSessionMutationBoundary(message = "Session access changed. Checking access…") {
+  // Fetch has delivered a successful response header, so any Set-Cookie is
+  // already authoritative even if the body is still streaming. Publish the
+  // shared generation and invalidate canonical reads before destroying this
+  // tab's old identity. This is deliberately synchronous: no old private DOM
+  // or permission model survives beside the replacement cookie.
+  publishSessionMutation();
+  const authIntent = newAuthIntent();
+  const reconcileSeq = ++externalSessionReconcileSeq;
+  if (currentUser) setUser(null);
+  else quarantineReplacedSessionState();
+  renderRoleSwitch();
+  showLogin(message);
+  return {
+    authIntent,
+    identityEpoch: uiIdentityEpoch,
+    sessionToken: readSessionMutationToken(),
+    reconcileSeq,
+  };
+}
+
+async function sessionCookiePost(p, b, signal = null,
+    onResponseHeaders = null) {
+  if (!SESSION_COOKIE_MUTATING_PATHS.has(p)) {
+    throw new Error(`Unregistered session-cookie mutation: ${p}`);
+  }
+  toastIsError = false;
+  let boundary = null;
+  const started = await startRawPost(p, b, (response) => {
+    if (onResponseHeaders) onResponseHeaders(response);
+    // A refused login/failed mutation carries no replacement cookie contract
+    // and must leave the existing identity intact. A 2xx header is the point
+    // at which the browser has applied the endpoint's Set-Cookie.
+    if (response.ok) {
+      // Make explicit logout sticky BEFORE publishing the cross-tab boundary.
+      // A peer that boots while this response body is still draining must not
+      // queue demo auto-login behind the Web Lock and silently undo logout.
+      if (p === "/api/auth/logout") {
+        try { localStorage.setItem("hs_signed_out", "1"); } catch (_) {}
+      }
+      boundary = establishSessionMutationBoundary();
+    }
+  }, signal);
+  return { resultPromise: started.result, boundary };
+}
+
+function clearSessionContextHash() {
+  contextOptions = null;
+  contextEpoch = null;
+  if (location.hash.indexOf("#ctx=") === 0) {
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+}
+
+async function rebuildVerifiedSession(user, stillCurrent, message = "") {
+  if (!stillCurrent()) return false;
+  setUser(user);
+  if (sessionAwaitingRoleMetadata) {
+    // A canonical identity is still not a renderable identity until its role
+    // row defines the visible routes. This path is shared by failed-mutation,
+    // resume, and bootstrap recovery—not only ordinary successful sign-in.
+    showLogin("Session verified. Loading access…");
+    requestRoleMetadataRecovery();
+    return true;
+  }
+  const myIdentityEpoch = uiIdentityEpoch;
+  const abandonSpeculativeIdentity = () => {
+    // /auth/me authorized `user`, but that identity is not adopted until its
+    // own context and generation are still current. If this exact speculative
+    // epoch loses that race, destroy it; never leave a permission-bearing
+    // currentUser behind the checking overlay. A newer epoch owns itself.
+    if (myIdentityEpoch === uiIdentityEpoch) {
+      setUser(null);
+      clearSessionContextHash();
+      renderRoleSwitch();
+      showLogin("Session access changed before it could be verified. Sign in again.");
+      // The speculative model may have been torn down because storage changed
+      // while its context read was in flight. A resume read for that change
+      // can itself have captured the just-destroyed epoch and discard. Queue a
+      // canonical retry that is allowed to start from this quarantine state;
+      // otherwise a valid cookie can be stranded behind currentUser=null with
+      // live!==observed and no future event to recover it.
+      revalidateSessionOnResume(true);
+    }
+    return false;
+  };
+  let adopted;
+  try {
+    adopted = await loadContextOptions();
+    if (!adopted || !stillCurrent() || myIdentityEpoch !== uiIdentityEpoch) {
+      return abandonSpeculativeIdentity();
+    }
+    await restoreContextDeepLink();
+  } catch (error) {
+    if (error instanceof IdentitySupersededError) {
+      return abandonSpeculativeIdentity();
+    }
+    throw error;
+  }
+  if (!stillCurrent() || myIdentityEpoch !== uiIdentityEpoch) {
+    return abandonSpeculativeIdentity();
+  }
+  toast = typeof message === "function" ? message() : message;
+  toastIsError = false;
+  renderRoleSwitch();
+  hideLogin();
+  await render();
+  if (!stillCurrent() || myIdentityEpoch !== uiIdentityEpoch) {
+    return abandonSpeculativeIdentity();
+  }
+  return true;
+}
+
+// An identity verdict is not fully adopted until its context/deep-link reads
+// and render finish. Track canonical rebuilds AND the ordinary successful
+// sign-in tail so a newer SAME-signature canonical verdict can terminally
+// cancel either and start a fresh rebuild; simply letting older dependent
+// responses finish would be unsafe across a server-side A→B→A.
+let canonicalSessionRebuildInFlight = null;
+function trackCanonicalSessionRebuild(flight) {
+  canonicalSessionRebuildInFlight = flight;
+  flight.catch(() => {}).finally(() => {
+    if (canonicalSessionRebuildInFlight === flight) {
+      canonicalSessionRebuildInFlight = null;
+    }
+  });
+  return flight;
+}
+function rebuildCanonicalVerifiedSession(user, stillCurrent, message = "") {
+  return trackCanonicalSessionRebuild(
+    rebuildVerifiedSession(user, stillCurrent, message));
+}
+
+async function reconcileCanonicalSessionAfterFailedMutation() {
+  // A refused/failed cookie mutation did not establish a new generation, but
+  // its 401 may be the first evidence that the session was remotely revoked
+  // while this focused tab still painted Admin. Re-read the canonical session
+  // now, after the serialized mutation phase has released its Web Lock. This
+  // does not replace an older resume verdict (local clicks no longer bump
+  // authIntent); both agree or the first later authoritative boundary cancels
+  // the other. Context/deep-link/render recovery is deliberately cancellable
+  // and can never starve a later Sign out.
+  const expectedAuthIntent = authIntentSeq;
+  const expectedSessionToken = readSessionMutationToken();
+  if (!sessionGenerationCurrent(expectedSessionToken)) return false;
+  const authorityRead = beginCanonicalAuthorityRead();
+  let response;
+  let me;
+  try {
+    response = await fetch("/api/auth/me", {
+      credentials: "same-origin", signal: authorityRead.controller.signal,
+    });
+    me = await readApiResponse(response);
+  } catch (_) {
+    response = null;
+    me = networkErrorResult();
+  } finally {
+    settleCanonicalAuthorityRead(authorityRead);
+  }
+  if (expectedAuthIntent !== authIntentSeq
+      || !sessionGenerationCurrent(expectedSessionToken)) return false;
+  const authority = classifyCanonicalAuthority(response, me);
+  if (!authority) {
+    quarantineAfterDisplacedCanonicalFailure(authorityRead);
+    return false;
+  }
+  const authorityClaim = claimCanonicalAuthorityVerdict(
+    authorityRead, authority);
+  if (!authorityClaim) return false;
+  const liveUser = authority.user;
+  const liveIdentity = authority.signature;
+  const paintedIdentity = currentUser
+    ? sessionIdentitySignature(currentUser) : null;
+  if (liveIdentity && liveIdentity === paintedIdentity
+      && !canonicalSessionRebuildInFlight) return true;
+
+  const reconcileSeq = ++externalSessionReconcileSeq;
+  const adoptedAuthIntent = newAuthIntent();
+  if (currentUser) setUser(null);
+  else quarantineReplacedSessionState();
+  renderRoleSwitch();
+  const stillCurrent = () => reconcileSeq === externalSessionReconcileSeq
+    && adoptedAuthIntent === authIntentSeq
+    && sessionGenerationCurrent(expectedSessionToken)
+    && canonicalAuthorityRebuildCurrent(authorityClaim);
+  if (liveUser) {
+    showLogin("Session access changed. Checking access…");
+    return rebuildCanonicalVerifiedSession(liveUser, stillCurrent);
+  }
+  clearSessionContextHash();
+  showLogin("Your session ended. Sign in again to continue.");
+  return true;
+}
+
+let externalSessionReconcileInFlight = null;
+
+// The synchronous half is the privacy boundary: destroy private stores, DOM,
+// focus intents, and privileged chrome before any reconciliation request is
+// dispatched. The async half may then rebuild from the canonical live cookie.
+function reconcileExternalSessionMutation(token) {
+  if (!token || token === observedSessionMutationToken) return;
+  const liveToken = readSessionMutationToken();
+  if (token !== liveToken) {
+    // Storage events may be delivered late or out of order after a suspended
+    // tab resumes. Never regress the tab-local generation or blank a session
+    // that already adopted the newer persisted token. If this tab has not yet
+    // seen that live generation, reconcile the live token directly instead of
+    // waiting for another focus/visibility event that may never arrive.
+    if (liveToken && liveToken !== observedSessionMutationToken) {
+      reconcileExternalSessionMutation(liveToken);
+    }
+    return;
+  }
+  observedSessionMutationToken = token;
+  const mySeq = ++externalSessionReconcileSeq;
+  const myAuthIntent = newAuthIntent();
+  if (currentUser) setUser(null);
+  else quarantineReplacedSessionState();
+  renderRoleSwitch();
+  showLogin("The session changed in another tab. Checking access…");
+
+  const flight = (async () => {
+    const authorityRead = beginCanonicalAuthorityRead(true);
+    let response;
+    let me;
+    try {
+      response = await fetch("/api/auth/me", {
+        credentials: "same-origin", signal: authorityRead.controller.signal,
+      });
+      me = await readApiResponse(response);
+    } catch (_) {
+      response = null;
+      me = networkErrorResult();
+    } finally {
+      settleCanonicalAuthorityRead(authorityRead);
+    }
+    const baseCurrent = () => mySeq === externalSessionReconcileSeq
+      && myAuthIntent === authIntentSeq
+      && token === observedSessionMutationToken
+      && token === readSessionMutationToken();
+    if (!baseCurrent()) return;
+
+    const authority = classifyCanonicalAuthority(response, me);
+    if (authority) {
+      const authorityClaim = claimCanonicalAuthorityVerdict(
+        authorityRead, authority);
+      if (!authorityClaim) return;
+      const stillCurrent = () => baseCurrent()
+        && canonicalAuthorityRebuildCurrent(authorityClaim);
+
+      if (authority.user) {
+        await rebuildCanonicalVerifiedSession(authority.user, stillCurrent);
+        return;
+      }
+
+      clearSessionContextHash();
+      renderRoleSwitch();
+      showLogin("The session changed in another tab. Sign in again to continue.");
+      return;
+    }
+
+    // For an outage/malformed body, remain quarantined: resurrecting the
+    // previous Admin DOM merely because verification failed would undo the
+    // boundary above. Do not let this fallback overwrite any authoritative
+    // verdict another overlapping reader accepted while this request waited.
+    if (quarantineAfterDisplacedCanonicalFailure(authorityRead)) return;
+    if (!canonicalAuthorityFallbackCurrent(authorityRead)) return;
+    clearSessionContextHash();
+    renderRoleSwitch();
+    showLogin("The session changed, but access could not be verified. Please sign in again.");
+  })();
+  externalSessionReconcileInFlight = flight;
+  flight.catch(() => {}).finally(() => {
+    if (externalSessionReconcileInFlight === flight) {
+      externalSessionReconcileInFlight = null;
+    }
+  });
+}
+
+function reconcileMissedSessionMutation(allowQuarantined = false) {
+  const token = readSessionMutationToken();
+  if (token && token !== observedSessionMutationToken) {
+    reconcileExternalSessionMutation(token);
+    return;
+  }
+  // Every successful cookie-changing header quarantines synchronously before
+  // its body/canonical rebuild completes (login, lifecycle, revoke, and peer
+  // reconciliation alike). If storage is evicted in that window,
+  // currentUser is already null and the ordinary signed-out early return
+  // would discard the only recovery signal. Fresh/intentionally signed-out
+  // pages have live===observed==='', so live==='' with an older observed
+  // nonempty generation is the narrow evidence that permits one canonical
+  // retry from quarantine without opening normal login-screen focus.
+  const recoverEvictedQuarantine = token === "" && !currentUser
+    && observedSessionMutationToken !== "";
+  revalidateSessionOnResume(allowQuarantined || recoverEvictedQuarantine);
+}
+let resumeSessionValidationInFlight = null;
+let resumeSessionValidationPending = false;
+let resumeSessionValidationPendingFromQuarantine = false;
+async function awaitSessionReconciliationDrain() {
+  // A generation mismatch can arrive while a focus /auth/me is already in
+  // flight. revalidateSessionOnResume() coalesces that signal and starts one
+  // pending rerun from the old flight's finally handler. Awaiting only the old
+  // promise is too early: Promise reactions resume this caller before that
+  // cleanup schedules the rerun. Keep yielding through both the live flights
+  // and the pending bit until the complete reconciliation chain is quiet.
+  for (;;) {
+    const flights = [resumeSessionValidationInFlight,
+      externalSessionReconcileInFlight].filter(Boolean);
+    if (flights.length) {
+      await Promise.all(flights.map((flight) => flight.catch(() => {})));
+      // Let the registered catch/finally chain clear the old pointer and, when
+      // needed, publish the coalesced rerun before observing state again.
+      await Promise.resolve();
+      continue;
+    }
+    if (resumeSessionValidationPending) {
+      await Promise.resolve();
+      continue;
+    }
+    return;
+  }
+}
+function sessionIdentitySignature(user) {
+  return JSON.stringify({
+    username: user && user.username || null,
+    role: user && user.role || null,
+    scope: user && user.scope || null,
+  });
+}
+function revalidateSessionOnResume(allowQuarantined = false) {
+  // Signed-out pages own no private authenticated tree. Bootstrap/sign-in is
+  // their reconciliation path; avoid turning every focus of the login form
+  // into a redundant network request. The one exception is a retry explicitly
+  // requested by speculative-identity teardown: it must be able to recover a
+  // still-valid cookie from the checking quarantine.
+  if (!currentUser && !allowQuarantined) return;
+  const liveSessionToken = readSessionMutationToken();
+  if (liveSessionToken
+      && liveSessionToken !== observedSessionMutationToken) {
+    // A nonempty unseen generation is always an identity boundary—even when
+    // /auth/me reports the same username. Never let a coalesced resume adopt
+    // it as if it were mere storage eviction and preserve the old generation's
+    // private DOM/stores.
+    reconcileExternalSessionMutation(liveSessionToken);
+    return;
+  }
+  if (resumeSessionValidationInFlight) {
+    // Focus/visibility signals coalesce while a read is in flight, but the
+    // last signal may belong to a NEW storage generation. The old read will
+    // correctly discard on its token check; remember one rerun so that
+    // discard cannot leave live!==observed forever and deadlock every later
+    // authenticated request.
+    resumeSessionValidationPending = true;
+    resumeSessionValidationPendingFromQuarantine =
+      resumeSessionValidationPendingFromQuarantine || allowQuarantined;
+    return;
+  }
+  resumeSessionValidationPending = false;
+  resumeSessionValidationPendingFromQuarantine = false;
+  const expectedAuthIntent = authIntentSeq;
+  const expectedIdentityEpoch = uiIdentityEpoch;
+  const expectedSessionToken = readSessionMutationToken();
+  const expectedIdentity = currentUser
+    ? sessionIdentitySignature(currentUser) : null;
+  const flight = (async () => {
+    const authorityRead = beginCanonicalAuthorityRead(allowQuarantined);
+    let response;
+    let me;
+    try {
+      response = await fetch("/api/auth/me", {
+        credentials: "same-origin", signal: authorityRead.controller.signal,
+      });
+      me = await readApiResponse(response);
+    } catch (_) {
+      response = null;
+      me = networkErrorResult();
+    } finally {
+      settleCanonicalAuthorityRead(authorityRead);
+    }
+    if (expectedAuthIntent !== authIntentSeq
+        || expectedIdentityEpoch !== uiIdentityEpoch
+        || expectedSessionToken !== readSessionMutationToken()) return;
+    const authority = classifyCanonicalAuthority(response, me);
+    if (!authority) {
+      quarantineAfterDisplacedCanonicalFailure(authorityRead);
+      return; // 5xx/malformed: no authority verdict
+    }
+    const authorityClaim = claimCanonicalAuthorityVerdict(
+      authorityRead, authority);
+    if (!authorityClaim) return;
+    const liveIdentity = authority.signature;
+    if (allowQuarantined && expectedSessionToken === ""
+        && (liveIdentity || authority.anonymous)) {
+      // A forced retry starts only after this exact speculative epoch was
+      // quarantined. Its canonical /auth/me response is therefore the missing
+      // verdict after storage eviction. Adopt the empty generation before
+      // rebuilding context—or before settling an authoritative anonymous
+      // result. Otherwise guarded GETs loop on live='' / observed=old, and an
+      // invalid-login error can be silently suppressed by that same mismatch.
+      observedSessionMutationToken = expectedSessionToken;
+    }
+    if (liveIdentity && liveIdentity === expectedIdentity
+        && !canonicalSessionRebuildInFlight) {
+      // Storage eviction/removeItem can erase the persisted generation while
+      // leaving the session cookie valid. The canonical identity read is the
+      // evidence needed to adopt that now-empty generation; without this,
+      // live!==observed would make every future authenticated GET/POST fail
+      // preflight forever even though /auth/me just confirmed the same user.
+      if (expectedSessionToken === "") {
+        observedSessionMutationToken = expectedSessionToken;
+      }
+      return;
+    }
+
+    // The canonical identity disappeared or changed without this origin's
+    // mutation token (remote revoke, natural expiry, account role/scope
+    // rebind). Establish the same synchronous boundary as a storage event,
+    // then either rebuild the newly-authorized identity or remain signed out.
+    const mySeq = ++externalSessionReconcileSeq;
+    const myAuthIntent = newAuthIntent();
+    if (currentUser) setUser(null);
+    else quarantineReplacedSessionState();
+    renderRoleSwitch();
+    const stillCurrent = () => mySeq === externalSessionReconcileSeq
+      && myAuthIntent === authIntentSeq
+      && expectedSessionToken === readSessionMutationToken()
+      && canonicalAuthorityRebuildCurrent(authorityClaim);
+    if (liveIdentity) {
+      showLogin("Session access changed. Checking access…");
+      await rebuildCanonicalVerifiedSession(authority.user, stillCurrent);
+    } else {
+      clearSessionContextHash();
+      showLogin("Your session ended. Sign in again to continue.");
+    }
+  })();
+  resumeSessionValidationInFlight = flight;
+  flight.catch(() => {}).finally(() => {
+    if (resumeSessionValidationInFlight === flight) {
+      resumeSessionValidationInFlight = null;
+      if (resumeSessionValidationPending) {
+        const allowPendingQuarantine =
+          resumeSessionValidationPendingFromQuarantine;
+        resumeSessionValidationPending = false;
+        resumeSessionValidationPendingFromQuarantine = false;
+        // Route the rerun through the generation-aware entry point. A newly
+        // visible nonempty token must quarantine synchronously; an empty-token
+        // eviction can use canonical identity to restore liveness.
+        reconcileMissedSessionMutation(allowPendingQuarantine);
+      }
+    }
+  });
+}
+window.addEventListener("storage", (event) => {
+  if (event.key === SESSION_MUTATION_STORAGE_KEY && event.newValue) {
+    reconcileExternalSessionMutation(event.newValue);
+  }
+});
+// Do not pass the FocusEvent into `allowQuarantined`: only the exact
+// speculative-teardown recovery path may grant that exception.
+window.addEventListener("focus", () => reconcileMissedSessionMutation());
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") reconcileMissedSessionMutation();
+});
+
+// Demo lifecycle/factory-reset responses also replace or expire the session
+// cookie. They share the auth queue, but remain bound to the identity that
+// clicked: an operation that sat behind a sign-in must not later dispatch
+// under the arriving session just because its turn in the queue came up.
+function runIdentityBoundSessionTransition(operation) {
+  const requestedIdentityEpoch = uiIdentityEpoch;
+  const requestedSessionToken = readSessionMutationToken();
+  const requestedIntent = newIdentityBoundIntent();
+  return runAuthTransition(async () => {
+    if (requestedIdentityEpoch !== uiIdentityEpoch
+        || !sessionGenerationCurrent(requestedSessionToken)) {
+      throw new IdentitySupersededError();
+    }
+    const outcome = await operation();
+    const resultPromise = outcome && outcome.resultPromise;
+    const boundary = outcome && outcome.boundary;
+    // A successful response established the cookie/store boundary as soon as
+    // its HEADERS arrived, while this mutation still owns the auth queue. The
+    // body may have drained later; only its cancellable UI tail is allowed to
+    // become obsolete.
+    // The lock ends with the headers and synchronous boundary. Body parsing is
+    // deliberately returned as a cancellable tail: a stalled stream must not
+    // stop a later Sign out from dispatching.
+    const boundaryEstablished = !!boundary;
+    return {
+      resultPromise,
+      requestedIdentityEpoch,
+      adoptedIdentityEpoch: boundaryEstablished
+        ? boundary.identityEpoch : requestedIdentityEpoch,
+      adoptedAuthIntent: boundaryEstablished
+        ? boundary.authIntent : requestedIntent.authIntent,
+      adoptedSessionToken: boundaryEstablished
+        ? boundary.sessionToken : requestedSessionToken,
+      localIntent: requestedIntent.localIntent,
+      explicitAuthIntent: requestedIntent.explicitAuthIntent,
+      boundaryEstablished,
+    };
+  }).then(async (transition) => {
+    transition.result = await transition.resultPromise;
+    delete transition.resultPromise;
+    transition.supersededByLocalIntent =
+      transition.localIntent !== identityBoundIntentSeq
+      || transition.explicitAuthIntent !== localAuthIntentSeq;
+    return transition;
+  });
+}
+
+function runSessionRevocationTransition(accountId, sessionId) {
+  const requestedIdentityEpoch = uiIdentityEpoch;
+  const requestedSessionToken = readSessionMutationToken();
+  const requestedIntent = newIdentityBoundIntent();
+  return runAuthTransition(async () => {
+    if (requestedIdentityEpoch !== uiIdentityEpoch
+        || !sessionGenerationCurrent(requestedSessionToken)) {
+      throw new IdentitySupersededError();
+    }
+    const path = `/api/accounts/${encodeURIComponent(accountId)}/sessions/`
+      + `${encodeURIComponent(sessionId)}/revoke`;
+    toastIsError = false;
+    let boundary = null;
+    const started = await startRawPost(path, {}, (response) => {
+      if (response.ok) {
+        boundary = establishSessionMutationBoundary(
+          "Checking this browser's session…");
+      }
+    });
+    const boundaryEstablished = !!boundary;
+    return {
+      resultPromise: started.result,
+      requestedIdentityEpoch,
+      adoptedIdentityEpoch: boundaryEstablished
+        ? boundary.identityEpoch : requestedIdentityEpoch,
+      adoptedAuthIntent: boundaryEstablished
+        ? boundary.authIntent : requestedIntent.authIntent,
+      adoptedSessionToken: boundaryEstablished
+        ? boundary.sessionToken : requestedSessionToken,
+      localIntent: requestedIntent.localIntent,
+      explicitAuthIntent: requestedIntent.explicitAuthIntent,
+      boundaryEstablished,
+    };
+  }).then(async (transition) => {
+    transition.result = await transition.resultPromise;
+    delete transition.resultPromise;
+    transition.supersededByLocalIntent =
+      transition.localIntent !== identityBoundIntentSeq
+      || transition.explicitAuthIntent !== localAuthIntentSeq;
+    return transition;
+  });
+}
+function sessionTransitionBoundaryCurrent(transition) {
+  return transition.adoptedAuthIntent === authIntentSeq
+    && sessionGenerationCurrent(transition.adoptedSessionToken);
+}
+function sessionTransitionAuthorityCurrent(transition) {
+  return !transition.supersededByLocalIntent
+    && transition.localIntent === identityBoundIntentSeq
+    && transition.explicitAuthIntent === localAuthIntentSeq
+    && sessionTransitionBoundaryCurrent(transition);
+}
+function sessionTransitionCurrent(transition) {
+  return transition.adoptedIdentityEpoch === uiIdentityEpoch
+    && sessionTransitionAuthorityCurrent(transition);
 }
 // The same transport as post(), minus its GLOBAL toast writes — for a write
 // whose outcome belongs to ONE card rather than to the page (#365).
@@ -926,14 +1890,23 @@ async function post(p, b) {
 // nothing itself. Callers announce through announceCardStatus(), which is
 // identity-gated like every other mutation point.
 async function postScoped(p, b) {
+  const sessionToken = readSessionMutationToken();
+  if (!sessionGenerationCurrent(sessionToken)) {
+    throw new IdentitySupersededError();
+  }
+  let result;
   try {
-    return await readApiResponse(await fetch(p, { method: "POST",
+    result = await readApiResponse(await fetch(p, { method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(b || {}) }));
   } catch (_) {
-    return networkErrorResult();
+    result = networkErrorResult();
   }
+  if (!sessionGenerationCurrent(sessionToken)) {
+    throw new IdentitySupersededError();
+  }
+  return result;
 }
 
 // Shared write-order logic for moving a season registration to a new
@@ -2500,9 +3473,10 @@ async function goToSetupWorkflow(key) {
     // contextSeededDrawerValues() itself separately guards against the
     // context SWITCHER changing contextOptions.selected while its own
     // fetch is in flight (a different trigger, so a different check).
+    const myIdentityEpoch = uiIdentityEpoch;
     const mySeq = ++drawerSeedFetchSeq;
     const seeded = await contextSeededDrawerValues(kind);
-    if (mySeq !== drawerSeedFetchSeq) return;  // a newer navigation already won
+    if (myIdentityEpoch !== uiIdentityEpoch || mySeq !== drawerSeedFetchSeq) return;
     if (!seeded.ok) {
       toast = "Couldn't load what's needed to open that — try again.";
       toastIsError = true;
@@ -4052,19 +5026,94 @@ function clearTransientStateAfterReset() {
   pendingReassign = null; modal = null;
 }
 
+// Demo lifecycle operations replace the session cookie while retaining the
+// same username, so setUser()'s ordinary prevId !== nextId boundary would not
+// fire. Treat that new cookie/store generation as an identity boundary anyway:
+// reject every pre-reset async continuation and destroy its private state
+// before any reads against the rebuilt store begin.
+function quarantineReplacedSessionState() {
+  resetTransientUiState();
+  applyRolePerms();
+  renderRoleSwitch();
+}
+
+// All three demo-store lifecycle actions share one mutation lane in the UI.
+// Besides preventing duplicate destructive work, this keeps a second click
+// from taking a newer auth-intent ticket that would suppress the first
+// successful replacement's one legitimate status/render reconciliation.
+let demoLifecycleInFlight = false;
+
+async function rebuildCanonicalSessionAfterTransition(transition) {
+  // Reset/clear/load return only an operation result; the replacement cookie,
+  // not that body, is the authority for who survived. A focus check may also
+  // have observed the old server session after the mutation committed but
+  // before these response headers reached the browser. Always rebuild from a
+  // fresh /auth/me under the adopted header boundary instead of assuming the
+  // pre-mutation currentUser is still valid.
+  const reconcileSeq = ++externalSessionReconcileSeq;
+  const baseCurrent = () => reconcileSeq === externalSessionReconcileSeq
+    && sessionTransitionBoundaryCurrent(transition);
+  const authorityRead = beginCanonicalAuthorityRead(true);
+  let response;
+  let me;
+  try {
+    response = await fetch("/api/auth/me", {
+      credentials: "same-origin", signal: authorityRead.controller.signal,
+    });
+    me = await readApiResponse(response);
+  } catch (_) {
+    response = null;
+    me = networkErrorResult();
+  } finally {
+    settleCanonicalAuthorityRead(authorityRead);
+  }
+  if (!baseCurrent()) return false;
+  const authority = classifyCanonicalAuthority(response, me);
+  if (authority) {
+    const authorityClaim = claimCanonicalAuthorityVerdict(
+      authorityRead, authority);
+    if (!authorityClaim) return false;
+    const stillCurrent = () => baseCurrent()
+      && canonicalAuthorityRebuildCurrent(authorityClaim);
+    if (authority.user) {
+      return rebuildCanonicalVerifiedSession(authority.user, stillCurrent);
+    }
+    clearSessionContextHash();
+    renderRoleSwitch();
+    showLogin("The session ended during that change. Sign in again to continue.");
+    return false;
+  }
+  if (quarantineAfterDisplacedCanonicalFailure(authorityRead)) return false;
+  if (!canonicalAuthorityFallbackCurrent(authorityRead)) return false;
+  clearSessionContextHash();
+  renderRoleSwitch();
+  showLogin("The change completed, but session access could not be verified. Sign in again.");
+  return false;
+}
+
 // After any demo lifecycle change (Load / Reset / Clear): drop transient view
 // state, refresh the demo-empty status (which flips the header Load↔Reset and
 // the empty-state card), and re-render. envStatus is refetched because
 // demo_empty is server-computed and not part of the overview (#215).
-async function afterDemoLifecycleChange(message) {
+async function afterDemoLifecycleChange(message, transition) {
   clearTransientStateAfterReset();
   onboardingStatusDirty = true;
   demoMenuOpen = false;
+  if (!await rebuildCanonicalSessionAfterTransition(transition)) return false;
+  const myIdentityEpoch = uiIdentityEpoch;
+  const stillCurrent = () => myIdentityEpoch === uiIdentityEpoch
+    && sessionTransitionAuthorityCurrent(transition);
   const status = await getJSON("/api/status");
+  if (!stillCurrent()) return;
   if (status && !status.error) envStatus = status;
+  // rebuildCanonicalSessionAfterTransition adopted the replacement identity's
+  // context directory and epoch as one verified pair.
+  syncContextHash();
+  renderContextSwitcher();
   toast = message;
   modal = null;
   await render();
+  return stillCurrent();
 }
 
 function wireModal(c) {
@@ -4083,13 +5132,30 @@ function wireModal(c) {
     demoInput.focus();
     demoConfirm.onclick = async () => {
       if (demoInput.value.trim().toUpperCase() !== word) return;
+      if (demoLifecycleInFlight) return;
+      demoLifecycleInFlight = true;
       demoConfirm.disabled = true;  // prevent a duplicate submit while running
-      // Server re-checks demo mode, MANAGE_SETUP, and the confirm value (#215).
-      const res = await post(clear ? "/api/demo/clear" : "/api/demo/reset",
-                             { confirm: word });
-      if (res && res.error) { modal = null; return render(); }  // post() set the toast
-      await afterDemoLifecycleChange(clear ? "Demo data cleared."
-                                           : "Demo data reset.");
+      try {
+        // Server re-checks demo mode, MANAGE_SETUP, and the confirm value (#215).
+        const transition = await runIdentityBoundSessionTransition(() =>
+          sessionCookiePost(
+            clear ? "/api/demo/clear" : "/api/demo/reset", { confirm: word }));
+        // Only the cookie-changing request owns the auth queue. Everything
+        // below is ordinary, cancellable UI reconciliation and must never hold
+        // a later Sign out behind its reads/render.
+        const res = transition.result;
+        if (res && res.error) {
+          await reconcileCanonicalSessionAfterFailedMutation();
+          if (!sessionTransitionCurrent(transition)) return;
+          publishPostError(res); modal = null; return render();
+        }
+        if (!transition.boundaryEstablished
+            || !sessionTransitionBoundaryCurrent(transition)) return;
+        await afterDemoLifecycleChange(clear ? "Demo data cleared."
+                                             : "Demo data reset.", transition);
+      } finally {
+        demoLifecycleInFlight = false;
+      }
     };
   }
   // Confirm-delete flow: POST the delete; a has_dependencies error swaps this
@@ -4228,13 +5294,18 @@ function wireModal(c) {
         // fire a second wipe while the first is in flight.
         confirm.disabled = true; confirm.textContent = "Resetting…";
         backup.disabled = password.disabled = phrase.disabled = true;
-        const res = await post("/api/admin/factory-reset/execute", {
-          password: password.value,
-          typed_phrase: phrase.value,
-          challenge_token: m.token,
-          backup_acknowledged: true,
-        });
+        const transition = await runIdentityBoundSessionTransition(() =>
+          sessionCookiePost("/api/admin/factory-reset/execute", {
+            password: password.value,
+            typed_phrase: phrase.value,
+            challenge_token: m.token,
+            backup_acknowledged: true,
+          }));
+        if (!sessionTransitionCurrent(transition)) return;
+        const res = transition.result;
         if (res && res.error) {
+          await reconcileCanonicalSessionAfterFailedMutation();
+          if (!sessionTransitionCurrent(transition)) return;
           // The challenge is single-use: a stale/expired/consumed one can't be
           // retried in place, so send the operator back to a fresh preview.
           // Everything else (wrong password, etc.) is retryable on this screen.
@@ -4248,7 +5319,15 @@ function wireModal(c) {
           toast = "";  // the modal owns the error surface, not the toast
           return render();
         }
-        modal.step = "success";
+        modal = { type: "factory-reset", step: "success" };
+        // The successful header boundary correctly hid the old privileged
+        // shell. Expose only this static, post-reset disclosure in that shell's
+        // modal host; every private store/content node is already destroyed,
+        // currentUser is null, and role chrome is gated. Done/close removes
+        // this narrow presentation exception and returns to the login wall.
+        document.body.classList.add("factory-reset-disclosure");
+        const loginScreen = document.getElementById("login-screen");
+        if (loginScreen) loginScreen.hidden = true;
         await render();
       };
     }
@@ -4260,10 +5339,12 @@ function wireModal(c) {
 // token bound to it. Kept as a standalone function so both the initial button
 // and the modal's "Start over" reuse the same entry point.
 async function startFactoryReset() {
+  const myIdentityEpoch = uiIdentityEpoch;
   modal = { type: "factory-reset", step: "loading" };
   render();
   const res = await post("/api/admin/factory-reset/preview", {});
-  if (!modal || modal.type !== "factory-reset") return;  // closed while loading
+  if (myIdentityEpoch !== uiIdentityEpoch
+      || !modal || modal.type !== "factory-reset") return;  // closed/signed out while loading
   if (res && res.error) {
     modal = { type: "factory-reset", step: "error", error: res.error.message };
   } else {
@@ -4279,6 +5360,7 @@ async function startFactoryReset() {
 // state and returns to the sign-in screen, mirroring the header Sign-out.
 function finishFactoryResetSignOut() {
   modal = null;
+  document.body.classList.remove("factory-reset-disclosure");
   try { localStorage.setItem("hs_signed_out", "1"); } catch (_) {}
   setUser(null);
   toast = "";
@@ -5562,9 +6644,10 @@ function runSetupWorkflowGo(key) {
   return goToSetupWorkflow(key);
 }
 async function openSetupWorkflowDrawer(kind) {
+  const myIdentityEpoch = uiIdentityEpoch;
   const mySeq = ++drawerSeedFetchSeq;
   const seeded = await contextSeededDrawerValues(kind);
-  if (mySeq !== drawerSeedFetchSeq) return;  // a newer open already won
+  if (myIdentityEpoch !== uiIdentityEpoch || mySeq !== drawerSeedFetchSeq) return;
   if (!seeded.ok) {
     toast = seeded.needsContext
       ? "Pick a program in the context bar first, so this is created in the right one."
@@ -6734,8 +7817,29 @@ async function reopenSelectedSeasonFromCard(key, held, c, reason) {
   // Focus followed the controls that were just replaced; put it on the card's
   // own pending line rather than letting it fall to <body>.
   focusCardTarget(identity, slot && slot.querySelector("[data-setup-card-pending]"));
-  const r = await postScoped(`/api/v2/setup/seasons/${seasonId}/reopen`,
-                             { reason: reason });
+  let r;
+  let settled = false;
+  let identitySuperseded = false;
+  try {
+    r = await postScoped(`/api/v2/setup/seasons/${seasonId}/reopen`,
+                         { reason: reason });
+  } catch (error) {
+    // postScoped deliberately rejects when the authenticated identity changes
+    // while the write is in flight. That cancels the departing principal's
+    // response payload, not the fact that the request settled. Remember the
+    // cancellation separately: `r` is intentionally undefined on this path
+    // and must never be mistaken for a transport/server failure that restores
+    // the old confirmation. Continue into the tuple/principal gates below so
+    // the live identity gets a refresh from fresh server truth; every other
+    // exception still propagates.
+    if (!(error instanceof IdentitySupersededError)) throw error;
+    identitySuperseded = true;
+  } finally {
+    // Identity cancellation is an exception by design. The server request has
+    // still settled, so its per-card unresolved-write ledger must drain before
+    // that private cancellation propagates to the window boundary.
+    settled = settleCardWrite(identity);
+  }
   // ======================= AFTER THE AWAIT =======================
   // SETTLEMENT, FIRST AND UNCONDITIONALLY. This is the instant the operation
   // stops being unresolved, so it is the instant its ledger entry is
@@ -6750,7 +7854,6 @@ async function reopenSelectedSeasonFromCard(key, held, c, reason) {
   // drained only on the path where the identity is still current would leave
   // the target tuple's card blocked forever the moment the operator glanced
   // at another Season.
-  const settled = settleCardWrite(identity);
   // Nothing to settle: this operation was never registered (its PENDING
   // commit was refused) or has already settled once. Either way there is no
   // outstanding write here and nothing this response may act on.
@@ -6780,6 +7883,29 @@ async function reopenSelectedSeasonFromCard(key, held, c, reason) {
   // this line would become the thing that does. Do not cite it as proof of
   // anything the tuple check is not already proving.
   if (!cardTupleCurrent(identity) || identity.season_id !== seasonId) return;
+  // THE RESPONSE BODY WAS CANCELLED BY A SESSION-GENERATION BOUNDARY. This is
+  // not evidence that the write failed: the server may already have committed
+  // it, and postScoped() discarded only the body because the local generation
+  // no longer matched. Storage eviction is the sharp same-principal case: the
+  // cookie, username, epoch, tuple and card generation can all remain current,
+  // so every ordinary identity gate below would pass and `r === undefined`
+  // would otherwise restore an actionable Reopen confirmation over an already
+  // active Season.
+  //
+  // sessionGenerationCurrent() starts the canonical /auth/me reconciliation
+  // before throwing. Wait for that exact flight so a valid same-user cookie
+  // can adopt the now-empty generation before the fresh card GETs run; without
+  // the wait those GETs would immediately reject on the same mismatch. Then
+  // re-check the tuple because reconciliation itself may have changed it. A
+  // different principal gets the existing silent policy; the same principal
+  // gets the ordinary generic refresh announcement/focus, never a success or
+  // failure claim derived from the discarded body.
+  if (identitySuperseded) {
+    await awaitSessionReconciliationDrain();
+    if (!cardTupleCurrent(identity) || identity.season_id !== seasonId) return;
+    return retrySetupWorkflowCard(key,
+      { silent: !cardIdentitySamePrincipal(identity) });
+  }
   // THE TARGET IS CURRENT, BUT THE AUTHENTICATED PRINCIPAL HAS CHANGED (#365
   // review round 7). A DIFFERENT PERSON is signed in and is standing on the
   // Season this write targets — an in-app persona switch through signIn(), or
@@ -10681,11 +11807,14 @@ function feedCopyBtn(url) {
 // when unavailable (e.g. plain-HTTP production without TLS).
 function wireCopyFeedUrl(container) {
   container.querySelectorAll("[data-copy-feed-url]").forEach((b) => b.onclick = async () => {
+    const myIdentityEpoch = uiIdentityEpoch;
     try {
       if (!navigator.clipboard) throw new Error("Clipboard access unavailable.");
       await navigator.clipboard.writeText(b.dataset.copyFeedUrl);
+      if (myIdentityEpoch !== uiIdentityEpoch) return;
       toast = "Copied to clipboard."; toastIsError = false;
     } catch (e) {
+      if (myIdentityEpoch !== uiIdentityEpoch) return;
       toast = "Couldn't copy automatically — select and copy the URL manually.";
       toastIsError = true;
     }
@@ -10703,6 +11832,7 @@ function captureDrawerValues(ent) {
 }
 
 async function submitSetup(kind) {
+  const myIdentityEpoch = uiIdentityEpoch;
   const ent = SETUP_ENTITIES.find((e) => e.key === kind);
   const editing = drawer && drawer.mode === "edit";
   toast = "";
@@ -10717,6 +11847,7 @@ async function submitSetup(kind) {
   // Edit (#268) routes to the entity's /<id>/update endpoint (Team + lifecycle
   // stay separate); create routes to the entity's POST.
   const res = editing ? await SETUP_EDIT[kind](drawer.id) : await SETUP_POST[kind]();
+  if (myIdentityEpoch !== uiIdentityEpoch) return;
   if (res && res.error) {
     // Keep the drawer open, preserve input, surface the server's message.
     drawerError = res.error.message;
@@ -10738,6 +11869,7 @@ async function submitSetup(kind) {
   // its League" a single uninterrupted flow.
   if (!editing && (kind === "season" || kind === "league")) {
     await loadContextOptions();
+    if (myIdentityEpoch !== uiIdentityEpoch) return;
     renderContextSwitcher();
   }
   const noun = entNoun(ent);
@@ -11835,9 +12967,24 @@ async function render() {
   // Empty-state "Load demo data" (#215): builds the sample dataset then refreshes.
   const demoLoad = c.querySelector("[data-demo-load]");
   if (demoLoad) demoLoad.onclick = async () => {
-    const res = await post("/api/demo/load", {});
-    if (res && res.error) return render();
-    await afterDemoLifecycleChange("Sample demo data loaded.");
+    if (demoLifecycleInFlight) return;
+    demoLifecycleInFlight = true;
+    demoLoad.disabled = true;
+    try {
+      const transition = await runIdentityBoundSessionTransition(() =>
+        sessionCookiePost("/api/demo/load", {}));
+      const res = transition.result;
+      if (res && res.error) {
+        await reconcileCanonicalSessionAfterFailedMutation();
+        if (!sessionTransitionCurrent(transition)) return;
+        publishPostError(res); return render();
+      }
+      if (!transition.boundaryEstablished
+          || !sessionTransitionBoundaryCurrent(transition)) return;
+      await afterDemoLifecycleChange("Sample demo data loaded.", transition);
+    } finally {
+      demoLifecycleInFlight = false;
+    }
   };
   c.querySelectorAll("[data-drawer-close]").forEach((b) => b.onclick = () => {
     drawer = null; drawerError = ""; drawerValues = {}; render();
@@ -12912,8 +14059,72 @@ async function render() {
   });
   c.querySelectorAll("[data-revoke-session]").forEach((b) => b.onclick = async () => {
     toast = "";
-    await post(`/api/accounts/${usersSelected}/sessions/${b.dataset.revokeSession}/revoke`, {});
-    await render();
+    const transition = await runSessionRevocationTransition(
+      usersSelected, b.dataset.revokeSession);
+    const res = transition.result;
+    if (res && res.error) {
+      await reconcileCanonicalSessionAfterFailedMutation();
+      if (!sessionTransitionCurrent(transition)) return;
+      publishPostError(res);
+      return render();
+    }
+    if (!transition.boundaryEstablished
+        || !sessionTransitionBoundaryCurrent(transition)) return;
+    // The response cannot identify whether this row was THIS browser's own
+    // session. Assume it may have been: notify peer tabs, destroy every
+    // private store/painted surface synchronously, and only then ask the
+    // canonical session endpoint whether this tab may be rebuilt. Holding the
+    // verification read must therefore expose an empty, non-privileged shell,
+    // never the Admin Users DOM whose authority may already be gone.
+    const revokeReconcileSeq = ++externalSessionReconcileSeq;
+    renderRoleSwitch();
+    showLogin("Checking this browser's session…");
+
+    const authorityRead = beginCanonicalAuthorityRead(true);
+    let meResponse;
+    let me;
+    try {
+      meResponse = await fetch("/api/auth/me", {
+        credentials: "same-origin", signal: authorityRead.controller.signal,
+      });
+      me = await readApiResponse(meResponse);
+    } catch (_) {
+      meResponse = null;
+      me = networkErrorResult();
+    } finally {
+      settleCanonicalAuthorityRead(authorityRead);
+    }
+    // The successful revoke boundary deliberately moved the page to the
+    // signed-out quarantine epoch. Re-adopting the canonical surviving user
+    // creates one more identity epoch, so only the transition's AUTHORITY
+    // (intent + shared generation) remains stable across this rebuild. The
+    // full epoch check above still prevents an obsolete handler from starting
+    // reconciliation in the first place.
+    const baseCurrent = () => revokeReconcileSeq === externalSessionReconcileSeq
+      && sessionTransitionBoundaryCurrent(transition);
+    if (!baseCurrent()) return;
+    const authority = classifyCanonicalAuthority(meResponse, me);
+    if (authority) {
+      const authorityClaim = claimCanonicalAuthorityVerdict(
+        authorityRead, authority);
+      if (!authorityClaim) return;
+      const stillCurrent = () => baseCurrent()
+        && canonicalAuthorityRebuildCurrent(authorityClaim);
+      if (authority.user) {
+        await rebuildCanonicalVerifiedSession(authority.user, stillCurrent, () =>
+        sessionTransitionAuthorityCurrent(transition) ? "Session revoked." : "");
+        return;
+      }
+      try { localStorage.setItem("hs_signed_out", "1"); } catch (_) {}
+      clearSessionContextHash();
+      renderRoleSwitch();
+      showLogin("That session was revoked. Sign in again to continue.");
+      return;
+    }
+    if (quarantineAfterDisplacedCanonicalFailure(authorityRead)) return;
+    if (!canonicalAuthorityFallbackCurrent(authorityRead)) return;
+    clearSessionContextHash();
+    showLogin("The session was revoked, but this browser's access could not be verified. Sign in again.");
   });
   // Coach scope rebind (#266 remediation): send the picked team inside `scope`
   // to the audited rebind route; the server validates the team and records the
@@ -12955,8 +14166,22 @@ async function render() {
   const acctRoleSelect = c.querySelector("#new-account-role");
   if (acctRoleSelect) acctRoleSelect.onchange = async () => {
     const inProgressPassword = val("new-account-password");
-    newAccountForm.role = acctRoleSelect.value;
+    const requestedRole = acctRoleSelect.value;
+    const ownerIdentityEpoch = uiIdentityEpoch;
+    const ownerUsername = currentUser && currentUser.username;
+    const restoreSeq = ++newAccountPasswordRestoreSeq;
+    newAccountForm.role = requestedRole;
     await render();
+    // The password is intentionally closure-only, never module state. That
+    // makes this post-render write its sole ownership boundary too: if a
+    // persona/session change or a newer role selection won while render was
+    // held, discard the departing operator's secret instead of writing it
+    // into whichever replacement form now occupies the same DOM id.
+    if (ownerIdentityEpoch !== uiIdentityEpoch
+        || restoreSeq !== newAccountPasswordRestoreSeq
+        || !currentUser || currentUser.username !== ownerUsername
+        || newAccountForm.role !== requestedRole
+        || document.body.dataset.view !== "users") return;
     const pwInput = document.getElementById("new-account-password");
     if (pwInput) pwInput.value = inProgressPassword;
   };
@@ -13765,9 +14990,24 @@ if (demoDropdown) demoDropdown.onclick = async (e) => {
   demoMenuOpen = false;
   const action = item.dataset.demoAction;
   if (action === "load") {
-    const res = await post("/api/demo/load", {});
-    if (res && res.error) return renderDemoMenu();
-    await afterDemoLifecycleChange("Sample demo data loaded.");
+    if (demoLifecycleInFlight) return;
+    demoLifecycleInFlight = true;
+    item.disabled = true;
+    try {
+      const transition = await runIdentityBoundSessionTransition(() =>
+        sessionCookiePost("/api/demo/load", {}));
+      const res = transition.result;
+      if (res && res.error) {
+        await reconcileCanonicalSessionAfterFailedMutation();
+        if (!sessionTransitionCurrent(transition)) return;
+        publishPostError(res); updateToast(); return renderDemoMenu();
+      }
+      if (!transition.boundaryEstablished
+          || !sessionTransitionBoundaryCurrent(transition)) return;
+      await afterDemoLifecycleChange("Sample demo data loaded.", transition);
+    } finally {
+      demoLifecycleInFlight = false;
+    }
   } else {
     modal = { type: "demo-confirm", action };  // reset | clear
     renderDemoMenu();
@@ -13906,10 +15146,12 @@ function writeContextHash(want) {
 // `contextOptions` if a newer load has started since.
 let contextOptionsLoadSeq = 0;
 async function loadContextOptions() {
-  if (!currentUser) { contextOptions = null; return; }
+  if (!currentUser) { contextOptions = null; return true; }
+  const myIdentityEpoch = uiIdentityEpoch;
   const mySeq = ++contextOptionsLoadSeq;
   const o = await getJSON("/api/context/options");
-  if (mySeq !== contextOptionsLoadSeq) return;  // superseded by a newer load
+  if (myIdentityEpoch !== uiIdentityEpoch
+      || mySeq !== contextOptionsLoadSeq) return false;  // superseded by a newer load/identity
   contextOptions = (o && !o.error) ? o : null;
   // THE EPOCH AND THE TUPLE ARE ADOPTED TOGETHER, from the same payload, under
   // the same supersession guard. That is the invariant the whole mechanism
@@ -13923,6 +15165,7 @@ async function loadContextOptions() {
   if (contextOptions && contextOptions.context_epoch) {
     contextEpoch = contextOptions.context_epoch;
   }
+  return true;
 }
 // Restore on load: the persisted context is already loaded above; if the URL
 // carries a DIFFERENT context, adopt it — delegating the authorization decision
@@ -14058,7 +15301,7 @@ function invalidateContextScopedMutations() {
 // POST ever in flight, the server's own last-write-wins persistence is
 // trivially equivalent to "last intent wins" -- there is no window left
 // for the two to disagree, on any backend.
-let contextSwitchInFlight = false;
+let contextSwitchInFlight = null;
 // #369: "the URL currently advertises an intent the server has NOT yet
 // confirmed", tracked INDEPENDENTLY of the network-in-flight flag. The two are
 // not the same window and conflating them left a hole: contextSwitchInFlight
@@ -14205,6 +15448,59 @@ function blankContextScopedCardSurfaces() {
     .forEach((chip) => chip.remove());
 }
 
+// Every node below #content was painted from the departing identity's reads,
+// not only the Setup cards above. In particular, Game Sheet's #off-pick
+// serializes the installation-wide Official directory into <option> text.
+// setUser() assigns the arriving identity and signIn() then awaits context
+// reconciliation before its first render, so leaving the old tree mounted for
+// that window exposes privileged DOM even when every backing array is empty.
+// Blank it synchronously at the identity boundary; the header/navigation are
+// outside #content and are re-gated by applyRolePerms() in the same call stack.
+function blankIdentityScopedContent() {
+  const content = document.getElementById("content");
+  if (!content) return;
+  const active = document.activeElement;
+  if (active && active !== document.body && content.contains(active)) {
+    active.blur();
+  }
+  content.innerHTML = "";
+}
+
+function clearContextConfirmIdentity() {
+  const confirm = document.getElementById("ctx-confirm");
+  if (!confirm) return;
+  confirm.textContent = "";
+  confirm.hidden = true;
+  delete confirm.dataset.ctxProgram;
+  delete confirm.dataset.ctxSeason;
+  delete confirm.dataset.ctxProgramName;
+  confirm.removeAttribute("aria-label");
+}
+
+// The authenticated shell also carries identity-scoped reads outside
+// #content: authorized context labels, breadcrumb names/counts, and the
+// notification badge. Hide and empty those synchronously too; the arriving
+// identity's context load and first render rebuild them from its own reads.
+function blankIdentityScopedShell() {
+  const context = document.getElementById("context-switcher");
+  if (context) context.hidden = true;
+  ["ctx-select", "ctx-league-select"].forEach((id) => {
+    const select = document.getElementById(id);
+    if (select) { select.innerHTML = ""; select.hidden = true; }
+  });
+  ["ctx-static"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) { el.textContent = ""; el.hidden = true; }
+  });
+  clearContextConfirmIdentity();
+  const readOnly = document.getElementById("ctx-ro");
+  if (readOnly) readOnly.hidden = true;
+  const breadcrumb = document.getElementById("breadcrumb");
+  if (breadcrumb) breadcrumb.textContent = "";
+  const badge = document.getElementById("notif-badge");
+  if (badge) { badge.textContent = ""; badge.style.display = "none"; }
+}
+
 // Persist a switcher pick, then reflect it in the hash and re-render.
 // `leagueId` is the third axis (#345/#364), additive like the backend's own
 // resolve_with_league/set_with_league -- every existing two-argument call
@@ -14264,7 +15560,9 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   // beside this one. #331 round 9's "at most one /api/context POST in flight"
   // invariant is what makes the server's last-write-wins equal last-intent-wins,
   // and the barrier must not punch a hole in it.
-  contextSwitchInFlight = true;
+  const myIdentityEpoch = uiIdentityEpoch;
+  const flight = { identityEpoch: myIdentityEpoch, sequence: mySeq };
+  contextSwitchInFlight = flight;
   // STEP TWO OF THE SETTLEMENT BARRIER. The cancellation is already done (see
   // setActiveContext's prologue); this waits for those reads to be FULLY
   // settled -- abort delivered, or response delivered and its body drained --
@@ -14282,6 +15580,20 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   // scoped reads are GETs issued by render(), never by the switch pipeline, and
   // cancelContextScopedReads() has already signalled every one of them.
   await awaitContextScopedReadSettlement();
+  // The barrier may outlive the identity that opened it. Do not let the old
+  // selection reach the network with the arriving session cookie, and do not
+  // clear a newer identity's flight record. A newer same-identity intent that
+  // queued before this request left can skip this unsent predecessor entirely.
+  if (contextSwitchInFlight !== flight || myIdentityEpoch !== uiIdentityEpoch) return;
+  if (mySeq !== contextSwitchSeq) {
+    const next = contextSwitchQueued;
+    contextSwitchQueued = null;
+    contextSwitchInFlight = null;
+    if (next) {
+      return sendContextSwitch(next.mySeq, next.programId, next.seasonId, next.leagueId);
+    }
+    return;
+  }
   // #369: publish the intent to the hash BEFORE the server can act on it, so
   // the hash never lags an already-mutated server. See writeContextHash().
   // Still immediately before the POST -- the barrier above sits on the far side
@@ -14290,7 +15602,7 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   contextHashIntentPending = true;
   const r = await post("/api/context",
     { program_id: programId, season_id: seasonId || null, league_id: leagueId || null });
-  contextSwitchInFlight = false;
+  if (contextSwitchInFlight === flight) contextSwitchInFlight = null;
   // A newer intent queued while this POST was in flight is strictly more
   // current than whatever this response says -- send it immediately, before
   // doing ANYTHING with this response (including reconciling a failure), so
@@ -14466,7 +15778,7 @@ function renderContextSwitcher() {
   const show = !!(currentUser && opts && opts.programs && opts.programs.length);
   wrap.hidden = !show;
   if (!show) {
-    if (confirmBtn) confirmBtn.hidden = true;
+    clearContextConfirmIdentity();
     renderLeagueSelect(null, null);
     return;
   }
@@ -14528,7 +15840,7 @@ function renderContextSwitcher() {
     // Only the collapsed state loses its control; wherever the <select> renders
     // it IS the explicit act, and a second control saying the same thing would
     // just be a second way to do it.
-    if (confirmBtn) confirmBtn.hidden = true;
+    clearContextConfirmIdentity();
     const optionTag = (e) => `<option value="${esc(e.value)}"`
       + `${e.value === curValue ? " selected" : ""}>${esc(e.label)}</option>`;
     if (multi) {
@@ -14659,20 +15971,73 @@ if (ctxConfirm) ctxConfirm.onclick = async () => {
 
 // Sign out ends the server session and returns to the sign-in screen (#71).
 const signoutBtn = document.getElementById("signout-btn");
-if (signoutBtn) signoutBtn.onclick = async () => {
-  await post("/api/auth/logout", {});
-  // Remember the explicit sign-out so a refresh does NOT silently re-run the
-  // zero-friction demo auto-login — logout must stick until the user signs in.
-  try { localStorage.setItem("hs_signed_out", "1"); } catch (_) {}
-  setUser(null); toast = "";
-  // Drop the active-context selection + its URL hash with the session (#159).
-  contextOptions = null;
-  if (location.hash.indexOf("#ctx=") === 0) {
-    history.replaceState(null, "", location.pathname + location.search);
-  }
-  renderRoleSwitch();
-  showLogin("You've been signed out.");
-};
+function signOut() {
+  // Taken synchronously, before this operation waits for an earlier cookie
+  // mutation. This also invalidates a bootstrap /api/auth/me response that
+  // may already be in flight while currentUser is still null.
+  const requestedIntent = newLocalAuthIntent();
+  const action = runAuthTransition(async () => {
+    // Sign out and explicit sign-in are ordered identity intents, not writes
+    // bound to the identity visible at click time. A prior LOCAL queue member
+    // may legitimately replace E/T before this one dispatches. Every explicit
+    // auth intent still dispatches in queue order; only its UI adoption is
+    // last-intent-wins. Require here only that the tab has adopted the origin's
+    // current generation. Login/Logout themselves are canonical identity
+    // operations and may safely run under whichever shared cookie won the
+    // preceding origin-lock slot—even if this document's storage event task
+    // has not fired yet. Lifecycle writes use the stricter click-bound rule.
+    reconcileLiveSessionBeforeExplicitAuth();
+    const outcome = await sessionCookiePost("/api/auth/logout", {});
+    return {
+      pending: true,
+      outcome,
+      localIntent: requestedIntent.localIntent,
+      sessionToken: outcome.boundary
+        ? outcome.boundary.sessionToken : readSessionMutationToken(),
+    };
+  }).then(async (phase) => {
+    if (phase && phase.pending) {
+      const result = await phase.outcome.resultPromise;
+      // A 5xx/transport failure is not proof that the privileged cookie was
+      // destroyed. Do not present a successful sign-out over a session the
+      // next refresh can restore.
+      if (!result || result.error) {
+        phase = { ok: false, result, localIntent: phase.localIntent,
+          sessionToken: phase.sessionToken };
+      } else if (!phase.outcome.boundary
+          || phase.localIntent !== localAuthIntentSeq
+          || phase.outcome.boundary.authIntent !== authIntentSeq
+          || !sessionGenerationCurrent(phase.outcome.boundary.sessionToken)) {
+        phase = { ok: false, superseded: true };
+      } else {
+        // Sticky logout was written before the header boundary was published;
+        // complete only the local presentation after the body drains.
+        toast = "";
+        contextOptions = null;
+        if (location.hash.indexOf("#ctx=") === 0) {
+          history.replaceState(null, "", location.pathname + location.search);
+        }
+        renderRoleSwitch();
+        showLogin("You've been signed out.");
+        phase = { ok: true };
+      }
+    }
+    if (phase && phase.ok) return true;
+    if (!phase || phase.superseded) return false;
+    // A failed logout leaves the cookie untouched, but the failure may be the
+    // first response after a remote revoke. Verify canonically after releasing
+    // the origin mutation lock; a held context/render recovery must not block
+    // a later logout from reaching the server.
+    await reconcileCanonicalSessionAfterFailedMutation();
+    if (phase.localIntent !== localAuthIntentSeq
+        || !sessionGenerationCurrent(phase.sessionToken)) return false;
+    publishPostError(phase.result);
+    updateToast();
+    return false;
+  });
+  return trackExplicitAuthAction(action);
+}
+if (signoutBtn) signoutBtn.onclick = () => signOut();
 // Manual sign-in form (#71) — the only way in when the picker is empty.
 const loginForm = document.getElementById("login-form");
 if (loginForm) loginForm.onsubmit = (e) => {
@@ -14703,6 +16068,9 @@ function applyRolePerms() {
   const r = roleCatalog.find((x) => x.id === currentRole);
   rolePerms = new Set(r ? r.permissions : []);
   gateChrome();
+}
+function currentRoleMetadataReady() {
+  return !!(currentUser && roleCatalog.find((x) => x.id === currentRole));
 }
 // Role-level mirror of the backend's private-game read gate (scope.py's
 // can_read_private_game_data), ignoring the specific game: operators read
@@ -14808,9 +16176,74 @@ function resetTransientUiState() {
   // privileged response delivered in that window still holds the current
   // renderPass and can write the private data straight back after this reset.
   renderPass += 1;
+  document.body.classList.remove("factory-reset-disclosure");
+  // The two Setup drawer seeders have their own async navigation generation.
+  // Supersede it here as well as checking uiIdentityEpoch at each caller: a
+  // held hierarchy response from the departing operator must disappear
+  // silently, not turn its context-revision refusal into an error toast or a
+  // render under the arriving identity.
+  drawerSeedFetchSeq += 1;
+  identityResetHooks.forEach((hook) => hook());
+  clearLoginCredentials();
   checkoutConfirm = null; oppDetailGame = null; oppDetail = null;
   gCheckout = null; gOpp = null; gOppDetail = null;
   newFeedUrl = null;
+  // These stores contain names, messages, destinations, tokens, and modal
+  // error/preview details from the departing identity. Some renders retain
+  // their previous value when the next request fails, so hiding their views
+  // is insufficient: destroy them before the arriving identity is assigned.
+  rosterBatch = null;
+  notifState = { notifications: [], unread: 0 };
+  deliveryState = { contacts: [], overview: null, deviceTokens: [] };
+  usersState = { accounts: [], sessions: [] };
+  guardianLinkForm = { guardian_user_id: "", player_id: "" };
+  notifPrefs = null;
+  feedTokens = [];
+  contactForm = { recipient_ref: "", channel: "email", destination: "", label: "" };
+  tokenForm = { recipient_ref: "", provider: "fcm", token: "", label: "" };
+  modal = null;
+  currentGame = null;
+  rosterTeamId = null;
+  pickedPlayer = null;
+  wizard = null;
+  // Calendar/setup intents can carry private names and identifiers too. They
+  // must die on the identity boundary itself, not only in signIn(): header
+  // Sign out and the post-factory-reset path call setUser(null) directly and
+  // never reach signIn()'s later cleanup.
+  movingGameId = null;
+  conflict = null;
+  pendingMove = null;
+  pendingReassign = null;
+  officialAvailability = [];
+  availSummary = null;
+  subCandidates = null;
+  addableSubs = null;
+  dashAvailability = null;
+  dashSubQueue = null;
+  rescheduleRequests = null;
+  guardianHome = null;
+  readinessCheck = null;
+  activityExpandedBatches = new Set();
+  leagueTeams = {};
+  permLeaguesByProgram = {};
+  allPermLeagues = [];
+  teamPermLeague = {};
+  seasonRegs = {};
+  seasonVenueAccess = {};
+  seasonVenueCandidates = {};
+  leagueDivisions = {};
+  rollover = { programId: "", fromSeasonId: "", toSeasonId: "", result: null };
+  schedulerState = freshSchedulerState();
+  schedFocusGenerateAfterRender = false;
+  homeCardPaintedHtml = null;
+  if (overlayFocusHandle) cancelAnimationFrame(overlayFocusHandle);
+  overlayOpenKey = null;
+  overlayFocusedKey = null;
+  overlayFocusHandle = 0;
+  overlayFocusQueued = false;
+  overlayReturnFocus = null;
+  overlayReturnSelector = null;
+  lastActivatedTrigger = null;
   publicState.game = null;
   publicState.feedUrl = null; publicState.feedLabel = null;
   publicTab = "schedule";
@@ -14825,7 +16258,6 @@ function resetTransientUiState() {
   gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };
   gamesExpanded = new Set();
   usersSelected = null;
-  schedulerState.selected = new Set();
   // playersList (#114) is real player names/teams fetched only for a
   // manage_setup session — the Setup view itself isn't permission-gated
   // (setupCard only hides the "+ New" button), so if it survived an
@@ -14880,8 +16312,11 @@ function resetTransientUiState() {
   iceBuilder = null;
   if (drawer) {
     document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
-    drawer = null; drawerError = ""; drawerValues = {};
   }
+  // The payloads outlive the drawer reference on several close/reassignment
+  // paths and can contain player names, emails, and server error text. Clear
+  // them unconditionally; `drawer === null` is not proof they are empty.
+  drawer = null; drawerError = ""; drawerValues = {};
   // ===== PER-CARD OPERATION/UI STATE (#365 review round 7) =================
   // The three stores the review names — cardWrites, cardStates,
   // cardGenerations — audited one by one, because they do NOT all deserve the
@@ -14969,6 +16404,14 @@ function resetTransientUiState() {
   //     arriving principal is exposed at all, because everything after this
   //     point is an await. See blankContextScopedCardSurfaces().
   blankContextScopedCardSurfaces();
+  // (c4) THE REST OF THE AUTHENTICATED CONTENT TREE. The card-specific pass
+  //     above preserves its older regression boundary, but other views paint
+  //     private data too. Game Sheet, for example, serializes officialsPool
+  //     into #off-pick. Remove the complete departing tree before currentUser
+  //     can become the arriving principal; its first render rebuilds only
+  //     what that principal may read.
+  blankIdentityScopedContent();
+  blankIdentityScopedShell();
   // (d) cardGenerations — DELIBERATELY KEPT, and the reasoning is the reason
   //     the epoch had to exist at all. The counters hold no operator text:
   //     they are monotone integers, so there is nothing here to disclose.
@@ -14993,28 +16436,9 @@ function resetTransientUiState() {
   // superseded switch already does.
   contextSwitchQueued = null;
   contextSwitchSeq += 1;
-  // `contextEpoch` IS DELIBERATELY NOT CLEARED HERE (#159 follow-up), and this
-  // is the one place that looks like it should be. It was, in the first cut of
-  // this change, and that reintroduced the very 404 the epoch exists to
-  // prevent: `contextOptions` deliberately SURVIVES an identity change (see the
-  // paragraph below — it is the last server-confirmed selection, and the hash
-  // is rewound to it), so clearing the epoch beside it leaves the page holding
-  // a tuple with no epoch. The next render then issues scoped reads for the
-  // DEPARTING identity's Season with no header at all, the server treats that
-  // as "no epoch supplied" and applies the ceiling, and the answer is the CI
-  // 404 — reproduced locally in `setup-state-matrix`'s phone leg as
-  // `GET .../seasons/season_3/venue-candidates -> 404` with the abort ledger
-  // showing `generation=5 dispatched=true`.
-  //
-  // THE RULE IS THE PAIRING, not the lifetime: the epoch must travel with
-  // whatever tuple this file is rendering, and go stale exactly when that tuple
-  // does. Kept here, those same reads echo the departing identity's epoch, the
-  // server compares it against the ARRIVING session's own row, it cannot match,
-  // and they are discarded (204) instead of refused. Nothing is disclosed by
-  // keeping it: it is an opaque digest that identifies nothing and authorizes
-  // nothing, and `contextOptions` beside it holds actual Program and Season
-  // names.
-  // ...and the same for a switch whose POST has already LEFT but has not yet
+  contextSwitchInFlight = null;
+  contextEpochResyncInFlight = null;
+  // A switch whose POST has already LEFT but has not yet
   // been ANSWERED. #369 made sendContextSwitch() publish the intended
   // selection into location.hash BEFORE its POST, so the hash can never lag
   // an already-mutated server. The flip side is that an unacknowledged switch
@@ -15050,6 +16474,14 @@ function resetTransientUiState() {
     syncContextHash();
     contextHashIntentPending = false;
   }
+  // Rewinding the pending hash is the last legitimate use of the departing
+  // identity's authorized context directory. Destroy its full option payload
+  // and epoch as one pair, and supersede any older options read, before the
+  // arriving principal is assigned. signIn()/bootstrap load a fresh pair
+  // before their first render.
+  contextOptionsLoadSeq += 1;
+  contextOptions = null;
+  contextEpoch = null;
   // ...and the identical reasoning for the ACTION-CONTROL withdrawal (#365).
   // The switch this flag was set for has just been orphaned: its POST's own
   // completion will hit the `mySeq !== contextSwitchSeq` guard above and
@@ -15060,13 +16492,24 @@ function resetTransientUiState() {
   // the new identity's own controls.
   contextSwitchIntentPending = false;
 }
-function setUser(user) {
+function setUser(user, forceSessionBoundary = false) {
   const prevId = currentUser ? currentUser.username : null;
   const nextId = user ? user.username : null;
-  if (prevId !== nextId) resetTransientUiState();
+  if (forceSessionBoundary || prevId !== nextId) resetTransientUiState();
   currentUser = user;
   currentRole = user ? user.role : "viewer";
+  // Bootstrap metadata can still be recovering when an explicit login wins.
+  // Empty permissions are the safe chrome state, but they are not evidence
+  // that an authenticated Admin/Coach is a Viewer.  Defer every landing
+  // decision derived from permissions until this role's catalog row exists;
+  // the recovery bootstrap calls setUser again after publishing that row.
+  const hasRoleMetadata = !!roleCatalog.find((x) => x.id === currentRole);
+  sessionAwaitingRoleMetadata = !!user && !hasRoleMetadata;
   applyRolePerms();
+  // signIn() now awaits two context reconciliations before its ordinary
+  // renderRoleSwitch() call. Update the identity label immediately so the
+  // held pre-render window cannot keep showing the departing principal.
+  renderRoleSwitch();
   // Players land on their Home page (#107 / HOME-001) instead of the
   // operator dashboard — only while still on the untouched default view,
   // so an explicit tab choice mid-session is never overridden. The inverse
@@ -15101,25 +16544,31 @@ function setUser(user) {
   // default so phase 2 can re-land them; the tab itself is already hidden by
   // gateChrome, but the *view* state has to follow or they'd stare at a
   // now-invisible screen.
-  if (["dashboard", "activity"].includes(view) && !canSeeOpsConsole()) view = "dashboard";
+  if (hasRoleMetadata && ["dashboard", "activity"].includes(view)
+      && !canSeeOpsConsole()) view = "dashboard";
   if (["roster", "sheet"].includes(view) && !canReadAnyPrivateGame()) view = "dashboard";
   // #233 B2a review r2: a no-reload persona switch off an operator role can
   // otherwise leave a viewer/coach/player/official staring at a Setup screen
   // whose tab gateChrome just hid out from under them.
-  if (view === "setup" && !(hasPerm("manage_setup") || hasPerm("manage_arena"))) view = "dashboard";
+  if (hasRoleMetadata && view === "setup"
+      && !(hasPerm("manage_setup") || hasPerm("manage_arena"))) view = "dashboard";
   // #331 review round 8: same reasoning for Import — renderImport() already
   // self-guards with its own "Operators only" banner rather than the
   // previous operator's actual state (importState is cleared regardless,
   // above), but bouncing off the view entirely is still correct so a
   // lower-privileged persona lands on ITS OWN home/dashboard instead of a
   // dead-end banner for a nav item its own sidebar no longer shows.
-  if (view === "import" && !hasPerm("manage_arena")) view = "dashboard";
+  if (hasRoleMetadata && view === "import" && !hasPerm("manage_arena")) {
+    view = "dashboard";
+  }
   if (isPlayerUser && view === "dashboard") view = "player_home";
   else if (isGuardianUser && view === "dashboard") view = "guardian_home";
   else if (isOfficialUser && view === "dashboard") view = "inbox";
   // A viewer has no dedicated home and can't see the operator Dashboard —
   // Standings is public info everyone can read, so it's their landing.
-  else if (view === "dashboard" && !canSeeOpsConsole()) view = "standings";
+  else if (hasRoleMetadata && view === "dashboard" && !canSeeOpsConsole()) {
+    view = "standings";
+  }
   if (view === priorView) return;
   document.querySelectorAll(".tab").forEach((x) =>
     x.classList.toggle("active", x.dataset.tab === view));
@@ -15142,6 +16591,12 @@ function showLogin(message) {
   if (u) u.focus();
   const guestLink = document.getElementById("guest-public-link");
   if (guestLink) guestLink.onclick = () => showPublicGuest();
+}
+function clearLoginCredentials() {
+  const username = document.getElementById("login-user");
+  const password = document.getElementById("login-pass");
+  if (username) username.value = "";
+  if (password) password.value = "";
 }
 function hideLogin() {
   hidePublicGuest();
@@ -15279,14 +16734,104 @@ function renderLoginPersonas() {
     b.onclick = () => signIn(b.dataset.persona, DEMO_PASSWORD));
 }
 
-async function signIn(username, password) {
-  const r = await post("/api/auth/login",
-    { username, password: password == null ? DEMO_PASSWORD : password });
-  if (!r || r.error) {
-    showLogin((r && r.error && r.error.message) || "Sign in failed.");
-    return false;
+function signIn(username, password) {
+  // The arguments already captured the credentials. Never leave a password
+  // in the hidden sign-in form while authentication or the signed-in shell is
+  // active; a later sign-out must not reveal the prior operator's secret.
+  clearLoginCredentials();
+  const requestedIntent = newLocalAuthIntent();
+  // Only the login request and its synchronous currentUser adoption are
+  // serialized. The context/deep-link/render tail is identity-cancellable and
+  // intentionally runs after the queue is released, so Sign out can reach the
+  // server even while one of those reads is held.
+  const action = runAuthTransition(
+    () => adoptSignIn(username, password, requestedIntent))
+    .then((phase) => finishSignIn(phase));
+  return trackExplicitAuthAction(action);
+}
+async function adoptSignIn(username, password,
+    requestedIntent = captureAuthOwnership(), passiveAttempt = null) {
+  reconcileLiveSessionBeforeExplicitAuth();
+  // Explicit auth intents are queued, and a preceding queued mutation may
+  // legitimately replace the cookie/epoch before this request dispatches.
+  // Bind authority ownership at actual dispatch while preserving the click's
+  // immutable local ordering ticket. Passive auto-login is created at this
+  // same point, so the two snapshots coincide for that path.
+  const dispatchOwnership = {
+    ...captureAuthOwnership(),
+    localIntent: requestedIntent.localIntent,
+    passive: requestedIntent.passive,
+  };
+  const outcome = await sessionCookiePost("/api/auth/login",
+    { username, password: password == null ? DEMO_PASSWORD : password },
+    passiveAttempt ? passiveAttempt.controller.signal : null,
+    () => {
+      if (!passiveAttempt) return;
+      passiveAttempt.headersSeen = true;
+      if (passiveAutoLoginAttempt === passiveAttempt) {
+        passiveAutoLoginAttempt = null;
+      }
+    });
+  if (passiveAutoLoginAttempt === passiveAttempt) {
+    passiveAutoLoginAttempt = null;
   }
-  setUser(r.user); toast = "";
+  // Only headers + their synchronous boundary are serialized. The body may
+  // be an arbitrarily slow stream, so return it to the cancellable tail; a
+  // later Sign out can acquire the lock and dispatch before it drains.
+  return { kind: "pending", outcome, requestedIntent: dispatchOwnership };
+}
+function completeSignInResponse(started, r) {
+  const { outcome, requestedIntent } = started;
+  if (outcome.boundary && (!r || !r.user)) {
+    // The successful headers may already have installed a valid cookie even
+    // when a proxy truncates/corrupts the JSON body. Never hide the checking
+    // wall with `currentUser=null`; ask the canonical endpoint and either
+    // rebuild that exact identity or remain quarantined.
+    return {
+      kind: "uncertain",
+      message: (r && r.error && r.error.message)
+        || "Sign in completed, but the session could not be verified.",
+      identityEpoch: outcome.boundary.identityEpoch,
+      authIntent: outcome.boundary.authIntent,
+      localIntent: requestedIntent
+        ? requestedIntent.localIntent : localAuthIntentSeq,
+      sessionToken: outcome.boundary.sessionToken,
+    };
+  }
+  if (!r || r.error) {
+    // A non-2xx response establishes no new cookie boundary. Attribute it to
+    // the immutable state at dispatch—not whichever identity happens to be
+    // live when a delayed body drains. This is especially important for the
+    // passive bootstrap login, which must never publish a stale error over a
+    // newer manual success.
+    if (!requestedIntent
+        || requestedIntent.localIntent !== localAuthIntentSeq
+        || (requestedIntent.passive
+          && (requestedIntent.identityEpoch !== uiIdentityEpoch
+            || requestedIntent.authIntent !== authIntentSeq
+            || !sessionGenerationCurrent(requestedIntent.sessionToken)))) return null;
+    const failureOwner = requestedIntent.passive
+      ? requestedIntent : captureAuthOwnership();
+    return {
+      kind: "failed",
+      message: (r && r.error && r.error.message) || "Sign in failed.",
+      identityEpoch: failureOwner.identityEpoch,
+      authIntent: failureOwner.authIntent,
+      localIntent: requestedIntent.localIntent,
+      sessionToken: failureOwner.sessionToken,
+    };
+  }
+  if (!outcome.boundary
+      || requestedIntent && requestedIntent.localIntent !== localAuthIntentSeq
+      || outcome.boundary.authIntent !== authIntentSeq
+      || !sessionGenerationCurrent(outcome.boundary.sessionToken)) return null;
+  const adoptedAuthIntent = outcome.boundary.authIntent;
+  // Every successful login replaces the session cookie even when the username
+  // is unchanged. Treat the cookie generation—not the display name—as the
+  // boundary so a same-user re-login cannot inherit private stores or settle
+  // continuations issued under an older role/scope binding.
+  setUser(r.user, true); toast = "";
+  const myIdentityEpoch = uiIdentityEpoch;
   // An explicit sign-in clears the sticky sign-out so the demo auto-login can
   // resume on future fresh visits.
   try { localStorage.removeItem("hs_signed_out"); } catch (_) {}
@@ -15295,14 +16840,94 @@ async function signIn(username, password) {
   // move staged by the previous operator must not carry into the new session.
   // pendingReassign is cleared for the same reason (#166).
   drawer = null; movingGameId = null; conflict = null; pendingMove = null; pendingReassign = null;
-  hideLogin();
-  // Load this identity's authorized context (a persona switch re-scopes it),
-  // then reconcile the URL: adopt an authorized deep link, else reflect the
-  // persisted selection (#159).
-  await loadContextOptions();
-  await restoreContextDeepLink();
-  renderRoleSwitch(); render();
-  return true;
+  if (currentRoleMetadataReady()) {
+    sessionAwaitingRoleMetadata = false;
+    hideLogin();
+  } else {
+    // Bootstrap has not yet supplied the role row that determines this
+    // identity's visible routes.  Do not render the default Dashboard with an
+    // empty permission set: Viewer would otherwise receive its operator data
+    // before the eventual metadata pass redirects it to Standings.
+    sessionAwaitingRoleMetadata = true;
+    showLogin("Session verified. Loading access…");
+  }
+  return {
+    kind: "success",
+    identityEpoch: myIdentityEpoch,
+    authIntent: adoptedAuthIntent,
+    localIntent: requestedIntent
+      ? requestedIntent.localIntent : localAuthIntentSeq,
+    sessionToken: readSessionMutationToken(),
+  };
+}
+async function finishSignIn(phase) {
+  if (phase && phase.kind === "pending") {
+    const r = await phase.outcome.resultPromise;
+    phase = completeSignInResponse(phase, r);
+  }
+  if (phase && (phase.kind === "failed" || phase.kind === "uncertain")) {
+    const phaseCurrent = () => phase.localIntent === localAuthIntentSeq
+      && phase.authIntent === authIntentSeq
+      && phase.identityEpoch === uiIdentityEpoch
+      && sessionGenerationCurrent(phase.sessionToken);
+    if (!phaseCurrent()) return false;
+    // Canonical recovery can load context and render, so it belongs OUTSIDE
+    // the auth/Web Lock. A held recovery tail must never prevent a later Sign
+    // out from reaching the server and ending the cookie.
+    const recovered = await reconcileCanonicalSessionAfterFailedMutation();
+    // Canonical recovery may legitimately advance authIntent when it adopts a
+    // valid cookie whose model was quarantined by an earlier successful
+    // mutation. The originating local intent and shared generation—not the
+    // pre-recovery auth counter—decide whether this tail still owns UI.
+    if (phase.localIntent !== localAuthIntentSeq
+        || !sessionGenerationCurrent(phase.sessionToken)) return false;
+    if (phase.kind === "uncertain" && recovered && currentUser) {
+      try { localStorage.removeItem("hs_signed_out"); } catch (_) {}
+      return true;
+    }
+    if (currentUser) {
+      toast = phase.message;
+      toastIsError = true;
+      updateToast();
+      if (sessionAwaitingRoleMetadata) showLogin(phase.message);
+    } else {
+      showLogin(phase.message);
+    }
+    return false;
+  }
+  const finishSuccessfulAdoption = async () => {
+    const stillCurrent = () => !!phase
+      && phase.identityEpoch === uiIdentityEpoch
+      && phase.authIntent === authIntentSeq
+      && phase.localIntent === localAuthIntentSeq
+      && sessionGenerationCurrent(phase.sessionToken);
+    if (!stillCurrent()) return false;
+    // The stale bootstrap owns the missing public role metadata and will run
+    // the guarded session rebuild once its catalog response (or recovery
+    // retry) settles.  Ending this explicit action now lets that bootstrap
+    // drain without deadlocking on the action tail, while the login wall keeps
+    // every private view unrendered.
+    if (sessionAwaitingRoleMetadata) {
+      requestRoleMetadataRecovery();
+      return true;
+    }
+    // Load this identity's authorized context (a persona switch re-scopes it),
+    // then reconcile the URL: adopt an authorized deep link, else reflect the
+    // persisted selection (#159).
+    try {
+      await loadContextOptions();
+      if (!stillCurrent()) return false;
+      await restoreContextDeepLink();
+      if (!stillCurrent()) return false;
+    } catch (error) {
+      if (error instanceof IdentitySupersededError) return false;
+      throw error;
+    }
+    renderRoleSwitch();
+    await render();
+    return stillCurrent();
+  };
+  return trackCanonicalSessionRebuild(finishSuccessfulAdoption());
 }
 function renderRoleSwitch() {
   const sel = document.getElementById("role-switch");
@@ -15364,6 +16989,150 @@ function isServerError(response) {
   return !response || response.status === 0 || response.status >= 500;
 }
 
+// A role-metadata quarantine owns its own recovery. It must not wait for the
+// startup request that exposed the race: that request may have failed already
+// or may remain hung forever. Fetch only public bootstrap metadata here—the
+// login response or canonical recovery already established the identity—and
+// bind the eventual rebuild to that exact identity, auth intent, and shared
+// cookie generation. Concurrent requests for the same tuple coalesce.
+let roleMetadataRecoveryFlight = null;
+async function rebuildRoleMetadataQuarantineFromPublished() {
+  if (!currentUser) return null;
+  // A sibling exact-session rebuild may finish while a failed/hung recovery
+  // response is draining. Treat that as success; the old lane must not put an
+  // already-adopted identity back behind the wall with a failure message.
+  if (!sessionAwaitingRoleMetadata) {
+    return currentRoleMetadataReady() && envStatus ? true : null;
+  }
+  if (!currentRoleMetadataReady() || !envStatus) return null;
+  const user = currentUser;
+  const signature = sessionIdentitySignature(user);
+  const identityEpoch = uiIdentityEpoch;
+  const authIntent = authIntentSeq;
+  const localIntent = localAuthIntentSeq;
+  const sessionToken = readSessionMutationToken();
+  const stillCurrent = () => !!currentUser
+    && sessionIdentitySignature(currentUser) === signature
+    && identityEpoch === uiIdentityEpoch
+    && authIntent === authIntentSeq
+    && localIntent === localAuthIntentSeq
+    && sessionGenerationCurrent(sessionToken);
+  applyRolePerms();
+  renderRoleSwitch();
+  renderEnvChips();
+  renderLoginPersonas();
+  const deferredToast = toastIsError && toast
+    ? { text: toast, isError: true } : null;
+  // Publishing the missing role row completes the same canonical identity
+  // adoption as sign-in/resume. Track the context/deep-link/render tail so a
+  // newer same-signature /auth/me verdict cannot mistake this half-adopted
+  // model for a settled session and return early across server-side A→B→A.
+  const rebuilt = await rebuildCanonicalVerifiedSession(user, stillCurrent);
+  if (rebuilt && stillCurrent() && deferredToast) {
+    toast = deferredToast.text;
+    toastIsError = deferredToast.isError;
+    updateToast();
+  }
+  return rebuilt;
+}
+function requestRoleMetadataRecovery() {
+  if (!currentUser || !sessionAwaitingRoleMetadata) {
+    return Promise.resolve(false);
+  }
+  const user = currentUser;
+  const signature = sessionIdentitySignature(user);
+  const identityEpoch = uiIdentityEpoch;
+  const authIntent = authIntentSeq;
+  const localIntent = localAuthIntentSeq;
+  const sessionToken = readSessionMutationToken();
+  const key = JSON.stringify([
+    signature, identityEpoch, authIntent, localIntent, sessionToken,
+  ]);
+  if (roleMetadataRecoveryFlight
+      && roleMetadataRecoveryFlight.key === key) {
+    return roleMetadataRecoveryFlight.promise;
+  }
+  const stillCurrent = () => !!currentUser
+    && sessionIdentitySignature(currentUser) === signature
+    && identityEpoch === uiIdentityEpoch
+    && authIntent === authIntentSeq
+    && localIntent === localAuthIntentSeq
+    && sessionGenerationCurrent(sessionToken);
+  const rebuildFromPublishedMetadata = async () => {
+    // The original startup request and this independent lane may finish in
+    // either order. If the other request already published a complete role +
+    // environment catalog, a failure here must consume that good result
+    // instead of stranding the session behind the wall.
+    if (!stillCurrent()) return false;
+    return rebuildRoleMetadataQuarantineFromPublished();
+  };
+  const entry = { key, promise: null };
+  entry.promise = (async () => {
+    try {
+      let rolesR, acctR, statusR;
+      if (!currentRoleMetadataReady()) {
+        [rolesR, acctR, statusR] = await Promise.all([
+          fetch("/api/auth/roles", { credentials: "same-origin" }),
+          fetch("/api/auth/accounts", { credentials: "same-origin" }),
+          fetch("/api/status", { credentials: "same-origin" }),
+        ]);
+        if (!stillCurrent()) return false;
+        if ([rolesR, acctR, statusR].some((r) => !r.ok || isServerError(r))) {
+          const raced = await rebuildFromPublishedMetadata();
+          if (raced !== null) return raced;
+          showLogin("Session verified, but access details are unavailable. Refresh to retry.");
+          return false;
+        }
+        const [rolesRes, acctRes, statusRes] = await Promise.all([
+          readApiResponse(rolesR), readApiResponse(acctR),
+          readApiResponse(statusR),
+        ]);
+        if (!stillCurrent()) return false;
+        if (!rolesRes || !Array.isArray(rolesRes.roles)
+            || !acctRes || !Array.isArray(acctRes.accounts)
+            || !statusRes || statusRes.error) {
+          const raced = await rebuildFromPublishedMetadata();
+          if (raced !== null) return raced;
+          showLogin("Session verified, but access details are unavailable. Refresh to retry.");
+          return false;
+        }
+        roleCatalog = rolesRes.roles;
+        accounts = acctRes.accounts;
+        envStatus = statusRes;
+      }
+      if (!stillCurrent()) return false;
+      if (!roleCatalog.find((role) => role.id === user.role)) {
+        showLogin("Session verified, but its role is unavailable. Refresh to retry.");
+        return false;
+      }
+      return rebuildFromPublishedMetadata();
+    } catch (_) {
+      if (stillCurrent()) {
+        const raced = await rebuildFromPublishedMetadata();
+        if (raced !== null) return raced;
+        showLogin("Session verified, but access details are unavailable. Refresh to retry.");
+      }
+      return false;
+    }
+  })();
+  roleMetadataRecoveryFlight = entry;
+  entry.promise.finally(() => {
+    if (roleMetadataRecoveryFlight === entry) {
+      roleMetadataRecoveryFlight = null;
+      // Close the last completion-order slit: the stale startup request can
+      // publish good metadata after this flight checked for it but before its
+      // waiter resumes. Re-enter on the next microtask only when the exact
+      // session is still quarantined and the complete published catalog is
+      // now usable.
+      if (stillCurrent() && sessionAwaitingRoleMetadata
+          && currentRoleMetadataReady() && envStatus) {
+        queueMicrotask(() => requestRoleMetadataRecovery());
+      }
+    }
+  });
+  return entry.promise;
+}
+
 // A startup outage must NOT masquerade as a normal signed-out/empty-account
 // state (which would silently clear roles and drop the user to the sign-in wall
 // as if nothing were wrong). Show the sign-in screen with a clear, retryable
@@ -15376,16 +17145,72 @@ function showBootstrapOutage() {
   showLogin("The server is temporarily unavailable. Please refresh in a moment.");
 }
 
-async function bootstrap() {
+async function bootstrap(allowDemoAutoLogin = true) {
+  // The static shell is interactive before these reads finish. A later user
+  // auth action owns the page, even if this request captured an older valid
+  // cookie; never let a stale /api/auth/me response reverse that action.
+  let bootstrapAuthIntent = authIntentSeq;
+  let bootstrapLocalIntent = localAuthIntentSeq;
+  let bootstrapSessionToken = readSessionMutationToken();
+  const bootstrapAuthorityRead = beginCanonicalAuthorityRead();
+  let bootstrapAuthorityClaim = null;
+  let bootstrapCanonicalGuardActive = true;
+  const bootstrapBaseCurrent = () => bootstrapAuthIntent === authIntentSeq
+    && bootstrapLocalIntent === localAuthIntentSeq
+    && sessionGenerationCurrent(bootstrapSessionToken);
+  const bootstrapAuthorityCurrent = () => !bootstrapCanonicalGuardActive
+    || (bootstrapAuthorityClaim
+      ? canonicalAuthorityRebuildCurrent(bootstrapAuthorityClaim)
+      : canonicalAuthorityFallbackCurrent(bootstrapAuthorityRead));
+  const bootstrapStillCurrent = () => bootstrapBaseCurrent()
+    && bootstrapAuthorityCurrent();
+  const refreshPublicShellAfterStaleBootstrap = async () => {
+    // The public role/account/environment catalog is still useful to the auth
+    // action that won while bootstrap was held. Refresh only non-private shell
+    // chrome; the stale me result is never adopted, claimed, or rendered.
+    await awaitExplicitAuthActionDrain();
+    applyRolePerms();
+    renderRoleSwitch();
+    renderEnvChips();
+    renderLoginPersonas();
+    // A successful explicit sign-in may have been deliberately quarantined
+    // while this bootstrap owned the missing catalog request. Consume a good
+    // catalog immediately: the independent recovery request may be hung and
+    // must not strand a now-renderable identity. The guarded rebuild uses no
+    // stale /auth/me body and is bound to the winning exact session.
+    if (sessionAwaitingRoleMetadata) {
+      const rebuilt = await rebuildRoleMetadataQuarantineFromPublished();
+      if (rebuilt === null) await requestRoleMetadataRecovery();
+    }
+  };
+  const restartAfterStaleBootstrapFailure = async () => {
+    // A user action that invalidated this bootstrap owns the cookie and its
+    // visible result.  Let that complete before fetching a fresh, coherent
+    // roles/accounts/status/me set.  The recovery run must never perform the
+    // demo convenience login: a refused manual login remains refused.
+    await awaitExplicitAuthActionDrain();
+    if (sessionAwaitingRoleMetadata) {
+      return requestRoleMetadataRecovery();
+    }
+    // A dedicated metadata recovery may already have completed while the
+    // superseded startup request was unwinding. Its exact-session render is
+    // authoritative; another full bootstrap would only contend for the one
+    // canonical /auth/me lane.
+    if (currentUser && currentRoleMetadataReady()) return;
+    return bootstrap(false);
+  };
   let rolesR, acctR, statusR, meR;
   try {
     [rolesR, acctR, statusR, meR] = await Promise.all([
       fetch("/api/auth/roles", { credentials: "same-origin" }),
       fetch("/api/auth/accounts", { credentials: "same-origin" }),
       fetch("/api/status", { credentials: "same-origin" }),
-      fetch("/api/auth/me", { credentials: "same-origin" }),
+      fetch("/api/auth/me", { credentials: "same-origin",
+        signal: bootstrapAuthorityRead.controller.signal }),
     ]);
   } catch (_) {
+    settleCanonicalAuthorityRead(bootstrapAuthorityRead);
+    if (!bootstrapStillCurrent()) return restartAfterStaleBootstrapFailure();
     return showBootstrapOutage();  // network unreachable — an outage, not "signed out"
   }
   // A 5xx / non-JSON proxy error on ANY of the four bootstrap calls is an
@@ -15393,45 +17218,140 @@ async function bootstrap() {
   // a roles/me failure would look "signed out", an accounts failure would skip
   // the demo auto-login into a bare sign-in screen, and a status failure would
   // leave envStatus null so isDemo() fails OPEN (demo controls in production).
-  if ([rolesR, acctR, statusR, meR].some(isServerError)) return showBootstrapOutage();
+  if ([rolesR, acctR, statusR, meR].some(isServerError)) {
+    settleCanonicalAuthorityRead(bootstrapAuthorityRead);
+    if (!bootstrapStillCurrent()) return restartAfterStaleBootstrapFailure();
+    return showBootstrapOutage();
+  }
 
   const rolesRes = await readApiResponse(rolesR);
   const acctRes = await readApiResponse(acctR);
   const statusRes = await readApiResponse(statusR);
-  roleCatalog = (rolesRes && rolesRes.roles) || [];
-  accounts = (acctRes && acctRes.accounts) || [];
-  envStatus = statusRes && !statusRes.error ? statusRes : null;
+  const publicMetadataValid = rolesR.ok && acctR.ok && statusR.ok
+    && rolesRes && Array.isArray(rolesRes.roles)
+    && acctRes && Array.isArray(acctRes.accounts)
+    && statusRes && !statusRes.error
+    && typeof statusRes.app_mode === "string";
+  const publishPublicMetadata = () => {
+    roleCatalog = publicMetadataValid ? rolesRes.roles : [];
+    accounts = publicMetadataValid ? acctRes.accounts : [];
+    envStatus = publicMetadataValid ? statusRes : null;
+  };
 
-  const meRes = meR.ok ? await readApiResponse(meR) : null;
-  if (meRes && meRes.user) {
-    setUser(meRes.user);
-  } else if (meR.status !== 401 && accounts.length && !signedOutSticky()) {
+  let meRes;
+  try {
+    meRes = meR.ok ? await readApiResponse(meR) : null;
+  } finally {
+    settleCanonicalAuthorityRead(bootstrapAuthorityRead);
+  }
+  // All other canonical readers reject a stale auth/token/epoch lane BEFORE
+  // claiming. Bootstrap must do the same: an old valid body is not allowed to
+  // advance accepted authority after logout/peer replacement, because that
+  // would suppress the live generation reader's outage fallback and strand
+  // the tab behind its checking quarantine.
+  if (!bootstrapBaseCurrent()) {
+    // Valid public metadata from an obsolete bootstrap may rescue the exact
+    // explicit session that is still quarantined, but an invalid response may
+    // never erase a newer recovery's good catalog. Once recovery has already
+    // cleared the wait flag, neither valid nor invalid stale globals may win.
+    if (publicMetadataValid && sessionAwaitingRoleMetadata
+        && currentUser
+        && rolesRes.roles.some((role) => role.id === currentRole)) {
+      publishPublicMetadata();
+    }
+    return refreshPublicShellAfterStaleBootstrap();
+  }
+  publishPublicMetadata();
+  const meAuthority = classifyCanonicalAuthority(meR, meRes);
+  if (!meAuthority) {
+    if (!bootstrapStillCurrent()) return;
+    return showBootstrapOutage();
+  }
+  bootstrapAuthorityClaim = claimCanonicalAuthorityVerdict(
+    bootstrapAuthorityRead, meAuthority);
+  if (!bootstrapStillCurrent()) {
+    return refreshPublicShellAfterStaleBootstrap();
+  }
+  if (!publicMetadataValid && !meAuthority.user) {
+    return showBootstrapOutage();
+  }
+  if (meAuthority.user) {
+    setUser(meAuthority.user);
+  } else if (allowDemoAutoLogin && meR.status !== 401
+      && accounts.length && !signedOutSticky()) {
     // Demo mode, fresh visit (no session, personas available, and the user has
     // not explicitly signed out — /api/auth/me answers 200 with no user, not a
     // 401): keep the zero-friction auto-login as League Admin.
-    const r = await post("/api/auth/login",
-      { username: "admin", password: DEMO_PASSWORD });
-    if (r && !r.error) setUser(r.user); else setUser(null);
+    const phase = await runAuthTransition(() => {
+      // A user intent that arrived while this convenience login waited for the
+      // queue wins without sending another cookie mutation at all.
+      if (!bootstrapStillCurrent() || signedOutSticky()) return null;
+      const requestedIntent = captureAuthOwnership(true);
+      const passiveAttempt = {
+        controller: new AbortController(), headersSeen: false,
+      };
+      passiveAutoLoginAttempt = passiveAttempt;
+      return adoptSignIn("admin", DEMO_PASSWORD,
+        requestedIntent, passiveAttempt);
+    });
+    if (phase && phase.kind !== "success") {
+      await finishSignIn(phase);
+      return;
+    }
+    if (phase) {
+      bootstrapAuthIntent = phase.authIntent;
+      bootstrapSessionToken = readSessionMutationToken();
+      // The successful cookie mutation and its response body now own the
+      // session. The startup anonymous verdict has served its purpose and
+      // must not make a later same-user canonical confirmation cancel this
+      // post-login context/render tail.
+      bootstrapCanonicalGuardActive = false;
+    }
+    if (!phase && bootstrapStillCurrent()) setUser(null);
   } else {
     // Production (empty picker), an expired/invalid session (401), or an
     // explicit prior sign-out: no silent login — show the sign-in screen (#71)
     // so logout is meaningful across a refresh.
     setUser(null);
   }
+  if (!bootstrapStillCurrent()) return;
+  const bootstrapIdentityEpoch = uiIdentityEpoch;
   applyRolePerms();
   renderRoleSwitch();
   renderEnvChips();
   if (currentUser) {
-    // Load the persisted active context first, then adopt a different authorized
-    // deep link if the URL carries one (#159).
-    await loadContextOptions();
-    await restoreContextDeepLink();
-    hideLogin();
-    render();
+    if (sessionAwaitingRoleMetadata) {
+      // A current canonical user with missing/malformed public role metadata
+      // is the same quarantine state as an explicit sign-in that beat startup.
+      // Never let the common bootstrap tail hide the wall or render the
+      // default Dashboard; the independent metadata lane can recover even if
+      // this request was the malformed one.
+      showLogin("Session verified. Loading access…");
+      await requestRoleMetadataRecovery();
+      return;
+    }
+    const bootstrapRebuild = (async () => {
+      // Load the persisted active context first, then adopt a different
+      // authorized deep link if the URL carries one (#159).
+      await loadContextOptions();
+      if (!bootstrapStillCurrent()
+          || bootstrapIdentityEpoch !== uiIdentityEpoch) return;
+      await restoreContextDeepLink();
+      if (!bootstrapStillCurrent()
+          || bootstrapIdentityEpoch !== uiIdentityEpoch) return;
+      hideLogin();
+      await render();
+    })();
+    await trackCanonicalSessionRebuild(bootstrapRebuild);
   }
   // A bookmarked/shared #public link (#34) drops a signed-out visitor
   // straight into the guest schedule instead of the sign-in wall.
   else if (location.hash === "#public") { showPublicGuest(); }
-  else { showLogin(); }
+  else if (!allowDemoAutoLogin
+      && !document.getElementById("login-screen").hidden) {
+    // A recovery run after a refused explicit login may refresh the persona
+    // catalog, but it must not erase the error that action just presented.
+    renderLoginPersonas();
+  } else { showLogin(); }
 }
 bootstrap();

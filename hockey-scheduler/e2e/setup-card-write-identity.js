@@ -222,7 +222,7 @@
 //      says "current". Nothing but the principal/session epoch stands between
 //      the departing operator's response and the arriving operator's card.
 //
-//      Each sub-leg holds A's reopen, switches to the arriving principal, and
+//      Sub-legs 7a-7e hold A's reopen, switch to the arriving principal, and
 //      asserts on BOTH sides of the release:
 //
 //        WHILE UNRESOLVED — the arriving principal's card is NON-ACTIONABLE
@@ -265,6 +265,11 @@
 //           reconciled card must offer NO action at all — the reported "can
 //           also restore controls/state that the arriving role ... may not be
 //           authorized to exercise" is what this sub-leg forbids.
+//      (7f) the SAME Admin, cookie, epoch, tuple and card generation, with only
+//           the shared localStorage generation evicted after the server commit
+//           and before delivery. A pre-existing held /auth/me forces the
+//           coalesced canonical rerun: the discarded old-generation body must
+//           drain the ledger and re-read Active truth, never restore Reopen.
 //
 //   (8) THE POST-AUTH / PRE-RENDER WINDOW (round 8). Everything in leg 7 is
 //       observed AFTER the arriving principal's own render, because both of its
@@ -321,8 +326,8 @@
 //       re-asserted after the sample, so a render of theirs slipping in cannot
 //       silently turn the assertions into observations of it. Nothing may be
 //       announced, committed, painted or focused under the arriving principal;
-//       then their own render still arrives and rebuilds the card from their
-//       own read, so the refusal is a window and not a dead surface.
+//       then their own render still arrives at their canonical fresh-session
+//       destination, so the refusal is a window and not a dead page.
 //
 //      (9a) a second League Admin — same role, same authority, different
 //           person, so the leak cannot be excused as a permissions difference.
@@ -1271,24 +1276,33 @@ async function arrivePrincipal(page, arrive, step) {
 // paths, belongs to the APP rather than to a promise the test happened to be
 // handed, and cannot be produced by the test.
 //
-// render() finishes by REPLACING #content's own children. Observed with
-// `subtree: false` for exactly the reason switchContext() gives: the retain-
-// the-cards pass at the top of render(), repaintContextScopedCardsAsStale()
-// and blankContextScopedCardSurfaces() all rewrite DESCENDANTS of #content
-// while the arriving principal still has nothing of their own to show, and a
-// subtree observer would count those and call the recovery proven before it
-// happened. Only the final `c.innerHTML = …` replaces #content's own children,
-// and by then the arriving principal's reads have landed.
+// The identity boundary now removes #content's own children outright. A DOM
+// observer would therefore count the privacy quarantine itself as the arriving
+// principal's render -- exactly the false positive this signal exists to
+// prevent. Wrap the real async render() instead and count only after its promise
+// resolves. That distinguishes the synchronous boundary withdrawal from the
+// first complete page built from the arriving principal's reads.
 //
 // Armed immediately before the sign-in is triggered, so "no render of their
 // own has run yet" is a measurement inside the window and not an assumption.
 async function armOwnRenderCounter(page) {
   await page.evaluate(() => {
-    if (window.__wiOwnObs) window.__wiOwnObs.disconnect();
+    if (!window.__wiOriginalRender) window.__wiOriginalRender = render;
     window.__wiOwnRenders = 0;
-    const c = document.getElementById("content");
-    window.__wiOwnObs = new MutationObserver(() => { window.__wiOwnRenders += 1; });
-    if (c) window.__wiOwnObs.observe(c, { childList: true, subtree: false });
+    render = async function (...args) {
+      const result = await window.__wiOriginalRender.apply(this, args);
+      window.__wiOwnRenders += 1;
+      return result;
+    };
+  });
+}
+
+async function disarmOwnRenderCounter(page) {
+  await page.evaluate(() => {
+    if (window.__wiOriginalRender) {
+      render = window.__wiOriginalRender;
+      delete window.__wiOriginalRender;
+    }
   });
 }
 
@@ -1353,8 +1367,8 @@ async function startArrival(page, arrive, step) {
 // standing behind a stale PAINTED card, and the painted card is what the
 // operator sees.
 // The exact set of containers app.js's blankContextScopedCardSurfaces() empties
-// at the identity boundary — one constant, because the recovery assertion marks
-// precisely the containers the boundary blanked and nothing else.
+// at the identity boundary — one constant shared by the focus and disclosure
+// searches below.
 const SCOPED_SURFACE_SELECTOR =
   "#sp-card-slot,[data-setup-card-slot],[data-setup-landing-actions],"
   + "[data-setup-hub-progress-slot],[data-setup-workflow-card]";
@@ -1416,6 +1430,10 @@ async function paintedContextScopedSurface(page) {
       landing: !!document.querySelector("[data-setup-workflow-landing]"),
       homeSlot: !!document.getElementById("sp-card-slot"),
       progressSlots: all("[data-setup-hub-progress-slot]").length,
+      contentChildren: document.getElementById("content")
+        ? document.getElementById("content").children.length : -1,
+      contentHtml: document.getElementById("content")
+        ? document.getElementById("content").innerHTML.trim() : null,
     };
   });
 }
@@ -1443,6 +1461,18 @@ function assertSurfaceStructure(painted, surface, L, step, when) {
         progressSlots: painted.progressSlots })}), so every "nothing of the `
       + `departing principal's remains" assertion would be true for the wrong `
       + `reason`);
+  }
+}
+
+// During the post-auth/pre-render window the stronger privacy boundary removes
+// the complete authenticated content tree. This is intentionally the opposite
+// of assertSurfaceStructure(): structure is required before the boundary and
+// after recovery, while exact emptiness is required in the held window.
+function assertIdentityContentQuarantined(painted, L, step, when) {
+  if (painted.contentChildren !== 0 || painted.contentHtml !== "") {
+    fail(`[${L}/${step}/${when}] #content is not fully quarantined before the `
+      + `arriving principal's render (children=${painted.contentChildren}, `
+      + `html=${JSON.stringify(painted.contentHtml)})`);
   }
 }
 
@@ -1505,12 +1535,11 @@ async function openScopedSurface(page, surface, step) {
 //                             on the pending line, the busy sentence spoken
 //   lands    what the ARRIVING principal's OWN post-options render must put on
 //            screen, with no navigation, click or render from this test:
-//              "surface"    — the same context-scoped surface, rebuilt and
-//                             settled (the in-app signIn() path, where nothing
-//                             touches `view`)
 //              "onboarding" — the Initial Setup destination the app's own
 //                             routing sends a fresh League Admin session to
-//                             after a REAL sign-out (see the recovery block)
+//                             after the successful-header quarantine
+//              "standings"  — the public destination an Arena Manager keeps
+//                             after that same fresh-session boundary
 async function preRenderIdentityWindow(ctx) {
   const { page, base, L, sub, arrive, shape } = ctx;
   const surface = ctx.surface || "landing";
@@ -1661,7 +1690,6 @@ async function preRenderIdentityWindow(ctx) {
   // window stops being a race and becomes a state the leg can stand inside.
   const releaseOptions = holdContextOptions();
   let released = false;
-  let marked = 0;
   try {
     await startArrival(page, arrive, step);
     // ...and this is the ONE instant the review names: `currentUser` is the
@@ -1689,9 +1717,9 @@ async function preRenderIdentityWindow(ctx) {
     // review is right that `__wiSignInDone` is dead weight on the login-form
     // path — the form handler discards the promise — so it is kept only for
     // the in-app path and is never load-bearing here. `ownRenders === 0` is the
-    // signal that carries both: render() has not once replaced #content's own
-    // children since the sign-in was triggered, so no render of the arriving
-    // principal's has run, whichever way they arrived.
+    // signal that carries both: the app's real async render() has not completed
+    // once since the sign-in was triggered, so no complete render of the
+    // arriving principal's has run, whichever way they arrived.
     if (stillHeld < 1 || signInDone || ownRenders !== 0) {
       fail(`[${step}/window] the arriving principal's context-options load is `
         + `no longer outstanding, or a render of their own has already run `
@@ -1700,9 +1728,11 @@ async function preRenderIdentityWindow(ctx) {
         + `than inside the post-auth/pre-render window and proves nothing `
         + `about it`);
     }
-    // ...and the surfaces are still THERE, so every emptiness below is a
-    // withdrawal rather than a page that lost its Setup DOM.
-    assertSurfaceStructure(window0, surface, L, sub, "window");
+    // The identity boundary withdraws the complete authenticated tree. The
+    // non-vacuity sample above proved the departing surface existed; this exact
+    // empty-content assertion proves it has now been removed before any render
+    // belonging to the arriving principal can run.
+    assertIdentityContentQuarantined(window0, L, sub, "window");
 
     if (sightings.length) {
       fail(`[${step}/window] the departing principal's own text is still on `
@@ -1748,23 +1778,6 @@ async function preRenderIdentityWindow(ctx) {
         + `${JSON.stringify(spokenInWindow)}`);
     }
 
-    // ---- MARK THE BLANKED CONTAINERS, before anything is released --------
-    // A sentinel attribute on every container the boundary just blanked. The
-    // arriving principal's own render() cannot preserve it: its final
-    // `c.innerHTML = …` replaces #content's children outright, so every marked
-    // node is discarded and rebuilt. Nothing the test does afterwards removes
-    // them — that is the point. If the marks are still there, no render
-    // happened; if they are gone, one did, and it was not the test's.
-    marked = await page.evaluate((sel) => {
-      const els = Array.from(document.querySelectorAll(sel));
-      els.forEach((el, i) => el.setAttribute("data-wi-blank-mark", String(i)));
-      return els.length;
-    }, SCOPED_SURFACE_SELECTOR);
-    if (!marked) {
-      fail(`[${step}/window] there is no blanked container to mark, so the `
-        + `repaint assertion below would have nothing to observe`);
-    }
-
     releaseOptions();
     released = true;
   } finally {
@@ -1793,78 +1806,48 @@ async function preRenderIdentityWindow(ctx) {
   // here the test only WAITS and READS; waitForFunction polls in the page and
   // runs no application code. What it waits for is the app's own work:
   //
-  //   * `__wiOwnRenders > 0` — render() has replaced #content's own children at
-  //     least once since the sign-in was triggered (subtree:false, so the
-  //     card-slot rewrites that run from held models while the withdrawal is
-  //     still in force cannot satisfy it);
-  //   * no MARKED container is still EMPTY — every container the boundary
-  //     blanked has either been rebuilt or refilled. The marks were placed
-  //     before the release and nothing in the test removes them;
+  //   * `__wiOwnRenders > 0` — the app's real async render() has completed at
+  //     least once since the sign-in was triggered; the synchronous privacy
+  //     quarantine cannot satisfy it;
   //   * and the DESTINATION the arriving principal's own render actually
   //     produces is complete and settled — see `lands` below.
   //
-  // WHERE THAT RENDER LANDS THEM IS NOT THE SAME ON BOTH PATHS, and the
-  // difference is pre-existing product behaviour that has nothing to do with
-  // this slice, so it is asserted explicitly per sub-leg rather than glossed:
-  //
-  //   in-app signIn()  — no sign-out happens, `view` is untouched, so the
-  //                      render repaints the very surface the boundary blanked.
-  //                      `lands: "surface"`.
-  //   sign-out + login form — setUser(null) demotes `view` off "setup"
-  //                      (#233 B2a r2: a signed-out visitor holds no
-  //                      manage_setup) and then off "dashboard" to "standings"
-  //                      (no ops console). On the way back in,
-  //                      onboarding-bootstrap.js restores "dashboard" for a
-  //                      fresh League Admin session and onboarding.js routes an
-  //                      installation that is not ready_to_schedule to the
-  //                      Initial Setup wizard (#174). So the arriving
-  //                      principal's own surface IS the Initial Setup shell —
-  //                      a complete page of their own, painted with no help
-  //                      from this test. `lands: "onboarding"`.
+  // WHERE THAT RENDER LANDS THEM follows the fresh authenticated session, not
+  // the departing route. Successful cookie-mutating response headers establish
+  // an anonymous quarantine before their body is trusted, on BOTH the in-app
+  // and sign-out/form paths. That demotes the old Setup view to public
+  // Standings. A fresh League Admin is then routed by onboarding-bootstrap.js
+  // and onboarding.js to Initial Setup while this fixture remains incomplete;
+  // an Arena Manager has no onboarding route and remains on Standings. Assert
+  // those destinations explicitly rather than preserving an old identity's
+  // navigation state through the security boundary.
   //
   // Either way the claim being proven is the same one, and it is the one the
   // review asks for: the blanking is a WINDOW. The identity transition itself
   // repaints, so the arriving operator is never left on the blanked husk
   // waiting for a navigation they have to think of themselves.
   const lands = ctx.lands;
-  if (lands !== "surface" && lands !== "onboarding") {
+  if (lands !== "onboarding" && lands !== "standings") {
     fail(`[${step}/recovery] this sub-leg does not declare what the arriving `
       + `principal's own render must land on (lands=${JSON.stringify(lands)})`);
   }
-  const SURFACE_CODE = { landing: 0, hub: 1, home: 2 };
-  await page.waitForFunction(([which, wantOnboarding]) => {
+  await page.waitForFunction((destination) => {
     if (!(window.__wiOwnRenders > 0)) return false;
-    // A marked container that is still empty is the husk itself, left standing.
-    const stillBlank = Array.from(
-      document.querySelectorAll("[data-wi-blank-mark]"))
-      .some((el) => !el.children.length
-        && !((el.textContent || "").trim().length));
-    if (stillBlank) return false;
     const content = document.getElementById("content");
     if (!content || !((content.textContent || "").trim().length)) return false;
     if (content.querySelector(".skeleton")) return false;   // still mid-render
-    if (wantOnboarding) {
+    if (destination === "onboarding") {
       return view === "onboarding" && !!content.querySelector(".onboarding-shell");
     }
-    const has = (s) => !!document.querySelector(s);
-    if (which === 0 && !(has('[data-setup-workflow-landing="facilities"]')
-        && has("[data-setup-card-slot]")
-        && has("[data-setup-landing-actions]"))) return false;
-    if (which === 1 && !(has("[data-setup-card-slot]")
-        && has("[data-setup-hub-progress-slot]"))) return false;
-    if (which === 2 && !has("#sp-card-slot")) return false;
-    const key = which === 2 ? "home/setup-progress" : "setup/facilities";
-    const e = readCardState(key);
-    return e.state !== "loading" && e.state !== "stale";
-  }, [SURFACE_CODE[surface], lands === "onboarding"], { timeout: 25000 })
+    if (destination === "standings") {
+      return view === "standings"
+        && !!content.querySelector(".st-toolbar,.empty");
+    }
+    return false;
+  }, lands, { timeout: 25000 })
     .catch(async () => {
       const why = await page.evaluate(() => ({
         renders: window.__wiOwnRenders,
-        marksLeft: document.querySelectorAll("[data-wi-blank-mark]").length,
-        marksStillBlank: Array.from(
-          document.querySelectorAll("[data-wi-blank-mark]"))
-          .filter((el) => !el.children.length
-            && !((el.textContent || "").trim().length)).length,
         user: currentUser && currentUser.username,
         view: view, setupView: setupView, setupWorkflow: setupWorkflow,
         landing: !!document.querySelector('[data-setup-workflow-landing="facilities"]'),
@@ -1880,7 +1863,8 @@ async function preRenderIdentityWindow(ctx) {
       })).catch(() => null);
       fail(`[${step}/recovery] releasing /api/context/options never produced a `
         + `render of the arriving principal's own that finished on `
-        + `${lands === "onboarding" ? "their Initial Setup destination" : `the ${surface} surface`}. `
+        + `${lands === "onboarding" ? "their Initial Setup destination"
+          : "their Standings destination"}. `
         + `The identity boundary blanks the painted card surfaces SYNCHRONOUSLY, `
         + `so without this render ${arrive.username} is left looking at an empty `
         + `page until they navigate — the privacy fix would have traded a `
@@ -1888,23 +1872,9 @@ async function preRenderIdentityWindow(ctx) {
         + `rendered after the release: ${JSON.stringify(why)}`);
     });
 
-  // ...and the same record every other moment in this leg is read with, so
-  // "restored" is measured on the same axes "withdrawn" was. Asserted BEFORE
-  // the test takes any action at all.
-  const recovered = await paintedContextScopedSurface(page);
-  if (lands === "surface") {
-    assertSurfaceStructure(recovered, surface, L, sub, "recovery");
-    if (!recovered.cardText.length) {
-      fail(`[${step}/recovery] the sign-in's own render rebuilt the containers `
-        + `but painted no card body for ${arrive.username}: `
-        + `${JSON.stringify(recovered)}`);
-    }
-    if (surface !== "home" && !recovered.counts.length) {
-      fail(`[${step}/recovery] ${arrive.username}'s own render restored no `
-        + `counts of their own, so "the blanking was a window" is only half `
-        + `true: ${JSON.stringify(recovered)}`);
-    }
-  } else {
+  // Assert the complete canonical destination BEFORE the test takes any action
+  // at all. The old Setup record is deliberately absent after the quarantine.
+  if (lands === "onboarding") {
     // The Initial Setup destination is a real, complete page — asserted
     // positively, so "landed somewhere else" can never pass by being empty.
     const shell = await page.evaluate(() => {
@@ -1917,6 +1887,17 @@ async function preRenderIdentityWindow(ctx) {
       fail(`[${step}/recovery] the arriving principal's own render landed on `
         + `their Initial Setup destination but painted no real page there: `
         + `${JSON.stringify(shell)}`);
+    }
+  } else {
+    const standings = await page.evaluate(() => {
+      const c = document.getElementById("content");
+      return { view, present: !!(c && c.querySelector(".st-toolbar,.empty")),
+               text: ((c && c.textContent) || "").replace(/\s+/g, " ").trim().length };
+    });
+    if (standings.view !== "standings" || !standings.present
+        || standings.text < 20) {
+      fail(`[${step}/recovery] the arriving principal's own render did not `
+        + `finish on a complete Standings page: ${JSON.stringify(standings)}`);
     }
   }
 
@@ -1939,9 +1920,7 @@ async function preRenderIdentityWindow(ctx) {
       .catch(() => fail(`[${step}] the held write never drained after the window`));
   }
   if (heldHandler) await page.unroute(REOPEN_RE, heldHandler);
-  await page.evaluate(() => {
-    if (window.__wiOwnObs) { window.__wiOwnObs.disconnect(); window.__wiOwnObs = null; }
-  });
+  await disarmOwnRenderCounter(page);
   await page.waitForTimeout(400);
 }
 
@@ -2078,8 +2057,8 @@ function heldReopen(opts) {
   return h;
 }
 
-// ONE sub-leg of leg 7, start to finish. Parameterised rather than copied five
-// times so the five sub-legs cannot silently drift apart: everything that
+// ONE cross-principal sub-leg of leg 7, start to finish. Parameterised rather
+// than copied five times so sub-legs 7a-7e cannot silently drift apart: everything that
 // differs between them — which Season, who arrives, how they arrive, and what
 // fresh server truth under THEIR permissions must produce — is an explicit
 // argument, and everything that must be identical is written once.
@@ -2118,6 +2097,21 @@ async function crossPrincipalRelease(ctx) {
   const h = heldReopen({ commit: ctx.commit,
                          allowResourceError: ctx.allowResourceError });
   await page.route(REOPEN_RE, h.handler);
+  if (ctx.expectIdentitySuperseded) {
+    await page.evaluate(() => {
+      const original = postScoped;
+      window.__wiOriginalPostScoped = original;
+      window.__wiPostScopedRejection = null;
+      postScoped = async (...args) => {
+        try {
+          return await original(...args);
+        } catch (error) {
+          window.__wiPostScopedRejection = error && error.name;
+          throw error;
+        }
+      };
+    });
+  }
   await page.click("[data-setup-card-confirm-yes]");
   await h.held;
   await page.waitForTimeout(400);
@@ -2281,6 +2275,21 @@ async function crossPrincipalRelease(ctx) {
     fail(`[${step}] the released response never reached the page, so nothing `
       + `was actually settled`);
   }
+  if (ctx.expectIdentitySuperseded) {
+    await page.waitForFunction(() => window.__wiPostScopedRejection !== null,
+    null, { timeout: 10000 });
+    const rejection = await page.evaluate(() => {
+      const name = window.__wiPostScopedRejection;
+      postScoped = window.__wiOriginalPostScoped;
+      delete window.__wiOriginalPostScoped;
+      delete window.__wiPostScopedRejection;
+      return name;
+    });
+    if (rejection !== "IdentitySupersededError") {
+      fail(`[${step}] the held write crossed the identity boundary with `
+        + `${JSON.stringify(rejection)}, not IdentitySupersededError`);
+    }
+  }
   await page.waitForFunction(() => {
     const e = readCardState("setup/facilities");
     return e.state !== "pending" && e.state !== "loading";
@@ -2382,6 +2391,209 @@ async function crossPrincipalRelease(ctx) {
     fail(`[${step}/settle] the server reports season_active met=${floorMet}, `
       + `expected ${ctx.commit} — the release did not do what this sub-leg `
       + `arranged, so the reconcile assertions above measured the wrong truth`);
+  }
+}
+
+// The cancellation shape that changes no authenticated identity at all.
+// route.fetch() commits the reopen under Admin, then same-document storage
+// eviction removes only the shared generation before the already-successful
+// body is delivered. postScoped() must reject that body (old generation), but
+// the writer must not reinterpret the resulting undefined payload as a 503 and
+// restore an actionable confirmation over the now-active Season.
+async function samePrincipalGenerationEvictionRelease(ctx) {
+  const { page, base, L } = ctx;
+  const step = `${L}/7f`;
+  await quiesce(page, step);
+  await loginAs(page, "admin", "demo");
+  const moved = await apiPost(page, "/api/context",
+    { program_id: ctx.program, season_id: ctx.season.season });
+  if (!moved || moved.error) {
+    fail(`[${step}] could not persist Admin on the target tuple: `
+      + `${JSON.stringify(moved)}`);
+  }
+  await reenter(page, base);
+  await openFacilities(page, step);
+  await armAnnouncements(page);
+
+  const before = await readCard(page);
+  if (before.effective !== "Reopen this season"
+      || await seasonActiveFloorMet(page) !== false) {
+    fail(`[${step}] the archived fixture is not an actionable reopen: `
+      + `${JSON.stringify(before)}`);
+  }
+  const reason = "commit across same-user generation eviction";
+  await openConfirmWithReason(page, step, reason);
+  await resetAnnouncements(page);
+
+  // Start an older focus-style canonical read and hold its DELIVERY. When the
+  // token is evicted below, postScoped's generation check must coalesce a rerun
+  // behind this flight. This makes the promise-reaction ordering deterministic:
+  // the writer may not retry its card after merely awaiting the old /me; it has
+  // to wait until the pending canonical rerun adopts the empty generation too.
+  let resumeRequests = 0;
+  let resumeTaken = false;
+  let releaseOldResume = () => {};
+  let markOldResumeHeld = () => {};
+  const oldResumeHeld = new Promise((resolve) => { markOldResumeHeld = resolve; });
+  const oldResumeGate = new Promise((resolve) => { releaseOldResume = resolve; });
+  const holdOldResume = async (route) => {
+    resumeRequests += 1;
+    if (resumeTaken) {
+      try { return await route.continue(); } catch (_) { return; }
+    }
+    resumeTaken = true;
+    const response = await route.fetch();
+    markOldResumeHeld();
+    await oldResumeGate;
+    try { await route.fulfill({ response }); } catch (_) { /* page closed */ }
+  };
+  await page.route("**/api/auth/me", holdOldResume);
+  await page.evaluate(() => revalidateSessionOnResume());
+  await oldResumeHeld;
+
+  const h = heldReopen({ commit: true, allowResourceError: ctx.allowResourceError });
+  await page.route(REOPEN_RE, h.handler);
+  await page.evaluate(() => {
+    window.__wiOriginalPostScoped = postScoped;
+    window.__wiPostScopedRejection = null;
+    postScoped = async (...args) => {
+      try {
+        return await window.__wiOriginalPostScoped(...args);
+      } catch (error) {
+        window.__wiPostScopedRejection = error && error.name;
+        throw error;
+      }
+    };
+  });
+  await page.click("[data-setup-card-confirm-yes]");
+  await h.held;
+  if (h.status !== 200 || !h.body || h.body.error) {
+    fail(`[${step}] the server did not commit before delivery was held: `
+      + `${h.status} ${JSON.stringify(h.body)}`);
+  }
+  const pending = await readCard(page);
+  if (pending.state !== "pending" || (await readLedger(page)).entries !== 1) {
+    fail(`[${step}] the committed-but-undelivered write is not registered and `
+      + `pending: ${JSON.stringify(pending)}`);
+  }
+
+  const generationBefore = await page.evaluate(() => ({
+    current: currentUser && currentUser.username,
+    epoch: uiIdentityEpoch,
+    observed: observedSessionMutationToken,
+    live: readSessionMutationToken(),
+    tuple: JSON.stringify((contextOptions && contextOptions.selected) || null),
+  }));
+  if (generationBefore.current !== "admin" || !generationBefore.observed
+      || generationBefore.live !== generationBefore.observed) {
+    fail(`[${step}] the same-principal generation precondition is absent: `
+      + `${JSON.stringify(generationBefore)}`);
+  }
+  const progressBefore = ctx.progress();
+  const deliveriesBefore = ctx.deliveries();
+  await resetAnnouncements(page);
+  await page.evaluate(() => localStorage.removeItem("hs_session_mutation_v1"));
+  const evicted = await page.evaluate(() => ({
+    current: currentUser && currentUser.username,
+    epoch: uiIdentityEpoch,
+    observed: observedSessionMutationToken,
+    live: readSessionMutationToken(),
+    tuple: JSON.stringify((contextOptions && contextOptions.selected) || null),
+  }));
+  if (evicted.current !== generationBefore.current
+      || evicted.epoch !== generationBefore.epoch
+      || evicted.tuple !== generationBefore.tuple
+      || evicted.live !== ""
+      || evicted.observed !== generationBefore.observed) {
+    fail(`[${step}] storage eviction changed more than the live generation, `
+      + `or was silently adopted before the held body arrived: `
+      + `${JSON.stringify({ generationBefore, evicted })}`);
+  }
+
+  h.release();
+  const deadline = Date.now() + 15000;
+  while (ctx.deliveries() === deliveriesBefore && Date.now() < deadline) {
+    await page.waitForTimeout(100);
+  }
+  if (ctx.deliveries() === deliveriesBefore) {
+    fail(`[${step}] the held committed body never reached postScoped`);
+  }
+  await page.waitForFunction(() => window.__wiPostScopedRejection !== null,
+    null, { timeout: 10000 });
+  const rejection = await page.evaluate(() => {
+    const name = window.__wiPostScopedRejection;
+    postScoped = window.__wiOriginalPostScoped;
+    delete window.__wiOriginalPostScoped;
+    delete window.__wiPostScopedRejection;
+    return name;
+  });
+  if (rejection !== "IdentitySupersededError") {
+    fail(`[${step}] the old-generation body was not cancelled exactly: `
+      + `${JSON.stringify(rejection)}`);
+  }
+  releaseOldResume();
+  await page.waitForFunction(() => {
+    const e = readCardState("setup/facilities");
+    return !resumeSessionValidationInFlight
+      && observedSessionMutationToken === ""
+      && e.state !== "pending" && e.state !== "loading" && e.state !== "stale";
+  }, null, { timeout: 20000 })
+    .catch(() => fail(`[${step}] canonical same-user generation recovery did `
+      + `not settle the card`));
+  await page.unroute(REOPEN_RE, h.handler);
+  await page.unroute("**/api/auth/me", holdOldResume);
+
+  const afterGeneration = await page.evaluate(() => ({
+    current: currentUser && currentUser.username,
+    epoch: uiIdentityEpoch,
+    observed: observedSessionMutationToken,
+    live: readSessionMutationToken(),
+    tuple: JSON.stringify((contextOptions && contextOptions.selected) || null),
+  }));
+  if (afterGeneration.current !== "admin"
+      || afterGeneration.epoch !== generationBefore.epoch
+      || afterGeneration.tuple !== generationBefore.tuple
+      || afterGeneration.live !== "" || afterGeneration.observed !== "") {
+    fail(`[${step}] canonical recovery did not preserve the same principal, `
+      + `epoch and tuple while adopting the empty generation: `
+      + `${JSON.stringify(afterGeneration)}`);
+  }
+  const ledger = await readLedger(page);
+  if (ledger.entries !== 0 || ledger.cards.length !== 0) {
+    fail(`[${step}] the cancelled body stranded the write ledger: `
+      + `${JSON.stringify(ledger)}`);
+  }
+  if (h.requests !== 1) {
+    fail(`[${step}] ${h.requests} reopen requests were issued for one Season`);
+  }
+  if (resumeRequests !== 2) {
+    fail(`[${step}] canonical generation recovery made ${resumeRequests} `
+      + `/api/auth/me reads, expected the held old read plus exactly one `
+      + `coalesced rerun`);
+  }
+  if (ctx.progress() <= progressBefore) {
+    fail(`[${step}] no fresh progress read followed the cancelled body `
+      + `(${progressBefore} -> ${ctx.progress()})`);
+  }
+  const card = await readCard(page);
+  const offersReopen = (card.actionButtons || []).concat(card.slotButtons || [])
+    .some((label) => /reopen/i.test(label));
+  if (card.state === "confirm" || card.effective !== "Add Ice" || offersReopen) {
+    fail(`[${step}] the discarded body was restored as a failed reopen instead `
+      + `of reconciling committed server truth: ${JSON.stringify(card)}`);
+  }
+  if (await seasonActiveFloorMet(page) !== true) {
+    fail(`[${step}] the server no longer reports the committed Season active`);
+  }
+  const leakedReason = await privateTextSightings(page, reason, true);
+  if (leakedReason.length) {
+    fail(`[${step}] the old confirmation reason survived fresh reconciliation: `
+      + `${JSON.stringify(leakedReason)}`);
+  }
+  const said = await spoken(page);
+  if (said.length !== 1 || said[0].text !== REFRESH_TEXT || said[0].error) {
+    fail(`[${step}] cancellation must produce one honest generic refresh, not `
+      + `a reopen success/failure claim: ${JSON.stringify(said)}`);
   }
 }
 
@@ -2654,9 +2866,7 @@ async function crossPrincipalCardRead(ctx) {
       fail(`[${step}/window] the identity boundary left committed card models `
         + `behind: ${JSON.stringify(boundary.stores.committedCards)}`);
     }
-    // ...and the surfaces are still THERE, so every emptiness below is a
-    // withdrawal rather than a page that lost its Setup DOM.
-    assertSurfaceStructure(boundary.painted, "landing", L, sub, "window");
+    assertIdentityContentQuarantined(boundary.painted, L, sub, "window");
     const focusAtBoundary = boundary.focus;
 
     // ============ THE RELEASE, INSIDE THE WINDOW ============
@@ -2706,7 +2916,7 @@ async function crossPrincipalCardRead(ctx) {
         + `recommendation are all derived from exactly this model.`);
     }
     // ---- (3) NOTHING PAINTED ----
-    assertSurfaceStructure(resolved.painted, "landing", L, sub, "resolve");
+    assertIdentityContentQuarantined(resolved.painted, L, sub, "resolve");
     for (const [what, value] of [
         ["card copy", resolved.painted.cardText],
         ["landing action copy", resolved.painted.actionsText],
@@ -2754,37 +2964,47 @@ async function crossPrincipalCardRead(ctx) {
   }
 
   // ---- RECOVERY: the arriving principal's OWN render still lands ----
-  // The gate refuses a foreign response; it must not leave the card dead. The
-  // arriving principal's own render rebuilds it from their own read, under
-  // their own identity.
-  await page.waitForFunction(() => window.__wiOwnRenders > 0, null,
-    { timeout: 20000 })
-    .catch(() => fail(`[${step}/recovery] the arriving principal's own render `
-      + `never replaced #content, so the refusal above left them on a blank `
-      + `card`));
-  await settled(page, `${step}/recovery`, ctx.season.season);
-  const recovered = await cardReadSample(page);
-  if (!recovered.stores.committed
-      || recovered.stores.committed.principal !== arrive.username
-      || recovered.stores.committed.epoch !== recovered.stores.epochNow) {
-    fail(`[${step}/recovery] the card's committed model is `
-      + `${JSON.stringify(recovered.stores.committed)}, not one issued to `
-      + `${arrive.username} in the current session epoch`);
+  // A successful session-cookie header intentionally routes through an
+  // anonymous quarantine, so recovery follows the fresh identity's canonical
+  // destination rather than reviving the departing Setup surface. The gate's
+  // refusal must still leave a complete, authorized page without help from the
+  // test.
+  const destination = ctx.lands;
+  if (destination !== "onboarding" && destination !== "standings") {
+    fail(`[${step}/recovery] no canonical fresh-session destination was `
+      + `declared (lands=${JSON.stringify(destination)})`);
   }
-  if (!recovered.painted.cardText.length) {
-    fail(`[${step}/recovery] the arriving principal's own render painted no `
-      + `card body, so the identity gate left the surface dead rather than `
-      + `merely refusing somebody else's response`);
-  }
-  if (recovered.spoken.length) {
+  await page.waitForFunction((want) => {
+    if (!(window.__wiOwnRenders > 0)) return false;
+    const content = document.getElementById("content");
+    if (!content || content.querySelector(".skeleton")
+        || !((content.textContent || "").trim().length)) return false;
+    if (want === "onboarding") {
+      return view === "onboarding" && !!content.querySelector(".onboarding-shell");
+    }
+    return view === "standings" && !!content.querySelector(".st-toolbar,.empty");
+  }, destination, { timeout: 25000 })
+    .catch(async () => {
+      const state = await page.evaluate(() => ({
+        renders: window.__wiOwnRenders,
+        user: currentUser && currentUser.username,
+        view,
+        onboarding: !!document.querySelector("#content .onboarding-shell"),
+        standings: !!document.querySelector("#content .st-toolbar,#content .empty"),
+        text: ((document.getElementById("content") || {}).textContent || "")
+          .replace(/\s+/g, " ").trim().slice(0, 160),
+      })).catch(() => null);
+      fail(`[${step}/recovery] the arriving principal's own render did not `
+        + `finish on ${destination}: ${JSON.stringify(state)}`);
+    });
+  const recoveredSpoken = await spoken(page);
+  if (recoveredSpoken.length) {
     fail(`[${step}/recovery] ${arrive.username} was told `
-      + `${JSON.stringify(recovered.spoken)} — their own render answers no `
+      + `${JSON.stringify(recoveredSpoken)} — their own render answers no `
       + `press of theirs and must announce nothing`);
   }
   await page.unroute(OVERVIEW_RE, h.handler);
-  await page.evaluate(() => {
-    if (window.__wiOwnObs) { window.__wiOwnObs.disconnect(); window.__wiOwnObs = null; }
-  });
+  await disarmOwnRenderCounter(page);
   await page.waitForTimeout(300);
 }
 
@@ -3137,8 +3357,8 @@ async function checkViewport(browser, viewport) {
     const s7 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A7");
     const s8 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A8");
     const s9 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A9");
-    // Leg 7's five sub-legs, one Season each for the same reason as above: two
-    // of them really are reopened, and a reused Season would silently make the
+    // Leg 7's cross-principal sub-legs, one Season each for the same reason as
+    // above: two of them really are reopened, and a reused Season would silently make the
     // next sub-leg's "still archived" precondition false.
     const s10 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A10");
     const s11 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A11");
@@ -3162,6 +3382,8 @@ async function checkViewport(browser, viewport) {
     // fixture's, not whatever the previous sub-leg left.
     const s20 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A20");
     const s21 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A21");
+    // Leg 7f commits its Season, so it owns a separate fixture too.
+    const s22 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A22");
 
     // THE SECOND OPERATOR (#365 round 7). A real, separate account with the
     // SAME role as the first: the leak the review reports is not a permissions
@@ -4368,7 +4590,7 @@ async function checkViewport(browser, viewport) {
     // reproduction, down to the reason string.
     await crossPrincipalRelease(Object.assign({}, legSeven, {
       sub: "7a", season: s10, reason: "first write held", arrive: ADMIN_B,
-      commit: false,
+      commit: false, expectIdentitySuperseded: true,
       // The 503 never reached the server, so the Season is still archived and
       // fresh truth under another League Admin is the REAL recovery action.
       expect: { effective: "Reopen this season", blocked: true,
@@ -4413,6 +4635,15 @@ async function checkViewport(browser, viewport) {
       expect: { effective: null, blocked: true, offersReopen: false },
     }));
 
+    // (7f) the principal, cookie, tuple, epoch and generation stay the same;
+    // only localStorage's shared generation is evicted after the server has
+    // committed and before the body is delivered. An already-held /auth/me
+    // forces the canonical empty-generation verdict through the coalesced
+    // rerun path before the card may read fresh truth.
+    await samePrincipalGenerationEvictionRelease(Object.assign({}, legSeven, {
+      season: s22,
+    }));
+
     // ======= (8) THE POST-AUTH / PRE-RENDER WINDOW (#365 round 8) =======
     // Leg 7 proves what the arriving principal is shown ONCE THEIR OWN RENDER
     // HAS RUN. This leg is about the gap before it. Verbatim from the review:
@@ -4445,9 +4676,9 @@ async function checkViewport(browser, viewport) {
     await preRenderIdentityWindow(Object.assign({}, legEight, {
       sub: "8a", season: s15, surface: "landing", shape: "failed",
       reason: "typed just before the switch", arrive: ADMIN_B,
-      // In-app signIn(): no sign-out, so `view` is untouched and their own
-      // render repaints the very surface the boundary blanked.
-      lands: "surface",
+      // Successful login headers quarantine the old session before the body;
+      // the fresh League Admin follows the canonical Initial Setup route.
+      lands: "onboarding",
     }));
 
     // (8b) an UNRESOLVED write across a REAL sign-out/sign-in: the busy copy,
@@ -4471,7 +4702,7 @@ async function checkViewport(browser, viewport) {
     await preRenderIdentityWindow(Object.assign({}, legEight, {
       sub: "8c", season: s17, surface: "landing", shape: "actionable",
       reason: "unused", arrive: ARENA_B,
-      lands: "surface",
+      lands: "standings",
     }));
 
     // (8d) the SETUP HUB rather than a landing: six cards' counts, their
@@ -4481,7 +4712,7 @@ async function checkViewport(browser, viewport) {
     await preRenderIdentityWindow(Object.assign({}, legEight, {
       sub: "8d", season: s18, surface: "hub", shape: "actionable",
       reason: "unused", arrive: ADMIN_B,
-      lands: "surface",
+      lands: "onboarding",
     }));
 
     // (8e) the HOME/TASKS card and its "Continue setup" CTA, across the real
@@ -4515,7 +4746,7 @@ async function checkViewport(browser, viewport) {
     // (9a) a second League Admin — same role, same authority, different
     // person, so the leak cannot be excused as a permissions difference.
     await crossPrincipalCardRead(Object.assign({}, legNine, {
-      sub: "9a", season: s20, arrive: ADMIN_B,
+      sub: "9a", season: s20, arrive: ADMIN_B, lands: "onboarding",
     }));
 
     // (9b) a LOWER-PRIVILEGE arriving role on the same authorized tuple. The
@@ -4523,7 +4754,7 @@ async function checkViewport(browser, viewport) {
     // permissions, and the effective action it carries is MANAGE_SETUP — an
     // Arena Manager must inherit neither.
     await crossPrincipalCardRead(Object.assign({}, legNine, {
-      sub: "9b", season: s21, arrive: ARENA_B,
+      sub: "9b", season: s21, arrive: ARENA_B, lands: "standings",
     }));
 
     // Every failed delivery this viewport saw, matched against every failure
@@ -4606,14 +4837,14 @@ async function checkViewport(browser, viewport) {
       + `on the hub, and on the Home/Tasks card, through the in-app signIn() `
       + `and through the real sign-out/login-form path, with a lower-privilege `
       + `arriving role included. And the blanking is a WINDOW rather than a `
-      + `dead page: with the containers MARKED before /api/context/options is `
-      + `released and NOTHING navigated, clicked or rendered by this journey `
-      + `afterwards, the transition's OWN render arrives — #content's children `
-      + `replaced, no marked container left blank, no skeleton standing — and `
-      + `finishes on the arriving principal's real destination: the same `
-      + `landing, hub or Home/Tasks surface with its own settled card and its `
-      + `own counts where `+"`view`"+` survives the transition, and the Initial Setup `
-      + `page where a real sign-out demotes it. And with the card's own `
+      + `dead page: with #content asserted exactly empty before `
+      + `/api/context/options is released and NOTHING navigated, clicked or `
+      + `rendered by this journey afterwards, the transition's OWN async `
+      + `render completes — authenticated content rebuilt, no skeleton `
+      + `standing — and `
+      + `finishes on the arriving principal's canonical fresh-session `
+      + `destination: Initial Setup for the League Admin fixture and Standings `
+      + `for the Arena Manager fixture. And with the card's own `
       + `per-card REFRESH held mid-read — the path whose four mutation points `
       + `are gated on cardIdentityCurrent() and on nothing else — released `
       + `INSIDE that same window, where no render of the arriving principal's `
@@ -4626,7 +4857,7 @@ async function checkViewport(browser, viewport) {
       + `IDENTICAL refresh shown first, under an unchanged principal, to reach `
       + `all four of those points — for a second League Admin and for a `
       + `lower-privilege Arena Manager, after which their OWN render still `
-      + `arrives and rebuilds the card under their own identity and epoch. `
+      + `arrives at that fresh identity's authorized destination. `
       + `Every failed delivery in the `
       + `run is reconciled by exact method, URL and status against the `
       + `deliberate 503s this file injected, so an unrelated failure is `

@@ -7,9 +7,9 @@
    Explicit in-session tab choices and persona switches are not changed. */
 
 const onboardingIntegratedSetUser = setUser;
-setUser = function setUserWithInitialSetupLanding(user) {
+setUser = function setUserWithInitialSetupLanding(user, ...rest) {
   const wasSignedOut = !currentUser && document.body.classList.contains("signed-out");
-  onboardingIntegratedSetUser(user);
+  onboardingIntegratedSetUser(user, ...rest);
   if (wasSignedOut && currentUser && currentUser.role === "league_admin"
       && view === "standings") {
     view = "dashboard";

@@ -14,12 +14,21 @@ let onboardingStatusDirty = true;
 let onboardingRoutePending = true;
 let onboardingDismissedForSession = false;
 
+registerIdentityResetHook(() => {
+  onboardingStatus = null;
+  onboardingStatusDirty = true;
+  onboardingRoutePending = false;
+  onboardingDismissedForSession = false;
+  const badge = document.getElementById("onboarding-badge");
+  if (badge) { badge.textContent = ""; badge.hidden = true; }
+});
+
 const onboardingBaseSetUser = setUser;
-setUser = function setUserWithOnboarding(user) {
+setUser = function setUserWithOnboarding(user, ...rest) {
   const previous = currentUser ? currentUser.username : null;
-  onboardingBaseSetUser(user);
+  onboardingBaseSetUser(user, ...rest);
   const next = currentUser ? currentUser.username : null;
-  if (previous !== next) {
+  if (previous !== next || rest[0] === true) {
     onboardingStatus = null;
     onboardingStatusDirty = true;
     onboardingRoutePending = !!(currentUser && currentUser.role === "league_admin");
@@ -88,10 +97,12 @@ function updateOnboardingBadge(status) {
 
 async function loadOnboardingStatus(force) {
   if (!force && onboardingStatus && !onboardingStatusDirty) return onboardingStatus;
+  const myIdentityEpoch = uiIdentityEpoch;
   // Canonical v2 readiness (#233 Slice B2b): same shape as v1
   // (complete/ready_to_schedule/steps/blocking/warnings) but v2 vocabulary —
   // see buildOnboardingGroups/nextOnboardingFix below for the key/code map.
   const status = await getJSON("/api/v2/onboarding/status");
+  if (myIdentityEpoch !== uiIdentityEpoch) throw new IdentitySupersededError();
   if (!status || status.error) {
     throw new Error((status && status.error && status.error.message)
       || "Could not load initial setup status.");
@@ -350,6 +361,7 @@ function wireOnboarding(container, status) {
 }
 
 async function renderInitialSetup() {
+  const myIdentityEpoch = uiIdentityEpoch;
   const content = document.getElementById("content");
   if (!content) return;
   onboardingActivateTab();
@@ -372,12 +384,15 @@ async function renderInitialSetup() {
   try {
     status = await loadOnboardingStatus(true);
   } catch (error) {
+    if (myIdentityEpoch !== uiIdentityEpoch
+        || error instanceof IdentitySupersededError) return;
     content.innerHTML = `<div class="banner alert"><h2>Could not load Initial Setup</h2>
       <p>${esc(error.message || error)}</p></div>
       <div class="actions"><button type="button" class="act primary" data-onboarding-refresh="1">Retry</button></div>`;
     wireOnboarding(content, { blocking: [] });
     return;
   }
+  if (myIdentityEpoch !== uiIdentityEpoch) return;
 
   const groups = buildOnboardingGroups(status);
   const firstIncompleteGroup = (groups.find((group) => !group.done && !group.optional) || {}).number;

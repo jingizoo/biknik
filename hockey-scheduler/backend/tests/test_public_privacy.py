@@ -112,9 +112,9 @@ class ProductionPublicPrivacyTest(_HttpBase):
         or an in-scope assignment. This test deliberately targets the global
         ``all_officials()`` read used by the assignment picker.
         """
-        # Use the store-neutral facade so this test exercises identically on
-        # Memory, SQLite and PostgreSQL rather than reaching into one store's
-        # private dictionary shape.
+        # Use the service facade rather than one store implementation's
+        # private dictionary shape. This class runs against the demo Memory
+        # fixture; backend-parity coverage belongs to the store matrix.
         official = srv.STATE.api.get_officials()[0]
         protected_values = (official["id"], official["name"])
 
