@@ -98,6 +98,8 @@ gate's cross-check reports where the two disagree.
 from dataclasses import dataclass
 import re
 
+from ..domain import SensitiveFieldCategory
+
 #: #202 repair round 6, finding 4: NOT "a slot no one has filled in yet" --
 #: every reachable spec IS classified (see the module docstring's own
 #: accounting, above). This is the value reserved for the one spec that
@@ -147,6 +149,11 @@ class RouteSpec:
              the persisted active Season and therefore must be ordered against
              a context switch. Runtime resolution is fail-closed on ambiguous
              matches and rejects markers on anything but a concrete GET.
+    transport_denial_audit_category / transport_denial_audit_purpose
+             The sensitive-field category and facade-purpose vocabulary used
+             when ``do_POST`` refuses this route at its generic 401/403 gate.
+             The pair is all-or-nothing, valid only on a concrete POST, and
+             resolved fail-closed before the denial audit is written.
     note     free text; provenance for the odd entries.
     """
 
@@ -159,6 +166,8 @@ class RouteSpec:
     auth: str = UNCLASSIFIED
     scope_axis: str = UNCLASSIFIED
     context_read_fence: bool = False
+    transport_denial_audit_category: SensitiveFieldCategory | None = None
+    transport_denial_audit_purpose: str | None = None
     note: str = ""
 
     @property
@@ -1567,6 +1576,10 @@ REGISTRY = (
               "post_notifications_contacts_id_active", "do_POST",
               auth="session+MANAGE_SETUP",
               scope_axis="none",
+              transport_denial_audit_category=(
+                  SensitiveFieldCategory.CONTACT_DESTINATION),
+              transport_denial_audit_purpose=(
+                  "set_contact_destination_active"),
               note=("#202: generic gate -> authz.py:198-200 -> MANAGE_SETUP (the branch's own comment: 'takes the League-Admin-only MANAGE_SETUP permission that gates Player/Official deletion itself'). server.py:3185-3189 -> `set_contact_destination_active(...)`.")),
     RouteSpec("POST", r"^/api/notifications/deliveries/process$",
               "/api/notifications/deliveries/process",
@@ -1579,12 +1592,20 @@ REGISTRY = (
               "post_notifications_deliveries_id_ignore", "do_POST",
               auth="session+MANAGE_SCHEDULE",
               scope_axis="none",
+              transport_denial_audit_category=(
+                  SensitiveFieldCategory.CONTACT_DESTINATION),
+              transport_denial_audit_purpose=(
+                  "ignore_notification_delivery"),
               note=("#202: generic gate -> authz.py:190-191 (`retry|ignore`) -> MANAGE_SCHEDULE. server.py:3167-3169 -> `ignore_notification_delivery(...)`, keyed by delivery id.")),
     RouteSpec("POST", r"^/api/notifications/deliveries/[^/]+/retry$",
               "/api/notifications/deliveries/{}/retry",
               "post_notifications_deliveries_id_retry", "do_POST",
               auth="session+MANAGE_SCHEDULE",
               scope_axis="none",
+              transport_denial_audit_category=(
+                  SensitiveFieldCategory.CONTACT_DESTINATION),
+              transport_denial_audit_purpose=(
+                  "retry_notification_delivery"),
               note=("#202: generic gate -> authz.py:190-191 (`retry|ignore`) -> MANAGE_SCHEDULE. server.py:3164-3166 -> `retry_notification_delivery(...)`, keyed by delivery id.")),
     RouteSpec("POST", r"^/api/notifications/device-tokens$",
               "/api/notifications/device-tokens",
@@ -1597,6 +1618,9 @@ REGISTRY = (
               "post_notifications_device_tokens_id_active", "do_POST",
               auth="session+MANAGE_SCHEDULE",
               scope_axis="none",
+              transport_denial_audit_category=(
+                  SensitiveFieldCategory.CONTACT_DESTINATION),
+              transport_denial_audit_purpose="set_device_token_active",
               note=("#202: generic gate -> authz.py:204-205 -> MANAGE_SCHEDULE. server.py:3196-3199 -> `set_device_token_active(...)`.")),
     RouteSpec("POST", r"^/api/notifications/preferences$",
               "/api/notifications/preferences",
@@ -2626,6 +2650,52 @@ _CONTEXT_SCOPED_READ_MATCHERS = tuple(
     (spec, re.compile(spec.pattern)) for spec in CONTEXT_SCOPED_READ_SPECS)
 
 
+def sensitive_post_denial_specs(registry=None):
+    """Return POST contracts whose transport refusal must be audited.
+
+    Sensitive category and purpose are one policy fact. A half-populated,
+    mistyped, empty, or structurally misplaced declaration is a registry
+    defect and must stop request handling rather than silently omit an audit.
+    """
+    specs = REGISTRY if registry is None else registry
+    half_filled = tuple(
+        spec.name for spec in specs
+        if ((spec.transport_denial_audit_category is None)
+            != (spec.transport_denial_audit_purpose is None)))
+    if half_filled:
+        raise RuntimeError(
+            "Sensitive POST denial audit category/purpose must be paired on: "
+            + ", ".join(half_filled))
+
+    marked = tuple(
+        spec for spec in specs
+        if spec.transport_denial_audit_category is not None)
+    invalid_values = tuple(
+        spec.name for spec in marked
+        if (not isinstance(spec.transport_denial_audit_category,
+                           SensitiveFieldCategory)
+            or type(spec.transport_denial_audit_purpose) is not str
+            or not spec.transport_denial_audit_purpose.strip()))
+    if invalid_values:
+        raise RuntimeError(
+            "Sensitive POST denial audit metadata is invalid on: "
+            + ", ".join(invalid_values))
+
+    invalid_routes = tuple(
+        spec.name for spec in marked
+        if spec.method != "POST" or spec.kind != "route")
+    if invalid_routes:
+        raise RuntimeError(
+            "Sensitive POST denial audit is only valid on concrete POST "
+            "routes: " + ", ".join(invalid_routes))
+    return marked
+
+
+SENSITIVE_POST_DENIAL_SPECS = sensitive_post_denial_specs()
+_SENSITIVE_POST_DENIAL_MATCHERS = tuple(
+    (spec, re.compile(spec.pattern)) for spec in SENSITIVE_POST_DENIAL_SPECS)
+
+
 def runtime_get_auth_spec(path: str, registry=None):
     """Return the one simple unscoped GET policy matching ``path``.
 
@@ -2668,4 +2738,24 @@ def runtime_context_read_spec(path: str, registry=None):
     if len(matches) > 1:
         raise RuntimeError(
             "Ambiguous RouteSpec context-read fence for " + path)
+    return matches[0] if matches else None
+
+
+def runtime_sensitive_post_denial_spec(path: str, registry=None):
+    """Return the sensitive denial-audit contract matching POST ``path``.
+
+    ``None`` preserves the existing silent transport-denial behavior for
+    every other POST. More than one match is a policy ambiguity and fails
+    closed rather than choosing a category or purpose by registry order.
+    """
+    path = path.split("?", 1)[0]
+    if registry is None:
+        matches = [spec for spec, pattern in _SENSITIVE_POST_DENIAL_MATCHERS
+                   if pattern.match(path)]
+    else:
+        matches = [spec for spec in sensitive_post_denial_specs(registry)
+                   if re.match(spec.pattern, path)]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "Ambiguous RouteSpec sensitive POST denial audit for " + path)
     return matches[0] if matches else None

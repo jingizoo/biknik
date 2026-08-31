@@ -62,6 +62,7 @@ from ..services import lineup_visibility
 from .rate_limit import LoginThrottle, RateLimiter
 from .route_registry import (
     REGISTRY, runtime_context_read_spec, runtime_get_auth_spec,
+    runtime_sensitive_post_denial_spec,
 )
 from .scope import (
     can_read_private_game_data, resolve_private_game_read, scope_violation)
@@ -641,45 +642,19 @@ def is_context_scoped_read(path: str) -> bool:
     return runtime_context_read_spec(path) is not None
 
 
-# Sensitive POST routes that must durably audit a denial at do_POST's
-# GENERIC per-request gate (#426 round-2 review finding 2: "the generic
-# do_POST authorize(role, path) gate still returns 403 without a
-# DataAccessLog denial for contact active-toggle and delivery retry/
-# ignore" — closing the residual gap #426's own first round left
-# documented, now ruled in scope). Each entry is
-# (pattern, SensitiveFieldCategory, purpose) — purpose mirrors the
-# facade method the SAME route reaches when authorized, so an allowed
-# and a denied attempt at the identical action share one vocabulary in
-# the audit trail. Consulted by do_POST's OWN two refusal points below
-# (the resolve_role() 401 and the authorize() 403), never by
-# _operator_only's GET-side gate, which already has its own
-# per-call-site audit_category parameter.
-#
-# The device-token active-toggle entry (#426 round-3 review finding 1)
-# joins the contacts-active-toggle entry above it for the SAME reason: its
-# response echoes a stored raw value (the token) an unauthorized caller
-# never submitted, so a transport-level refusal is exactly as much a
-# sensitive-read denial as the facade's own — reusing the ONE
-# CONTACT_DESTINATION-category gate, not a second one.
-_SENSITIVE_POST_AUDIT_ROUTES = (
-    (re.compile(r"^/api/notifications/contacts/[^/]+/active$"),
-     SensitiveFieldCategory.CONTACT_DESTINATION, "set_contact_destination_active"),
-    (re.compile(r"^/api/notifications/deliveries/[^/]+/retry$"),
-     SensitiveFieldCategory.CONTACT_DESTINATION, "retry_notification_delivery"),
-    (re.compile(r"^/api/notifications/deliveries/[^/]+/ignore$"),
-     SensitiveFieldCategory.CONTACT_DESTINATION, "ignore_notification_delivery"),
-    (re.compile(r"^/api/notifications/device-tokens/[^/]+/active$"),
-     SensitiveFieldCategory.CONTACT_DESTINATION, "set_device_token_active"),
-)
-
-
 def _sensitive_post_audit_target(path: str):
     """The ``(category, purpose)`` a denial of this POST ``path`` must be
-    durably audited under, or ``(None, None)`` for every other route —
-    see ``_SENSITIVE_POST_AUDIT_ROUTES`` above."""
-    for pattern, category, purpose in _SENSITIVE_POST_AUDIT_ROUTES:
-        if pattern.match(path):
-            return category, purpose
+    durably audited under, or ``(None, None)`` for every other route.
+
+    The policy is declared on the matching RouteSpec rather than in a second
+    server-owned regex table, so route identity, category, and facade purpose
+    cannot drift independently. The selector raises on invalid or ambiguous
+    metadata before a denial can be silently lost.
+    """
+    spec = runtime_sensitive_post_denial_spec(path)
+    if spec is not None:
+        return (spec.transport_denial_audit_category,
+                spec.transport_denial_audit_purpose)
     return None, None
 
 
@@ -1183,13 +1158,13 @@ class Handler(BaseHTTPRequestHandler):
     def _audit_sensitive_post_denial(self, path: str, role, uid) -> None:
         """Durably audit a denial at do_POST's GENERIC per-request
         ``authorize(role, path)`` gate, for the sensitive routes named in
-        ``_SENSITIVE_POST_AUDIT_ROUTES`` (#426 round-2 review finding 2 —
+        the RouteSpec denial-audit metadata (#426 round-2 review finding 2 —
         the residual gap the FIRST #426 review round documented and left
-        open; the owner has since ruled it in scope). A no-op for every
-        OTHER POST route — every other route's 401/403 keeps today's exact
-        silent behavior, the SAME "existing caller unaffected" contract
-        ``_operator_only``'s own ``audit_category`` parameter already
-        keeps for the GET side.
+        open; the owner has since ruled it in scope). A no-op for every OTHER
+        POST route — every other route's 401/403 keeps today's exact silent
+        behavior, the SAME "existing caller unaffected" contract
+        ``_operator_only``'s own ``audit_category`` parameter already keeps
+        for the GET side.
 
         ``role`` is ``None`` for the missing/invalid-session (401) case,
         matching every other transport-boundary denial audit — see
