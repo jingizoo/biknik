@@ -15,6 +15,7 @@ from hockey_scheduler.api.service import ApiService
 from hockey_scheduler.domain import Permission, Role, can
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web.server import STATE, Handler
+from hockey_scheduler.web.route_registry import RouteSpec
 
 
 class ServerAuthzTest(unittest.TestCase):
@@ -264,6 +265,99 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertIn("device_tokens", listing)
 
     # -- user accounts are league-admin-only, narrower than MANAGE_SCHEDULE (#67) --
+    def _routespec_manage_users_gets(self):
+        account_id = STATE.api.list_user_accounts()["user_accounts"][0]["id"]
+        return (
+            ("/api/accounts", "list_user_accounts", ()),
+            (f"/api/accounts/{account_id}/sessions",
+             "list_account_sessions", (account_id,)),
+            ("/api/guardians/links", "list_guardian_links", ()),
+        )
+
+    def test_routespec_manage_users_get_role_matrix(self):
+        """RouteSpec, not a handler-local guard, owns this complete policy
+        class. Derive the expected result from the domain permission over every
+        Role and prove refused requests never reach their facade method."""
+        for path, method_name, expected_args in self._routespec_manage_users_gets():
+            for role in tuple(Role):
+                allowed = can(role, Permission.MANAGE_USERS)
+                with self.subTest(path=path, role=role.value, allowed=allowed):
+                    method = getattr(STATE.api, method_name)
+                    with mock.patch.object(
+                            STATE.api, method_name, wraps=method) as service:
+                        status, body = self._get_h(path, role=role.value)
+                    if allowed:
+                        self.assertEqual(status, 200)
+                        service.assert_called_once_with(*expected_args)
+                    else:
+                        self.assertEqual(status, 403)
+                        self.assertEqual(body["error"]["code"], "forbidden")
+                        self.assertEqual(body["error"]["details"], {
+                            "role": role.value,
+                            "required": Permission.MANAGE_USERS.value,
+                        })
+                        service.assert_not_called()
+
+    def test_routespec_manage_users_get_authentication_refuses_before_service(self):
+        for path, method_name, _expected_args in self._routespec_manage_users_gets():
+            for cookie in (None, "hs_sid=bogus-session"):
+                with self.subTest(path=path, cookie=cookie):
+                    method = getattr(STATE.api, method_name)
+                    with mock.patch.object(
+                            STATE.api, method_name, wraps=method) as service, \
+                            mock.patch.dict(
+                                os.environ, {"DEMO_HEADERLESS_ADMIN": "0"}):
+                        status, body = self._get_h(path, cookie=cookie)
+                    self.assertEqual(status, 401)
+                    self.assertEqual(body["error"]["code"], "unauthorized")
+                    service.assert_not_called()
+
+    def test_routespec_account_sessions_has_no_unauthorized_id_oracle(self):
+        real_id = STATE.api.list_user_accounts()["user_accounts"][0]["id"]
+        for role in tuple(Role):
+            if can(role, Permission.MANAGE_USERS):
+                continue
+            for account_id in (real_id, "account_that_does_not_exist"):
+                with self.subTest(role=role.value, account_id=account_id):
+                    with mock.patch.object(
+                            STATE.api, "list_account_sessions",
+                            wraps=STATE.api.list_account_sessions) as service:
+                        status, body = self._get_h(
+                            f"/api/accounts/{account_id}/sessions",
+                            role=role.value)
+                    self.assertEqual(status, 403)
+                    self.assertEqual(body["error"]["code"], "forbidden")
+                    service.assert_not_called()
+
+    def test_routespec_lookup_supplies_the_live_http_policy(self):
+        """Bind the HTTP gate to RouteSpec metadata, not a parallel path map.
+
+        Supply MANAGE_SCHEDULE for a route that normally requires MANAGE_USERS:
+        an Arena Manager must become allowed while a Coach remains refused.
+        Thus neither a hard-coded MANAGE_USERS switch nor an ignored lookup
+        result can satisfy this test while bypassing the registry source.
+        """
+        supplied = RouteSpec(
+            "GET", r"^/api/accounts$", "/api/accounts", "sentinel_accounts",
+            "_dispatch_get", auth="session+MANAGE_SCHEDULE", scope_axis="none")
+        with mock.patch(
+                "hockey_scheduler.web.server.runtime_get_auth_spec",
+                return_value=supplied) as lookup:
+            allowed_status, allowed_body = self._get_h(
+                "/api/accounts?source=registry",
+                role=Role.ARENA_MANAGER.value)
+            denied_status, denied_body = self._get_h(
+                "/api/accounts", role=Role.COACH.value)
+        self.assertEqual(allowed_status, 200)
+        self.assertIn("user_accounts", allowed_body)
+        self.assertEqual(denied_status, 403)
+        self.assertEqual(denied_body["error"]["details"], {
+            "role": Role.COACH.value,
+            "required": Permission.MANAGE_SCHEDULE.value,
+        })
+        self.assertEqual(lookup.call_args_list, [
+            mock.call("/api/accounts"), mock.call("/api/accounts")])
+
     def test_viewer_cannot_read_or_write_accounts(self):
         status, _ = self._get_h("/api/accounts", role="viewer")
         self.assertEqual(status, 403)

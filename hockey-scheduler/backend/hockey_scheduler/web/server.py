@@ -60,7 +60,7 @@ from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
 from ..services import lineup_visibility
 from .rate_limit import LoginThrottle, RateLimiter
-from .route_registry import REGISTRY
+from .route_registry import REGISTRY, runtime_get_auth_spec
 from .scope import (
     can_read_private_game_data, resolve_private_game_read, scope_violation)
 from .validation import BodyError, check_body, parse_json_object
@@ -1112,11 +1112,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(payload, code)
         return self._send_api(result)
 
-    def _operator_only(self, guard: str, *, audit_category=None) -> bool:
-        """For read-only operator routes: send 401/403 and return True if the
-        caller may not operate, else False. Same resolution as the feed —
-        invalid cookie → 401, and the ``guard`` path's permission → 403 for
-        non-operators.
+    def _permission_only(self, permission, *, audit_category=None) -> bool:
+        """Enforce one already-declared permission at the HTTP boundary.
+
+        Returns ``True`` after sending a 401/403 refusal and ``False`` when
+        dispatch may continue. Both RouteSpec-driven GET authorization and the
+        remaining handler-local operator gates use this one response contract.
 
         ``audit_category`` (#426 review finding 1, optional, default
         ``None``): when supplied, EVERY refusal this call sends — the 401
@@ -1139,20 +1140,49 @@ class Handler(BaseHTTPRequestHandler):
             code, payload = err
             self._send_json(payload, code)
             return True
-        if not authorize(role, guard):
+        if permission is not None and not can(role, permission):
             if audit_category is not None:
                 STATE.api._audit_transport_denial(
                     audit_category, "http_operator_gate", uid, role)
-            perm = required_permission(guard)
             self._send_json({"error": {
                 "code": "forbidden",
                 "message": (f"Your role ({ROLE_LABELS[role]}) can't do this "
-                            f"(requires {perm.value})."),
+                            f"(requires {permission.value})."),
                 "details": {"role": role.value,
-                            "required": perm.value if perm else None},
+                            "required": permission.value},
             }}, 403)
             return True
         return False
+
+    def _operator_only(self, guard: str, *, audit_category=None) -> bool:
+        """Compatibility gate for operator GETs not moved to RouteSpec yet.
+
+        ``guard`` is translated through the existing path-to-permission map;
+        the shared permission boundary above preserves the current 401/403 and
+        sensitive-denial-audit behavior while bounded #202 slices remove these
+        handler-local calls one policy-equivalence class at a time.
+        """
+        return self._permission_only(
+            required_permission(guard), audit_category=audit_category)
+
+    def _routespec_get_denied(self, path: str) -> bool:
+        """Enforce the simple unscoped GET policy declared by RouteSpec.
+
+        Complex/resource-scoped labels intentionally return no spec and stay
+        on their existing handler gate. An invalid Permission name raises into
+        the safe request error boundary, so malformed policy metadata can never
+        fail open.
+        """
+        spec = runtime_get_auth_spec(path)
+        if spec is None:
+            return False
+        try:
+            permission = Permission[spec.runtime_permission_name]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Unknown RouteSpec permission on {spec.name}: "
+                f"{spec.runtime_permission_name}") from exc
+        return self._permission_only(permission)
 
     def _audit_sensitive_post_denial(self, path: str, role, uid) -> None:
         """Durably audit a denial at do_POST's GENERIC per-request
@@ -2199,6 +2229,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch_get(self):
         path = self.path.split("?", 1)[0]
+        # #202 runtime-policy slice 1: RouteSpec is now the authorization
+        # source for the complete unscoped MANAGE_USERS GET family. This gate
+        # preserves the existing no-oracle ordering before every account,
+        # session, or guardian-link lookup at one common boundary. More complex
+        # auth/scope labels deliberately remain in their handlers until their
+        # complete resolver contract moves with them.
+        if self._routespec_get_denied(path):
+            return
         api = STATE.api
         if path == "/favicon.ico":
             self.send_response(204)
@@ -2597,24 +2635,18 @@ class Handler(BaseHTTPRequestHandler):
                  "label": ROLE_LABELS[Role(a["role"])]}
                 for a in rows if a["active"]]})
         if path == "/api/accounts":
-            # Full account listing for operators (#67); same operator guard
-            # as the delivery/contacts/device-token registries.
-            if self._operator_only("/api/accounts"):
-                return
+            # Full account listing for League Admins (#67). The RouteSpec
+            # pre-dispatch gate above owns MANAGE_USERS authorization.
             return self._send_api(api.list_user_accounts())
         ms = re.match(r"^/api/accounts/([^/]+)/sessions$", path)
         if ms:
-            # An account's login sessions, League-Admin only (#78). No token
-            # material is ever returned — only lifecycle metadata.
-            if self._operator_only(path):
-                return
+            # An account's login sessions, League-Admin only through the same
+            # RouteSpec policy (#78). No token material is ever returned.
             return self._send_api(api.list_account_sessions(ms.group(1)))
         if path == "/api/guardians/links":
             # Every guardian↔junior link, for the Users tab's admin surface
-            # (#35). Same operator guard as account listing — this is
-            # identity administration, not guardian-scoped self-service.
-            if self._operator_only("/api/accounts"):
-                return
+            # (#35). RouteSpec declares the same MANAGE_USERS policy as account
+            # listing; this is not guardian-scoped self-service.
             return self._send_api(api.list_guardian_links())
         if path == "/api/officials":
             # Installation-wide staff directory for the assign control (#30).

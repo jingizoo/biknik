@@ -33,17 +33,36 @@ import unittest
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
+from hockey_scheduler.domain import Permission
 from hockey_scheduler.web import authz
 from hockey_scheduler.web import server as srv
 from hockey_scheduler.web.route_extract import (
     SERVER_PATH, extract_walker, sample_path, templates_of_pattern,
 )
 from hockey_scheduler.web.route_registry import (
-    BY_KEY, BY_NAME, REGISTRY, UNCLASSIFIED,
+    BY_KEY, BY_NAME, REGISTRY, UNCLASSIFIED, runtime_get_auth_spec,
 )
 
 WALKER = extract_walker()
 LIVE = {route.key: route for route in WALKER.routes.values()}
+
+_EXPECTED_RUNTIME_GET_AUTH = {
+    "get_accounts": "MANAGE_USERS",
+    "get_accounts_id_sessions": "MANAGE_USERS",
+    "get_guardians_links": "MANAGE_USERS",
+}
+
+
+def _runtime_get_auth_map(registry):
+    """Resolve every concrete GET template through the production selector."""
+    selected = {}
+    for source in registry:
+        if source.method != "GET" or source.kind != "route":
+            continue
+        spec = runtime_get_auth_spec(sample_path(source.template), registry)
+        if spec is not None:
+            selected[spec.name] = spec.runtime_permission_name
+    return selected
 
 
 def _describe(keys, source):
@@ -150,10 +169,10 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
     #     auth="none", scope_axis="none";
     #   * ``get_empty_path`` — the impossible fallback (unreachable over HTTP,
     #     see its note) — is deliberately EXCLUDED and stays UNCLASSIFIED.
-    # Both fields are CLASSIFIED and CI-GATED for every reachable spec, but
-    # NOT YET runtime-enforced -- nothing in server.py reads either field
-    # while dispatching a request (wiring real enforcement is later #202
-    # work, not this repair round's).
+    # Both fields are CLASSIFIED and CI-GATED for every reachable spec. The
+    # exact unscoped ``session+<Permission>`` GET class is now also consumed
+    # by server.py before dispatch; complex/resource-scoped labels remain in
+    # their handler until a later bounded #202 slice moves their resolver.
     _KNOWN_NONE_NONE_LEAVES = frozenset({
         "get_index", "get_mobile_shell", "get_mobile_shell_slash",
         "get_setup_shell", "get_setup_shell_slash", "get_static_tail",
@@ -242,11 +261,10 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
 #     ``authz.required_permission(sample_path(spec.template))`` DIRECTLY --   #
 #     a pure function, called here again at test time, not a value taken on   #
 #     faith from a prior run;                                                 #
-#   * every GET leaf gated by ``self._operator_only(...)`` is detected by     #
-#     PARSING server.py itself and checking, via ``ast``, whether that        #
-#     SPECIFIC If node's own body contains the call -- not a hand-typed       #
-#     list -- see test_operator_only_detection_matches_the_real_dispatch      #
-#     below for the same check, live;                                        #
+#   * every handler-local GET leaf gated by ``self._operator_only(...)`` is   #
+#     detected by PARSING server.py itself. The first centrally-enforced      #
+#     class (exact ``session+MANAGE_USERS`` + no scope) is separately pinned  #
+#     by _EXPECTED_RUNTIME_GET_AUTH and live matching/mutation tests below;   #
 #   * every other leaf (custom-gated, or genuinely public) was independently  #
 #     read from server.py's actual handler code (which guard function it     #
 #     calls, and what THAT function's own contract is -- no cookie -> 401 vs  #
@@ -319,8 +337,8 @@ _VALID_AUTH_VALUES = frozenset({
 # was derived and independently re-verified, not copied.
 _EXPECTED_CLASSIFICATION = {
     ("GET", '/'): ('none', 'none'),  # get_index
-    ("GET", '/api/accounts'): ('operator_only', 'none'),  # get_accounts
-    ("GET", '/api/accounts/{}/sessions'): ('operator_only', 'none'),  # get_accounts_id_sessions
+    ("GET", '/api/accounts'): ('session+MANAGE_USERS', 'none'),  # get_accounts
+    ("GET", '/api/accounts/{}/sessions'): ('session+MANAGE_USERS', 'none'),  # get_accounts_id_sessions
     ("GET", '/api/auth/accounts'): ('none', 'none'),  # get_auth_accounts
     ("GET", '/api/auth/me'): ('optional_session', 'none'),  # get_auth_me
     ("GET", '/api/auth/roles'): ('none', 'none'),  # get_auth_roles
@@ -371,7 +389,7 @@ _EXPECTED_CLASSIFICATION = {
         ('session+MANAGE_ROSTER+own-side-projection', 'none'),  # get_games_id_substitute_candidates
     ("GET", '/api/games/{}/substitutes'):
         ('session+own-side-projection', 'none'),  # get_games_id_substitutes
-    ("GET", '/api/guardians/links'): ('operator_only', 'none'),  # get_guardians_links
+    ("GET", '/api/guardians/links'): ('session+MANAGE_USERS', 'none'),  # get_guardians_links
     ("GET", '/api/health'): ('none', 'none'),  # get_health
     ("GET", '/api/import/hierarchy-codes'): ('operator_only', 'none'),  # get_import_hierarchy_codes
     ("GET", '/api/me/assignments'): ('optional_session', 'none'),  # get_me_assignments
@@ -697,8 +715,8 @@ class RouteClassificationTests(unittest.TestCase):
         self.assertGreater(checked, 100)
 
     def test_operator_only_detection_matches_the_real_dispatch(self):
-        """Re-derive, live, the OTHER primary source: does THIS SPECIFIC
-        route's own ``ast.If`` body call ``self._operator_only(...)``,
+        """Re-derive the still-handler-local operator policy source: does THIS
+        SPECIFIC route's own ``ast.If`` call ``self._operator_only(...)``,
         parsed directly out of server.py -- not a hand-typed list, and not
         a naive source-line window (which can spill into the NEXT sibling
         branch for a short body: DEMONSTRATED against get_officials, whose
@@ -737,6 +755,43 @@ class RouteClassificationTests(unittest.TestCase):
                                  spec.auth == "operator_only")
                 checked += 1
         self.assertGreater(checked, 40)
+
+    def test_runtime_get_auth_is_the_complete_manage_users_class(self):
+        """The first runtime class is derived from metadata, but independently
+        pinned so deleting or widening one label cannot silently change which
+        handlers the central gate owns."""
+        self.assertEqual(_runtime_get_auth_map(REGISTRY),
+                         _EXPECTED_RUNTIME_GET_AUTH)
+        for name, permission_name in _EXPECTED_RUNTIME_GET_AUTH.items():
+            with self.subTest(name=name):
+                spec = BY_NAME[name]
+                path = sample_path(spec.template)
+                self.assertIs(runtime_get_auth_spec(path), spec)
+                self.assertIs(runtime_get_auth_spec(path + "?ignored=1"), spec)
+                self.assertIs(Permission[permission_name],
+                              Permission.MANAGE_USERS)
+
+    def test_runtime_get_auth_metadata_mutations_are_detected(self):
+        """Removing, weakening, or changing the scope of an enrolled policy
+        changes the independently expected class and therefore fails CI."""
+        target = BY_NAME["get_accounts"]
+        for changes in (
+                {"auth": "operator_only"},
+                {"auth": "session+MANAGE_SCHEDULE"},
+                {"scope_axis": "cross"}):
+            with self.subTest(changes=changes):
+                mutated = tuple(
+                    dataclasses.replace(spec, **changes)
+                    if spec is target else spec
+                    for spec in REGISTRY)
+                self.assertNotEqual(_runtime_get_auth_map(mutated),
+                                    _EXPECTED_RUNTIME_GET_AUTH)
+
+    def test_runtime_get_auth_ambiguity_fails_closed(self):
+        spec = BY_NAME["get_accounts"]
+        duplicate = dataclasses.replace(spec, name="duplicate_get_accounts")
+        with self.assertRaisesRegex(RuntimeError, "Ambiguous RouteSpec"):
+            runtime_get_auth_spec("/api/accounts", (spec, duplicate))
 
 
 class ClassificationMutationTests(unittest.TestCase):

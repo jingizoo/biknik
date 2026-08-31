@@ -61,21 +61,21 @@ What is NOT here
   leaf, #202 repair root cause 1's own lesson), and every non-``"route"``
   entry is pinned by name so retagging even one is a conspicuous, reviewed
   diff line, the same discipline ``_AUDIT_WAIVERS`` uses in route_extract.py.
-* ``auth`` and ``scope_axis`` were declared slots for that later work when
-  this section was first written; they are NOT ANY MORE (#202 repair round
-  4, finding 4). Every REACHABLE spec now carries a real classification,
-  and ``tests/test_route_registry.py``'s
-  ``_VALID_AUTH_VALUES``/``_EXPECTED_CLASSIFICATION`` CI-GATES both fields
-  for every reachable spec: an unclassified reachable entry, a value outside
-  the declared vocabulary, or a classification that drifts from what
-  ``_EXPECTED_CLASSIFICATION`` independently expects all fail CI. What
-  remains true from the ORIGINAL design intent is only "nothing reads
-  either field AT RUNTIME" -- classification and CI-gating are done;
-  wiring auth/scope enforcement into the request path itself is still
-  LATER #202 work, not this repair round's. The one entry that stays
-  ``UNCLASSIFIED``, deliberately, is ``get_empty_path`` -- an impossible
-  fallback shape (unreachable over HTTP; see its own note below) with no
-  real request ever able to reach it to classify.
+* ``auth`` and ``scope_axis`` were declared slots for later work when this
+  section was first written; they are NOT merely placeholders any more (#202
+  repair round 4, finding 4). Every REACHABLE spec carries a real
+  classification, and ``tests/test_route_registry.py``'s
+  ``_VALID_AUTH_VALUES``/``_EXPECTED_CLASSIFICATION`` CI-GATES both fields.
+  The first bounded runtime-enforcement class is live too: a concrete GET with
+  ``scope_axis="none"`` and an exact ``session+<Permission name>`` auth label
+  is matched here before dispatch and enforced by ``server.py``. The initial
+  class is the complete installation-wide identity-administration family
+  (accounts, account sessions, and guardian links), all ``MANAGE_USERS``.
+  More complex labels (``-or-self``, projections, and resource scopes) remain
+  classified but handler-enforced until a later bounded #202 slice supplies
+  their resource resolver. The one entry that stays ``UNCLASSIFIED``,
+  deliberately, is ``get_empty_path`` -- an impossible fallback shape
+  (unreachable over HTTP; see its own note below).
 * ``do_POST``'s tail (``_unmatched_route("POST")``) is an UNCONDITIONAL
   fallthrough, not a branch, and so has no spec. ``_dispatch_get``'s
   equivalent tail hands any non-``/api/`` path to ``_serve_static`` -- which
@@ -94,6 +94,7 @@ branch that exists in the dispatch — not, on its own, a path that answers. The
 gate's cross-check reports where the two disagree.
 """
 from dataclasses import dataclass
+import re
 
 #: #202 repair round 6, finding 4: NOT "a slot no one has filled in yet" --
 #: every reachable spec IS classified (see the module docstring's own
@@ -109,6 +110,9 @@ from dataclasses import dataclass
 #: this value AT RUNTIME while dispatching a request -- see the module
 #: docstring's own note on that.
 UNCLASSIFIED = "unclassified"
+
+_SIMPLE_SESSION_PERMISSION = re.compile(
+    r"^session\+([A-Z][A-Z0-9_]*)$")
 
 
 @dataclass(frozen=True)
@@ -130,10 +134,12 @@ class RouteSpec:
     auth / scope_axis
              CLASSIFIED and CI-GATED for every reachable spec (#202 repair
              round 4, finding 4; see tests/test_route_registry.py's
-             ``_VALID_AUTH_VALUES``/``_EXPECTED_CLASSIFICATION``) but NOT
-             YET runtime-enforced -- nothing in server.py reads either
-             field while dispatching a request. Only ``get_empty_path``
-             (an unreachable-over-HTTP fallback shape) stays UNCLASSIFIED.
+             ``_VALID_AUTH_VALUES``/``_EXPECTED_CLASSIFICATION``). The simple
+             unscoped GET form ``session+<Permission name>`` is also a runtime
+             contract: ``runtime_get_auth_spec`` selects it before dispatch.
+             Complex/resource-scoped labels remain handler-enforced. Only
+             ``get_empty_path`` (an unreachable-over-HTTP fallback shape)
+             stays UNCLASSIFIED.
     note     free text; provenance for the odd entries.
     """
 
@@ -150,6 +156,17 @@ class RouteSpec:
     @property
     def key(self) -> tuple:
         return (self.method, self.template)
+
+    @property
+    def runtime_permission_name(self):
+        """The simple permission this spec can enforce before dispatch.
+
+        Resource projections and ``-or-self`` policies deliberately do not
+        match. They need their own resolver and remain in their existing
+        handler until a bounded slice can move that complete contract.
+        """
+        match = _SIMPLE_SESSION_PERMISSION.fullmatch(self.auth)
+        return match.group(1) if match is not None else None
 
 
 REGISTRY = (
@@ -172,16 +189,18 @@ REGISTRY = (
                     "unconditionally serves index.html.")),
     RouteSpec("GET", r"^/api/accounts$", "/api/accounts", "get_accounts",
               "_dispatch_get",
-              auth="operator_only", scope_axis="none",
-              note=("#202: _operator_only('/api/accounts') (server.py:"
-                    "1718). list_user_accounts (service.py:5448-5450) is "
+              auth="session+MANAGE_USERS", scope_axis="none",
+              note=("#202 runtime GET authorization: the exact RouteSpec "
+                    "label is enforced before dispatch. list_user_accounts "
+                    "(service.py:5448-5450) is "
                     "self.accounts.list_accounts() -- installation-wide, "
                     "no P/S/L filter.")),
     RouteSpec("GET", r"^/api/accounts/[^/]+/sessions$",
               "/api/accounts/{}/sessions", "get_accounts_id_sessions",
               "_dispatch_get",
-              auth="operator_only", scope_axis="none",
-              note=("#202: _operator_only(path) (server.py:1725-1726). "
+              auth="session+MANAGE_USERS", scope_axis="none",
+              note=("#202 runtime GET authorization: the exact RouteSpec "
+                    "label is enforced before dispatch. "
                     "list_account_sessions (service.py:5486-5495) filters "
                     "by account_id only -- no P/S/L concept.")),
     RouteSpec("GET", r"^/api/auth/accounts$", "/api/auth/accounts",
@@ -509,9 +528,10 @@ REGISTRY = (
                     "game-keyed -- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/guardians/links$", "/api/guardians/links",
               "get_guardians_links", "_dispatch_get",
-              auth="operator_only", scope_axis="none",
-              note=("#202: _operator_only('/api/accounts') (server.py:"
-                    "1732). list_guardian_links (service.py:5729-5730) is "
+              auth="session+MANAGE_USERS", scope_axis="none",
+              note=("#202 runtime GET authorization: the exact RouteSpec "
+                    "label is enforced before dispatch. list_guardian_links "
+                    "(service.py:5729-5730) is "
                     "self.guardians.all_links() -- installation-wide, no "
                     "P/S/L filter.")),
     RouteSpec("GET", r"^/api/health$", "/api/health", "get_health",
@@ -2558,3 +2578,27 @@ REGISTRY = (
 BY_KEY = {spec.key: spec for spec in REGISTRY}
 #: name -> RouteSpec.
 BY_NAME = {spec.name: spec for spec in REGISTRY}
+
+
+def runtime_get_auth_spec(path: str, registry=None):
+    """Return the one simple unscoped GET policy matching ``path``.
+
+    ``None`` means this bounded #202 slice has not moved that route out of its
+    handler yet. More than one match is a registry defect and fails closed via
+    the request error boundary rather than choosing an arbitrary policy.
+    ``registry`` is injectable only so the contract tests can prove ambiguity
+    and metadata mutations are detected without altering the module global.
+    """
+    path = path.split("?", 1)[0]
+    specs = REGISTRY if registry is None else registry
+    matches = [
+        spec for spec in specs
+        if (spec.method == "GET" and spec.kind == "route"
+            and spec.scope_axis == "none"
+            and spec.runtime_permission_name is not None
+            and re.match(spec.pattern, path))
+    ]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "Ambiguous RouteSpec runtime authorization for " + path)
+    return matches[0] if matches else None

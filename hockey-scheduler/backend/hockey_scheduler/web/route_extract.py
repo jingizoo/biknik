@@ -3205,11 +3205,13 @@ _AUDIT_WAIVERS = {
     # nothing and must be removed: proof nothing depends on it") rather
     # than left as a stale entry a future reader would have no way to tell
     # apart from a live one.
-    ("_dispatch_get", "self._operator_only(path)", "if_test", "ms"):
-        "get_accounts_id_sessions: the SAME blanket `_operator_only` gate, "
-        "this call site passes the raw `path` directly rather than a "
-        "literal guard string; the route was already selected by `ms` "
-        "(^/api/accounts/([^/]+)/sessions$) before this line runs",
+    ("_dispatch_get", "self._routespec_get_denied(path)", "if_test", ""):
+        "#202 runtime GET authorization: a blanket pre-dispatch permission "
+        "gate derived from the same exact RouteSpec inventory the extractor "
+        "checks. It may refuse the request or fall through; it never chooses "
+        "a handler or changes the dispatch leaf. The exact expression and "
+        "top-level if-test position are fingerprinted and exact-one-hit "
+        "verified, so moving or widening this policy lookup raises fresh",
     ("_dispatch_get", "self._guardian_link_or_403(guid, jid)", "if_test",
      "mgo"):
         "get_me_guardian_id_substitute_opportunities_id: verifies the "
