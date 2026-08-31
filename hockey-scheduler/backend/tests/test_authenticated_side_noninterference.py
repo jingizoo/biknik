@@ -507,8 +507,8 @@ exists to prevent, in the file whose whole thesis is MEASURED RATHER THAN
 IMPLIED, so the numbers below are re-measured on the current tree rather than
 adjusted:
 
-* **2,560 real HTTP requests per world, 61,440 per backend** for the main
-  property — 64 concrete paths x 10 principals x the 4 per-world variants in
+* **2,600 real HTTP requests per world, 62,400 per backend** for the main
+  property — 65 concrete paths x 10 principals x the 4 per-world variants in
   :data:`HINTS`. Round 11 added two concrete paths and one world-pair: the
   guardian route is bound to a junior the guardian is NOT linked to (see
   :class:`TheSweptBindingsExerciseTheUnentitledDirection`),
@@ -576,7 +576,7 @@ adjusted:
   and :class:`EveryAdmissionBranchIsDerivedAndCarriesAnAuthority` sweeps
   nothing at all: it reads the GATE'S OWN SOURCE;
 * and the full derived parameter matrix — :data:`FULL_HINTS`, ten variants,
-  6,400 requests — once per backend on a fresh world, which is the shape
+  6,500 requests — once per backend on a fresh world, which is the shape
   that made closing the query-string axis affordable at all;
 * round 17 sweeps NOTHING and adds FORTY plain requests per backend — the
   two principals ``_entitlement`` gives an empty entitled-team set x the ten
@@ -627,26 +627,26 @@ become another set of stale numbers.
 
 **2. THE INVENTORY IS GET-ONLY.** :meth:`_SweepHarness
 ._authenticated_get_specs` filters ``method == "GET"``, so the fail-closed
-property covers exactly the authenticated GET surface — 50 routes on this
+property covers exactly the authenticated GET surface — 51 routes on this
 tree. Counted off ``route_registry.REGISTRY`` rather than estimated: 161
 authenticated POST specs return response bodies and enter NO oracle, and a
 newly added one is NOT reported by :meth:`_SweepHarness
-._assert_inventory_is_closed`; a further 17 ``auth="none"`` GET routes are
+._assert_inventory_is_closed`; a further 16 ``auth="none"`` GET routes are
 unswept as well. No live POST leak was found when this was
 written — the obvious candidates each return a single ``_serialized`` row —
 but "none found" is not "none exists", and a POST-shaped sweep is a separate
 piece of work rather than a line that can be added here.
 
-**3. ORACLE 2 REACHES 18 OF THE 50 SWEPT ROUTES.** Re-measured on the
+**3. ORACLE 2 REACHES 18 OF THE 51 SWEPT ROUTES.** Re-measured on the
 round-11 tree across all sixteen perturbation worlds — unchanged from rounds
 8, 9 and 10, and unchanged by the wider hint matrix or by the two paths round
 11 adds: only eighteen route NAMES ever move, so
 :meth:`_SweepHarness._assert_non_interference` CANNOT fail on the other
-thirty-two for any principal. This is not "thirty-two unprotected routes" —
+thirty-three for any principal. This is not "thirty-three unprotected routes" —
 oracle 1 and hint-inertness are asserted on every route in every world, and
 they are the two that caught D3 and are pinned by
 :class:`EveryOracleGoesRedOnADefectOnlyItCanSee` — but it does bound what the
-non-interference argument covers. Two of the thirty-two,
+non-interference argument covers. Two of the thirty-three,
 ``get_games_id_officials`` and ``get_games_id_reschedule``, are leaves of the
 private-game family this round is about, and that specific pair is asserted
 rather than left in prose by
@@ -945,10 +945,10 @@ GUARDIAN_OF_A_JUNIOR = "guardian_of_a_junior"
 #: OFFICIAL and left the GUARDIAN one seat over in exactly the shape the owner
 #: had just ruled on: :meth:`_entitled_teams` returned the junior's whole side
 #: for every route and every data class, so all three oracles read that one
-#: number for the guardian on all 50 swept route names. (It said 48 until
+#: number for the guardian on all 51 swept route names. (It said 48 until
 #: round 10: the count was written when the surface had 48, never re-counted,
 #: and `TheMethodAxisIsADisclosedLimitWithLiveNumbers` has been asserting
-#: `assertEqual(50, count("GET", True))` beside it.) MEASURED on the head
+#: `assertEqual(51, count("GET", True))` beside it.) MEASURED on the head
 #: this corrects: a REGISTERED authenticated route returning to
 #: ``Role.GUARDIAN`` alone the entire AWAY side's private workflow state —
 #: per-player availability answers, substitute status, roster statuses and
@@ -1254,8 +1254,8 @@ VIEWER_ENTITLED_TO_NOTHING = "viewer_entitled_to_nothing"
 #: ever needed one. The condition is now the CLASS: one of the two unscoped
 #: operator classes, and nothing else.
 #:
-#: MEASURED, not assumed, on this fixture: of 5,580 hinted requests across
-#: every authenticated GET route x ten principals x eight parameters, exactly
+#: MEASURED, not assumed, on this fixture: of 5,850 hinted requests across
+#: every authenticated GET route x ten principals x nine probe variants, exactly
 #: SIX (route, parameter) pairs move a response at all, and every one of them
 #: moves ONLY for ``operator`` and/or ``arena``. NO SCOPED PRINCIPAL MOVES ON
 #: ANY PARAMETER ON ANY ROUTE. That measurement is what
@@ -6435,7 +6435,7 @@ class _SweepHarness(_OverviewHarness):
             return frozenset()
         if klass == GUARDIAN_OF_A_JUNIOR:
             # The junior's own SIDE, on the junior's own two routes — not a
-            # standing grant over the junior's whole team on all 50 swept
+            # standing grant over the junior's whole team on all 51 swept
             # route names, and not the junior's own ROW either: the
             # row-level narrowing is oracle 1's, in `_permitted_ids`. What
             # is returned here is the
@@ -6490,6 +6490,7 @@ class _SweepHarness(_OverviewHarness):
                 "get_notifications_preferences", "get_me_guardian_home",
                 "get_v2_setup_overview", "get_v2_setup_progress",
                 "get_accounts", "get_guardians_links",
+                "get_officials",
                 "get_import_hierarchy_codes", "get_notifications_contacts",
                 "get_notifications_deliveries",
                 "get_notifications_device_tokens", "get_onboarding_status",
@@ -6972,7 +6973,7 @@ class _SweepHarness(_OverviewHarness):
         by one. Counted by walking every swept body for a dict carrying a
         non-null ``jersey_number``:
 
-        * **789 jersey-bearing NODES**, on **112 of the 2,560 requests** of
+        * **789 jersey-bearing NODES**, on **112 of the 2,600 requests** of
           the base world — a node is one player on one response, so the two
           are different units and 779-of-2,480 read as neither;
         * on **FOUR** routes, not three: ``get_games_id_lineups`` (424),
@@ -8398,7 +8399,7 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
                 # round 3). Asserting only "the guardian's side equals the
                 # junior's resolved side" says nothing about the SURFACE that
                 # side is readable on, and it was precisely that gap that let
-                # the class hand out a whole side on all 50 swept routes. The
+                # the class hand out a whole side on all 51 swept routes. The
                 # official got a per-leaf 403/200 matrix; so does this one.
                 #
                 # The guardian differs from the official in the direction
@@ -18882,8 +18883,8 @@ class TheMethodAxisIsADisclosedLimitWithLiveNumbers(unittest.TestCase):
                 and ((s.auth not in ("none", route_registry.UNCLASSIFIED))
                      is authed)])
 
-        self.assertEqual(50, count("GET", True), "authenticated GET (SWEPT)")
-        self.assertEqual(17, count("GET", False), "auth=none GET (unswept)")
+        self.assertEqual(51, count("GET", True), "authenticated GET (SWEPT)")
+        self.assertEqual(16, count("GET", False), "auth=none GET (unswept)")
         self.assertEqual(161, count("POST", True),
                          "authenticated POST (unswept, and NOT reported by "
                          "_assert_inventory_is_closed)")
@@ -19008,7 +19009,7 @@ class TheDisclosedLimitsAreMeasuredNotRemembered(_SweepHarness,
         "get_games_id_roster": 8,
     }
 
-    #: Requests of the base world's 2,560 that carry at least one such node.
+    #: Requests of the base world's 2,600 that carry at least one such node.
     JERSEY_BEARING_REQUESTS = 112
 
     @staticmethod

@@ -221,8 +221,8 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
 # never carries HALF a classification; every other reachable spec, and any    #
 # auth STRING WHATSOEVER (a typo, 'unclassified', a value                     #
 # from a different axis entirely), passed silently. Reviewer-demonstrated:    #
-# get_officials's auth/scope_axis can be mutated none/none -> operator_only/  #
-# season, or reverted to (UNCLASSIFIED, UNCLASSIFIED) outright, and every     #
+# get_officials's auth/scope_axis can be mutated operator_only/none ->        #
+# none/none, or reverted to (UNCLASSIFIED, UNCLASSIFIED) outright, and every  #
 # test above -- all five of RegistryInternalConsistencyTests included --      #
 # stays green.                                                                #
 #                                                                              #
@@ -384,7 +384,7 @@ _EXPECTED_CLASSIFICATION = {
     ("GET", '/api/notifications/deliveries'): ('operator_only', 'none'),  # get_notifications_deliveries
     ("GET", '/api/notifications/device-tokens'): ('operator_only', 'none'),  # get_notifications_device_tokens
     ("GET", '/api/notifications/preferences'): ('session+MANAGE_SCHEDULE-or-self', 'none'),  # get_notifications_preferences
-    ("GET", '/api/officials'): ('none', 'none'),  # get_officials
+    ("GET", '/api/officials'): ('operator_only', 'none'),  # get_officials
     ("GET", '/api/officials/{}/availability'): ('session+MANAGE_SCHEDULE-or-self', 'none'),  # get_officials_id_availability
     ("GET", '/api/onboarding/status'): ('operator_only', 'none'),  # get_onboarding_status
     ("GET", '/api/players'): ('operator_only', 'cross'),  # get_players
@@ -758,11 +758,11 @@ class ClassificationMutationTests(unittest.TestCase):
         STATED reason (the mutation), not because the gate always fails."""
         self.assertEqual(_classification_mismatches(REGISTRY), [])
 
-    def test_mutation_public_to_private_is_caught(self):
-        """The reviewer's own named example, first half: get_officials
-        none/none -> operator_only/season."""
-        mutated = self._mutate("get_officials", auth="operator_only",
-                               scope_axis="season")
+    def test_mutation_private_to_public_is_caught(self):
+        """The privacy-sensitive directory cannot drift back to public."""
+        spec = BY_NAME["get_officials"]
+        self.assertEqual(spec.auth, "operator_only")
+        mutated = self._mutate("get_officials", auth="none")
         mismatches = _classification_mismatches(mutated)
         names = {m[0] for m in mismatches}
         self.assertIn("get_officials", names)
@@ -811,8 +811,8 @@ class ClassificationMutationTests(unittest.TestCase):
         base = _classification_mismatches(REGISTRY)
         self.assertEqual(base, [])
 
-        public_private = _classification_mismatches(self._mutate(
-            "get_officials", auth="operator_only", scope_axis="season"))
+        private_public = _classification_mismatches(self._mutate(
+            "get_officials", auth="none"))
         permission = _classification_mismatches(self._mutate(
             "post_setup_league", auth="session+MANAGE_ARENA"))
         scope_axis = _classification_mismatches(self._mutate(
@@ -820,9 +820,9 @@ class ClassificationMutationTests(unittest.TestCase):
         both_unclassified = _classification_mismatches(self._mutate(
             "get_officials", auth=UNCLASSIFIED, scope_axis=UNCLASSIFIED))
 
-        for result in (public_private, permission, scope_axis, both_unclassified):
+        for result in (private_public, permission, scope_axis, both_unclassified):
             self.assertEqual(len(result), 1)
-        self.assertEqual(public_private[0][0], "get_officials")
+        self.assertEqual(private_public[0][0], "get_officials")
         self.assertEqual(permission[0][0], "post_setup_league")
         self.assertEqual(scope_axis[0][0], "post_scheduler_draft")
         self.assertEqual(both_unclassified[0][0], "get_officials")
@@ -830,7 +830,7 @@ class ClassificationMutationTests(unittest.TestCase):
         # DIFFERENT reasons -- one is a value mismatch, the other a
         # vocabulary rejection -- distinguished by the field/expected
         # columns, not merely by which name is present.
-        self.assertEqual(public_private[0][1], "(auth, scope_axis)")
+        self.assertEqual(private_public[0][1], "(auth, scope_axis)")
         self.assertEqual(both_unclassified[0][1], "auth")
 
 

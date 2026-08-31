@@ -760,7 +760,133 @@ async function checkViewport(browser, viewport) {
     await installContextFixture(page);
     await reachDashboard(page);
     if (!(await page.$('.tab[data-tab="users"]'))) fail("setup precondition: Users tab not visible for League Admin");
-    await page.evaluate(([u, p]) => signIn(u, p), [accounts.viewer.username, PW]);
+    // Populate a real operator-only staff directory before the no-reload
+    // identity transition.  The lower role cannot fetch this pool, so the
+    // reset boundary must destroy it rather than merely hide its controls.
+    await page.evaluate(() => switchTab("sheet"));
+    await waitForView(page, "sheet");
+    await waitForRealContent(page);
+    await page.waitForFunction(() => officialsPool.length > 0, null,
+      { timeout: 10000 });
+    const privateOfficial = {
+      id: official.body.id,
+      name: `Ozzy Official ${suffix}`,
+    };
+    const adminOfficialPool = await page.evaluate(() =>
+      officialsPool.map((entry) => ({ id: entry.id, name: entry.name })));
+    if (!adminOfficialPool.some((entry) => entry.id === privateOfficial.id
+        && entry.name === privateOfficial.name)) {
+      fail(`setup precondition: League Admin's directory did not contain the `
+        + `distinctive private Official: ${JSON.stringify(adminOfficialPool)}`);
+    }
+
+    // A simple post-switch assertion only proves a pool that has ALREADY
+    // landed is cleared. Exercise the harder serialization: a privileged
+    // render gets a real 200 directory response, browser delivery is held,
+    // setUser(Viewer) clears the pool, and Viewer context reconciliation is
+    // then held before its first render. Releasing the old response in that
+    // exact window must not let the departing render write the private
+    // directory back.
+    let releaseStaleOfficial;
+    let markStaleOfficialHeld;
+    let markStaleOfficialDelivered;
+    const staleOfficialRelease = new Promise((resolve) => {
+      releaseStaleOfficial = resolve;
+    });
+    const staleOfficialHeld = new Promise((resolve) => {
+      markStaleOfficialHeld = resolve;
+    });
+    const staleOfficialDelivered = new Promise((resolve) => {
+      markStaleOfficialDelivered = resolve;
+    });
+    let heldOfficialBody = null;
+    let officialDirectoryRequests = 0;
+    const holdStaleOfficial = async (route) => {
+      const request = route.request();
+      const requestPath = new URL(request.url()).pathname;
+      if (request.method() !== "GET" || requestPath !== "/api/officials") {
+        await route.continue();
+        return;
+      }
+      officialDirectoryRequests += 1;
+      const response = await route.fetch();
+      heldOfficialBody = await response.json();
+      markStaleOfficialHeld();
+      await staleOfficialRelease;
+      await route.fulfill({ response, json: heldOfficialBody });
+      markStaleOfficialDelivered();
+    };
+
+    let releaseViewerContext;
+    let markViewerContextHeld;
+    const viewerContextRelease = new Promise((resolve) => {
+      releaseViewerContext = resolve;
+    });
+    const viewerContextHeld = new Promise((resolve) => {
+      markViewerContextHeld = resolve;
+    });
+    const holdViewerContext = async (route) => {
+      const response = await route.fetch();
+      markViewerContextHeld();
+      await viewerContextRelease;
+      await route.fulfill({ response });
+    };
+
+    await page.route("**/api/officials", holdStaleOfficial);
+    await page.evaluate(() => {
+      window.__officialPrivacyStaleRender = render();
+    });
+    await staleOfficialHeld;
+    if (!heldOfficialBody || !Array.isArray(heldOfficialBody.officials)
+        || !heldOfficialBody.officials.some((entry) =>
+          entry.id === privateOfficial.id && entry.name === privateOfficial.name)) {
+      fail(`held response was not a non-vacuous private Official directory: `
+        + `${JSON.stringify(heldOfficialBody)}`);
+    }
+
+    await page.route("**/api/context/options", holdViewerContext);
+    await page.evaluate(([u, p]) => {
+      window.__officialPrivacySwitch = signIn(u, p);
+    }, [accounts.viewer.username, PW]);
+    await viewerContextHeld;
+    const afterViewerReset = await page.evaluate(() => ({
+      role: currentRole,
+      username: currentUser && currentUser.username,
+      officials: officialsPool.map((entry) => ({ id: entry.id, name: entry.name })),
+    }));
+    if (afterViewerReset.role !== "viewer"
+        || afterViewerReset.username !== accounts.viewer.username
+        || afterViewerReset.officials.length !== 0) {
+      fail(`identity boundary did not synchronously clear the private Official `
+        + `pool before Viewer context reconciliation: ${JSON.stringify(afterViewerReset)}`);
+    }
+
+    releaseStaleOfficial();
+    await staleOfficialDelivered;
+    // Await the exact old render promise rather than a timer/frame proxy: the
+    // assertion below must run only after that pass either observes the new
+    // identity token and returns or attempts its stale module-state commit.
+    await page.evaluate(async () => {
+      await window.__officialPrivacyStaleRender;
+      delete window.__officialPrivacyStaleRender;
+    });
+    const afterStaleDelivery = await page.evaluate(() => ({
+      role: currentRole,
+      officials: officialsPool.map((entry) => ({ id: entry.id, name: entry.name })),
+    }));
+    if (afterStaleDelivery.role !== "viewer"
+        || afterStaleDelivery.officials.length !== 0) {
+      fail(`departing League Admin render repopulated the private Official `
+        + `directory under Viewer: ${JSON.stringify(afterStaleDelivery)}`);
+    }
+
+    releaseViewerContext();
+    await page.evaluate(async () => {
+      await window.__officialPrivacySwitch;
+      delete window.__officialPrivacySwitch;
+    });
+    await page.unroute("**/api/context/options", holdViewerContext);
+    await page.unroute("**/api/officials", holdStaleOfficial);
     await waitForView(page, "standings");
     const postSwitchTabs = await visibleTabs(page);
     assertVisibleTabs(fail, "no-reload League Admin -> Viewer switch", postSwitchTabs, [
@@ -771,9 +897,14 @@ async function checkViewport(browser, viewport) {
       hasUsersTab: !!document.querySelector('.tab[data-tab="users"]')
         && document.querySelector('.tab[data-tab="users"]').offsetParent !== null,
       demoMenuHidden: (document.getElementById("demo-menu") || {}).hidden !== false,
+      officialsPoolSize: officialsPool.length,
     }));
-    if (postSwitchDom.hasSetupCard || postSwitchDom.hasUsersTab || !postSwitchDom.demoMenuHidden) {
-      fail(`no-reload League Admin -> Viewer switch retained admin UI: ${JSON.stringify(postSwitchDom)}`);
+    if (postSwitchDom.hasSetupCard || postSwitchDom.hasUsersTab
+        || !postSwitchDom.demoMenuHidden || postSwitchDom.officialsPoolSize !== 0
+        || officialDirectoryRequests !== 1) {
+      fail(`no-reload League Admin -> Viewer switch retained admin UI or `
+        + `requested the global directory as Viewer: state=${JSON.stringify(postSwitchDom)} `
+        + `directoryRequests=${officialDirectoryRequests}`);
     }
     await logout(page);
 
@@ -843,6 +974,34 @@ async function checkViewport(browser, viewport) {
     if (!/League admins only/i.test(amUsersBypass)) {
       fail(`Arena Manager: direct-navigating to Users must show the `
         + `"League admins only" guard, got "${amUsersBypass}"`);
+    }
+    // The Official directory follows MANAGE_SCHEDULE, not MANAGE_SETUP:
+    // Arena Manager is the load-bearing role that separates those two
+    // permissions.  Drive a real-session Game Sheet render at both viewports
+    // and require the actual pool plus its assign control, so narrowing the
+    // client gate to League Admin cannot pass behind the server's correct
+    // role matrix.
+    await page.evaluate(() => switchTab("sheet"));
+    await waitForView(page, "sheet");
+    await waitForRealContent(page);
+    await page.waitForSelector(".game-sheet .gs-grid", { timeout: 10000 });
+    const amDirectory = await apiGet(page, "/api/officials");
+    const amSheet = await page.evaluate(() => ({
+      poolIds: officialsPool.map((official) => official.id).sort(),
+      assignControls: document.querySelectorAll(".gs-assign").length,
+      officialSlots: document.querySelectorAll(".gs-off-slot").length,
+    }));
+    const amExpectedPoolIds = ((amDirectory.body || {}).officials || [])
+      .map((official) => official.id).sort();
+    if (amDirectory.status !== 200 || !amExpectedPoolIds.length
+        || JSON.stringify(amSheet.poolIds) !== JSON.stringify(amExpectedPoolIds)) {
+      fail(`Arena Manager [${L}]: Game Sheet did not load the exact `
+        + `MANAGE_SCHEDULE Official pool: response=${JSON.stringify(amDirectory)} `
+        + `sheet=${JSON.stringify(amSheet)}`);
+    }
+    if (amSheet.assignControls !== 1 || amSheet.officialSlots < 1) {
+      fail(`Arena Manager [${L}]: the authorized Official assign surface is `
+        + `missing or vacuous: ${JSON.stringify(amSheet)}`);
     }
     await page.click('.tab[data-tab="dashboard"]');
     await installContextFixture(page);
@@ -1154,23 +1313,40 @@ async function checkViewport(browser, viewport) {
     // authenticated Coach with scope.team_id, already runs at BOTH viewports
     // (desktop 1440x900 and phone 390x844), and is already registered.
     // ============================================================
+    // The installation-wide assignment pool is MANAGE_SCHEDULE-only.  Pin
+    // the server refusal first (and register that exact expected 403 with the
+    // journey's global failure tracker), then observe the real Game Sheet
+    // render and prove it does not make the forbidden request at all.
+    tracker.expect("GET", "/api/officials", 403);
+    const officialsForCoach = await apiGet(page, "/api/officials");
+    if (officialsForCoach.status !== 403
+        || !officialsForCoach.body.error
+        || officialsForCoach.body.error.code !== "forbidden"
+        || officialsForCoach.body.error.details.role !== "coach"
+        || officialsForCoach.body.error.details.required !== "manage_schedule") {
+      fail(`Coach [${L}]: /api/officials did not enforce the exact `
+        + `MANAGE_SCHEDULE refusal: ${JSON.stringify(officialsForCoach)}`);
+    }
+
+    const sheetPoolRequests = [];
+    const observeOfficialPool = (request) => {
+      let requestPath = request.url();
+      try { requestPath = new URL(request.url()).pathname; } catch (_) {}
+      if (request.method() === "GET" && requestPath === "/api/officials") {
+        sheetPoolRequests.push(request.url());
+      }
+    };
+    page.on("request", observeOfficialPool);
     // A real keyboard activation of the real nav tab, the same discipline
     // every other reachability claim in this file uses.
     await tabToAndActivate(page, '.tab[data-tab="sheet"]', "Coach reach Game Sheet");
     await waitForView(page, "sheet");
     await waitForRealContent(page);
     await page.waitForSelector(".game-sheet .gs-grid", { timeout: 10000 });
-
-    // The sheet render fires GET /api/officials for its assign control.
-    // That route carries no operator gate, so a Coach gets 200 -- asserted
-    // rather than assumed, because this file's failure tracker fails the
-    // whole run on any unregistered HTTP >= 400 and a silent 403 here would
-    // surface as an unrelated-looking failure at the end of the journey.
-    const officialsForCoach = await apiGet(page, "/api/officials");
-    if (officialsForCoach.status !== 200) {
-      fail(`Coach [${L}]: the Game Sheet's own /api/officials fetch returned `
-        + `${officialsForCoach.status} -- the sheet cannot render without it `
-        + `and this file's tracker fails on unregistered >= 400 responses`);
+    page.off("request", observeOfficialPool);
+    if (sheetPoolRequests.length) {
+      fail(`Coach [${L}]: Game Sheet requested the private global officials `
+        + `pool ${sheetPoolRequests.length} time(s)`);
     }
 
     const sheet = await page.evaluate(() => {

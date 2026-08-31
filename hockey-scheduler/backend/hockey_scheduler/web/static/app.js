@@ -166,7 +166,12 @@ let importOperationSeq = 0;
 // pass is SUSPENDED at an await -- the run between two awaits is a critical
 // section during which `renderPass` cannot move. Checking on every resume is
 // therefore both necessary and sufficient for "a superseded pass performs no
-// further module-level write".
+// further module-level write".  Starting a newer render is not the only event
+// that supersedes a pass: changing identity does too, before the new identity
+// reaches its first render().  resetTransientUiState() therefore advances the
+// same token synchronously at that boundary, so an old privileged response
+// cannot land in the post-auth/pre-render window and repopulate state that the
+// reset just destroyed.
 //
 // The alternative shape -- stage everything pass-locally and commit
 // atomically at the boundary -- was rejected for THIS function: at least
@@ -11353,8 +11358,12 @@ async function render() {
       commitSetupWorkflowCards({ sv: sv, ov: ov, players: playersList,
         svOk: svOk, playersOk: playersOk, progress: progress });
     }
-    // The game sheet also needs the officials pool for its assign control (#30).
-    if (view === "sheet") {
+    // The game sheet needs the installation-wide officials pool only for its
+    // operator-only assign control (#30).  Non-operators still see already-
+    // assigned officials through the game-scoped lineups payload and may see
+    // #367's separate active-context Dashboard projection; neither contract
+    // requires probing the private global directory just to render this sheet.
+    if (view === "sheet" && hasPerm("manage_schedule")) {
       const op = await getJSON("/api/officials");
       if (renderPass !== myRenderPass) return;  // superseded (#215)
       officialsPool = (op && op.officials) || [];
@@ -14793,6 +14802,12 @@ function gateChrome() {
 // across a persona switch would show one user's confirmation/secret to the
 // next signed-in user.
 function resetTransientUiState() {
+  // Invalidate every render owned by the departing identity BEFORE clearing
+  // any of its state. signIn() awaits context reconciliation between setUser()
+  // and the arriving identity's render(); without this boundary claim, a
+  // privileged response delivered in that window still holds the current
+  // renderPass and can write the private data straight back after this reset.
+  renderPass += 1;
   checkoutConfirm = null; oppDetailGame = null; oppDetail = null;
   gCheckout = null; gOpp = null; gOppDetail = null;
   newFeedUrl = null;
@@ -14818,6 +14833,11 @@ function resetTransientUiState() {
   // without a page reload, that role would see the previous operator's
   // fetched player roster.
   playersList = [];
+  // officialsPool is the installation-wide staff directory and is fetched
+  // only for MANAGE_SCHEDULE/MANAGE_USERS surfaces.  Destroy it at the same
+  // identity boundary as playersList so a no-reload operator -> lower-role
+  // switch cannot retain the previous operator's private pool in memory.
+  officialsPool = [];
   // guardianLinksState (#35) isn't currently reachable by a lower-privileged
   // role either — renderUsers() gates its whole body (including the
   // Guardian Links card) on hasPerm("manage_users") before touching this

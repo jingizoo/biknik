@@ -5,6 +5,7 @@ import unittest
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 from helpers import BACKEND, cookie_from_set_cookie  # noqa: F401  (sets up sys.path)
 
@@ -102,6 +103,37 @@ class ProductionPublicPrivacyTest(_HttpBase):
         status, body = self._get(f"/api/games/{self.game_id}/lineups",
                                  cookie=f"{srv.SESSION_COOKIE}=bogus")
         self.assertEqual(status, 401)
+
+    def test_global_official_directory_is_never_anonymous(self):
+        """Protect the installation-wide pool, not #367's scoped overview.
+
+        ``/api/demo/overview`` has a separate owner-approved contract: it may
+        return Officials joined through the caller's active-context home Club
+        or an in-scope assignment. This test deliberately targets the global
+        ``all_officials()`` read used by the assignment picker.
+        """
+        # Use the service facade rather than one store implementation's
+        # private dictionary shape. This class runs against the demo Memory
+        # fixture; backend-parity coverage belongs to the store matrix.
+        official = srv.STATE.api.get_officials()[0]
+        protected_values = (official["id"], official["name"])
+
+        with mock.patch.object(
+                srv.STATE.api, "get_officials",
+                wraps=srv.STATE.api.get_officials) as get_officials:
+            for label, cookie in (
+                    ("missing", None),
+                    ("invalid", f"{srv.SESSION_COOKIE}=bogus")):
+                with self.subTest(cookie=label):
+                    status, body = self._get("/api/officials", cookie=cookie)
+                    self.assertEqual(status, 401)
+                    self.assertEqual(body["error"]["code"], "unauthorized")
+                    self.assertNotIn("officials", body)
+                    blob = json.dumps(body)
+                    for value in protected_values:
+                        self.assertNotIn(value, blob)
+
+        get_officials.assert_not_called()
 
     # -- role/scope authorization (#73 review) -----------------------------
     def _get_as(self, account_id, role, scope, path):
@@ -310,15 +342,24 @@ class DemoPublicPrivacyTest(_HttpBase):
                                   cookie=cookie)
             self.assertEqual(status, 200, sub)
 
+        status, body = self._get("/api/officials", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["officials"])
+
     def test_headerless_demo_player_data_now_signed_out(self):
         # A cookieless demo request no longer silently becomes the operator:
         # player data requires a session.
         for sub in PLAYER_DATA_SUBS:
             status, _ = self._get(f"/api/games/{self.game_id}/{sub}")
             self.assertEqual(status, 401, sub)
+        status, _ = self._get("/api/officials")
+        self.assertEqual(status, 401)
 
     def test_invalid_cookie_still_rejected_in_demo(self):
         status, _ = self._get(f"/api/games/{self.game_id}/roster",
+                              cookie=f"{srv.SESSION_COOKIE}=bogus")
+        self.assertEqual(status, 401)
+        status, _ = self._get("/api/officials",
                               cookie=f"{srv.SESSION_COOKIE}=bogus")
         self.assertEqual(status, 401)
 

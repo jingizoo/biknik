@@ -2451,6 +2451,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self._send_api(api.list_guardian_links())
         if path == "/api/officials":
+            # Installation-wide staff directory for the assign control (#30).
+            # Assigned officials on a game remain visible through that game's
+            # separately-authorized sheet payload. The #367 Dashboard read may
+            # also retain its distinct active-context projection (home Club or
+            # in-scope assignment); this route is the unscoped global pool and
+            # is only for operators who may assign from it.
+            if self._operator_only("/api/setup/official"):
+                return
             return self._send_api({"officials": api.get_officials()})
         if path == "/api/players":
             # League-wide player list for the Setup "Players" card (#114) —
