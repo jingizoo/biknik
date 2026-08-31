@@ -19,6 +19,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 from datetime import datetime, timedelta
 
@@ -45,7 +46,7 @@ from ..services.context_epoch import (
 from ..services.context_gate import (
     CONTEXT_GATE, LIFECYCLE_GATE, LIFECYCLE_GATE_KEY as _LIFECYCLE_GATE_KEY)
 from ..services.epoch_fence import EPOCH_FENCE_GLOBAL_KEY, user_fence_key
-from ..store import SqlStore, create_store
+from ..store import SqlStore, StoreConnectionError, create_store
 from .auth import (
     DEFAULT_TTL_SECONDS,
     DEMO_PASSWORD,
@@ -335,14 +336,18 @@ class DemoState:
         self.boot_error_ref: Optional[str] = None
         try:
             self.reset(seed=False)
-        except Exception as exc:                      # noqa: BLE001
+        except StoreConnectionError as exc:
+            # At this call site the phase-specific type comes from the initial
+            # psycopg.connect() boundary.  A missing driver, authentication,
+            # bootstrap, migration, or programming error therefore still fails
+            # fast instead of masquerading indefinitely as an unreachable DB.
             self.api = None
             self.game_id = None
             self.ids = {}
             self._record_boot_error(exc)
 
     @staticmethod
-    def _redact(text: str) -> str:
+    def _redact(text: str, database_url: Optional[str] = None) -> str:
         """Strip credentials before ANYTHING writes this, including the log.
 
         Sanitizing only the response would move the leak rather than remove it:
@@ -350,14 +355,53 @@ class DemoState:
         can carry `scheme://user:pass@host/db`, a bare `password=...`, or a
         token, so they are redacted once, where the text is captured.
         """
-        text = re.sub(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/@]+)@",
+        # libpq treats the first unencoded ``@`` as the end of userinfo.  If a
+        # password itself contains ``@``, the driver's DNS error can therefore
+        # contain only ``<password-tail>@<real-host>`` -- no scheme and no
+        # ``password=`` marker for the generic patterns below to recognise.
+        # Derive that exact malformed authority from the configured URL and
+        # remove it before recording the exception.  Never publish the URL or
+        # any parsed credential; this is a one-way sanitization input only.
+        if database_url:
+            driver_host = ""
+            try:
+                # Use the same parser as the production driver first.  In the
+                # exact libpq defect being contained, an unencoded password
+                # ``@`` becomes part of *its* host value (including odd IPv6
+                # shapes such as ``TAIL@[``), which stdlib URL parsing cannot
+                # reproduce reliably.
+                from psycopg.conninfo import conninfo_to_dict
+                driver_host = conninfo_to_dict(database_url).get("host", "")
+            except (ImportError, TypeError, ValueError):
+                pass
+            if "@" in driver_host:
+                text = text.replace(driver_host, "***")
+
+            try:
+                parsed = urlsplit(database_url)
+                password = unquote(parsed.password or "")
+                host = parsed.hostname or ""
+            except (TypeError, ValueError):
+                password = host = ""
+            if "@" in password and host:
+                leaked_authority = f"{password.split('@', 1)[1]}@{host}"
+                text = text.replace(leaked_authority, "***")
+
+        # Greedy userinfo deliberately reaches the LAST ``@`` before the host,
+        # so a raw URL containing an unencoded ``@`` in its password is consumed
+        # atomically instead of leaving the password tail behind.
+        text = re.sub(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/]+)@",
                       r"\1***:***@", text)
-        return re.sub(r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)"
-                      r"\s*[=:]\s*\S+", r"\1=***", text)
+        return re.sub(
+            r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)"
+            r"\s*[=:]\s*(?:'(?:\\.|[^'\\])*'|"
+            r"\"(?:\\.|[^\"\\])*\"|\S+)",
+            r"\1=***", text)
 
     def _record_boot_error(self, exc) -> None:
         """Full (redacted) cause to the log; only a category goes public."""
-        self.boot_error = self._redact(f"{type(exc).__name__}: {exc}")
+        self.boot_error = self._redact(
+            f"{type(exc).__name__}: {exc}", os.environ.get("DATABASE_URL"))
         self.boot_error_ref = uuid.uuid4().hex[:8]
         print(f"[boot ref={self.boot_error_ref}] store unavailable, serving 503: "
               f"{self.boot_error}", file=sys.stderr, flush=True)
@@ -412,12 +456,21 @@ class DemoState:
         # whatever is there and only bootstrap the first admin from env if the
         # store has no accounts yet.
         if _app_mode() == "production":
-            self.api = self._make_api(store)
+            try:
+                api = self._make_api(store)
+                bootstrap_admin_from_env(api, os.environ)
+                RATE_LIMITER.reset()  # (#131) fresh process → clean slate
+                LOGIN_THROTTLE.reset()  # (#267) clear login lockouts too
+            except Exception:
+                # Nothing has been published yet.  Release the candidate store
+                # deterministically, then let configuration/programming errors
+                # fail boot with their real category instead of degrading as a
+                # fake connectivity outage.
+                self._close_store(store, None)
+                raise
+            self.api = api
             self.game_id = None
             self.ids = {}
-            bootstrap_admin_from_env(self.api, os.environ)
-            RATE_LIMITER.reset()  # (#131) fresh process → clean rate-limit slate
-            LOGIN_THROTTLE.reset()  # (#267) clear login lockouts on rebuild too
             self._close_store(old_store, store)
             return
 
@@ -1543,19 +1596,19 @@ class Handler(BaseHTTPRequestHandler):
     # right lifetime for it.
     _context_read_ticket = None
 
-    # Verbs whose contract forbids a body. The degraded answer must honour it
-    # with a TRUE zero-length response -- declaring a Content-Length and then
-    # omitting the bytes is correct only for HEAD, and would leave a keep-alive
-    # client on any other verb waiting for bytes that never arrive.
-    _BODYLESS_VERBS = ("HEAD", "OPTIONS")
+    # Verbs whose representation is genuinely zero-length. HEAD is deliberately
+    # absent: it writes no bytes, but its headers describe the GET representation.
+    _BODYLESS_VERBS = ("OPTIONS",)
 
     def _store_unavailable(self) -> bool:
         """True (and a 503 already sent) when the store never came up.
 
-        Called first in every ``do_*`` so a new verb cannot silently bypass it.
-        Health and readiness are exempt HERE rather than by route order: being
-        called first is what makes this guard trustworthy, and they are exactly
-        the two endpoints whose purpose is to report this condition.
+        Reached before store-dependent work for every HTTP verb: GET, POST,
+        HEAD and OPTIONS call it directly, while PUT/PATCH/DELETE and every
+        dynamically synthesized extension verb converge on the guarded
+        ``_method_fallback`` boundary. Health and readiness are exempt HERE
+        rather than by route order; they are exactly the two endpoints whose
+        purpose is to report this condition.
         """
         if STATE.store_available:
             return False
@@ -2479,20 +2532,26 @@ class Handler(BaseHTTPRequestHandler):
             status["factory_reset_enabled"] = (
                 _app_mode() == "production" and _allow_production_factory_reset())
             return self._send_json(status)
-        if path in ("/api/health", "/api/readiness") and not STATE.store_available:
-            # THE PAIR THAT MUST ANSWER WHILE THE STORE IS DOWN. Both normally
-            # delegate to a facade that does not exist yet, so the answer comes
-            # from process state: 503 (so the platform marks the instance
-            # unhealthy) plus a sanitized category and a reference an operator
-            # can grep for in the log.
-            return self._send_json({
-                "status": "unavailable",
-                "app_mode": _app_mode(),
-                "store": STATE.public_store_failure(),
-                "detail": "The service is running but has not reached its "
-                          "database. The full cause is in the server log under "
-                          "this reference.",
-            }, 503)
+        if path in ("/api/health", "/api/readiness"):
+            if not STATE.store_available:
+                # THE PAIR THAT MUST ANSWER WHILE THE STORE IS DOWN. Both
+                # normally delegate to a facade that does not exist yet, so the
+                # answer comes from process state: 503 (so the platform marks
+                # the instance unhealthy) plus a sanitized category and a
+                # reference an operator can grep for in the log.
+                #
+                # Keep the route predicate and the runtime-state predicate
+                # nested.  The fail-closed route extractor owns the former and
+                # deliberately refuses compound dispatch expressions it cannot
+                # prove; the latter is ordinary runtime state, not routing.
+                return self._send_json({
+                    "status": "unavailable",
+                    "app_mode": _app_mode(),
+                    "store": STATE.public_store_failure(),
+                    "detail": "The service is running but has not reached its "
+                              "database. The full cause is in the server log "
+                              "under this reference.",
+                }, 503)
         if path == "/api/health":
             # Liveness + dependency snapshot (#90). Public, non-sensitive.
             # The STATUS CODE carries the verdict (#404): a platform health
@@ -3196,9 +3255,9 @@ class Handler(BaseHTTPRequestHandler):
     def _send_status(self, code: int, extra_headers=None) -> None:
         """Send a bodyless response (status line + standard headers, no body).
 
-        Used for HEAD/OPTIONS and other empty responses (#271): a HEAD or a 204
-        must never write a body, so this sends ``Content-Length: 0`` and ends
-        the headers without a payload.
+        Used for OPTIONS and other genuinely empty responses (#271). HEAD uses
+        the normal GET serializer with body writes suppressed so its metadata
+        describes the GET representation rather than an empty payload.
         """
         self.send_response(code)
         self.send_header("Content-Length", "0")
@@ -3216,6 +3275,11 @@ class Handler(BaseHTTPRequestHandler):
         where applicable); an unknown ``/api/...`` path → JSON 404; any other
         path → JSON 404.
         """
+        # PUT/PATCH/DELETE and every __getattr__-synthesized extension method
+        # converge here.  Guarding the shared boundary keeps a future token
+        # from bypassing degraded mode without duplicating a path policy.
+        if self._store_unavailable():
+            return
         path = self.path.split("?", 1)[0]
         methods = self._supported_methods(path)
         if methods:
@@ -3250,18 +3314,12 @@ class Handler(BaseHTTPRequestHandler):
             "code": "not_found", "message": "Unknown endpoint."}}, 404)
 
     def do_PUT(self):
-        if self._store_unavailable():
-            return
         self._method_fallback("PUT")
 
     def do_PATCH(self):
-        if self._store_unavailable():
-            return
         self._method_fallback("PATCH")
 
     def do_DELETE(self):
-        if self._store_unavailable():
-            return
         self._method_fallback("DELETE")
 
     def __getattr__(self, name):
@@ -3287,10 +3345,14 @@ class Handler(BaseHTTPRequestHandler):
         (an unauthenticated ``HEAD /api/accounts`` mirrors GET's 401/403, never
         a blind 200) — with body writes suppressed via ``_head_only``. A
         POST-only path falls through do_GET's tail to a bodyless 405 + Allow."""
-        if self._store_unavailable():
-            return
         self._head_only = True
         try:
+            # HEAD suppresses bytes, not GET's representation metadata.  Set
+            # the suppression flag BEFORE the degraded guard so its 503 carries
+            # the same Content-Type/Content-Length as degraded GET while still
+            # writing a zero-byte body.
+            if self._store_unavailable():
+                return
             self.do_GET()
         finally:
             self._head_only = False

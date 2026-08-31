@@ -1,10 +1,11 @@
 import os
 from typing import Optional
 
+from .db import StoreConnectionError
 from .memory_store import InMemoryStore
 from .sql_store import SqlStore
 
-__all__ = ["InMemoryStore", "SqlStore", "create_store"]
+__all__ = ["InMemoryStore", "SqlStore", "StoreConnectionError", "create_store"]
 
 
 def create_store(url: Optional[str] = None):
