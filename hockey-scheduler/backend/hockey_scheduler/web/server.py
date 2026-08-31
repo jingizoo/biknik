@@ -2085,10 +2085,10 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         # #202 runtime-policy slice 1: RouteSpec is now the authorization
         # source for the complete unscoped MANAGE_USERS GET family. This gate
-        # runs before every route branch and therefore before any account,
-        # session, or guardian-link lookup can reveal whether a named resource
-        # exists. More complex auth/scope labels deliberately remain in their
-        # handlers until their complete resolver contract moves with them.
+        # preserves the existing no-oracle ordering before every account,
+        # session, or guardian-link lookup at one common boundary. More complex
+        # auth/scope labels deliberately remain in their handlers until their
+        # complete resolver contract moves with them.
         if self._routespec_get_denied(path):
             return
         api = STATE.api

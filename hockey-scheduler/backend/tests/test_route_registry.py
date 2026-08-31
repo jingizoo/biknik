@@ -54,14 +54,15 @@ _EXPECTED_RUNTIME_GET_AUTH = {
 
 
 def _runtime_get_auth_map(registry):
-    """The whole simple, unscoped GET policy class moved in this slice."""
-    return {
-        spec.name: spec.runtime_permission_name
-        for spec in registry
-        if (spec.method == "GET" and spec.kind == "route"
-            and spec.scope_axis == "none"
-            and spec.runtime_permission_name is not None)
-    }
+    """Resolve every concrete GET template through the production selector."""
+    selected = {}
+    for source in registry:
+        if source.method != "GET" or source.kind != "route":
+            continue
+        spec = runtime_get_auth_spec(sample_path(source.template), registry)
+        if spec is not None:
+            selected[spec.name] = spec.runtime_permission_name
+    return selected
 
 
 def _describe(keys, source):
