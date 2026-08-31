@@ -11,9 +11,9 @@ adding a route without registering it fails, and registering a route that was
 deleted fails. See ``test_route_extract.py`` for the extractor's own proof that
 it finds every branch shape and refuses the ones it cannot read.
 
-``CONTEXT_SCOPED_READ_ROUTES`` in ``server.py`` is still a separate,
-hand-maintained table, CROSS-CHECKED here and otherwise left exactly as it is
--- rewiring it is separate, later #202 work (enforcement, not admission).
+The exact-Season context-read fence is also registry-driven now. Its five
+``RouteSpec.context_read_fence`` markers are resolved by production before
+dispatch and pinned in both directions below.
 
 ``_GET_ROUTES``/``_POST_ROUTES`` were the same kind of hand-maintained table
 through the #202 routespec-inventory step; the #202 WIRING step replaced
@@ -40,7 +40,9 @@ from hockey_scheduler.web.route_extract import (
     SERVER_PATH, extract_walker, sample_path, templates_of_pattern,
 )
 from hockey_scheduler.web.route_registry import (
-    BY_KEY, BY_NAME, REGISTRY, UNCLASSIFIED, runtime_get_auth_spec,
+    BY_KEY, BY_NAME, CONTEXT_SCOPED_READ_SPECS, REGISTRY, UNCLASSIFIED,
+    context_scoped_read_specs, runtime_context_read_spec,
+    runtime_get_auth_spec,
 )
 
 WALKER = extract_walker()
@@ -50,6 +52,17 @@ _EXPECTED_RUNTIME_GET_AUTH = {
     "get_accounts": "MANAGE_USERS",
     "get_accounts_id_sessions": "MANAGE_USERS",
     "get_guardians_links": "MANAGE_USERS",
+}
+
+_EXPECTED_CONTEXT_SCOPED_READS = {
+    "get_scheduler_scenarios_id": "/api/scheduler/scenarios/{}",
+    "get_standings_id": "/api/standings/{}",
+    "get_standings_league_season_id_id":
+        "/api/standings/league-season/{}/{}",
+    "get_v2_setup_seasons_id_venue_access":
+        "/api/v2/setup/seasons/{}/venue-access",
+    "get_v2_setup_seasons_id_venue_candidates":
+        "/api/v2/setup/seasons/{}/venue-candidates",
 }
 
 
@@ -62,6 +75,18 @@ def _runtime_get_auth_map(registry):
         spec = runtime_get_auth_spec(sample_path(source.template), registry)
         if spec is not None:
             selected[spec.name] = spec.runtime_permission_name
+    return selected
+
+
+def _runtime_context_read_map(registry):
+    """Resolve every concrete GET through the production fence selector."""
+    selected = {}
+    for source in registry:
+        if source.method != "GET" or source.kind != "route":
+            continue
+        spec = runtime_context_read_spec(sample_path(source.template), registry)
+        if spec is not None:
+            selected[spec.name] = spec.template
     return selected
 
 
@@ -223,8 +248,7 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
         ``_POST_ROUTES``) -- so what is worth pinning now is that the import
         is real and did not quietly get reverted, not that it is absent.
         """
-        self.assertIn("from .route_registry import REGISTRY",
-                      SERVER_PATH.read_text())
+        self.assertIs(srv.REGISTRY, REGISTRY)
 
 
 # --------------------------------------------------------------------------- #
@@ -902,15 +926,12 @@ class DispatchHasNoDeadBranchesTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Cross-checks against server.py's three method/scope tables. Assertions      #
-# only -- none of this rewires or deletes them; ``_GET_ROUTES``/              #
-# ``_POST_ROUTES`` are already wired (they ARE a REGISTRY derivation, see     #
-# server.py), ``CONTEXT_SCOPED_READ_ROUTES`` still is not (separate, later    #
-# #202 work).                                                                 #
+# Cross-checks against server.py's method tables. The exact-Season scoped-    #
+# read contract is no longer another server table; its production selector   #
+# is tested separately below.                                                 #
 # --------------------------------------------------------------------------- #
 TABLES = (("_GET_ROUTES", srv._GET_ROUTES, "GET"),
-          ("_POST_ROUTES", srv._POST_ROUTES, "POST"),
-          ("CONTEXT_SCOPED_READ_ROUTES", srv.CONTEXT_SCOPED_READ_ROUTES, "GET"))
+          ("_POST_ROUTES", srv._POST_ROUTES, "POST"))
 
 COMPILED = {method: [(spec, re.compile(spec.pattern)) for spec in REGISTRY
                      if spec.method == method]
@@ -918,11 +939,11 @@ COMPILED = {method: [(spec, re.compile(spec.pattern)) for spec in REGISTRY
 
 
 class TableCrossCheckTests(unittest.TestCase):
-    """Every path either table claims must be a route this registry knows.
+    """Every path either method table claims is a known RouteSpec.
 
-    A pattern in the 405 table or the scoped-read table with no corresponding
-    RouteSpec means that table has drifted away from the dispatch — the exact
-    failure #202 exists to make impossible.
+    A pattern in the 405 table with no corresponding RouteSpec means that table
+    has drifted away from the dispatch — the exact failure #202 exists to make
+    impossible.
     """
 
     maxDiff = None
@@ -939,23 +960,72 @@ class TableCrossCheckTests(unittest.TestCase):
                                        f"(from {rx.pattern})")
         self.assertEqual(orphans, [])
 
-    def test_context_scoped_reads_are_all_get_routes(self):
-        for rx in srv.CONTEXT_SCOPED_READ_ROUTES:
-            for template in templates_of_pattern(rx.pattern):
-                with self.subTest(template=template):
-                    self.assertIn(("GET", template), BY_KEY)
-
     def test_is_context_scoped_read_agrees_with_the_registry(self):
         """The predicate the dispatch actually calls, exercised on real paths."""
-        scoped = set()
-        for rx in srv.CONTEXT_SCOPED_READ_ROUTES:
-            scoped.update(templates_of_pattern(rx.pattern))
+        scoped = {spec.template for spec in CONTEXT_SCOPED_READ_SPECS}
         for spec in REGISTRY:
             if spec.method != "GET" or spec.kind != "route":
                 continue
             with self.subTest(spec=spec.name):
                 self.assertEqual(srv.is_context_scoped_read(
                     sample_path(spec.template)), spec.template in scoped)
+
+
+class ContextReadFenceContractTests(unittest.TestCase):
+    """The exact-Season fence is one fail-closed RouteSpec contract."""
+
+    def test_runtime_context_read_fence_is_the_complete_class(self):
+        self.assertEqual(_runtime_context_read_map(REGISTRY),
+                         _EXPECTED_CONTEXT_SCOPED_READS)
+        self.assertEqual(
+            {spec.name: spec.template for spec in CONTEXT_SCOPED_READ_SPECS},
+            _EXPECTED_CONTEXT_SCOPED_READS)
+        for name in _EXPECTED_CONTEXT_SCOPED_READS:
+            with self.subTest(name=name):
+                spec = BY_NAME[name]
+                path = sample_path(spec.template)
+                self.assertIs(runtime_context_read_spec(path), spec)
+                self.assertIs(runtime_context_read_spec(
+                    path + "?ignored=1"), spec)
+
+    def test_runtime_context_read_fence_detects_narrowing_and_widening(self):
+        enrolled = BY_NAME["get_scheduler_scenarios_id"]
+        unenrolled = BY_NAME["get_scheduler_scenarios"]
+        for target, value in ((enrolled, False), (unenrolled, True)):
+            with self.subTest(target=target.name, value=value):
+                mutated = tuple(
+                    dataclasses.replace(spec, context_read_fence=value)
+                    if spec is target else spec
+                    for spec in REGISTRY)
+                self.assertNotEqual(_runtime_context_read_map(mutated),
+                                    _EXPECTED_CONTEXT_SCOPED_READS)
+
+    def test_runtime_context_read_fence_rejects_a_non_get_marker(self):
+        target = BY_NAME["post_context"]
+        mutated = tuple(
+            dataclasses.replace(spec, context_read_fence=True)
+            if spec is target else spec
+            for spec in REGISTRY)
+        with self.assertRaisesRegex(RuntimeError, "concrete GET routes"):
+            context_scoped_read_specs(mutated)
+
+    def test_runtime_context_read_fence_rejects_a_non_boolean_marker(self):
+        target = BY_NAME["get_scheduler_scenarios_id"]
+        mutated = tuple(
+            dataclasses.replace(spec, context_read_fence="yes")
+            if spec is target else spec
+            for spec in REGISTRY)
+        with self.assertRaisesRegex(RuntimeError, "must be a boolean"):
+            context_scoped_read_specs(mutated)
+
+    def test_runtime_context_read_fence_ambiguity_fails_closed(self):
+        spec = BY_NAME["get_scheduler_scenarios_id"]
+        duplicate = dataclasses.replace(
+            spec, name="duplicate_get_scheduler_scenarios_id")
+        with self.assertRaisesRegex(RuntimeError,
+                                    "Ambiguous RouteSpec context-read fence"):
+            runtime_context_read_spec(
+                "/api/scheduler/scenarios/example", (spec, duplicate))
 
 
 class MethodTableNarrowingTests(unittest.TestCase):

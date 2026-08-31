@@ -676,16 +676,16 @@ class ContextReadEpochBase(ContextGateFixtureBase):
                     "venue-access": "list_season_venue_access"}
 
     def _all_scoped_route_cases(self, fx):
-        """One case per entry in ``CONTEXT_SCOPED_READ_ROUTES`` (#159 review
+        """One case per fenced ``RouteSpec`` (#159 review
         finding 1) -- label, the exact path to hit, the ``ApiService`` method
         the ceiling reaches, and the id ``_watch_service`` should watch for on
         that method. Built fresh under ``fx['s1']`` so every target genuinely
         exists and answers non-204 there, the same discipline
         ``_program_with_two_seasons`` fixtures already use.
 
-        A TABLE, not a hand-picked subset: the whole point is that a route
-        added to ``CONTEXT_SCOPED_READ_ROUTES`` later shows up here too,
-        rather than this file silently testing yesterday's membership.
+        The registry contract, not a hand-picked subset: a route marked
+        ``context_read_fence`` later changes the asserted count here rather
+        than letting this file silently test yesterday's membership.
         """
         division_id = self._division_with_teams(fx, fx["s1"], tag="Tbl")
         scenario_id = self._scenario_in(fx, fx["s1"], name="Table run")
@@ -1213,13 +1213,13 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
         self.assertEqual(current, 200, raw2)
 
     # ======================================================================
-    # 6. EVERY REGISTERED ROUTE, TABLE-DRIVEN — not a hand-picked subset
+    # 6. EVERY REGISTERED ROUTE, REGISTRY-DRIVEN — not a hand-picked subset
     # ======================================================================
     def test_every_registered_scoped_read_route_discards_on_a_stale_epoch(self):
-        """``CONTEXT_SCOPED_READ_ROUTES`` is the authoritative definition of a
-        context-scoped read, and every entry gets the SAME treatment — driven
-        off the table itself (``_all_scoped_route_cases``), not a hand-picked
-        pair (#159 review finding 1).
+        """``RouteSpec.context_read_fence`` is the authoritative definition of
+        a context-scoped read, and every marked entry gets the SAME treatment
+        — matched by ``_all_scoped_route_cases``, not a hand-picked pair
+        (#159 review finding 1).
 
         THE GAP THIS REPLACES A NARROWER TEST FOR: the previous version of
         this case exercised only the Division standings route and the
@@ -1245,10 +1245,12 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
         client = self._login(username)
         self._select(client, fx["program_id"], fx["s1"])
         cases = self._all_scoped_route_cases(fx)
+        registered = sum(
+            spec.context_read_fence for spec in self.srv.REGISTRY)
         self.assertEqual(
-            len(cases), len(self.srv.CONTEXT_SCOPED_READ_ROUTES),
-            "this table has drifted out of sync with "
-            "CONTEXT_SCOPED_READ_ROUTES — every registered route needs a "
+            len(cases), registered,
+            "these cases have drifted out of sync with "
+            "RouteSpec.context_read_fence — every marked route needs a "
             "case here, or this test is silently back to hand-picking")
 
         # The no-header baseline, captured BEFORE any epoch enters play, so
@@ -1851,8 +1853,8 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
         strictly AFTER ``_read_under_context_gate``'s epoch check has
         already matched and BEFORE the ceiling evaluates anything — then
         archive the selected Season from a SECOND request while the read is
-        held there. Exercised over EVERY route in
-        ``CONTEXT_SCOPED_READ_ROUTES`` (a table, not a hand-picked one, for
+        held there. Exercised over EVERY ``RouteSpec.context_read_fence``
+        marker (not a hand-picked set, for
         the same reason ``test_every_registered_scoped_read_route_discards_
         on_a_stale_epoch`` is).
 

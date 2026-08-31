@@ -60,7 +60,9 @@ from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
 from ..services import lineup_visibility
 from .rate_limit import LoginThrottle, RateLimiter
-from .route_registry import REGISTRY, runtime_get_auth_spec
+from .route_registry import (
+    REGISTRY, runtime_context_read_spec, runtime_get_auth_spec,
+)
 from .scope import (
     can_read_private_game_data, resolve_private_game_read, scope_violation)
 from .validation import BodyError, check_body, parse_json_object
@@ -569,13 +571,14 @@ class DemoState:
 STATE = DemoState()
 
 # The exact-Season scoped READS whose answer is only meaningful under the
-# CURRENTLY PERSISTED context tuple. Deliberately an EXPLICIT table rather than
-# a prefix or a decorator: joining it costs a request an ordering constraint
-# against every context switch by the same operator, so a route earns its place
-# here by having the exact-selected-Season ceiling
-# (`season_id != active_season.id`), not by resembling one.
+# CURRENTLY PERSISTED context tuple. Membership is declared explicitly on each
+# qualifying ``RouteSpec`` rather than inferred from a prefix or scope axis:
+# joining costs a request an ordering constraint against every context switch
+# by the same operator, so a route earns ``context_read_fence=True`` only by
+# having the exact-selected-Season ceiling
+# (``season_id != active_season.id``), not by resembling one.
 #
-# THE CRITERION, SHARPENED so the table can be audited rather than trusted
+# THE CRITERION, SHARPENED so the contract can be audited rather than trusted
 # (#159 review — the first cut listed two of the four that qualify, and stopped
 # at the two it had a CI failure for). A GET route belongs here when BOTH hold:
 #
@@ -631,18 +634,11 @@ STATE = DemoState()
 #
 # Every mutation route that reaches the same comparison takes the WRITER side
 # of this gate (or none of it) by construction: the reader side is wired only
-# into `do_GET`.
-CONTEXT_SCOPED_READ_ROUTES = (
-    re.compile(r"^/api/v2/setup/seasons/[^/]+/venue-candidates$"),
-    re.compile(r"^/api/v2/setup/seasons/[^/]+/venue-access$"),
-    re.compile(r"^/api/scheduler/scenarios/[^/]+$"),
-    re.compile(r"^/api/standings/[^/]+$"),
-    re.compile(r"^/api/standings/league-season/[^/]+/[^/]+$"),
-)
-
-
+# into ``do_GET``. ``runtime_context_read_spec`` resolves the five explicit
+# registry markers and raises on ambiguity, so the fence cannot pick whichever
+# overlapping policy happened to appear first.
 def is_context_scoped_read(path: str) -> bool:
-    return any(rx.match(path) for rx in CONTEXT_SCOPED_READ_ROUTES)
+    return runtime_context_read_spec(path) is not None
 
 
 # Sensitive POST routes that must durably audit a denial at do_POST's
@@ -1665,8 +1661,8 @@ class Handler(BaseHTTPRequestHandler):
         for and let the switch commit straight past this request — which is the
         CI failure. PHASE B (binding the ticket to the resolved ``user_id``)
         happens in each listed route's branch below, around the service call —
-        one branch per entry in ``CONTEXT_SCOPED_READ_ROUTES``, which is where
-        the membership criterion and the full per-route enumeration live.
+        one branch per ``RouteSpec.context_read_fence`` marker, whose complete
+        membership criterion and per-route enumeration live above.
 
         The ticket is released in ``finally`` — including when the response
         write raises ``BrokenPipeError`` on a vanished client — so no gate hold
@@ -1691,9 +1687,10 @@ class Handler(BaseHTTPRequestHandler):
         service call, then release BEFORE the response is written — a slow or
         dead client socket must never be able to pin the gate.
 
-        A request that reached here without an arrival ticket (a route not in
-        ``CONTEXT_SCOPED_READ_ROUTES``) takes nothing, so adding the hold to a
-        branch is inert until the route is also listed there.
+        A request that reached here without an arrival ticket (a route whose
+        ``RouteSpec.context_read_fence`` is false) takes nothing, so adding the
+        hold to a branch is inert until the route is also marked in the
+        registry.
         """
         ticket = self._context_read_ticket
         if ticket is None:
@@ -2866,8 +2863,8 @@ class Handler(BaseHTTPRequestHandler):
             # mid-read makes that empty answer arrive for a Division the
             # operator has selected and is looking at.
             # The late-arrival discard is wired here for the same reason this
-            # route is in `CONTEXT_SCOPED_READ_ROUTES` at all — that table is
-            # the authoritative definition and every entry gets the same
+            # route has ``RouteSpec.context_read_fence`` at all — that registry
+            # marker is authoritative and every marked entry gets the same
             # treatment. `app.js` does not enrol this read today, so no request
             # carries the header and the branch is INERT until one does; wiring
             # it now is what stops the four routes drifting apart.
@@ -2913,7 +2910,7 @@ class Handler(BaseHTTPRequestHandler):
             # route resolves the active tuple, a switch committing mid-read
             # turns a legitimately-requested table into the generic not_found.
             # THROUGH THE COMMON EPOCH GATE (#159 review finding 1), not the
-            # bare hold: this route is listed in `CONTEXT_SCOPED_READ_ROUTES`
+            # bare hold: this route carries ``RouteSpec.context_read_fence``
             # alongside its per-Division sibling immediately above, and a bare
             # `_context_read_hold` gives it PHASE B's ordering against an
             # in-flight switch but skips the late-arrival epoch comparison

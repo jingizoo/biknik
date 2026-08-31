@@ -244,7 +244,8 @@ class EpochFenceZeroCallHttpBase(ContextReadEpochBase):
     # scenarios use a DELIBERATELY minimal season rather than that table's
     # richly-populated one) ----------------------------------------------
     def _routes_for(self, season_id):
-        """The 5 ``CONTEXT_SCOPED_READ_ROUTES`` entries against ``season_id``.
+        """The five ``RouteSpec.context_read_fence`` entries against
+        ``season_id``.
         Deliberately-nonexistent scenario/division/league ids for the three
         routes that need one: this file only needs the scoped-read SERVICE
         METHOD to be genuinely CALLABLE (and therefore genuinely observable
@@ -418,8 +419,9 @@ class EpochFenceZeroCallHttpBase(ContextReadEpochBase):
         moves, to `(None, None, None)`.
 
         RUN AGAINST BOTH ROUTES an Official can actually reach -- not just
-        one. Of the 5 `CONTEXT_SCOPED_READ_ROUTES`, THREE (venue-candidates,
-        venue-access, scenario) are gated `_operator_only` (MANAGE_SETUP)
+        one. Of the five `RouteSpec.context_read_fence` entries, THREE
+        (venue-candidates, venue-access, scenario) are gated `_operator_only`
+        (MANAGE_SETUP)
         even as GETs (confirmed directly against `web/server.py`'s own
         dispatch -- an Official reading any of them gets a bare 403 before
         ever reaching the scoped-read machinery this file exercises, at
