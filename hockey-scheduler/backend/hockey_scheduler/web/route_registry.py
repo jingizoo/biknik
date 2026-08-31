@@ -41,12 +41,14 @@ Each spec carries BOTH
                 compares templates and separately proves that each
                 ``pattern`` expands to exactly its own ``template``.
 
-What is NOT here
-----------------
-* ``CONTEXT_SCOPED_READ_ROUTES`` in ``server.py`` still exists as a separate,
-  hand-maintained table and is still the code path that runs; this file only
-  CROSS-CHECKS it against this registry (see the gate). Rewiring it is
-  separate, later work (#202 enforcement) -- narrower in scope than this step.
+Runtime contract status
+-----------------------
+* The exact-Season context-read fence is no longer a separate, hand-maintained
+  server table (#202 enforcement step). The five qualifying ``RouteSpec`` rows
+  carry ``context_read_fence=True`` and ``server.py`` resolves that metadata
+  before dispatch. The marker is deliberately independent of ``scope_axis``:
+  many routes are scoped, but only caller-named targets ceilinged to the
+  persisted active Season need ordering against a context switch.
 * ``_GET_ROUTES`` / ``_POST_ROUTES`` in ``server.py`` are NO LONGER a second
   hand-maintained table (#202 wiring step): they are now derived directly from
   ``REGISTRY`` at import time. Every concrete GET ``kind="route"`` is admitted
@@ -140,6 +142,11 @@ class RouteSpec:
              Complex/resource-scoped labels remain handler-enforced. Only
              ``get_empty_path`` (an unreachable-over-HTTP fallback shape)
              stays UNCLASSIFIED.
+    context_read_fence
+             ``True`` only when this GET compares a caller-named target with
+             the persisted active Season and therefore must be ordered against
+             a context switch. Runtime resolution is fail-closed on ambiguous
+             matches and rejects markers on anything but a concrete GET.
     note     free text; provenance for the odd entries.
     """
 
@@ -151,6 +158,7 @@ class RouteSpec:
     kind: str = "route"
     auth: str = UNCLASSIFIED
     scope_axis: str = UNCLASSIFIED
+    context_read_fence: bool = False
     note: str = ""
 
     @property
@@ -759,6 +767,7 @@ REGISTRY = (
               "/api/scheduler/scenarios/{}", "get_scheduler_scenarios_id",
               "_dispatch_get",
               auth="operator_only", scope_axis="cross",
+              context_read_fence=True,
               note=("#202: _operator_only('/api/scheduler/commit') "
                     "(server.py:2026), user_id is None -> 401 (server.py:"
                     "2032-2035). get_schedule_scenario (service.py:"
@@ -808,6 +817,7 @@ REGISTRY = (
               "/api/standings/league-season/{}/{}",
               "get_standings_league_season_id_id", "_dispatch_get",
               auth="session", scope_axis="cross",
+              context_read_fence=True,
               note=("#202: _resolve_role (server.py:1945), user_id is "
                     "None -> 401 (server.py:1949-1952). "
                     "get_league_season_standings (service.py:6149-6191) "
@@ -818,6 +828,7 @@ REGISTRY = (
     RouteSpec("GET", r"^/api/standings/[^/]+$", "/api/standings/{}",
               "get_standings_id", "_dispatch_get",
               auth="session", scope_axis="cross",
+              context_read_fence=True,
               note=("#202: _resolve_role (server.py:1904), user_id is "
                     "None -> 401 (server.py:1908-1911). get_standings "
                     "(service.py:6012-6048) compares the named Division's "
@@ -923,6 +934,7 @@ REGISTRY = (
               "/api/v2/setup/seasons/{}/venue-access",
               "get_v2_setup_seasons_id_venue_access", "_dispatch_get",
               auth="operator_only", scope_axis="season",
+              context_read_fence=True,
               note=(
                     "#202: _operator_only('/api/setup/player') (server.py:1627-1628) "
                     "-> MANAGE_SETUP, then role/user_id are resolved again for the "
@@ -938,6 +950,7 @@ REGISTRY = (
               "/api/v2/setup/seasons/{}/venue-candidates",
               "get_v2_setup_seasons_id_venue_candidates", "_dispatch_get",
               auth="operator_only", scope_axis="season",
+              context_read_fence=True,
               note=(
                     "#202: _operator_only(guard) (server.py:1510-1511) -> "
                     "MANAGE_SETUP, role/user_id resolved again (server.py:1512-1515, "
@@ -2580,6 +2593,39 @@ BY_KEY = {spec.key: spec for spec in REGISTRY}
 BY_NAME = {spec.name: spec for spec in REGISTRY}
 
 
+def context_scoped_read_specs(registry=None):
+    """Return the concrete GET contracts that need the context-read fence.
+
+    A marker on any other structural class is a registry defect, not metadata
+    to ignore. Reject it when the registry is loaded (and in injected contract
+    tests) so a misspelt method or retagged route cannot silently disable the
+    fence.
+    """
+    specs = REGISTRY if registry is None else registry
+    invalid_values = tuple(
+        spec.name for spec in specs
+        if type(spec.context_read_fence) is not bool)
+    if invalid_values:
+        raise RuntimeError(
+            "Context-read fence must be a boolean on: "
+            + ", ".join(invalid_values))
+    marked = tuple(spec for spec in specs if spec.context_read_fence is True)
+    invalid = tuple(spec.name for spec in marked
+                    if spec.method != "GET" or spec.kind != "route")
+    if invalid:
+        raise RuntimeError(
+            "Context-read fence is only valid on concrete GET routes: "
+            + ", ".join(invalid))
+    return marked
+
+
+# A derived inventory for exhaustive tests and documentation. Runtime lookup
+# still uses ``runtime_context_read_spec`` so an ambiguous match fails closed.
+CONTEXT_SCOPED_READ_SPECS = context_scoped_read_specs()
+_CONTEXT_SCOPED_READ_MATCHERS = tuple(
+    (spec, re.compile(spec.pattern)) for spec in CONTEXT_SCOPED_READ_SPECS)
+
+
 def runtime_get_auth_spec(path: str, registry=None):
     """Return the one simple unscoped GET policy matching ``path``.
 
@@ -2601,4 +2647,25 @@ def runtime_get_auth_spec(path: str, registry=None):
     if len(matches) > 1:
         raise RuntimeError(
             "Ambiguous RouteSpec runtime authorization for " + path)
+    return matches[0] if matches else None
+
+
+def runtime_context_read_spec(path: str, registry=None):
+    """Return the one context-read-fenced contract matching ``path``.
+
+    ``None`` means this GET does not compare a caller-named target with the
+    persisted active Season. More than one match is a registry defect and
+    fails closed rather than choosing whichever regex happened to come first.
+    Query parameters never participate in route identity.
+    """
+    path = path.split("?", 1)[0]
+    if registry is None:
+        matches = [spec for spec, pattern in _CONTEXT_SCOPED_READ_MATCHERS
+                   if pattern.match(path)]
+    else:
+        matches = [spec for spec in context_scoped_read_specs(registry)
+                   if re.match(spec.pattern, path)]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "Ambiguous RouteSpec context-read fence for " + path)
     return matches[0] if matches else None

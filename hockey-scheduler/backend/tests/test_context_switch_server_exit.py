@@ -26,9 +26,9 @@ load-bearing assertions are (a) the persisted tuple is still the OLD one while
 the read is held, (b) the read answers 200 for the Season it named, and (c) the
 switch's commit timestamp is strictly after the read handler's exit timestamp.
 
-ONE CASE PER LISTED ROUTE, because the route table is a claim about coverage
-and is tested as one. ``CONTEXT_SCOPED_READ_ROUTES`` states its own admission
-criterion, and applying that criterion to the code rather than to the CI
+ONE CASE PER MARKED ROUTE, because the registry contract is a claim about
+coverage and is tested as one. ``RouteSpec.context_read_fence`` has an explicit
+admission criterion, and applying that criterion to the code rather than to the CI
 incident finds four routes, not the two the incident happened to hit: the two
 venue reads, ``GET /api/scheduler/scenarios/<id>`` (whose ceiling is
 ``_scenario_in_active_tuple`` and whose mismatch is the generic
@@ -613,10 +613,10 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
                                       "venue-access")
 
     # ----------------------------------------------------------------------
-    # THE ROUTE TABLE IS A CLAIM ABOUT COVERAGE, so it is tested as one.
+    # THE REGISTRY CLASS IS A CLAIM ABOUT COVERAGE, so it is tested as one.
     #
-    # `CONTEXT_SCOPED_READ_ROUTES` states its own admission criterion: a route
-    # belongs there when it has the exact-selected-Season ceiling
+    # `RouteSpec.context_read_fence` has an explicit admission criterion: a
+    # route belongs there when it has the exact-selected-Season ceiling
     # (`season_id != active_season.id`). Two routes were listed; three more
     # GET routes reach that comparison, and two of them apply it to a
     # CALLER-NAMED record and answer generically when it does not match — the

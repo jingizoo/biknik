@@ -11,10 +11,10 @@ looking at. CI reproduced exactly that on
 ``/api/v2/setup/seasons/<id>/venue-candidates`` (run 31504917446, browser shard
 1, phone leg).
 
-WHICH ROUTES, and why that is a table and not a rule of thumb. The authoritative
-list is ``CONTEXT_SCOPED_READ_ROUTES`` in ``web/server.py``, which carries the
-per-route enumeration and the criterion a route must meet to be in it. Five
-routes are listed today: the two venue reads above, ``GET
+WHICH ROUTES, and why that is an explicit contract rather than a rule of thumb.
+The authoritative markers are ``RouteSpec.context_read_fence`` in
+``web/route_registry.py``; ``web/server.py`` carries the criterion a route must
+meet. Five routes are marked today: the two venue reads above, ``GET
 /api/scheduler/scenarios/<id>`` (refused as ``_scenario_not_found``), ``GET
 /api/standings/<division_id>`` (whose mismatch is the generic EMPTY standings
 shape — a wrong answer that looks like a real one), and ``GET
@@ -25,7 +25,7 @@ only the two it had a failure for. The fifth is the newest and arrived by the
 route acquiring the ceiling rather than by an audit finding one already there:
 before #202 it resolved no tuple at all — it answered ANONYMOUS callers — so it
 genuinely did not qualify, and listing it then would have been wrong. If a
-route grows the exact-selected-Season ceiling later, it belongs in that table,
+route grows the exact-selected-Season ceiling later, it needs that marker,
 and this paragraph is here so that is not rediscovered from an outage.
 
 WHY THE CLIENT CANNOT FIX IT. ``app.js`` enrols those reads in an

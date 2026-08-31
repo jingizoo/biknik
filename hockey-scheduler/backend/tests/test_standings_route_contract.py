@@ -31,7 +31,7 @@ is meant to be the same, so the pair cannot silently diverge again:
     neither becomes an existence oracle;
   * the operator/public divergence itself, in both directions, so a future
     "these are the same, just make it public" simplification fails here;
-  * membership of both routes in `CONTEXT_SCOPED_READ_ROUTES` — the
+  * membership of both routes in the `RouteSpec.context_read_fence` class — the
     LeagueSeason route only earned that by acquiring the ceiling in #202.
 """
 
@@ -362,7 +362,7 @@ class StandingsRouteContract:
                              (key, body))
 
     def test_both_operator_routes_are_context_scoped_reads(self):
-        """Structural pin of the pairing in `CONTEXT_SCOPED_READ_ROUTES`. Both
+        """Structural pin of the `RouteSpec.context_read_fence` pairing. Both
         routes now resolve the active tuple inside the request and refuse a
         caller-named target against it, so both need the #159 gate's arrival
         ordering; the public siblings resolve no tuple and must stay out."""
