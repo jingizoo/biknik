@@ -1,9 +1,11 @@
 """Shared test helpers: a deterministic clock and a small game builder."""
 
+import contextlib
 import os
 import re
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -153,6 +155,194 @@ def fresh_sql_store(url):
     return store
 
 
+def end_membership_directly(store, membership_id, status="released"):
+    """Move a SeasonRosterMembership straight to a TERMINAL status via the
+    STORE layer, bypassing ``SetupService.set_season_roster_membership_
+    status`` entirely.
+
+    #205 review round 2 (owner product ruling, overriding round 1 finding
+    5's shipped "actor_id + reason" floor): that service method now hard-
+    refuses EVERY terminal transition (released/transferred), for any
+    actor_id/reason, unconditionally — no caller can reach one through it
+    any more. Several existing Slice-A tests need an ALREADY-terminal
+    membership only as a PRECONDITION for something ELSE they exercise
+    (e.g. "a terminal membership does not block unregister/transfer",
+    unlike a live one; "release frees a jersey number") — not to test the
+    transition method's own authorization, which is exactly what the owner
+    ruling says must be reconstructed this way rather than weakened back
+    open. A membership moved this way carries no ``status_changed`` event
+    and no audit row (a direct write, not a service call) — callers whose
+    assertions count events/audits need to account for that.
+    """
+    from hockey_scheduler.domain import MembershipStatus
+    m = store.get_season_roster_membership(membership_id)
+    m.status = MembershipStatus(status)
+    store.save_season_roster_membership(m)
+    return m
+
+
+def end_parity_stints_directly(store, player_id, status="transferred"):
+    """Move every LIVE membership of ``player_id`` to a TERMINAL status via
+    the STORE layer (see ``end_membership_directly`` above for why the
+    service surface cannot do this yet).
+
+    #205 substitute cutover plumbing: the parity dual-write auto-opens an
+    ACTIVE stint for every facade-created active player on an actively
+    registered team, and the landed stranding guards then rightly block
+    ``unregister_team_from_season`` / ``transfer_team_to_league`` while
+    that stint is live. Tests whose SUBJECT is one of those other mutations
+    end the auto-opened stints this way first — the operator action the
+    production refusal message itself demands ("release/transfer them
+    first"), reconstructed out-of-band because the governed workflow ships
+    in a later #205 slice."""
+    from hockey_scheduler.domain import MembershipStatus
+    ended = []
+    for m in store.memberships_for_player(player_id):
+        if m.status not in (MembershipStatus.RELEASED,
+                            MembershipStatus.TRANSFERRED):
+            ended.append(end_membership_directly(store, m.id, status))
+    return ended
+
+
+def clear_membership_rows_directly(store, player_id):
+    """Physically remove ``player_id``'s SeasonRosterMembership rows AND
+    their events at the STORE layer — NOT a lifecycle transition.
+
+    #205 substitute cutover plumbing for HARD-DELETE probes only: the
+    landed #205 service rule blocks ``delete_player`` while ANY membership
+    row (even terminal) exists, and the store-level FK enforces the same
+    (that posture is pinned by test_membership_parent_mutation_guards and
+    must stay). A handful of pre-cutover tests hard-delete a player purely
+    as PLUMBING for something else they exercise (context fail-closed on a
+    deleted subject, account-scope rejection for a deleted player, the
+    route-authorization positive delete case) — post-cutover their
+    facade-created players carry an auto-opened stint, so the precondition
+    "a player with no membership rows" is reconstructed here out-of-band,
+    exactly like the direct writes above. Never use this to bypass the
+    delete guards in a test ABOUT deletion behavior."""
+    memberships = list(store.memberships_for_player(player_id))
+    ids = {m.id for m in memberships}
+    from hockey_scheduler.store import InMemoryStore
+    if isinstance(store, InMemoryStore):
+        store.season_roster_membership_events = {
+            eid: e for eid, e in store.season_roster_membership_events.items()
+            if e.membership_id not in ids}
+        for mid in ids:
+            store.season_roster_memberships.pop(mid, None)
+    else:
+        with store.transaction():
+            store._exec(
+                "DELETE FROM season_roster_membership_events WHERE"
+                " membership_id IN (SELECT id FROM season_roster_memberships"
+                " WHERE player_id = ?)", (player_id,))
+            store._exec("DELETE FROM season_roster_memberships"
+                        " WHERE player_id = ?", (player_id,))
+    return memberships
+
+
+def race_with_forced_order(url, gate_method, first, second, timeout=5):
+    """Run ``first(store)`` and ``second(store)`` concurrently, each on its
+    OWN new real-PostgreSQL ``SqlStore(url)`` connection/thread, but force
+    ``first``'s call to store method ``gate_method`` to reach PostgreSQL
+    strictly BEFORE ``second``'s call to the SAME method — deterministically,
+    on EVERY run (#205 review round 2: owner ruling + review finding 3).
+
+    Replaces "launch both simultaneously and hope OS/DB scheduling samples
+    both orderings across N rounds" (every real-Postgres race test in this
+    PR's round 1 shape, including the already-superseded round-1
+    CreateVsUnregisterRaceTest fix that tried to patch that approach by
+    widening 8 rounds to 80 rather than making the ordering itself
+    deterministic — a correct implementation could still flake without ever
+    exercising the reverse order, and an incorrect one could hide behind
+    whichever ordering happened to sample less). Calling this ONCE per
+    desired ordering — with the callables in one order, then swapped —
+    deterministically forces BOTH orderings, once each, and each call's
+    result is fully attributable to that specific forced ordering: no
+    round-count, no "both orderings occurred across N samples" statistics.
+
+    Mechanism: ``first``'s connection has ``gate_method`` wrapped so the
+    REAL underlying call runs immediately, and a ``threading.Event`` is set
+    the instant it returns. ``second``'s connection has the SAME method
+    wrapped to wait on that Event BEFORE ever invoking the real call. Since
+    ``gate_method`` is always a ``..._for_update`` row lock (``SELECT ...
+    FOR UPDATE``, held until the surrounding ``@_transactional``
+    transaction commits/rolls back — see ``SqlStore._get_for_update``) or
+    the exact write statement contending on a unique index, ``second``'s
+    call cannot even be DISPATCHED to PostgreSQL until ``first``'s own call
+    to the identical statement has already returned — which, for a row
+    lock, cannot happen until ``first``'s ENTIRE transaction has already
+    resolved (Postgres holds a FOR UPDATE lock across the whole
+    transaction, not just the one statement). So by the time ``second``'s
+    gated call unblocks, ``first`` has not merely "gone first" in call
+    order — its whole operation, commit included, has ALREADY happened;
+    ``second`` deterministically observes ``first``'s fully-committed
+    effect, with no residual timing ambiguity of the kind the old barrier-
+    based approach had (see the module/class docstrings this replaces).
+
+    ``first``/``second`` each receive their own wrapped ``SqlStore`` and are
+    responsible for constructing whatever they call it through (a bare
+    store write, or an ``ApiService``) and returning/raising whatever their
+    own assertions need to see. This helper only controls ordering and
+    connection lifecycle (both stores are always closed). Any exception
+    ``first``/``second`` raises is CAPTURED, not propagated — returned in
+    place of a normal result — so a raising callable (e.g. a raw store
+    write hitting a real ``IntegrityConflictError``) is handled the same
+    way a normal return value is, and both threads are always joined
+    before this returns. Raises ``AssertionError`` if either thread fails
+    to terminate within ``timeout`` seconds of the join deadline (a stuck
+    thread is a bug in the test or the code under test, never silently
+    treated as "no result")."""
+    from hockey_scheduler.store import SqlStore
+
+    gate = threading.Event()
+    results = {}
+
+    def _wrap_release(store):
+        original = getattr(store, gate_method)
+
+        def wrapped(*args, **kwargs):
+            result = original(*args, **kwargs)
+            gate.set()
+            return result
+
+        setattr(store, gate_method, wrapped)
+
+    def _wrap_wait(store):
+        original = getattr(store, gate_method)
+
+        def wrapped(*args, **kwargs):
+            if not gate.wait(timeout=timeout):
+                raise AssertionError(
+                    f"race_with_forced_order: 'first' side never reached "
+                    f"{gate_method!r} within {timeout}s")
+            return original(*args, **kwargs)
+
+        setattr(store, gate_method, wrapped)
+
+    def _run(role, fn, wrap):
+        store = SqlStore(url)
+        wrap(store)
+        try:
+            results[role] = fn(store)
+        except BaseException as exc:  # noqa: BLE001 - captured, never swallowed
+            results[role] = exc
+        finally:
+            store.close()
+
+    threads = [threading.Thread(target=_run, args=("first", first, _wrap_release)),
+              threading.Thread(target=_run, args=("second", second, _wrap_wait))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=timeout + 10)
+    still_alive = [t for t in threads if t.is_alive()]
+    if still_alive:
+        raise AssertionError(
+            f"race_with_forced_order: {len(still_alive)} thread(s) did not "
+            f"terminate")
+    return results["first"], results["second"]
+
+
 def cookie_from_set_cookie(set_cookie_header, name):
     """Extract a single cookie's ``name=value`` from a Set-Cookie header.
 
@@ -262,3 +452,60 @@ def select_and_confirm(service, game_id, player_ids, coach="coach_1"):
 
     for pid in player_ids:
         service.set_availability(game_id, pid, AvailabilityStatus.AVAILABLE)
+
+
+# --------------------------------------------------------------------------
+# "zero write ATTEMPTS", the observation a snapshot diff cannot make
+# --------------------------------------------------------------------------
+WRITE_METHOD_PREFIXES = ("save_", "add_", "upsert_", "insert_", "update_",
+                         "delete_", "remove_", "clear_", "next_id")
+
+
+@contextlib.contextmanager
+def write_attempt_spy(store):
+    """Record every STORE WRITE METHOD CALLED on ``store``, whether or not it
+    survived, for the duration of the block.
+
+    A SNAPSHOT DIFF CANNOT PROVE WHAT THIS IS FOR. Every gated mutation in
+    the #205 family is wrapped in a single transaction, so a guard placed
+    AFTER the first write still leaves an empty before/after diff — the raise
+    rolls it back on Memory, SQLite and PostgreSQL alike. "Zero writes" is an
+    ORDERING property, and only a spy on the ATTEMPTS can see it.
+
+    Patched on the INSTANCE and removed in ``finally`` (``delattr`` restores
+    the bound class method). The number of methods actually wrapped is
+    asserted, so a store-layer rename that empties
+    ``WRITE_METHOD_PREFIXES`` fails loudly instead of quietly turning this
+    into a spy that can never fire.
+
+    Shared by ``test_coach_team_authorization`` and
+    ``test_batch_effective_team`` so both files' "zero write attempts" claims
+    mean exactly the same thing, checked by one implementation.
+    """
+    calls = []
+    originals = {}
+    for name in dir(store):
+        if not name.startswith(WRITE_METHOD_PREFIXES):
+            continue
+        attr = getattr(store, name, None)
+        if not callable(attr):
+            continue
+        originals[name] = attr
+
+        def make(n, orig):
+            def spy(*a, **kw):
+                calls.append(n)
+                return orig(*a, **kw)
+            return spy
+
+        setattr(store, name, make(name, attr))
+    if len(originals) <= 10:
+        raise AssertionError(
+            f"write_attempt_spy wrapped only {sorted(originals)} — the "
+            f"write prefixes no longer match this store's API, so this spy "
+            f"could never fire")
+    try:
+        yield calls
+    finally:
+        for name in originals:
+            delattr(store, name)

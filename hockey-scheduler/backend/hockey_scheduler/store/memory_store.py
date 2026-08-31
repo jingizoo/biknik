@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from ..domain import (
     ActiveContext,
+    AgeEligibilityRule,
     AuditLog,
     CalendarFeedToken,
     Club,
@@ -25,6 +26,7 @@ from ..domain import (
     SchedulingPolicy,
     GameResult,
     ContactDestination,
+    DataAccessLog,
     DeliveryStatus,
     DeviceToken,
     FactoryResetChallenge,
@@ -32,6 +34,7 @@ from ..domain import (
     FactoryResetLock,
     League,
     LeagueSeason,
+    MembershipStatus,
     Program,
     Notification,
     NotificationDelivery,
@@ -47,8 +50,12 @@ from ..domain import (
     Rink,
     ScheduleScenario,
     Season,
+    SeasonCopyForwardCommit,
+    SeasonRosterMembership,
+    SeasonRosterMembershipEvent,
     SeasonTeamRegistration,
     SeasonVenueAccess,
+    SensitiveFieldCategory,
     TeamLeagueMigrationDecision,
     Session,
     SetupAuditLog,
@@ -56,8 +63,10 @@ from ..domain import (
     Team,
     UserAccount,
     Organization,
+    VALID_OUTCOMES,
     Venue,
 )
+from ..domain.errors import IntegrityConflictError, ValidationError
 
 
 class InMemoryStore:
@@ -80,6 +89,11 @@ class InMemoryStore:
         self.league_seasons: Dict[str, LeagueSeason] = {}
         self.divisions: Dict[str, Division] = {}
         self.season_team_registrations: Dict[str, SeasonTeamRegistration] = {}
+        self.season_copy_forward_commits: Dict[
+            str, SeasonCopyForwardCommit] = {}
+        self.season_roster_memberships: Dict[str, SeasonRosterMembership] = {}
+        self.season_roster_membership_events: Dict[
+            str, SeasonRosterMembershipEvent] = {}
         self.team_league_migration_decisions: Dict[
             str, TeamLeagueMigrationDecision] = {}
         self.season_venue_access: Dict[str, SeasonVenueAccess] = {}
@@ -89,6 +103,7 @@ class InMemoryStore:
         self.ice_slots: Dict[str, IceSlot] = {}
         self.scheduling_policies: Dict[str, SchedulingPolicy] = {}
         self.schedule_scenarios: Dict[str, ScheduleScenario] = {}
+        self.age_eligibility_rules: Dict[str, AgeEligibilityRule] = {}
         self.officials: Dict[str, Official] = {}
         self.official_assignments: Dict[str, OfficialAssignment] = {}
         self.game_results: Dict[str, GameResult] = {}
@@ -107,6 +122,10 @@ class InMemoryStore:
         self.guardian_links: Dict[str, GuardianLink] = {}
         self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
+        # Durable sensitive-read audit (#124). A plain list attribute so the
+        # generic transaction snapshot, clear_all_data() and row_counts()
+        # machinery all cover it exactly like the other audit surfaces.
+        self.data_access: List[DataAccessLog] = []
         # Never cleared by clear_all_data() (#256) — the durable record of a
         # production factory-reset attempt must survive the wipe it describes.
         self.factory_reset_events: List[FactoryResetEvent] = []
@@ -125,11 +144,33 @@ class InMemoryStore:
         self._lock = threading.RLock()
         # Depth of the current (possibly nested) transaction; 0 = none open.
         self._txn_depth = 0
+        # The epoch fence's persisted version counters (PR #423 round-N
+        # review finding 1) — bumped by epoch_fence_acquire_exclusive, on the
+        # SAME transaction as everything else that call's writer does, so it
+        # rolls back with the rest via _snapshot()/_restore() (a plain dict
+        # attribute, not in _NON_SNAPSHOT — dicts are already handled
+        # generically by _snapshot_value's shallow-copy branch). Keyed PER
+        # FENCE KEY (mirroring the advisory lock's own user:<id>/global
+        # split — migration 052's own docstring explains why a single shared
+        # counter was tried and reverted: it broke cross-user independence).
+        # A key with no entry has never been bumped and reads as version 0 —
+        # see SqlStore.current_epoch_fence_version's own docstring for the
+        # read-side contract this mirrors.
+        self._epoch_fence_versions: Dict[str, int] = {}
+        # DataAccessLog rows queued by add_data_access_durable() while nested
+        # inside an ambient transaction, to be flushed once that transaction
+        # has FULLY concluded regardless of outcome (#426 review finding 4)
+        # — see transaction()'s finally and add_data_access_durable()'s own
+        # docstring. Bookkeeping, not application data: excluded from
+        # _NON_SNAPSHOT below like _lock/_txn_depth, never itself rolled
+        # back.
+        self._pending_durable_data_access: List[DataAccessLog] = []
 
     # Instance attributes that are NOT part of the persisted state and so must
     # never be snapshotted/restored by a transaction (the lock is unpicklable
     # and the depth counter drives the rollback machinery itself).
-    _NON_SNAPSHOT = frozenset({"_lock", "_txn_depth"})
+    _NON_SNAPSHOT = frozenset(
+        {"_lock", "_txn_depth", "_pending_durable_data_access"})
 
     # Snapshot invariant: a stored dataclass's nested mutable fields (the only
     # ones today are AuditLog.detail, SetupAuditLog.detail and
@@ -212,7 +253,7 @@ class InMemoryStore:
                 value.clear()
 
     @contextmanager
-    def transaction(self, isolation=None):
+    def transaction(self, isolation=None, read_only=False):
         """Atomic, reentrant unit of work — the shared store transaction contract.
 
         ``isolation`` (e.g. ``"SERIALIZABLE"``) is accepted for parity with
@@ -220,6 +261,21 @@ class InMemoryStore:
         lock already fully serializes every transaction, so all reads inside one
         transaction observe a single consistent snapshot with no concurrent
         interleaving — the strongest isolation, for free.
+
+        ``read_only`` (round-N+2 regression fix, PR #423) is likewise accepted
+        for parity with :class:`SqlStore` and is likewise a **no-op** here: the
+        re-entrant lock this method takes below (``self._lock``, a single
+        per-instance ``threading.RLock`` — see its many "transaction() holds
+        self._lock for its whole body" call-site comments throughout this
+        file) is already the ONLY thing serializing access to this store, at
+        full strength, regardless of whether the caller intends to write —
+        there is no second, weaker lock tier for a promise of read-only-ness
+        to relax. The SQLite store's own ``read_only`` fixes a real contention
+        bug specific to ITS two-tier SHARED/RESERVED FILE locking, which this
+        store has no analogue of at all (there is no second connection, and no
+        file); so nothing here needed to change — the parameter exists purely
+        so a caller (e.g. ``ContextService._snapshot``) can pass the identical
+        keyword to whichever backend it happens to be holding.
 
         Contract (identical observable behavior in every store implementation):
 
@@ -250,6 +306,18 @@ class InMemoryStore:
                 raise
             finally:
                 self._txn_depth -= 1
+                # #426 review finding 4: flush any DataAccessLog rows queued
+                # by add_data_access_durable() while nested inside the
+                # transaction that JUST concluded. Runs AFTER _restore()
+                # above (so a flushed row is never itself wiped by the
+                # rollback it is surviving) and regardless of commit vs
+                # rollback — a durable row is never contingent on the
+                # ambient unit's own outcome. Guarded by `outermost` (via
+                # the depth check) so a nested transaction() never triggers
+                # a premature flush of its enclosing caller's still-open
+                # unit.
+                if self._txn_depth == 0 and self._pending_durable_data_access:
+                    self._flush_pending_durable_data_access()
 
     def close(self) -> None:
         pass
@@ -264,16 +332,25 @@ class InMemoryStore:
                 "current": True}
 
     # -- id generation -----------------------------------------------------
+    def next_seq(self, prefix: str) -> int:
+        """Increment and return the RAW per-prefix counter (#205 review round
+        1 finding 4) — the same counter :meth:`next_id` formats into a
+        string id, exposed here so a caller that also needs a genuinely
+        sortable integer (e.g. ``SeasonRosterMembershipEvent.seq``) can mint
+        both from ONE atomic step rather than drawing two different
+        numbers."""
+        with self._lock:
+            value = self._counters.get(prefix, 0) + 1
+            self._counters[prefix] = value
+            return value
+
     def next_id(self, prefix: str) -> str:
         # itertools.count's next() was a single atomic step; a plain
         # read-modify-write is not, and next_id() may be called outside a
         # transaction on the threaded server, so serialize it to avoid two
         # requests handing out the same id. The lock is the same re-entrant one
         # transaction() holds, so calling this from within a transaction is safe.
-        with self._lock:
-            value = self._counters.get(prefix, 0) + 1
-            self._counters[prefix] = value
-            return f"{prefix}_{value}"
+        return f"{prefix}_{self.next_seq(prefix)}"
 
     # -- teams / players ---------------------------------------------------
     def add_team(self, team: Team) -> Team:
@@ -373,6 +450,177 @@ class InMemoryStore:
     def add_audit(self, entry: AuditLog) -> AuditLog:
         self.audit.append(entry)
         return entry
+
+    # -- sensitive-read audit (#124; ordering/validation/durability #426) ---
+    #: Dedicated counter key for the audit log's own monotonic ordering key
+    #: — deliberately NOT an id prefix (``next_id("daccess")`` already owns
+    #: row ids; this is a separate counter, see domain/privacy.py's
+    #: ORDERING section and SqlStore's identical ``_DATA_ACCESS_SEQ_PREFIX``).
+    _DATA_ACCESS_SEQ_KEY = "__data_access_seq__"
+
+    def _next_data_access_seq(self) -> int:
+        with self._lock:
+            value = self._counters.get(self._DATA_ACCESS_SEQ_KEY, 0) + 1
+            self._counters[self._DATA_ACCESS_SEQ_KEY] = value
+            return value
+
+    def _validate_data_access(self, entry: DataAccessLog) -> None:
+        """Closed-vocabulary + uniqueness guard (#426 review finding 5),
+        mirroring SqlStore's Python-side check and migration 053's CHECK/
+        UNIQUE constraints — so a MemoryStore-backed demo/test run rejects
+        exactly what a real database would, rather than silently accepting
+        an invalid outcome/category or a duplicate id list.append() never
+        would have caught on its own (a plain list has no primary key).
+
+        The uniqueness half is skipped while ``entry.id`` is still ``None``
+        (#426 round-2 review finding 1): a durable write nested inside an
+        ambient transaction is validated once EAGERLY, before an id has
+        been assigned (id allocation is deferred to flush time — see
+        ``add_data_access_durable``), and re-validated in full, id
+        included, once flushed. Comparing on ``id`` while it is still
+        unset would be worse than a no-op — TWO SEPARATE unassigned
+        entries queued in the same ambient transaction both carry
+        ``id=None``, and ``None == None`` is True, so an unguarded
+        comparison here would misreport the second of any two legitimate
+        nested denials as a duplicate of the first.
+        """
+        cat = entry.category
+        cat_value = cat.value if isinstance(cat, SensitiveFieldCategory) else cat
+        if cat_value not in {c.value for c in SensitiveFieldCategory}:
+            raise ValidationError(
+                f"Unknown sensitive-field category {cat_value!r}.")
+        if entry.outcome not in VALID_OUTCOMES:
+            raise ValidationError(
+                f"Unknown DataAccessLog outcome {entry.outcome!r}.")
+        if entry.id is not None and (
+                any(r.id == entry.id for r in self.data_access)
+                or any(r.id == entry.id
+                       for r in self._pending_durable_data_access)):
+            raise IntegrityConflictError(
+                "The change conflicts with an existing record.",
+                details={"reason": "unique_violation"})
+
+    def _assign_data_access_id(self, entry: DataAccessLog) -> None:
+        """Assign ``entry.id`` if the caller left it unset (#426 round-2
+        review finding 1). Called at the SAME moment ``entry.seq`` is
+        assigned in every path below — never earlier — so an id is never
+        handed out by a counter state an enclosing rollback could later
+        erase; see ``domain/privacy.py``'s DURABLE ID ALLOCATION section.
+        """
+        if entry.id is None:
+            entry.id = self.next_id("daccess")
+
+    def add_data_access(self, entry: DataAccessLog) -> DataAccessLog:
+        """Append one durable row and return it.
+
+        The CALLER's ``entry`` object is mutated with its real id/seq (a
+        courtesy — existing callers already read them back off the object
+        they passed in), but neither the STORED row nor the RETURNED value
+        is that same object (#426 round-2 review finding 4: "the exact
+        caller-owned DataAccessLog object" stayed mutable through the write
+        API — mutating it, or the return value, after insertion silently
+        corrupted the durable record). Three distinct objects exist once
+        this returns: the caller's ``entry``, the private copy appended to
+        ``self.data_access``, and the private copy handed back — mutating
+        any one of them can never reach either of the other two, matching
+        SQL's inherent immutability (a Python object mutated after
+        ``INSERT`` cannot retroactively change what was already written).
+        """
+        with self._lock:
+            self._assign_data_access_id(entry)
+            self._validate_data_access(entry)
+            entry.seq = self._next_data_access_seq()
+            self.data_access.append(copy.copy(entry))
+            return copy.copy(entry)
+
+    def add_data_access_durable(self, entry: DataAccessLog) -> DataAccessLog:
+        """Write a row that survives regardless of what an AMBIENT
+        (already-open, possibly nested) transaction later does — including a
+        later rollback (#426 review finding 4). See SqlStore's identical
+        method for the full rationale; this store's version is the SAME
+        "failure-safe transaction lifecycle hook" shape, just against
+        ``_txn_depth``/``_restore()`` instead of a real database connection.
+
+        Not nested (``_txn_depth == 0``): id/seq are assigned right here,
+        exactly like ``add_data_access`` — including that method's own
+        caller/stored/returned detachment (#426 round-2 review finding 4).
+        Nested: id/seq are deliberately NOT assigned here (#426 round-2
+        review finding 1) — this entry's row is queued and both are
+        assigned at FLUSH time instead, by
+        ``_flush_pending_durable_data_access``, once the ambient transaction
+        that could still roll back has FULLY concluded. Allocating either
+        one now, inside that still-open ambient transaction, is the exact
+        bug that closes: the queued row survives a rollback by construction
+        (see below), but ``next_id()``'s counter does NOT — it rolls back
+        with everything else — so an id allocated here would already be
+        orphaned from the counter by the time this row is flushed, and the
+        NEXT allocation would hand out the identical id again and collide
+        with the durable row already sitting there. Category/outcome are
+        still checked eagerly, below, so a malformed entry fails loudly at
+        the ORIGINAL call site rather than much later during an unrelated
+        flush; the id-uniqueness half of that same check is there today a
+        no-op (no id exists to compare yet) and is re-run in full, id
+        included, at flush time.
+
+        The QUEUED row is ALSO a private detached copy, made HERE before it
+        is ever appended to ``_pending_durable_data_access`` (#426 round-2
+        review finding 4's "including durable queued rows") — so mutating
+        the caller's ``entry`` (or the value this method returns) ANY time
+        between queueing and the eventual flush can never reach the row
+        that actually gets persisted.
+        """
+        with self._lock:
+            if self._txn_depth == 0:
+                self._assign_data_access_id(entry)
+                self._validate_data_access(entry)
+                entry.seq = self._next_data_access_seq()
+                self.data_access.append(copy.copy(entry))
+            else:
+                self._validate_data_access(entry)
+                self._pending_durable_data_access.append(copy.copy(entry))
+        return copy.copy(entry)
+
+    def _flush_pending_durable_data_access(self) -> None:
+        # Each queued entry is ALREADY a private copy add_data_access_durable
+        # made before queueing it (#426 round-2 review finding 4) — no
+        # caller holds a reference to it, so assigning id/seq in place and
+        # appending it directly (no further copy) is safe.
+        pending, self._pending_durable_data_access = (
+            self._pending_durable_data_access, [])
+        for entry in pending:
+            self._assign_data_access_id(entry)
+            self._validate_data_access(entry)
+            entry.seq = self._next_data_access_seq()
+            self.data_access.append(entry)
+
+    def list_data_access(self, subject_type=None, subject_id=None,
+                         category=None) -> List[DataAccessLog]:
+        """Sensitive-read rows, optionally filtered to one subject and/or one
+        category — the "who read this person's data" query (#124).
+
+        Returns immutable snapshots (#426 review finding 5), NOT the live
+        stored objects: this store used to hand back the SAME dataclass
+        instances it holds internally, so a caller mutating one field of a
+        "returned" row silently corrupted the durable record — an audit
+        trail that is not append-only is not an audit trail. Ordered by
+        ``seq``, matching SqlStore's ``ORDER BY seq`` (never by ``id``,
+        which is a textual label sorted lexicographically, not
+        chronologically — see domain/privacy.py's ORDERING section).
+        """
+        rows = self.data_access
+        if subject_type is not None:
+            rows = [r for r in rows if r.subject_type == subject_type]
+        if subject_id is not None:
+            rows = [r for r in rows if r.subject_id == subject_id]
+        if category is not None:
+            cat_value = (category.value
+                        if isinstance(category, SensitiveFieldCategory)
+                        else category)
+            rows = [r for r in rows
+                   if (r.category.value
+                       if isinstance(r.category, SensitiveFieldCategory)
+                       else r.category) == cat_value]
+        return [copy.copy(r) for r in sorted(rows, key=lambda r: r.seq)]
 
     def audit_for_game(self, game_id: str) -> List[AuditLog]:
         return [a for a in self.audit if a.game_id == game_id]
@@ -596,6 +844,109 @@ class InMemoryStore:
         return next((r for r in self.registrations_for_season(season_id)
                      if r.team_id == team_id), None)
 
+    # -- season roster memberships (#205 Slice A) --------------------------
+    def add_season_roster_membership(
+            self, m: SeasonRosterMembership) -> SeasonRosterMembership:
+        self.season_roster_memberships[m.id] = m
+        return m
+
+    def get_season_roster_membership(
+            self, membership_id: str) -> Optional[SeasonRosterMembership]:
+        return self.season_roster_memberships.get(membership_id)
+
+    def get_season_roster_membership_for_update(
+            self, membership_id: str) -> Optional[SeasonRosterMembership]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.season_roster_memberships.get(membership_id)
+
+    def save_season_roster_membership(
+            self, m: SeasonRosterMembership) -> SeasonRosterMembership:
+        self.season_roster_memberships[m.id] = m
+        return m
+
+    def all_season_roster_memberships(self) -> List[SeasonRosterMembership]:
+        return list(self.season_roster_memberships.values())
+
+    def memberships_for_player(
+            self, player_id: str) -> List[SeasonRosterMembership]:
+        return [m for m in self.season_roster_memberships.values()
+                if m.player_id == player_id]
+
+    def memberships_for_season(
+            self, season_id: str) -> List[SeasonRosterMembership]:
+        return [m for m in self.season_roster_memberships.values()
+                if m.season_id == season_id]
+
+    def memberships_for_league_season_team(
+            self, league_season_id: str,
+            team_id: str) -> List[SeasonRosterMembership]:
+        return [m for m in self.season_roster_memberships.values()
+                if m.league_season_id == league_season_id
+                and m.team_id == team_id]
+
+    def memberships_for_team(
+            self, team_id: str) -> List[SeasonRosterMembership]:
+        """EVERY membership row naming this Team, at ANY LeagueSeason and in
+        ANY status — terminal and parked rows included (#427).
+
+        Deliberately unfiltered, unlike
+        :meth:`memberships_for_league_season_team`. It backs the auto-fill
+        candidate COHORT, which the owner ruled must be the UNION of the
+        legacy team pointers and the team's season-membership rows
+        "including terminal, inactive, wrong-LeagueSeason, and
+        divergent-pointer cases, then deduplicated and classified". Filtering
+        here would drop exactly the players the batch owes the operator a
+        reason for, before the classifier ever sees them — the silent drop in
+        a new form. Every one of these rows is CLASSIFIED by the caller; none
+        of them is seated on the strength of appearing in this list."""
+        return [m for m in self.season_roster_memberships.values()
+                if m.team_id == team_id]
+
+    def active_memberships_for_player_in_season(
+            self, player_id: str,
+            season_id: str) -> List[SeasonRosterMembership]:
+        """Every AUTHORITATIVE (active) membership at this (player, Season)
+        key. Normally 0 or 1 — SQL's ``ux_srm_active_player_season`` partial
+        unique index (migration 059) guarantees it there — but this store has
+        no equivalent enforcement on add/save, so returning the list lets
+        callers detect legacy/corrupted multiplicity instead of assuming a
+        bare lookup is unambiguous (``registrations_for_team_in_league_season``
+        precedent, #331 round 19)."""
+        return [m for m in self.season_roster_memberships.values()
+                if m.player_id == player_id and m.season_id == season_id
+                and m.status is MembershipStatus.ACTIVE]
+
+    def open_memberships_for_player_in_league_season(
+            self, player_id: str,
+            league_season_id: str) -> List[SeasonRosterMembership]:
+        """Every NON-terminal membership at this (player, LeagueSeason) key —
+        the open stint(s); released/transferred rows are history."""
+        return [m for m in self.season_roster_memberships.values()
+                if m.player_id == player_id
+                and m.league_season_id == league_season_id
+                and not m.status.is_terminal]
+
+    # Append-only (#205): events have add + list only — no update, no delete.
+    def add_season_roster_membership_event(
+            self, event: SeasonRosterMembershipEvent
+    ) -> SeasonRosterMembershipEvent:
+        self.season_roster_membership_events[event.id] = event
+        return event
+
+    def events_for_membership(
+            self, membership_id: str) -> List[SeasonRosterMembershipEvent]:
+        # Ordered by the real monotonic ``seq`` (#205 review round 1 finding
+        # 4), not dict insertion order: the two happen to coincide today, but
+        # sorting explicitly makes this store's contract match SqlStore's
+        # (``ORDER BY seq``) instead of relying on an incidental Python
+        # dict-ordering guarantee no docstring here actually promised.
+        return sorted(
+            (e for e in self.season_roster_membership_events.values()
+             if e.membership_id == membership_id),
+            key=lambda e: e.seq)
+
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(
             self, decision: TeamLeagueMigrationDecision
@@ -715,6 +1066,29 @@ class InMemoryStore:
 
     def all_scheduling_policies(self) -> List[SchedulingPolicy]:
         return list(self.scheduling_policies.values())
+
+    # -- versioned age eligibility rules (#273) --------------------------
+    def add_age_eligibility_rule(
+            self, rule: AgeEligibilityRule) -> AgeEligibilityRule:
+        """Store an immutable rule version. Deep-copied on the way in AND on
+        every read (like schedule scenarios): rule rows are append-only
+        history, so no caller may mutate a stored version in place."""
+        stored = copy.deepcopy(rule)
+        self.age_eligibility_rules[stored.id] = stored
+        return copy.deepcopy(stored)
+
+    def get_age_eligibility_rule(
+            self, rule_id: str) -> Optional[AgeEligibilityRule]:
+        rule = self.age_eligibility_rules.get(rule_id)
+        return copy.deepcopy(rule) if rule is not None else None
+
+    def age_eligibility_rules_for_league_season(
+            self, league_season_id: str) -> List[AgeEligibilityRule]:
+        """Every version for one LeagueSeason, ascending by version."""
+        rules = [r for r in self.age_eligibility_rules.values()
+                 if r.league_season_id == league_season_id]
+        rules.sort(key=lambda r: r.version)
+        return [copy.deepcopy(r) for r in rules]
 
     # -- immutable schedule scenarios (#378) -----------------------------
     def add_schedule_scenario(self, scenario: ScheduleScenario) -> ScheduleScenario:
@@ -899,6 +1273,15 @@ class InMemoryStore:
                 return c
         return None
 
+    def get_contact_destination_for_update(
+            self, contact_id: str) -> Optional[ContactDestination]:
+        # No row locking needed (#426 review finding 4, mirroring
+        # get_team_for_update's identical comment): transaction() holds
+        # self._lock for its entire body, so a concurrent upsert can't
+        # interleave with the caller's fetch-then-write. Provided for
+        # interface parity with SqlStore.
+        return self.contact_destinations.get(contact_id)
+
     def all_contact_destinations(self) -> List[ContactDestination]:
         return list(self.contact_destinations.values())
 
@@ -913,6 +1296,39 @@ class InMemoryStore:
 
     def get_device_token(self, token_id: str) -> Optional[DeviceToken]:
         return self.device_tokens.get(token_id)
+
+    def get_device_token_for_update(
+            self, token_id: str) -> Optional[DeviceToken]:
+        # No row locking needed (#426 round-4 review finding 1, mirroring
+        # get_contact_destination_for_update's identical comment):
+        # transaction() holds self._lock for its entire body, so a
+        # concurrent upsert can't interleave with the caller's
+        # fetch-then-write. Provided for interface parity with SqlStore.
+        return self.device_tokens.get(token_id)
+
+    def upsert_device_token(
+            self, recipient_ref: str, provider: str, token: str,
+            label: Optional[str]) -> DeviceToken:
+        """Insert-or-update a DeviceToken keyed by its natural key
+        (recipient_ref, token) — the Memory-store sibling of
+        SqlStore.upsert_device_token (#426 round-4 review finding 1), same
+        docstring contract. Callers wrap this in ``store.transaction()``
+        (same requirement as every other multi-step Memory mutation), whose
+        ``self._lock`` fully serializes the find-then-mutate-or-create
+        below against any concurrent store access — the SAME "strongest
+        isolation, for free" guarantee ``transaction()``'s own docstring
+        describes, not a per-call lock here."""
+        existing = self.get_device_token_by_value(recipient_ref, token)
+        if existing is not None:
+            existing.provider = provider
+            existing.label = label
+            existing.active = True
+            return existing
+        t = DeviceToken(
+            id=self.next_id("devtok"), recipient_ref=recipient_ref,
+            provider=provider, token=token, label=label, active=True)
+        self.device_tokens[t.id] = t
+        return t
 
     def get_device_token_by_value(
             self, recipient_ref: str, token: str) -> Optional[DeviceToken]:
@@ -1119,6 +1535,89 @@ class InMemoryStore:
         """
         yield
 
+    # -- epoch fence (PR #423 redesign) -------------------------------------
+    def epoch_fence_acquire_exclusive(self, key: str) -> None:
+        """The LOCK side stays a documented no-op, matching ``SqlStore``'s
+        spelling, and for the analogous reason: ``self._lock`` (this store's
+        process-wide, per-INSTANCE RLock) already wraps the WHOLE
+        ``transaction()`` body this method is always called from inside, on
+        the only Python object that could ever be racing (``InMemoryStore``
+        cannot participate in independent workers at all -- two separate
+        instances share zero state, so "independent Memory workers
+        coordinating" is not a deployment shape this store needs to defend
+        against; see the design's §5). That serialization already gives every
+        OTHER ``transaction()``-wrapped writer full mutual exclusion against
+        this one.
+
+        A REAL BLOCKING acquire here would still be wrong, for the same
+        reason it is on SQLite: waiting on any lock/condition while
+        ``self._lock`` is already held by this same call frame (it always is;
+        this method's contract requires it be called from inside an open
+        ``transaction()``) can deadlock against a scoped read whose shared
+        hold spans a ``produce()`` call that itself needs ``self._lock``:
+        this thread holds ``self._lock`` and blocks waiting for the read to
+        release; the read, mid-``produce()``, blocks waiting for
+        ``self._lock``. Proven directly (a real ``ContextSwitchGate``-backed
+        attempt at this method reproduces the deadlock on demand) before
+        settling on the no-op, exactly mirroring the AB-BA hazard
+        ``context_gate.py:107-115``'s LOCK ORDER note already documents for
+        the in-process gate.
+
+        THE VERSION BUMP (round-N review finding 1) is NOT a no-op, though,
+        and is what actually closes the same-process torn-read window this
+        docstring used to just document as an accepted gap. Every one of the
+        17 fenced writers already calls this method as its first fence
+        action; bumping ``self._epoch_fence_versions[key]`` here — a plain
+        dict write, already covered by ``self._lock`` (held by the caller's
+        open ``transaction()``) and by this store's own
+        ``_snapshot()``/``_restore()`` rollback machinery — needs no NEW lock
+        of any kind, so it cannot reintroduce the AB-BA hazard above. A
+        scoped read samples ``current_epoch_fence_version(key)`` — for its
+        OWN user key and separately for the global key, mirroring the
+        advisory lock's own two acquisitions — before deriving its epoch and
+        again after ``produce()`` returns, with NOTHING held in between; if a
+        writer's bump for that SAME key landed inside that window, the two
+        samples disagree and the read is discarded rather than served — see
+        ``current_epoch_fence_version``'s own docstring and
+        ``web/server.py``'s ``_read_under_context_gate``. This closes exactly
+        the gap this docstring previously named as the accepted CONSEQUENCE
+        of the lock staying a no-op: the newly-listed writers (account scope
+        rebind/activate, Season/Program/League/LeagueSeason delete,
+        venue-access revoke/delete, Team transfer, Official assign/unassign,
+        Player/Guardian reassignment, selected-Season delete among them) now
+        DO have a real backstop on Memory, without a lock ever crossing a
+        ``produce()`` call.
+        """
+        self._epoch_fence_versions[key] = (
+            self._epoch_fence_versions.get(key, 0) + 1)
+
+    @contextmanager
+    def epoch_fence_acquire_shared(self, key: str):
+        """A documented no-op, for the same reason as the exclusive side
+        above: since nothing on Memory ever holds this primitive's exclusive
+        side as a genuine LOCK (the version bump it now also does is not a
+        hold this shared side needs to wait for), there is never a genuine
+        holder for this method to defer to — a real gate object here would be
+        exercised but never actually contended, which is observationally
+        identical to not having one. Yields ``True`` (not ``False``/fail-open)
+        since this call never times out — it never even tries to wait. The
+        real protection on Memory is the version counter
+        (``current_epoch_fence_version``), sampled by the caller OUTSIDE this
+        hold — see ``web/server.py``'s ``_read_under_context_gate``."""
+        yield True
+
+    def current_epoch_fence_version(self, key: str) -> int:
+        """The CURRENT value of the persisted epoch-fence version counter FOR
+        ``key`` (round-N review finding 1) — see ``SqlStore``'s own copy for
+        the full contract this mirrors, including why this is keyed rather
+        than a single shared counter. On Memory this is simply the live dict
+        entry (``0`` if ``key`` has never been bumped), read under
+        ``self._lock`` for the same reason every other read here is: two
+        concurrent callers on this ONE shared instance (the web server's
+        shape) must never tear each other's read of it."""
+        with self._lock:
+            return self._epoch_fence_versions.get(key, 0)
+
     def get_active_context(self, user_id: str) -> Optional[ActiveContext]:
         return self.user_active_context.get(user_id)
 
@@ -1152,6 +1651,50 @@ class InMemoryStore:
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)
         return entry
+
+    # -- copy-forward commit idempotency ledger (#159 review round 2) ------
+    def add_season_copy_forward_commit(
+            self, row: SeasonCopyForwardCommit) -> SeasonCopyForwardCommit:
+        """One committed Season per copy_forward_fingerprint, mirroring
+        SqlStore's migration-053 UNIQUE index: a second attempt to record
+        the SAME fingerprint raises the IDENTICAL IntegrityConflictError
+        shape SqlStore's translated unique-violation raises (same message,
+        same ``reason``), so ``commit_new_season_copy_forward``'s
+        idempotent-replay handling (pre-check + retryable
+        ConcurrencyConflictError on this residual race) is backend-
+        agnostic. Safe under this store's own concurrency model without a
+        real index: every call runs inside ``transaction()``'s process-wide
+        lock (see its docstring), so the check-then-set below can never
+        itself race, and a failed caller's writes are undone by
+        ``transaction()``'s own snapshot/restore — the same atomicity
+        SqlStore gets from the database rolling back an aborted
+        transaction."""
+        for existing in self.season_copy_forward_commits.values():
+            if (existing.copy_forward_fingerprint
+                    == row.copy_forward_fingerprint):
+                raise IntegrityConflictError(
+                    "This copy-forward was already committed.",
+                    details={"reason": "copy_forward_already_committed"})
+        self.season_copy_forward_commits[row.id] = row
+        return row
+
+    def get_season_copy_forward_commit_by_fingerprint(
+            self, fingerprint: str) -> Optional[SeasonCopyForwardCommit]:
+        for row in self.season_copy_forward_commits.values():
+            if row.copy_forward_fingerprint == fingerprint:
+                return row
+        return None
+
+    def season_copy_forward_commits_for_season(
+            self, season_id: str) -> List[SeasonCopyForwardCommit]:
+        """Every ledger row naming ``season_id`` as the Season a copy-forward
+        commit produced (#159 review round 3) -- at most one in practice
+        (each commit mints a brand-new Season and writes exactly one row
+        for it, in the same transaction), but returned as a list like every
+        other ``*_for_season`` dependency query so ``delete_season`` can
+        itemize it the same way as team registrations/games/venue access."""
+        return [row for row in self.season_copy_forward_commits.values()
+                if row.season_id == season_id]
 
     def add_factory_reset_event(self, event: FactoryResetEvent) -> FactoryResetEvent:
         self.factory_reset_events.append(event)

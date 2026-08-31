@@ -63,8 +63,16 @@ _CONCURRENCY_MESSAGE = (
 
 _CONCURRENCY_REASONS = frozenset(_PG_CONCURRENCY.values())
 _ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_players_active_team_jersey"
+# Migration 059 (#205 Slice A) partial unique indexes.
+_SRM_ACTIVE_PLAYER_SEASON_CONSTRAINT = "ux_srm_active_player_season"
+_SRM_ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_srm_active_team_jersey"
+# #205 review round 1 finding 1.
+_SRM_OPEN_PLAYER_LEAGUE_SEASON_CONSTRAINT = "ux_srm_open_player_league_season"
 _ACTIVE_ICE_SLOT_CONSTRAINT = "ux_games_active_ice_slot"
 _ICE_SLOT_TIME_CONSTRAINT = "ux_ice_slots_rink_time"
+_COPY_FORWARD_FINGERPRINT_CONSTRAINT = \
+    "ux_season_copy_forward_commits_fingerprint"
+_TEAM_REGISTRATION_NUMBER_CONSTRAINT = "ux_players_team_registration_number"
 
 
 def translate_player_jersey_exception(
@@ -85,6 +93,83 @@ def translate_player_jersey_exception(
         "on this team.",
         details={"reason": "duplicate_jersey_number",
                  "team_id": team_id, "jersey_number": jersey_number})
+
+
+def translate_registration_number_exception(
+        exc: BaseException, team_id: str,
+        registration_number) -> Optional[DomainError]:
+    """Translate migration 058's ``(team_id, registration_number)`` unique
+    violation with domain-safe context (#273 review round 2 finding 2).
+
+    ``SetupService._assert_registration_number_available`` already rejects a
+    same-team duplicate governing-body id at create/update/move
+    (``assign_player_team``) and both import paths, but — exactly like
+    migration 038's jersey check — that check-then-write is not itself safe
+    under a cross-process race: two concurrent writers can each observe the
+    number as free before either insert/update commits. The partial unique
+    index is the database backstop; a race-losing write's UNIQUE violation is
+    translated here into the SAME stable ``duplicate_registration_number``
+    reason the service pre-check raises (as ``IntegrityConflictError``, the
+    class this module's exception-translation boundary always raises — the
+    pre-check itself stays a field-level ``ValidationError``, unchanged),
+    never a raw driver error, SQL, or constraint name.
+    """
+    if isinstance(exc, DomainError):
+        return None
+    if not _is_team_registration_number_violation(exc):
+        return None
+    return IntegrityConflictError(
+        "registration_number is already used by another player on this team.",
+        details={"reason": "duplicate_registration_number",
+                 "team_id": team_id, "registration_number": registration_number})
+
+
+def translate_membership_conflict_exception(
+        exc: BaseException, membership) -> Optional[DomainError]:
+    """Translate migration 059's partial-unique violations with domain-safe
+    context (#205 Slice A).
+
+    The membership store write site knows the attempted row, so a race lost to
+    any of the three indexes — one authoritative active membership per
+    (player, Season); one active jersey per (LeagueSeason, Team); one OPEN
+    (non-terminal) stint per (player, LeagueSeason), #205 review round 1
+    finding 1 — surfaces as the SAME stable conflict the service pre-checks
+    raise, without exposing driver text, SQL, or constraint names. Mirrors
+    :func:`translate_player_jersey_exception`.
+    """
+    if isinstance(exc, DomainError):
+        return None
+    if _is_unique_violation_on(
+            exc, _SRM_ACTIVE_PLAYER_SEASON_CONSTRAINT,
+            ("season_roster_memberships.player_id",
+             "season_roster_memberships.season_id")):
+        return IntegrityConflictError(
+            "Player already has an active membership this season.",
+            details={"reason": "membership_active_conflict",
+                     "player_id": membership.player_id,
+                     "season_id": membership.season_id})
+    if _is_unique_violation_on(
+            exc, _SRM_ACTIVE_TEAM_JERSEY_CONSTRAINT,
+            ("season_roster_memberships.team_id",
+             "season_roster_memberships.jersey_number")):
+        return IntegrityConflictError(
+            f"Jersey number {membership.jersey_number} is already worn by an "
+            "active membership on this team this season.",
+            details={"reason": "duplicate_membership_jersey_number",
+                     "league_season_id": membership.league_season_id,
+                     "team_id": membership.team_id,
+                     "jersey_number": membership.jersey_number})
+    if _is_unique_violation_on(
+            exc, _SRM_OPEN_PLAYER_LEAGUE_SEASON_CONSTRAINT,
+            ("season_roster_memberships.player_id",
+             "season_roster_memberships.league_season_id")):
+        return IntegrityConflictError(
+            "Player already has an open membership on this league season; "
+            "update or end it instead of creating another.",
+            details={"reason": "membership_open_conflict",
+                     "player_id": membership.player_id,
+                     "league_season_id": membership.league_season_id})
+    return None
 
 
 def translate_reassignment_fk_exception(
@@ -213,6 +298,34 @@ def translate_ice_slot_time_conflict_exception(
         details={"reason": "ice_slot_time_taken", "rink_id": rink_id})
 
 
+def translate_copy_forward_commit_conflict_exception(
+        exc: BaseException) -> Optional[DomainError]:
+    """Translate migration 053's one-Season-per-fingerprint violation (#159
+    review round 2: double-submit/retry blocker).
+
+    ux_season_copy_forward_commits_fingerprint is the atomic backstop that
+    stops two ``commit_new_season_copy_forward`` calls — sequential replay
+    or a genuine concurrent race, two real connections both racing to
+    INSERT the same ``copy_forward_fingerprint`` — from ever minting two
+    Seasons for the SAME fingerprint. A race-losing INSERT surfaces this
+    stable IntegrityConflictError (reason ``copy_forward_already_
+    committed``), which the commit path re-raises as a retryable
+    ConcurrencyConflictError so it unwinds to whichever transaction is
+    genuinely outermost for that call; a subsequent attempt's own
+    idempotent-replay pre-check then finds this row and returns the
+    ALREADY-COMMITTED season/registrations/totals — the standard REST
+    idempotency-key replay, never a raw driver error, SQL, or constraint
+    name.
+    """
+    if isinstance(exc, DomainError):
+        return None
+    if not _is_copy_forward_fingerprint_violation(exc):
+        return None
+    return IntegrityConflictError(
+        "This copy-forward was already committed.",
+        details={"reason": "copy_forward_already_committed"})
+
+
 class DependentDeleteConflict(Exception):
     """Internal signal — a parent delete was rejected by an INCOMING foreign key
     because a concurrent create committed a dependent in the pre-check→delete
@@ -306,6 +419,27 @@ def _is_ice_slot_time_violation(exc: BaseException) -> bool:
     return False
 
 
+def _is_copy_forward_fingerprint_violation(exc: BaseException) -> bool:
+    """A unique violation of ``ux_season_copy_forward_commits_fingerprint``
+    specifically (migration 053). PostgreSQL carries the authoritative
+    constraint name on ``.diag`` (a 23505 for a different index is not
+    matched). SQLite names the index's column on ``UNIQUE constraint
+    failed: season_copy_forward_commits.copy_forward_fingerprint`` —
+    distinct from the table's primary key (``season_copy_forward_
+    commits.id``), the only other unique constraint on this table."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate == "23505":
+        diag = getattr(exc, "diag", None)
+        return (getattr(diag, "constraint_name", None)
+                == _COPY_FORWARD_FINGERPRINT_CONSTRAINT)
+    if isinstance(exc, sqlite3.IntegrityError):
+        text = str(exc)
+        return ("UNIQUE constraint failed" in text
+                and "season_copy_forward_commits.copy_forward_fingerprint"
+                in text)
+    return False
+
+
 def _is_named_fk_violation(exc: BaseException, constraint: str) -> bool:
     """A foreign-key violation for ``constraint``.
 
@@ -324,6 +458,25 @@ def _is_named_fk_violation(exc: BaseException, constraint: str) -> bool:
     return False
 
 
+def _is_unique_violation_on(exc: BaseException, constraint: str,
+                            sqlite_columns) -> bool:
+    """A unique violation for one specific partial index (#205 Slice A).
+
+    PostgreSQL carries the index name authoritatively on ``.diag``; SQLite
+    names only the columns, so the caller supplies the column list that
+    identifies its index unambiguously within the table. Same detection split
+    as :func:`_is_active_team_jersey_violation`, generalized."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate == "23505":
+        diag = getattr(exc, "diag", None)
+        return getattr(diag, "constraint_name", None) == constraint
+    if isinstance(exc, sqlite3.IntegrityError):
+        text = str(exc)
+        return ("UNIQUE constraint failed" in text
+                and all(col in text for col in sqlite_columns))
+    return False
+
+
 def _is_active_team_jersey_violation(exc: BaseException) -> bool:
     sqlstate = getattr(exc, "sqlstate", None)
     if sqlstate == "23505":
@@ -335,6 +488,30 @@ def _is_active_team_jersey_violation(exc: BaseException) -> bool:
         return ("UNIQUE constraint failed" in text
                 and "players.team_id" in text
                 and "players.jersey_number" in text)
+    return False
+
+
+def _is_team_registration_number_violation(exc: BaseException) -> bool:
+    """A unique violation of ``ux_players_team_registration_number``
+    specifically (migration 058, #273 review round 2 finding 2).
+
+    PostgreSQL/psycopg carry the authoritative constraint name on ``.diag`` (a
+    23505 for a different unique index on ``players`` — e.g. the active-jersey
+    one — is not matched). SQLite names the index's columns on its
+    ``UNIQUE constraint failed: players.team_id, players.registration_number``
+    message; ``players.registration_number`` appears in no other players
+    unique index, so it alone disambiguates from the jersey index (which also
+    names ``players.team_id``).
+    """
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate == "23505":
+        diag = getattr(exc, "diag", None)
+        return (getattr(diag, "constraint_name", None)
+                == _TEAM_REGISTRATION_NUMBER_CONSTRAINT)
+    if isinstance(exc, sqlite3.IntegrityError):
+        text = str(exc)
+        return ("UNIQUE constraint failed" in text
+                and "players.registration_number" in text)
     return False
 
 

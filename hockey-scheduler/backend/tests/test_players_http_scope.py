@@ -50,6 +50,7 @@ from http.server import ThreadingHTTPServer
 from urllib.parse import quote
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import end_parity_stints_directly
 
 from hockey_scheduler.api.service import ApiService
 from hockey_scheduler.domain import Role, Team
@@ -196,8 +197,9 @@ class PlayersHttpScopeTest(unittest.TestCase):
                           "name": "PS Team B"})
         self._v2(c, "player", {"team_id": team_a["id"], "name": LEAGA_NAME,
                               "position": POSITION, "email": LEAGA_EMAIL})
-        self._v2(c, "player", {"team_id": team_b["id"], "name": LEAGB_NAME,
-                              "position": POSITION, "email": LEAGB_EMAIL})
+        player_b = self._v2(c, "player",
+                            {"team_id": team_b["id"], "name": LEAGB_NAME,
+                             "position": POSITION, "email": LEAGB_EMAIL})
 
         status, reg_a = self._req(
             c, "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
@@ -211,6 +213,13 @@ class PlayersHttpScopeTest(unittest.TestCase):
         # id" case: the permanent Team.league_id (not registration state)
         # drives scoping, so this must stay excluded from League A exactly
         # like an actively-registered sibling-League team would.
+        # The #205 cutover's registration mirror auto-opened a live stint
+        # for Team B's player, and the landed stranding guard rightly
+        # refuses the revocation while it is live -- perform the operator
+        # action out-of-band first (the governed workflow is a later #205
+        # slice); this test's subject is permanent-League scoping, which
+        # memberships do not drive.
+        end_parity_stints_directly(self.srv.STATE.api.store, player_b["id"])
         status, _ = self._req(
             c, "POST",
             f"/api/v2/setup/season-team-registration/{reg_b['id']}/remove", {})

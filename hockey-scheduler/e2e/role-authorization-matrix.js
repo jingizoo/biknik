@@ -612,6 +612,66 @@ async function checkViewport(browser, viewport) {
     if (publish.status !== 200 || publish.body.error) {
       fail(`game publish failed: ${JSON.stringify(publish)}`);
     }
+    // ------------------------------------------------------------------
+    // A PRIOR game for the Coach's own team, with a real seated roster --
+    // the source a "Copy previous roster" reads from (#427). Placed in the
+    // PAST so it cannot become anybody's "next game" and the Next Game card
+    // below still points at the fixture's real target game.
+    //
+    // Two players are seated on it while both are eligible; one is then
+    // deactivated, which makes the copy below a genuinely MIXED batch: one
+    // player seats, one is skipped with a reason the warning must NAME.
+    // ------------------------------------------------------------------
+    const priorStart = new Date(Date.now() - 10 * 24 * 3600 * 1000);
+    priorStart.setUTCHours(18, 30, 0, 0);
+    const priorEnd = new Date(priorStart.getTime() + 90 * 60000);
+    const priorRink = await apiPost(page, "/api/v2/setup/rink",
+      { venue_id: venue.body.id, name: `Prior Rink ${suffix}` });
+    const priorSlot = await apiPost(page, "/api/v2/setup/ice-slot", {
+      rink_id: priorRink.body.id, start_time: iso(priorStart),
+      end_time: iso(priorEnd), slot_type: "game",
+    });
+    if (priorSlot.status !== 200 || priorSlot.body.error) {
+      fail(`prior ice slot create failed: ${JSON.stringify(priorSlot)}`);
+    }
+    const priorGame = await apiPost(page, "/api/setup/game", {
+      season_id: season.id, division_id: division.body.id,
+      home_team_id: coachTeam.body.id, away_team_id: rivalTeam.body.id,
+      ice_slot_id: priorSlot.body.id,
+    });
+    if (priorGame.status !== 200 || priorGame.body.error) {
+      fail(`prior game create failed: ${JSON.stringify(priorGame)}`);
+    }
+    // Names fix the order the warning lists them in: the batch orders
+    // candidates by (name, player_id), so "Copy Keeper" precedes
+    // "Copy Skipped" in every response, on every backend.
+    const keeper = await apiPost(page, "/api/v2/setup/player",
+      { team_id: coachTeam.body.id, name: `Copy Keeper ${suffix}`, position: "forward" });
+    const skipped = await apiPost(page, "/api/v2/setup/player",
+      { team_id: coachTeam.body.id, name: `Copy Skipped ${suffix}`, position: "defense" });
+    const seatPrior = await apiPost(page,
+      `/api/games/${priorGame.body.id}/roster/select`,
+      { player_ids: [keeper.body.id, skipped.body.id] });
+    if (seatPrior.status !== 200 || seatPrior.body.error) {
+      fail(`prior roster select failed: ${JSON.stringify(seatPrior)}`);
+    }
+    // The durable attribution the copy discovers candidates from must really
+    // be on those rows -- if it were not, the copy would find nobody and the
+    // whole leg below would pass vacuously.
+    const priorBoard = await apiGet(page, `/api/games/${priorGame.body.id}/lineups`);
+    const priorSeated = (priorBoard.body.home.players || [])
+      .filter((pl) => pl.group === "selected").map((pl) => pl.id).sort();
+    if (JSON.stringify(priorSeated)
+        !== JSON.stringify([keeper.body.id, skipped.body.id].sort())) {
+      fail(`prior game did not seat both players on the Coach's side: `
+        + `${JSON.stringify(priorSeated)}`);
+    }
+    const deactivate = await apiPost(page,
+      `/api/v2/setup/player/${skipped.body.id}/active`, { active: false });
+    if (deactivate.status !== 200 || deactivate.body.error) {
+      fail(`deactivate failed: ${JSON.stringify(deactivate)}`);
+    }
+
     // Jamie Junior plays for the Rival Team -- deliberately NOT the Coach's
     // own team, and deliberately a different team than Priya Player's, so
     // Guardian's "next game" and Player's "no upcoming game" are each
@@ -622,6 +682,15 @@ async function checkViewport(browser, viewport) {
       { team_id: playerTeam.body.id, name: `Priya Player ${suffix}`, position: "forward" });
     const official = await apiPost(page, "/api/v2/setup/official",
       { name: `Ozzy Official ${suffix}` });
+    // A SECOND official, ASSIGNED to this game (#427 final blocker, round 2).
+    // Distinct from Ozzy on purpose, and for this file's own stated reason --
+    // "every role gets its own distinctly-named user ... so no role's fixture
+    // can accidentally satisfy another role's assertion". Ozzy proves the
+    // UNASSIGNED official's Inbox empty state; assigning Ozzy would destroy
+    // it. Only an ASSIGNED official passes `can_read_private_game_data`, and
+    // that is the principal whose Roster tab this leg is about.
+    const assignedOfficial = await apiPost(page, "/api/v2/setup/official",
+      { name: `Avery Assigned ${suffix}` });
 
     // Seven distinct, role-scoped accounts (League Admin reuses the
     // existing seeded "admin"/"demo" login used to build this fixture).
@@ -635,6 +704,8 @@ async function checkViewport(browser, viewport) {
       guardian: { username: mk("guardian"), role: "guardian", scope: {} },
       official: { username: mk("official"), role: "official",
         scope: { official_id: official.body.id } },
+      assigned_official: { username: mk("assignedofficial"), role: "official",
+        scope: { official_id: assignedOfficial.body.id } },
       viewer: { username: mk("viewer"), role: "viewer", scope: {} },
     };
     for (const key of Object.keys(accounts)) {
@@ -645,6 +716,16 @@ async function checkViewport(browser, viewport) {
         fail(`account create failed for ${acct.username}: ${JSON.stringify(res)}`);
       }
       acct.id = res.body.id;
+    }
+    // Assign Avery to the fixture game, as the operator, so the account above
+    // is a genuinely ASSIGNED official -- the only shape
+    // `can_read_private_game_data` admits, and therefore the only one whose
+    // Roster tab reaches the private-game family at all.
+    const assign = await apiPost(page,
+      `/api/games/${game.body.id}/officials/assign`,
+      { official_id: assignedOfficial.body.id, role: "referee" });
+    if (assign.status !== 200 || assign.body.error) {
+      fail(`official assignment failed: ${JSON.stringify(assign)}`);
     }
     const link = await apiPost(page, "/api/guardians/links",
       { guardian_user_id: accounts.guardian.id, player_id: junior.body.id });
@@ -679,7 +760,133 @@ async function checkViewport(browser, viewport) {
     await installContextFixture(page);
     await reachDashboard(page);
     if (!(await page.$('.tab[data-tab="users"]'))) fail("setup precondition: Users tab not visible for League Admin");
-    await page.evaluate(([u, p]) => signIn(u, p), [accounts.viewer.username, PW]);
+    // Populate a real operator-only staff directory before the no-reload
+    // identity transition.  The lower role cannot fetch this pool, so the
+    // reset boundary must destroy it rather than merely hide its controls.
+    await page.evaluate(() => switchTab("sheet"));
+    await waitForView(page, "sheet");
+    await waitForRealContent(page);
+    await page.waitForFunction(() => officialsPool.length > 0, null,
+      { timeout: 10000 });
+    const privateOfficial = {
+      id: official.body.id,
+      name: `Ozzy Official ${suffix}`,
+    };
+    const adminOfficialPool = await page.evaluate(() =>
+      officialsPool.map((entry) => ({ id: entry.id, name: entry.name })));
+    if (!adminOfficialPool.some((entry) => entry.id === privateOfficial.id
+        && entry.name === privateOfficial.name)) {
+      fail(`setup precondition: League Admin's directory did not contain the `
+        + `distinctive private Official: ${JSON.stringify(adminOfficialPool)}`);
+    }
+
+    // A simple post-switch assertion only proves a pool that has ALREADY
+    // landed is cleared. Exercise the harder serialization: a privileged
+    // render gets a real 200 directory response, browser delivery is held,
+    // setUser(Viewer) clears the pool, and Viewer context reconciliation is
+    // then held before its first render. Releasing the old response in that
+    // exact window must not let the departing render write the private
+    // directory back.
+    let releaseStaleOfficial;
+    let markStaleOfficialHeld;
+    let markStaleOfficialDelivered;
+    const staleOfficialRelease = new Promise((resolve) => {
+      releaseStaleOfficial = resolve;
+    });
+    const staleOfficialHeld = new Promise((resolve) => {
+      markStaleOfficialHeld = resolve;
+    });
+    const staleOfficialDelivered = new Promise((resolve) => {
+      markStaleOfficialDelivered = resolve;
+    });
+    let heldOfficialBody = null;
+    let officialDirectoryRequests = 0;
+    const holdStaleOfficial = async (route) => {
+      const request = route.request();
+      const requestPath = new URL(request.url()).pathname;
+      if (request.method() !== "GET" || requestPath !== "/api/officials") {
+        await route.continue();
+        return;
+      }
+      officialDirectoryRequests += 1;
+      const response = await route.fetch();
+      heldOfficialBody = await response.json();
+      markStaleOfficialHeld();
+      await staleOfficialRelease;
+      await route.fulfill({ response, json: heldOfficialBody });
+      markStaleOfficialDelivered();
+    };
+
+    let releaseViewerContext;
+    let markViewerContextHeld;
+    const viewerContextRelease = new Promise((resolve) => {
+      releaseViewerContext = resolve;
+    });
+    const viewerContextHeld = new Promise((resolve) => {
+      markViewerContextHeld = resolve;
+    });
+    const holdViewerContext = async (route) => {
+      const response = await route.fetch();
+      markViewerContextHeld();
+      await viewerContextRelease;
+      await route.fulfill({ response });
+    };
+
+    await page.route("**/api/officials", holdStaleOfficial);
+    await page.evaluate(() => {
+      window.__officialPrivacyStaleRender = render();
+    });
+    await staleOfficialHeld;
+    if (!heldOfficialBody || !Array.isArray(heldOfficialBody.officials)
+        || !heldOfficialBody.officials.some((entry) =>
+          entry.id === privateOfficial.id && entry.name === privateOfficial.name)) {
+      fail(`held response was not a non-vacuous private Official directory: `
+        + `${JSON.stringify(heldOfficialBody)}`);
+    }
+
+    await page.route("**/api/context/options", holdViewerContext);
+    await page.evaluate(([u, p]) => {
+      window.__officialPrivacySwitch = signIn(u, p);
+    }, [accounts.viewer.username, PW]);
+    await viewerContextHeld;
+    const afterViewerReset = await page.evaluate(() => ({
+      role: currentRole,
+      username: currentUser && currentUser.username,
+      officials: officialsPool.map((entry) => ({ id: entry.id, name: entry.name })),
+    }));
+    if (afterViewerReset.role !== "viewer"
+        || afterViewerReset.username !== accounts.viewer.username
+        || afterViewerReset.officials.length !== 0) {
+      fail(`identity boundary did not synchronously clear the private Official `
+        + `pool before Viewer context reconciliation: ${JSON.stringify(afterViewerReset)}`);
+    }
+
+    releaseStaleOfficial();
+    await staleOfficialDelivered;
+    // Await the exact old render promise rather than a timer/frame proxy: the
+    // assertion below must run only after that pass either observes the new
+    // identity token and returns or attempts its stale module-state commit.
+    await page.evaluate(async () => {
+      await window.__officialPrivacyStaleRender;
+      delete window.__officialPrivacyStaleRender;
+    });
+    const afterStaleDelivery = await page.evaluate(() => ({
+      role: currentRole,
+      officials: officialsPool.map((entry) => ({ id: entry.id, name: entry.name })),
+    }));
+    if (afterStaleDelivery.role !== "viewer"
+        || afterStaleDelivery.officials.length !== 0) {
+      fail(`departing League Admin render repopulated the private Official `
+        + `directory under Viewer: ${JSON.stringify(afterStaleDelivery)}`);
+    }
+
+    releaseViewerContext();
+    await page.evaluate(async () => {
+      await window.__officialPrivacySwitch;
+      delete window.__officialPrivacySwitch;
+    });
+    await page.unroute("**/api/context/options", holdViewerContext);
+    await page.unroute("**/api/officials", holdStaleOfficial);
     await waitForView(page, "standings");
     const postSwitchTabs = await visibleTabs(page);
     assertVisibleTabs(fail, "no-reload League Admin -> Viewer switch", postSwitchTabs, [
@@ -690,9 +897,14 @@ async function checkViewport(browser, viewport) {
       hasUsersTab: !!document.querySelector('.tab[data-tab="users"]')
         && document.querySelector('.tab[data-tab="users"]').offsetParent !== null,
       demoMenuHidden: (document.getElementById("demo-menu") || {}).hidden !== false,
+      officialsPoolSize: officialsPool.length,
     }));
-    if (postSwitchDom.hasSetupCard || postSwitchDom.hasUsersTab || !postSwitchDom.demoMenuHidden) {
-      fail(`no-reload League Admin -> Viewer switch retained admin UI: ${JSON.stringify(postSwitchDom)}`);
+    if (postSwitchDom.hasSetupCard || postSwitchDom.hasUsersTab
+        || !postSwitchDom.demoMenuHidden || postSwitchDom.officialsPoolSize !== 0
+        || officialDirectoryRequests !== 1) {
+      fail(`no-reload League Admin -> Viewer switch retained admin UI or `
+        + `requested the global directory as Viewer: state=${JSON.stringify(postSwitchDom)} `
+        + `directoryRequests=${officialDirectoryRequests}`);
     }
     await logout(page);
 
@@ -762,6 +974,34 @@ async function checkViewport(browser, viewport) {
     if (!/League admins only/i.test(amUsersBypass)) {
       fail(`Arena Manager: direct-navigating to Users must show the `
         + `"League admins only" guard, got "${amUsersBypass}"`);
+    }
+    // The Official directory follows MANAGE_SCHEDULE, not MANAGE_SETUP:
+    // Arena Manager is the load-bearing role that separates those two
+    // permissions.  Drive a real-session Game Sheet render at both viewports
+    // and require the actual pool plus its assign control, so narrowing the
+    // client gate to League Admin cannot pass behind the server's correct
+    // role matrix.
+    await page.evaluate(() => switchTab("sheet"));
+    await waitForView(page, "sheet");
+    await waitForRealContent(page);
+    await page.waitForSelector(".game-sheet .gs-grid", { timeout: 10000 });
+    const amDirectory = await apiGet(page, "/api/officials");
+    const amSheet = await page.evaluate(() => ({
+      poolIds: officialsPool.map((official) => official.id).sort(),
+      assignControls: document.querySelectorAll(".gs-assign").length,
+      officialSlots: document.querySelectorAll(".gs-off-slot").length,
+    }));
+    const amExpectedPoolIds = ((amDirectory.body || {}).officials || [])
+      .map((official) => official.id).sort();
+    if (amDirectory.status !== 200 || !amExpectedPoolIds.length
+        || JSON.stringify(amSheet.poolIds) !== JSON.stringify(amExpectedPoolIds)) {
+      fail(`Arena Manager [${L}]: Game Sheet did not load the exact `
+        + `MANAGE_SCHEDULE Official pool: response=${JSON.stringify(amDirectory)} `
+        + `sheet=${JSON.stringify(amSheet)}`);
+    }
+    if (amSheet.assignControls !== 1 || amSheet.officialSlots < 1) {
+      fail(`Arena Manager [${L}]: the authorized Official assign surface is `
+        + `missing or vacuous: ${JSON.stringify(amSheet)}`);
     }
     await page.click('.tab[data-tab="dashboard"]');
     await installContextFixture(page);
@@ -875,6 +1115,679 @@ async function checkViewport(browser, viewport) {
       fail(`Coach: expected the Roster view to show Coach's own team `
         + `("Coach Team ${suffix}"), got: ${coachRosterText.slice(0, 200)}`);
     }
+
+    // ============================================================
+    // Coach -- the AUTHORIZED batch mutation, and the partial outcome
+    // it must make visible (#427).
+    //
+    // Until this leg existed the Coach's only proven interactions were
+    // navigational: every role in this matrix probed a FORBIDDEN mutation,
+    // and Coach -- the one role that actually manages rosters -- performed
+    // no authorized one at all. The owner's ruling ("show the partial-result
+    // warning on desktop and 390px rather than reducing it to a copied
+    // count") is a claim about THIS surface at BOTH of the viewports this
+    // file already runs, so it is proven here rather than in a new spec.
+    // ============================================================
+    const onTarget = await page.evaluate(() => ({
+      game: typeof currentGame === "string" ? currentGame : null,
+      team: typeof rosterTeamId === "string" ? rosterTeamId : null,
+    }));
+    if (onTarget.game !== game.body.id) {
+      fail(`Coach: expected the Roster view to be on the fixture's target `
+        + `game ${game.body.id}, got ${onTarget.game}`);
+    }
+    if (onTarget.team !== coachTeam.body.id) {
+      fail(`Coach: expected the Roster view to be on the Coach's own side `
+        + `${coachTeam.body.id}, got ${onTarget.team}`);
+    }
+    // ------------------------------------------------------------
+    // THE COACH'S OWN SIDE IS NAMED IN THE SCHEDULE ROW (#205, round 4) --
+    // the positive half of the withheld-render leg the assigned official
+    // runs below, and it is here so that leg cannot pass because the field
+    // is simply broken for everybody. This Coach IS in this game, so they
+    // are entitled to a value, the value is THEIR side's, and the screen
+    // renders a real checklist state rather than the withheld marker.
+    // ------------------------------------------------------------
+    const coachOverview = await apiGet(page, "/api/demo/overview");
+    if (coachOverview.status !== 200 || coachOverview.body.error) {
+      fail(`Coach [${L}]: /api/demo/overview failed: `
+        + `${JSON.stringify(coachOverview).slice(0, 200)}`);
+    }
+    const coachRow = (coachOverview.body.schedule || [])
+      .find((g) => g.game_id === game.body.id);
+    if (!coachRow) {
+      fail(`Coach [${L}]: the fixture game is absent from this Coach's `
+        + `schedule, so nothing here is being asserted`);
+    }
+    if (coachRow.roster_status_restricted !== false
+        || coachRow.roster_status_team_id !== coachTeam.body.id
+        || typeof coachRow.roster_status !== "string") {
+      fail(`Coach [${L}]: the schedule row must carry THIS Coach's own side's `
+        + `roster status (team ${coachTeam.body.id}), got `
+        + `${JSON.stringify(coachRow)}`);
+    }
+    // No warning before the action -- so the assertions below cannot be
+    // satisfied by something that was already on screen.
+    if (await page.$(".ros-partial")) {
+      fail("Coach: a batch partial-result warning was present before any "
+        + "batch action ran");
+    }
+    // A REAL keyboard activation of the real control, the same discipline
+    // every other authorized mutation in this file uses.
+    await page.waitForSelector('[data-act="copy"]', { timeout: 10000 });
+    await tabToAndActivate(page, '[data-act="copy"]', "Coach copy previous roster");
+    await page.waitForSelector(".ros-partial", { timeout: 10000 });
+    const partial = await page.evaluate(() => {
+      const el = document.querySelector(".ros-partial");
+      return {
+        text: (el.textContent || "").replace(/\s+/g, " ").trim(),
+        items: Array.from(el.querySelectorAll(".rp-list li"))
+          .map((li) => (li.textContent || "").replace(/\s+/g, " ").trim()),
+      };
+    });
+    // It NAMES the skipped player and says WHY, in operator language -- not
+    // a machine code, and not a bare count.
+    if (!new RegExp(`Copy Skipped ${suffix}`).test(partial.text)) {
+      fail(`Coach: the partial-result warning must NAME the skipped player `
+        + `("Copy Skipped ${suffix}"), got: ${partial.text}`);
+    }
+    if (!/no longer an active player/i.test(partial.text)) {
+      fail(`Coach: the partial-result warning must give the skipped player's `
+        + `reason in operator language, got: ${partial.text}`);
+    }
+    if (/player_inactive/.test(partial.text)) {
+      fail(`Coach: the warning leaked the raw machine reason code instead of `
+        + `its operator wording: ${partial.text}`);
+    }
+    if (partial.items.length !== 1) {
+      fail(`Coach: expected exactly one skipped player listed, got `
+        + `${JSON.stringify(partial.items)}`);
+    }
+    // ...and the ELIGIBLE player really was seated: a partial success, not a
+    // refusal dressed up as a warning.
+    const afterCopy = await apiGet(page, `/api/games/${game.body.id}/lineups`);
+    const seatedNow = (afterCopy.body.home.players || [])
+      .filter((pl) => pl.group === "selected").map((pl) => pl.id);
+    if (JSON.stringify(seatedNow) !== JSON.stringify([keeper.body.id])) {
+      fail(`Coach: expected the copy to seat exactly the eligible player, `
+        + `got ${JSON.stringify(seatedNow)}`);
+    }
+    // The live region spoke the outcome ONCE (#toast-root is the single
+    // sitewide role="status" region).
+    const spoken = await page.evaluate(() => {
+      const root = document.getElementById("toast-root");
+      return { hidden: !!root.hidden, regions: document.querySelectorAll('[role="status"]').length,
+        text: (root.textContent || "").replace(/\s+/g, " ").trim() };
+    });
+    if (spoken.hidden || !/could not be added/i.test(spoken.text)) {
+      fail(`Coach: the partial outcome was not announced in the live region, `
+        + `got ${JSON.stringify(spoken)}`);
+    }
+    if (spoken.regions !== 1) {
+      fail(`Coach: expected exactly one role="status" live region so the `
+        + `outcome is spoken once, found ${spoken.regions}`);
+    }
+    // ------------------------------------------------------------
+    // ZERO-SEAT: the other half of the ruling. An authorized admin
+    // (the independent reader session) deactivates the one player who
+    // seated, so every candidate on the prior roster is now ineligible.
+    // The copy must SUCCEED, seat nobody, write nothing, and say so.
+    // ------------------------------------------------------------
+    const deactivateKeeper = await apiPost(reader,
+      `/api/v2/setup/player/${keeper.body.id}/active`, { active: false });
+    if (deactivateKeeper.status !== 200 || deactivateKeeper.body.error) {
+      fail(`Coach: could not deactivate the remaining player: `
+        + `${JSON.stringify(deactivateKeeper)}`);
+    }
+    await tabToAndActivate(page, '[data-act="copy"]', "Coach copy again (zero seat)");
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector(".ros-partial");
+        return !!el && el.querySelectorAll(".rp-list li").length === 2;
+      }, { timeout: 10000 });
+    const zero = await page.evaluate(() => {
+      const el = document.querySelector(".ros-partial");
+      return (el.textContent || "").replace(/\s+/g, " ").trim();
+    });
+    if (!/No players were added/i.test(zero)) {
+      fail(`Coach: expected the ZERO-SEAT warning, got: ${zero}`);
+    }
+    for (const who of [`Copy Keeper ${suffix}`, `Copy Skipped ${suffix}`]) {
+      if (!new RegExp(who).test(zero)) {
+        fail(`Coach: the zero-seat warning must name every candidate `
+          + `("${who}"), got: ${zero}`);
+      }
+    }
+    // No roster writes: the already-seated row is untouched and nothing new
+    // appeared.
+    const afterZero = await apiGet(page, `/api/games/${game.body.id}/lineups`);
+    const seatedAfterZero = (afterZero.body.home.players || [])
+      .filter((pl) => pl.group === "selected").map((pl) => pl.id);
+    if (JSON.stringify(seatedAfterZero) !== JSON.stringify(seatedNow)) {
+      fail(`Coach: a zero-seat copy must write no roster rows; lineup went `
+        + `from ${JSON.stringify(seatedNow)} to `
+        + `${JSON.stringify(seatedAfterZero)}`);
+    }
+    // The whole warning fits the viewport -- at 390px as well as at
+    // desktop -- with no horizontal overflow. No new breakpoint exists or
+    // may exist (e2e/breakpoint-contract.js), so 390 is covered by the
+    // existing 480px rule and by the block's own wrapping.
+    const overflow = await page.evaluate(() => {
+      const el = document.querySelector(".ros-partial");
+      return {
+        docScroll: document.documentElement.scrollWidth,
+        docClient: document.documentElement.clientWidth,
+        elRight: Math.ceil(el.getBoundingClientRect().right),
+        elScroll: el.scrollWidth, elClient: el.clientWidth,
+      };
+    });
+    if (overflow.docScroll > overflow.docClient) {
+      fail(`Coach [${L}]: the partial-result warning pushed the page into a `
+        + `horizontal scroll: ${JSON.stringify(overflow)}`);
+    }
+    if (overflow.elScroll > overflow.elClient + 1) {
+      fail(`Coach [${L}]: the partial-result warning overflows its own box `
+        + `(text not wrapping): ${JSON.stringify(overflow)}`);
+    }
+    if (overflow.elRight > overflow.docClient) {
+      fail(`Coach [${L}]: the partial-result warning extends past the `
+        + `viewport: ${JSON.stringify(overflow)}`);
+    }
+
+    // ============================================================
+    // Coach -- the GAME SHEET, own side rendered and OPPONENT REDACTED
+    // (#427 blocker, owner ruling comment 5394947899).
+    //
+    // /lineups used to hand either Coach BOTH sides' private candidate,
+    // availability and substitute state, and this file already fetched
+    // /lineups and /board without ever asserting WHICH players came back.
+    // Nothing in e2e/ opened the Game Sheet at all -- zero hits for
+    // switchTab("sheet"), .gs-row or .gs-side across the whole directory --
+    // so the screen the ruling is about had no journey coverage.
+    //
+    // Extended here rather than added as a new spec file on purpose: the
+    // journey list is enumerated BY HAND three times in
+    // .github/workflows/hockey-scheduler-ci.yml (a `node --check` line, a
+    // shard string, and e2e/package.json), so a new file silently skips CI
+    // until three separate edits land. This file already logs in as a real
+    // authenticated Coach with scope.team_id, already runs at BOTH viewports
+    // (desktop 1440x900 and phone 390x844), and is already registered.
+    // ============================================================
+    // The installation-wide assignment pool is MANAGE_SCHEDULE-only.  Pin
+    // the server refusal first (and register that exact expected 403 with the
+    // journey's global failure tracker), then observe the real Game Sheet
+    // render and prove it does not make the forbidden request at all.
+    tracker.expect("GET", "/api/officials", 403);
+    const officialsForCoach = await apiGet(page, "/api/officials");
+    if (officialsForCoach.status !== 403
+        || !officialsForCoach.body.error
+        || officialsForCoach.body.error.code !== "forbidden"
+        || officialsForCoach.body.error.details.role !== "coach"
+        || officialsForCoach.body.error.details.required !== "manage_schedule") {
+      fail(`Coach [${L}]: /api/officials did not enforce the exact `
+        + `MANAGE_SCHEDULE refusal: ${JSON.stringify(officialsForCoach)}`);
+    }
+
+    const sheetPoolRequests = [];
+    const observeOfficialPool = (request) => {
+      let requestPath = request.url();
+      try { requestPath = new URL(request.url()).pathname; } catch (_) {}
+      if (request.method() === "GET" && requestPath === "/api/officials") {
+        sheetPoolRequests.push(request.url());
+      }
+    };
+    page.on("request", observeOfficialPool);
+    // A real keyboard activation of the real nav tab, the same discipline
+    // every other reachability claim in this file uses.
+    await tabToAndActivate(page, '.tab[data-tab="sheet"]', "Coach reach Game Sheet");
+    await waitForView(page, "sheet");
+    await waitForRealContent(page);
+    await page.waitForSelector(".game-sheet .gs-grid", { timeout: 10000 });
+    page.off("request", observeOfficialPool);
+    if (sheetPoolRequests.length) {
+      fail(`Coach [${L}]: Game Sheet requested the private global officials `
+        + `pool ${sheetPoolRequests.length} time(s)`);
+    }
+
+    const sheet = await page.evaluate(() => {
+      const sides = Array.from(document.querySelectorAll(".gs-grid > section.gs-side"));
+      const read = (el) => ({
+        team: (el.querySelector(".gs-side-team") || {}).textContent || "",
+        label: (el.querySelector(".gs-side-label") || {}).textContent || "",
+        restricted: !!el.querySelector("[data-restricted]"),
+        restrictedClass: el.classList.contains("gs-side-restricted"),
+        rows: Array.from(el.querySelectorAll(".gs-roster > .gs-row")).map((r) => ({
+          num: (r.querySelector(".gs-num") || {}).textContent || "",
+          name: (r.querySelector(".gs-name") || {}).textContent || "",
+          pos: (r.querySelector(".pos-tag") || {}).className || "",
+        })),
+        text: (el.textContent || "").replace(/\s+/g, " ").trim(),
+      });
+      return {
+        count: sides.length,
+        sides: sides.map(read),
+        assign: document.querySelectorAll(".gs-assign").length,
+        offSlots: document.querySelectorAll(".gs-off-slot").length,
+      };
+    });
+    if (sheet.count !== 2) {
+      fail(`Coach [${L}]: the Game Sheet must still show BOTH sides -- which `
+        + `team you are playing is public, only their lineup is not -- got `
+        + `${sheet.count} side section(s)`);
+    }
+    const [ownSide, oppSide] = sheet.sides;
+    // OWN SIDE: real, named, seated rows.
+    if (!new RegExp(`Coach Team ${suffix}`).test(ownSide.team)) {
+      fail(`Coach [${L}]: expected the first sheet column to be the Coach's `
+        + `own team ("Coach Team ${suffix}"), got "${ownSide.team}"`);
+    }
+    if (ownSide.restricted) {
+      fail(`Coach [${L}]: the Coach's OWN side was redacted on the Game Sheet`);
+    }
+    const ownNames = ownSide.rows.map((r) => r.name);
+    if (ownNames.length !== 1 || !new RegExp(`Copy Keeper ${suffix}`).test(ownNames[0])) {
+      fail(`Coach [${L}]: expected the own side's submitted lineup to be the `
+        + `one seated player ("Copy Keeper ${suffix}"), got `
+        + `${JSON.stringify(ownNames)}`);
+    }
+    // OPPONENT SIDE: redacted, and redacted AS SUCH.
+    if (!new RegExp(`Rival Team ${suffix}`).test(oppSide.team)) {
+      fail(`Coach [${L}]: the redacted opponent must keep its PUBLIC team `
+        + `name so the sheet can still say who the game is against, got `
+        + `"${oppSide.team}"`);
+    }
+    if (!oppSide.restricted || !oppSide.restrictedClass) {
+      fail(`Coach [${L}]: the opponent side was not rendered as restricted: `
+        + `${JSON.stringify(oppSide)}`);
+    }
+    if (oppSide.rows.length !== 0) {
+      fail(`Coach [${L}]: the redacted opponent rendered ${oppSide.rows.length} `
+        + `player row(s) -- private identities leaked onto the Game Sheet`);
+    }
+    // THE POINT OF THE WHOLE REPRESENTATION: redaction must not read as the
+    // opponent having failed to submit a lineup, which is a different and
+    // materially misleading operational claim.
+    if (/No lineup submitted/i.test(oppSide.text)) {
+      fail(`Coach [${L}]: the redacted opponent is displayed as "No lineup `
+        + `submitted" -- an operational claim about the OPPONENT rather than `
+        + `about this reader's access: ${oppSide.text}`);
+    }
+    if (!/Restricted/i.test(oppSide.text)) {
+      fail(`Coach [${L}]: the redacted opponent does not say it is `
+        + `restricted: ${oppSide.text}`);
+    }
+    // And no AWAY player's name appears on the page at all. `Jamie Junior`
+    // is the rival team's own player -- a real body on the opponent side, so
+    // this is a positive absence and not a search for a string that could
+    // never have been there.
+    const sheetText = await page.evaluate(() =>
+      document.getElementById("content").textContent || "");
+    if (new RegExp(`Jamie Junior ${suffix}`).test(sheetText)) {
+      fail(`Coach [${L}]: an opponent player's name ("Jamie Junior ${suffix}") `
+        + `is rendered on the Coach's Game Sheet`);
+    }
+    // A free "unauthorized control absent" assertion while we are here: the
+    // assign control renders only for manage_schedule, which a Coach lacks,
+    // but the unassigned slots themselves are part of the sheet.
+    if (sheet.assign !== 0) {
+      fail(`Coach [${L}]: the officials ASSIGN control is rendered for a Coach `
+        + `(manage_schedule is not theirs)`);
+    }
+    if (sheet.offSlots === 0) {
+      fail(`Coach [${L}]: the officials panel rendered no slots at all, so the `
+        + `assertion above proves nothing`);
+    }
+    // The sheet fits the viewport -- at 390px as well as desktop. NO NEW
+    // BREAKPOINT exists or may exist (e2e/breakpoint-contract.js pins the
+    // four approved widths), so 390 is covered by the Game Sheet's existing
+    // 720px stacking rule and the redaction block's own wrapping.
+    const sheetOverflow = await page.evaluate(() => {
+      const el = document.querySelector(".gs-side-restricted");
+      return {
+        docScroll: document.documentElement.scrollWidth,
+        docClient: document.documentElement.clientWidth,
+        elRight: Math.ceil(el.getBoundingClientRect().right),
+        elScroll: el.scrollWidth, elClient: el.clientWidth,
+      };
+    });
+    if (sheetOverflow.docScroll > sheetOverflow.docClient) {
+      fail(`Coach [${L}]: the Game Sheet pushed the page into a horizontal `
+        + `scroll: ${JSON.stringify(sheetOverflow)}`);
+    }
+    if (sheetOverflow.elScroll > sheetOverflow.elClient + 1
+        || sheetOverflow.elRight > sheetOverflow.docClient) {
+      fail(`Coach [${L}]: the restricted-opponent block overflows at this `
+        + `viewport: ${JSON.stringify(sheetOverflow)}`);
+    }
+
+    // ------------------------------------------------------------
+    // The same redaction on the ROSTER view, where the empty state it must
+    // NOT be confused with is worded differently ("No players on the roster
+    // yet"). A scoped Coach must not LAND on the redacted tab, but must be
+    // able to OPEN it and read why it is closed.
+    // ------------------------------------------------------------
+    await page.evaluate(() => switchTab("roster"));
+    await waitForView(page, "roster");
+    await waitForRealContent(page);
+    await page.waitForSelector(".lineup-switch .ls", { timeout: 10000 });
+    const landed = await page.evaluate(() => ({
+      active: (document.querySelector(".lineup-switch .ls.active") || {}).dataset,
+      restrictedTabs: Array.from(document.querySelectorAll(".lineup-switch .ls.restricted"))
+        .map((b) => b.dataset.side),
+      panel: document.querySelectorAll("[data-restricted]").length,
+    }));
+    if (landed.active.side !== "home") {
+      fail(`Coach [${L}]: the roster view did not land on the Coach's own `
+        + `side, it landed on ${landed.active.side}`);
+    }
+    if (JSON.stringify(landed.restrictedTabs) !== JSON.stringify(["away"])) {
+      fail(`Coach [${L}]: expected exactly the opponent tab to be marked `
+        + `restricted, got ${JSON.stringify(landed.restrictedTabs)}`);
+    }
+    if (landed.panel !== 0) {
+      fail(`Coach [${L}]: the redaction panel is showing on the Coach's own `
+        + `side`);
+    }
+    // Opening the opponent tab deliberately explains the closure rather than
+    // showing an empty roster.
+    await tabToAndActivate(page, '.lineup-switch .ls[data-side="away"]',
+      "Coach open the opponent lineup tab");
+    await page.waitForSelector("[data-restricted]", { timeout: 10000 });
+    const opened = await page.evaluate(() => {
+      const el = document.querySelector(".restricted-side");
+      return {
+        text: (el.textContent || "").replace(/\s+/g, " ").trim(),
+        rows: document.querySelectorAll("#content .card .row").length,
+        emptyStates: Array.from(document.querySelectorAll("#content .empty"))
+          .map((e) => (e.textContent || "").replace(/\s+/g, " ").trim()),
+      };
+    });
+    if (!/Restricted/i.test(opened.text) || !/not shown/i.test(opened.text)) {
+      fail(`Coach [${L}]: the opponent roster tab does not explain the `
+        + `redaction: ${opened.text}`);
+    }
+    if (opened.emptyStates.some((t) => /No players on the roster yet/i.test(t))) {
+      fail(`Coach [${L}]: the redacted opponent roster is displayed as an `
+        + `empty roster: ${JSON.stringify(opened.emptyStates)}`);
+    }
+    if (opened.rows !== 0) {
+      fail(`Coach [${L}]: ${opened.rows} opponent player row(s) rendered on a `
+        + `restricted side`);
+    }
+    // Back to the Coach's own side for whatever runs after this leg.
+    await tabToAndActivate(page, '.lineup-switch .ls[data-side="home"]',
+      "Coach return to own lineup tab");
+    await page.waitForSelector('.lineup-switch .ls[data-side="home"].active',
+      { timeout: 10000 });
+
+    // ------------------------------------------------------------
+    // A CLIENT SIDE HINT IS INERT ON THE TWO WORKFLOW LEAVES (#427 final
+    // blocker, round 3).
+    //
+    // The Roster tab really does send `?team_id=` on both of these, on every
+    // render, with the side toggle choosing the value -- so "the hint is
+    // ignored" is a claim about a parameter this SHIPPED SCREEN supplies,
+    // not a theoretical one, and it is worth proving from the same session
+    // that supplies it. Until round 3 these two answered a hinted call
+    // DIFFERENTLY from an un-hinted one (403 for the opponent's id) while
+    // the contract shipped in round 2 listed them among the routes where a
+    // hint is ignored.
+    //
+    // Byte equality against the un-hinted response, not "200 and looks
+    // right": that is the only assertion that cannot be satisfied by a
+    // second, differently-narrowed answer.
+    // ------------------------------------------------------------
+    for (const leaf of ["substitute-candidates", "substitute-addable"]) {
+      const path = `/api/games/${game.body.id}/${leaf}`;
+      const plain = await apiGet(page, path);
+      if (plain.status !== 200 || plain.body.error) {
+        fail(`Coach [${L}]: un-hinted GET ${leaf} failed, so the hint `
+          + `comparison below would prove nothing: `
+          + `${JSON.stringify(plain)}`);
+      }
+      if (plain.body.team_id !== coachTeam.body.id) {
+        fail(`Coach [${L}]: ${leaf} answered for ${plain.body.team_id} `
+          + `rather than this Coach's own team ${coachTeam.body.id}`);
+      }
+      for (const hinted of [rivalTeam.body.id, coachTeam.body.id]) {
+        const probe = await apiGet(page, `${path}?team_id=${hinted}`);
+        if (probe.status !== 200 || probe.body.error) {
+          fail(`Coach [${L}]: ${leaf}?team_id=${hinted} was REFUSED rather `
+            + `than answered identically to the un-hinted call -- a 403 that `
+            + `appears only for the opponent's id is a side selector by `
+            + `another name: ${JSON.stringify(probe)}`);
+        }
+        if (JSON.stringify(probe.body) !== JSON.stringify(plain.body)) {
+          fail(`Coach [${L}]: ${leaf}?team_id=${hinted} changed the answer -- `
+            + `a client hint selected a side: `
+            + `${JSON.stringify(probe.body)} vs ${JSON.stringify(plain.body)}`);
+        }
+      }
+    }
+
+    // ------------------------------------------------------------
+    // INELIGIBLE-BUT-VISIBLE substitute rows (#427). "Make that row
+    // non-actionable except for permitted cleanup and expose/label its
+    // ineligible state so the UI does not offer an add/seat action that the
+    // service must reject."
+    //
+    // The state is real and the SERVICE side of it is pinned tri-store
+    // (backend/tests/test_lineup_population_authority.py,
+    // ParticipationEndingDoesNotFlipTheDurableSide, which also proves the
+    // service really does refuse the seat). It cannot be REACHED from a
+    // browser journey, though: ending a participation stint means writing a
+    // SeasonRosterMembership status, and memberships have no HTTP surface at
+    // all -- there is no route to call. So the payload is produced by
+    // rewriting the real /lineups response in flight, which still drives the
+    // whole genuine path from fetch through render to DOM, and the SHAPE
+    // being injected is exactly the shape those Python tests pin.
+    await page.route("**/api/games/*/lineups", async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      const own = body.home;
+      if (own && Array.isArray(own.players)) {
+        own.players.push({
+          id: "e2e-ineligible", name: `Departed Sub ${suffix}`,
+          position: "forward", slot_type: "skater",
+          // null, not a permanent number: no seasonal value survives.
+          jersey_number: null, group: "substitute", roster_status: null,
+          backed_out: false, availability: "pending", sub_status: "enrolled",
+          eligible: false,
+        });
+        own.players.push({
+          id: "e2e-eligible", name: `Standing Sub ${suffix}`,
+          position: "forward", slot_type: "skater", jersey_number: 9,
+          group: "substitute", roster_status: null, backed_out: false,
+          availability: "pending", sub_status: "enrolled", eligible: true,
+        });
+        // An open skater slot, so "no slot" cannot be the reason the
+        // ineligible row is unactionable -- the ELIGIBLE row beside it must
+        // get its Add button from the very same counts.
+        own.status.open_skater_slots = Math.max(1, own.status.open_skater_slots);
+        own.status.target_skaters = own.status.target_skaters
+          + own.status.open_skater_slots;
+      }
+      await route.fulfill({ response, json: body });
+    });
+    // Force a real re-render through the real fetch.
+    await page.evaluate(() => switchTab("games"));
+    await waitForView(page, "games");
+    await page.evaluate(() => switchTab("roster"));
+    await waitForView(page, "roster");
+    await waitForRealContent(page);
+    await page.waitForSelector("[data-ineligible]", { timeout: 10000 });
+    const cleanup = await page.evaluate((names) => {
+      // The cleanup block is identified by the label it renders, not by a
+      // position, so re-ordering the coach surface cannot silently retarget
+      // this assertion at some other card.
+      const title = Array.from(document.querySelectorAll("#content .section-title"))
+        .find((t) => /Needs cleanup/i.test(t.textContent || ""));
+      const card = title && title.nextElementSibling;
+      const rows = card ? Array.from(card.querySelectorAll(".row")) : [];
+      return {
+        found: !!card,
+        titleText: title ? (title.textContent || "").trim() : null,
+        cardText: card ? (card.textContent || "").replace(/\s+/g, " ").trim() : null,
+        rows: rows.map((r) => ({
+          text: (r.textContent || "").replace(/\s+/g, " ").trim(),
+          ineligible: !!r.querySelector("[data-ineligible]"),
+          acts: Array.from(r.querySelectorAll("[data-act]")).map((b) => b.dataset.act),
+        })),
+        eligibleAnywhere: (document.getElementById("content").textContent || "")
+          .includes(names.ok),
+      };
+    }, { ok: `Standing Sub ${suffix}` });
+    if (!cleanup.found || cleanup.rows.length !== 1) {
+      fail(`Coach [${L}]: the durably-owned enrolment whose candidate can no `
+        + `longer play must stay VISIBLE to its owning Coach -- the live `
+        + `outreach queue drops it, so without this block it is actionable by `
+        + `nobody: ${JSON.stringify(cleanup)}`);
+    }
+    const stale = cleanup.rows[0];
+    if (!new RegExp(`Departed Sub ${suffix}`).test(stale.text)) {
+      fail(`Coach [${L}]: the cleanup block names the wrong row: `
+        + `${JSON.stringify(stale)}`);
+    }
+    // LABELLED, so the coach can see WHY it is here.
+    if (!stale.ineligible || !/Ineligible/i.test(stale.text)) {
+      fail(`Coach [${L}]: the stale enrolment is not labelled ineligible: `
+        + `${JSON.stringify(stale)}`);
+    }
+    // NON-ACTIONABLE EXCEPT FOR CLEANUP -- asserted as an exact set, so this
+    // fails both if a seat control appears AND if the cleanup control the
+    // ruling requires disappears. `data-act` is what the click handler
+    // dispatches on, so its presence/absence is what actually decides whether
+    // an action can be taken.
+    if (JSON.stringify(stale.acts) !== JSON.stringify(["withdraw"])) {
+      fail(`Coach [${L}]: expected the stale enrolment to offer EXACTLY the `
+        + `cleanup action and no seat/add, got ${JSON.stringify(stale.acts)}`);
+    }
+    // ...and the block really is eligibility-driven: the ELIGIBLE row
+    // injected alongside it is not swept in here. (It does not appear on this
+    // screen at all -- the outreach queue is its home, and that queue is
+    // built from a separate endpoint this rewrite does not touch.)
+    if (cleanup.eligibleAnywhere) {
+      fail(`Coach [${L}]: the eligible substitute was pulled into the cleanup `
+        + `block, so the block is not keyed on eligibility: `
+        + `${JSON.stringify(cleanup)}`);
+    }
+    // The block says, in operator language, what the coach may do about it.
+    if (!/can only be removed/i.test(cleanup.cardText)) {
+      fail(`Coach [${L}]: the cleanup block does not explain itself: `
+        + `${cleanup.cardText}`);
+    }
+    await page.unroute("**/api/games/*/lineups");
+
+    // ------------------------------------------------------------
+    // GAME ACTIVITY (#427 final blocker). "/board: scoped callers and
+    // officials must not receive game-wide notifications, audit, or
+    // audit_count... audit_count must not survive as a covert cardinality
+    // oracle over omitted rows."
+    //
+    // The SERVER side is pinned tri-store over real authenticated HTTP
+    // (backend/tests/test_private_game_sibling_routes.py). What can only be
+    // proven here is the RENDERING of the two projections it now sends,
+    // because both had an empty state that would have MISREPRESENTED them:
+    // `notifications: []` renders as "No notifications yet." and `audit: []`
+    // as "No audit entries." -- claims that THIS GAME has had no activity,
+    // when the truth is that this READER is not being shown it.
+    // ------------------------------------------------------------
+    await page.evaluate(() => switchTab("activity"));
+    await waitForView(page, "activity");
+    await waitForRealContent(page);
+    const ownActivity = await page.evaluate(() => {
+      const titles = Array.from(document.querySelectorAll("#content .section-title"))
+        .map((t) => (t.textContent || "").trim());
+      const auditTitle = titles.find((t) => /^Game audit/.test(t)) || "";
+      const m = /\((\d+)\)/.exec(auditTitle);
+      const card = Array.from(document.querySelectorAll("#content .section-title"))
+        .find((t) => /^Game audit/.test(t.textContent || ""));
+      return {
+        scopeNote: document.querySelectorAll("[data-activity-scope]").length,
+        restricted: document.querySelectorAll("[data-restricted]").length,
+        auditTitle,
+        claimed: m ? Number(m[1]) : null,
+        rendered: card && card.nextElementSibling
+          ? card.nextElementSibling.querySelectorAll(".tl-item").length : -1,
+      };
+    });
+    // A Coach reads their OWN side's activity, and is told so -- otherwise a
+    // short list reads as a claim about the whole game.
+    if (ownActivity.scopeNote !== 1) {
+      fail(`Coach [${L}]: the own-side activity feed must say it is scoped to `
+        + `this team, found ${ownActivity.scopeNote} scope note(s): `
+        + `${JSON.stringify(ownActivity)}`);
+    }
+    // THE CARDINALITY ORACLE, closed at the surface the coach actually reads:
+    // the number in the heading is the number of rows on the screen, never a
+    // count of the whole game's log.
+    if (ownActivity.claimed === null
+        || ownActivity.claimed !== ownActivity.rendered) {
+      fail(`Coach [${L}]: "Game audit (N)" must count the rows actually sent, `
+        + `not the whole game's log: ${JSON.stringify(ownActivity)}`);
+    }
+
+    // THE WITHHELD PROJECTION. An assigned official receives all three fields
+    // as null. No browser journey can BE an assigned official mid-run (this
+    // page holds a real Coach session and officials are assigned through a
+    // separate operator flow), so the payload is injected by rewriting the
+    // real /board response in flight -- the same technique, and the same
+    // justification, as the ineligible-row leg above: the fetch-to-DOM path
+    // is entirely real and the SHAPE injected is exactly the one the Python
+    // tests pin for an official.
+    await page.route("**/api/games/*/board", async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.audit_scope = "withheld";
+      body.notifications = null;
+      body.audit = null;
+      body.audit_count = null;
+      await route.fulfill({ response, json: body });
+    });
+    await page.evaluate(() => switchTab("games"));
+    await waitForView(page, "games");
+    await page.evaluate(() => switchTab("activity"));
+    await waitForView(page, "activity");
+    await waitForRealContent(page);
+    const withheldActivity = await page.evaluate(() => {
+      const text = (document.getElementById("content").textContent || "")
+        .replace(/\s+/g, " ");
+      const titles = Array.from(document.querySelectorAll("#content .section-title"))
+        .map((t) => (t.textContent || "").trim());
+      return {
+        restricted: document.querySelectorAll("[data-restricted]").length,
+        scopeNote: document.querySelectorAll("[data-activity-scope]").length,
+        auditTitle: titles.find((t) => /^Game audit/.test(t)) || "",
+        saysNoNotifications: /No notifications yet\./.test(text),
+        saysNoAudit: /No audit entries\./.test(text),
+        saysWithheld: /Game activity not shown/.test(text),
+      };
+    });
+    // WITHHELD IS NOT EMPTY. Both collections get the redacted treatment, and
+    // the two misleading empty-state sentences must be gone -- this is the
+    // assertion that fails if someone "simplifies" the server back to [].
+    if (withheldActivity.restricted !== 2 || !withheldActivity.saysWithheld) {
+      fail(`Coach [${L}]: a withheld activity log must render as WITHHELD in `
+        + `both cards: ${JSON.stringify(withheldActivity)}`);
+    }
+    if (withheldActivity.saysNoNotifications || withheldActivity.saysNoAudit) {
+      fail(`Coach [${L}]: withheld activity rendered as an EMPTY OPERATIONAL `
+        + `STATE -- "no notifications"/"no audit entries" claims this game has `
+        + `had no activity, which is a different and false statement: `
+        + `${JSON.stringify(withheldActivity)}`);
+    }
+    // ...and no count survives in the heading, which would be the same oracle
+    // in string form.
+    if (/\(/.test(withheldActivity.auditTitle)) {
+      fail(`Coach [${L}]: the withheld audit heading still carries a count: `
+        + `${JSON.stringify(withheldActivity)}`);
+    }
+    if (withheldActivity.scopeNote !== 0) {
+      fail(`Coach [${L}]: the own-side scope note must not appear when the `
+        + `whole log is withheld: ${JSON.stringify(withheldActivity)}`);
+    }
+    await page.unroute("**/api/games/*/board");
+
     // Direct-navigation bypass: Setup is hidden from nav (neither
     // manage_setup nor manage_arena) -- switchTab() must self-guard.
     await page.evaluate(() => switchTab("setup"));
@@ -1004,6 +1917,320 @@ async function checkViewport(browser, viewport) {
     await assertForbiddenNoChange(page, reader, tracker, fail, "Official",
       "/api/setup/official", { name: "Should Not Exist (official)" },
       ["/api/v2/setup/overview", "/api/demo/overview"]);
+    await logout(page);
+
+    // ============================================================
+    // ASSIGNED Official -- the Roster tab degrades honestly (#427 final
+    // blocker, round 2).
+    //
+    // WHAT ONLY A BROWSER CAN PROVE HERE. The server side is pinned tri-store
+    // over real authenticated HTTP (backend/tests/
+    // test_private_game_sibling_routes.py). What that cannot show is that the
+    // SHIPPED SCREEN was the live path: `canReadAnyPrivateGame()` admits any
+    // official_id to the Roster tab, and an official's /lineups sides come
+    // back `projection: "submitted_lineup"` with `restricted: false` -- so
+    // every "not restricted" gate read TRUE for them and the tab fetched
+    // `/availability-summary?team_id=<the side being shown>` on every render,
+    // with the side toggle switching teams. Measured in exactly this browser
+    // before the fix: 200, both sides, names and per-player availability.
+    //
+    // Unlike the two injected legs elsewhere in this file, NOTHING is faked:
+    // this is a real assigned official's real session reading the real
+    // endpoint. Three things are required, and they are different claims --
+    // the request is not made, the withheld state is NAMED, and the two
+    // FULL-shaped empty states that would misdescribe it are gone.
+    // ============================================================
+    await loginAs(page, accounts.assigned_official.username, PW);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await waitForView(page, "inbox");
+    await waitForRealContent(page);
+    const officialGameCalls = [];
+    const collectGameCalls = (req) => {
+      const u = new URL(req.url());
+      if (/^\/api\/games\//.test(u.pathname)) {
+        officialGameCalls.push(`${req.method()} ${u.pathname}${u.search}`);
+      }
+    };
+    page.on("request", collectGameCalls);
+    await page.evaluate(() => switchTab("roster"));
+    await waitForView(page, "roster");
+    await waitForRealContent(page);
+    // The COACH sub-view explicitly: `gameView` is a module global that an
+    // earlier role's journey may have left on "player", and the candidate
+    // pool and substitute workflow this leg is about live only on the coach
+    // body. Clicked, not assigned -- this is the control a real reader uses.
+    await page.click('.seg[data-view="coach"]');
+    await waitForRealContent(page);
+    // The data-side toggle is the half a landing-only check would miss: it is
+    // what turned one side's rollup into both.
+    const sideTabs = await page.$$("[data-side]");
+    if (sideTabs.length !== 2) {
+      fail(`Assigned official [${L}]: expected both side tabs on the Roster `
+        + `tab, found ${sideTabs.length} -- the leg below cannot prove the `
+        + `toggle no longer fetches the other side's rollup`);
+    }
+    await page.click('[data-side="away"]');
+    await waitForRealContent(page);
+    page.off("request", collectGameCalls);
+    const leaked = officialGameCalls.filter((c) =>
+      /availability-summary|substitute-candidates|substitute-addable/.test(c));
+    if (leaked.length) {
+      fail(`Assigned official [${L}]: the Roster tab still fetches a route `
+        + `that carries private candidate/availability state -- and which now `
+        + `refuses this caller, so every render would 403: `
+        + `${JSON.stringify(leaked)}`);
+    }
+    if (!officialGameCalls.some((c) => /\/lineups$/.test(c))) {
+      fail(`Assigned official [${L}]: the Roster tab fetched no /lineups at `
+        + `all, so the check above passed vacuously: `
+        + `${JSON.stringify(officialGameCalls)}`);
+    }
+    const officialRoster = await page.evaluate(() => {
+      const text = (document.getElementById("content").textContent || "")
+        .replace(/\s+/g, " ");
+      return {
+        restricted: document.querySelectorAll("[data-restricted]").length,
+        saysAvailWithheld: /Availability not shown/.test(text),
+        saysWorkflowWithheld: /Candidate and substitute list not shown/.test(text),
+        saysAllOnRoster: /All eligible players are on the roster or in the sub pool\./.test(text),
+        saysNoSubs: /No substitutes enrolled\./.test(text),
+        // The submitted lineup this reader IS entitled to. In this fixture
+        // the Coach's own journey ends with nothing seated, so the honest
+        // answer is the Game Sheet's "No lineup submitted" -- a true claim
+        // about the SUBMITTED lineup, which is exactly what this projection
+        // sends.
+        saysNothingSubmitted: /No lineup submitted/.test(text),
+        // ...and NOT the full-side instruction, which asserts the team has
+        // no players AT ALL and tells the reader to go add some.
+        saysTeamHasNoPlayers: /The home team has no players/.test(text),
+      };
+    });
+    // WITHHELD IS NAMED...
+    if (!officialRoster.saysAvailWithheld || !officialRoster.saysWorkflowWithheld
+        || officialRoster.restricted < 2) {
+      fail(`Assigned official [${L}]: the Roster tab must say the availability `
+        + `rollup and the candidate/substitute list are WITHHELD, not render `
+        + `them as absent: ${JSON.stringify(officialRoster)}`);
+    }
+    // ...AND NOT RENDERED AS AN EMPTY OPERATIONAL STATE. Both sentences are
+    // claims about THIS TEAM's preparedness -- "everyone eligible is already
+    // on the roster", "this team has enrolled no substitutes" -- and both are
+    // false for a reader who is simply not being shown those populations.
+    if (officialRoster.saysAllOnRoster || officialRoster.saysNoSubs) {
+      fail(`Assigned official [${L}]: withheld candidate/substitute state was `
+        + `rendered as an EMPTY operational claim about the team rather than `
+        + `as withheld: ${JSON.stringify(officialRoster)}`);
+    }
+    // AND THE SAME RULE ONE LAYER UP. An empty `players` array means
+    // different things on the two projections: on a full side it is the whole
+    // population, on this one it is only what was SUBMITTED. The full-side
+    // sentence ("The home team has no players. Add players in Setup first")
+    // is a claim about another team's roster that this reader was never shown
+    // -- the same mistake as the two above, made by an earlier guard.
+    if (officialRoster.saysTeamHasNoPlayers || !officialRoster.saysNothingSubmitted) {
+      fail(`Assigned official [${L}]: an empty SUBMITTED lineup must read as `
+        + `"no lineup submitted", never as "this team has no players": `
+        + `${JSON.stringify(officialRoster)}`);
+    }
+    // AND THE ROUTE ITSELF REFUSES, probed directly the way a console user
+    // would -- so the UI gate is defence in depth, never the boundary.
+    for (const teamId of [coachTeam.body.id, rivalTeam.body.id]) {
+      const probePath = `/api/games/${game.body.id}/availability-summary`;
+      tracker.expect("GET", probePath, 403);
+      const probe = await apiGet(page, `${probePath}?team_id=${teamId}`);
+      if (probe.status !== 403 || !probe.body.error
+          || probe.body.error.code !== "forbidden") {
+        fail(`Assigned official [${L}]: ?team_id=${teamId} must be refused, `
+          + `got status=${probe.status} body=${JSON.stringify(probe.body)}`);
+      }
+      if ("players" in probe.body || "counts" in probe.body) {
+        fail(`Assigned official [${L}]: the refusal carried a rollup shape -- `
+          + `an empty summary is a claim about the team, not about the `
+          + `reader: ${JSON.stringify(probe.body)}`);
+      }
+    }
+
+    // ------------------------------------------------------------
+    // THE GAME SHEET HOLDS ONLY ROWS THAT OCCUPY A SLOT (#427 round 2,
+    // blocker 3), probed from the assigned official's own real session.
+    //
+    // `_lineup_rows` keeps a seated player in the `selected` GROUP after they
+    // have gone unavailable, flagged `backed_out: true`, so their own coach
+    // can still see the row for cleanup. The official's projection filtered
+    // on that group alone, so a referee's Game Sheet listed a player who is
+    // not playing -- that side's roster HISTORY rather than its current
+    // sheet. All three routes share one helper, so all three are probed.
+    //
+    // The fixture is built through the OPERATOR reader (the same authorized
+    // boundary this file already uses to snapshot state), and read back
+    // through the OFFICIAL's session. Nothing is faked, and nothing is
+    // asserted about a row this reader is not entitled to at all.
+    // ------------------------------------------------------------
+    const sheetOn = await apiPost(reader, "/api/v2/setup/player",
+      { team_id: coachTeam.body.id, name: `Sheet Playing ${suffix}`, position: "forward" });
+    const sheetOff = await apiPost(reader, "/api/v2/setup/player",
+      { team_id: coachTeam.body.id, name: `Sheet Backed Out ${suffix}`, position: "defense" });
+    const seatSheet = await apiPost(reader,
+      `/api/games/${game.body.id}/roster/select`,
+      { player_ids: [sheetOn.body.id, sheetOff.body.id] });
+    if (seatSheet.status !== 200 || seatSheet.body.error) {
+      fail(`sheet seat failed: ${JSON.stringify(seatSheet)}`);
+    }
+    const backOut = await apiPost(reader,
+      `/api/games/${game.body.id}/availability`,
+      { player_id: sheetOff.body.id, availability_status: "unavailable" });
+    if (backOut.status !== 200 || backOut.body.error) {
+      fail(`sheet back-out failed: ${JSON.stringify(backOut)}`);
+    }
+    // The PREMISE, read through the operator: one row occupies its slot and
+    // the other does not, and BOTH are still in the `selected` display group.
+    // Without this the probes below could pass because the row was never
+    // created at all.
+    const fullSide = await apiGet(reader, `/api/games/${game.body.id}/lineups`);
+    const fullRows = (fullSide.body.home.players || [])
+      .filter((pl) => pl.id === sheetOn.body.id || pl.id === sheetOff.body.id);
+    if (fullRows.length !== 2
+        || !fullRows.every((pl) => pl.group === "selected")
+        || fullRows.filter((pl) => pl.backed_out === true).length !== 1) {
+      fail(`Assigned official [${L}]: the sheet fixture is not the shape this `
+        + `leg is about (two 'selected' rows, exactly one backed out): `
+        + `${JSON.stringify(fullRows)}`);
+    }
+    const sheetProbes = {
+      board: (b) => b.players || [],
+      lineups: (b) => (b.home.players || []),
+      roster: (b) => (b || []).filter((r) => r.team_id === coachTeam.body.id),
+    };
+    for (const route of Object.keys(sheetProbes)) {
+      const res = await apiGet(page, `/api/games/${game.body.id}/${route}`);
+      if (res.status !== 200) {
+        fail(`Assigned official [${L}]: /${route} answered ${res.status}: `
+          + `${JSON.stringify(res.body)}`);
+      }
+      const rows = sheetProbes[route](res.body);
+      const ids = rows.map((r) => r.id);
+      if (!ids.includes(sheetOn.body.id)) {
+        fail(`Assigned official [${L}]: /${route} dropped a row that DOES `
+          + `occupy a slot: ${JSON.stringify(rows)}`);
+      }
+      if (ids.includes(sheetOff.body.id)) {
+        fail(`Assigned official [${L}]: /${route} carried a backed-out row `
+          + `into the Game Sheet -- a player who no longer occupies a slot, `
+          + `which is that side's roster history and not the current sheet: `
+          + `${JSON.stringify(rows)}`);
+      }
+      if (rows.some((r) => r.backed_out !== false)) {
+        fail(`Assigned official [${L}]: /${route} returned a row whose `
+          + `backed_out is not false: ${JSON.stringify(rows)}`);
+      }
+    }
+
+    // ------------------------------------------------------------
+    // THE GAMES LIST RENDERS THE WITHHELD ROSTER STATUS AS WITHHELD
+    // (#205, round 4).
+    //
+    // WHAT ONLY A BROWSER CAN PROVE. The server side -- that
+    // /api/demo/overview omits `schedule[].roster_status` for a caller
+    // entitled to no side -- is pinned tri-store over real authenticated
+    // HTTP (backend/tests/test_overview_schedule_side.py). What that cannot
+    // show is what the SHIPPED SCREEN does with the omission, and that is
+    // the whole reason the field carries an explicit marker rather than
+    // just disappearing: every consumer of it asks
+    // `["roster_confirmed","locked"].includes(g.roster_status)`, which a
+    // missing key answers `false` -- so a naive omission renders as the
+    // badge "Roster open" and the checklist line "Roster -- Not confirmed".
+    // That is restricted data displayed as an EMPTY OPERATIONAL STATE, and
+    // it is a false claim about the other team rather than a true one about
+    // this reader.
+    //
+    // The Games tab is where it shows: `gateChrome()` never hides it, so an
+    // official reaches this list, and before the fix its rows carried the
+    // HOME side's real private status for every game in the Program --
+    // including games this official was never assigned to.
+    //
+    // Nothing is faked: a real assigned official's real session, the real
+    // route, the real render.
+    // ------------------------------------------------------------
+    const officialOverview = await apiGet(page, "/api/demo/overview");
+    if (officialOverview.status !== 200 || officialOverview.body.error) {
+      fail(`Assigned official [${L}]: /api/demo/overview failed, so the `
+        + `render assertions below would prove nothing: `
+        + `${JSON.stringify(officialOverview).slice(0, 200)}`);
+    }
+    const officialRow = (officialOverview.body.schedule || [])
+      .find((g) => g.game_id === game.body.id);
+    if (!officialRow) {
+      fail(`Assigned official [${L}]: the fixture game is absent from this `
+        + `official's schedule, so nothing below is being asserted`);
+    }
+    if ("roster_status" in officialRow) {
+      fail(`Assigned official [${L}]: schedule[].roster_status was served to `
+        + `a caller entitled to no side of this game -- `
+        + `${JSON.stringify(officialRow.roster_status)}`);
+    }
+    if (officialRow.roster_status_restricted !== true
+        || officialRow.roster_status_team_id !== null) {
+      fail(`Assigned official [${L}]: the withheld row carries no explicit `
+        + `marker, so the screen has nothing to distinguish it from a real `
+        + `unconfirmed roster: ${JSON.stringify(officialRow)}`);
+    }
+    await page.evaluate(() => switchTab("games"));
+    await waitForView(page, "games");
+    await waitForRealContent(page);
+    await page.waitForSelector(".games-row", { timeout: 10000 });
+    // Expand THIS game's row -- clicked by its own game id, so re-ordering
+    // the list cannot silently retarget the assertion at another game.
+    await page.click(`.games-row[data-games-toggle="${game.body.id}"]`);
+    await page.waitForSelector(".games-detail", { timeout: 10000 });
+    const officialGames = await page.evaluate((gid) => {
+      const head = document.querySelector(`.games-row[data-games-toggle="${gid}"]`);
+      const detail = head && head.nextElementSibling;
+      const checks = Array.from(
+        (detail || document).querySelectorAll(".games-detail .check"));
+      const roster = checks.find((c) => {
+        const lbl = c.querySelector(".lbl");
+        return lbl && lbl.textContent.trim() === "Roster";
+      });
+      return {
+        badge: head ? (head.querySelector(".pill") || {}).textContent : null,
+        rosterClass: roster ? roster.className : null,
+        rosterMeta: roster
+          ? ((roster.querySelector(".meta") || {}).textContent || "").trim()
+          : null,
+        detailText: (detail ? detail.textContent : "").replace(/\s+/g, " "),
+      };
+    }, game.body.id);
+    if (!officialGames.rosterClass) {
+      fail(`Assigned official [${L}]: no "Roster" checklist line rendered, so `
+        + `the withheld state has no proven rendering: `
+        + `${JSON.stringify(officialGames)}`);
+    }
+    // THE THIRD STATE, and it is the point: `check todo` is the rendering of
+    // "this roster is not confirmed", which is exactly the false claim.
+    if (!/\bunknown\b/.test(officialGames.rosterClass)
+        || /\btodo\b/.test(officialGames.rosterClass)
+        || /\bok\b/.test(officialGames.rosterClass)) {
+      fail(`Assigned official [${L}]: a withheld roster status rendered as a `
+        + `done/to-do checklist state ("${officialGames.rosterClass}") -- `
+        + `restricted data must never be shown as an empty operational `
+        + `state`);
+    }
+    if (!/not shown/i.test(officialGames.rosterMeta || "")) {
+      fail(`Assigned official [${L}]: the withheld roster line does not say `
+        + `it was withheld, got "${officialGames.rosterMeta}"`);
+    }
+    if (/not confirmed/i.test(officialGames.detailText)
+        || /Draft — no players/i.test(officialGames.detailText)) {
+      fail(`Assigned official [${L}]: the game row asserts an operational `
+        + `roster state this reader was never shown: `
+        + `${officialGames.detailText.slice(0, 200)}`);
+    }
+    // And the row's own badge claims neither readiness nor an open roster.
+    if (/Roster open/i.test(officialGames.badge || "")
+        || /^\s*Ready\s*$/i.test(officialGames.badge || "")) {
+      fail(`Assigned official [${L}]: the row badge "${officialGames.badge}" `
+        + `states a readiness verdict whose roster half was withheld`);
+    }
     await logout(page);
 
     // ============================================================

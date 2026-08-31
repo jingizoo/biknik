@@ -203,6 +203,26 @@ body {
 .lineup-switch .ls .ls-team { font-size: 14px; font-weight: 700; color: var(--ink); }
 .lineup-switch .ls .ls-sub { font-size: 11px; color: var(--muted); }
 .lineup-switch .ls.active { border-color: var(--blue); box-shadow: 0 0 0 1px var(--blue) inset; background: #f2f8ff; }
+/* A side this caller may not read (#427). Muted and marked, never hidden:
+   the tab still names the opponent, because WHICH team you are playing is
+   public and only their lineup is not. */
+.lineup-switch .ls.restricted { background: #f7f8fa; border-style: dashed; }
+.lineup-switch .ls.restricted .ls-sub { color: var(--muted); font-style: italic; }
+
+/* ----- redacted opponent side (#427) -----
+   Deliberately does NOT reuse `.empty`, which is what "No lineup submitted."
+   and "No players on the roster yet" render as. A reader must be able to tell
+   "withheld from you" from "this team has not submitted one", so the two
+   states look different, and this one carries its own lock affordance.
+   NO NEW BREAKPOINT: this block is width-independent and the Game Sheet's
+   two columns already stack under the existing 720px rule, which is what
+   makes it readable at the 390px verification viewport. */
+.restricted-side { padding: 18px 14px; text-align: center; }
+.rs-head { margin-bottom: 8px; }
+.rs-title { font-size: 14px; font-weight: 700; color: var(--ink); }
+.rs-note { font-size: 12px; color: var(--muted); margin-top: 4px;
+  max-width: 34ch; margin-left: auto; margin-right: auto; line-height: 1.45; }
+.gs-side-restricted { border-style: dashed; }
 
 .content {
   flex: 1;
@@ -474,6 +494,17 @@ select.player-picker {
 .ps-bar.open span { background: var(--orange); }
 .ros-warn { background: #fff5e8; border: 1px solid #ffd9a8; border-radius: 10px;
   padding: 9px 12px; margin: 10px 0; font-size: 13px; color: #8a5a00; }
+/* The batch-seating partial-result / zero-seat warning (#427). Same block,
+   same palette; only the internal layout differs, because this one names
+   players and reasons as a list rather than a run-on sentence.
+   NO NEW BREAKPOINT: it is fluid, so 390px is covered by the existing 480px
+   rule below and by `overflow-wrap` — e2e/breakpoint-contract.js fails the
+   build for any width outside {480,720,880,1040}. */
+.ros-partial .rp-head { font-weight: 700; margin-bottom: 4px; }
+.ros-partial .rp-list { margin: 0; padding-left: 18px; }
+/* A long "Name — reason" pair must wrap inside the card, never widen the page
+   into a horizontal scroll on a 390px viewport. */
+.ros-partial .rp-list li { margin: 2px 0; overflow-wrap: anywhere; }
 .ros-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
 .ros-toolbar .act { flex: 1; }
 .avail-group { border-bottom: 1px solid var(--sep); }
@@ -1178,6 +1209,10 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .check .ic { width: 20px; text-align: center; }
 .check.ok .ic { color: var(--green); }
 .check.todo .ic { color: var(--muted); }
+/* #205: a check whose answer is WITHHELD from this reader — neither done
+   nor to-do. Its own class so it can never be styled, or read, as either. */
+.check.unknown .ic { color: var(--muted); }
+.check.unknown .lbl { color: var(--muted); }
 .check .lbl { flex: 1; }
 .check .meta { font-size: 12px; color: var(--muted); }
 

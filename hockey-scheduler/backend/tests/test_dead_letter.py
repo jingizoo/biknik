@@ -18,7 +18,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import DeliveryStatus
+from hockey_scheduler.domain import DeliveryStatus, Role
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import DeliveryWorker
 from hockey_scheduler.services.delivery import MAX_ATTEMPTS
@@ -55,7 +55,7 @@ class DeadLetterServiceTest(unittest.TestCase):
     def test_retry_requeues_and_clears_dead_letter_state(self):
         self._exhaust()
         d = self.store.all_notification_deliveries()[0]
-        res = self.api.retry_notification_delivery(d.id)
+        res = self.api.retry_notification_delivery(d.id, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(res["status"], "pending")
         self.assertEqual(res["attempts"], 0)
         self.assertIsNone(res["dead_lettered_at"])
@@ -70,7 +70,7 @@ class DeadLetterServiceTest(unittest.TestCase):
     def test_ignored_delivery_is_not_retried(self):
         self._exhaust()
         d = self.store.all_notification_deliveries()[0]
-        res = self.api.ignore_notification_delivery(d.id)
+        res = self.api.ignore_notification_delivery(d.id, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(res["status"], "ignored")
         # Never deliverable again, even by a fresh worker run.
         DeliveryWorker(self.store, _clock).process_pending()
@@ -81,7 +81,7 @@ class DeadLetterServiceTest(unittest.TestCase):
         DeliveryWorker(self.store, _clock).process_pending()  # all sent
         d = self.store.all_notification_deliveries()[0]
         self.assertEqual(d.status, DeliveryStatus.SENT)
-        res = self.api.retry_notification_delivery(d.id)
+        res = self.api.retry_notification_delivery(d.id, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(res["error"]["code"], "validation_error")
 
     def test_ignore_sent_delivery_is_rejected(self):
@@ -90,17 +90,17 @@ class DeadLetterServiceTest(unittest.TestCase):
         DeliveryWorker(self.store, _clock).process_pending()  # all sent
         d = self.store.all_notification_deliveries()[0]
         self.assertEqual(d.status, DeliveryStatus.SENT)
-        res = self.api.ignore_notification_delivery(d.id)
+        res = self.api.ignore_notification_delivery(d.id, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(res["error"]["code"], "validation_error")
         self.assertEqual(self.store.get_notification_delivery(d.id).status,
                          DeliveryStatus.SENT)
 
     def test_retry_and_ignore_unknown_are_not_found(self):
         self.assertEqual(
-            self.api.retry_notification_delivery("nope")["error"]["code"],
+            self.api.retry_notification_delivery("nope", actor_role=Role.LEAGUE_ADMIN)["error"]["code"],
             "not_found")
         self.assertEqual(
-            self.api.ignore_notification_delivery("nope")["error"]["code"],
+            self.api.ignore_notification_delivery("nope", actor_role=Role.LEAGUE_ADMIN)["error"]["code"],
             "not_found")
 
 

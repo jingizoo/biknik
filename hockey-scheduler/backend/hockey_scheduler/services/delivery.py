@@ -10,14 +10,19 @@ sender is pluggable, so success / failure / retry are all unit-testable.
 """
 
 import threading
+from datetime import datetime, timezone
 
 from ..domain import (
+    ACCESS_ALLOWED,
+    DataAccessLog,
     DeliveryStatus,
     NotificationAudience,
     NotificationChannel,
     NotificationDelivery,
+    SensitiveFieldCategory,
 )
 from ..domain.errors import ValidationError
+from . import visibility_policy
 from .email_transport import DryRunEmailTransport
 from .push_transport import DryRunPushTransport
 
@@ -94,6 +99,16 @@ def resolve_destination(store, recipient: str, channel) -> str:
     delete. Every retry/re-resolution (below) re-checks this, so a delivery
     enqueued before retirement falls back to the placeholder on its very
     next attempt rather than continuing to reach the retired address.
+
+    Audit-free by design — several call sites (import/reactivation checks,
+    contact-registry tests, device-token tests) need the resolved value
+    with no system-attributed DataAccessLog side effect. The delivery
+    worker's OWN two call sites (below) do not use this function directly;
+    they use ``_resolve_and_audit_destination``, which performs the SAME
+    resolution but from exactly ONE store read shared with its audit
+    decision (#426 round-2 review finding 3 — see that function's own
+    docstring for why splitting the read from the audit, as this function
+    and a separate audit call used to be combined, is unsafe).
     """
     if channel == NotificationChannel.PUSH:
         token = store.active_device_token_for(recipient)
@@ -103,6 +118,145 @@ def resolve_destination(store, recipient: str, channel) -> str:
     if stored is not None and stored.destination and stored.active:
         return stored.destination
     return destination_for(recipient, channel)
+
+
+def _resolve_and_audit_destination(store, clock, recipient: str, channel,
+                                   request_id: str,
+                                   purpose: str = "delivery_resolve") -> str:
+    """Resolve (recipient, channel)'s real delivery destination AND, if a
+    stored ContactDestination OR DeviceToken row is what that resolution
+    actually used, durably audit reading it — both derived from exactly
+    ONE store read (#426 round-2 review finding 3).
+
+    PUSH TOKEN BRANCH (#426 round-3 review finding 1). Until this fix, a
+    resolved active device token was returned directly from inside the
+    ``read_only`` transaction below — before ever reaching the
+    ``store.add_data_access`` call beneath it, which only the
+    ContactDestination branch was wired to run. The reviewer's own repro:
+    plant a ``push-secret-token-426`` device token, and both
+    ``ApiService.list_device_tokens()`` (a separate #426 round-3 finding 1
+    fix, see ``api/service.py``) and THIS function returned/sent it with
+    ``list_data_access()`` staying empty — a stored, real push destination
+    disclosed with no trace, exactly the class of gap #124 exists to
+    close. A device token is, for audit purposes, the SAME kind of "real
+    stored contact destination" a ContactDestination row is (``resolve_
+    destination``'s own docstring already lists them as the two ranked
+    sources of "the real stored destination") — so it is audited under
+    the SAME ``SensitiveFieldCategory.CONTACT_DESTINATION`` category,
+    ``subject_type="recipient"`` shape, and ``SYSTEM_PRINCIPAL``
+    attribution as the ContactDestination branch, just with ``purpose``
+    suffixed ``"_push_token"`` so a reader of the ledger can still tell
+    WHICH underlying stored row a given ``delivery_resolve``-family row
+    disclosed, without needing a second category or a second gate (the
+    external review's own instruction: "one CONTACT_DESTINATION-category
+    gate that both ContactDestination and DeviceToken route through, not
+    two similar-but-separate gates").
+
+    The bug this replaces: ``enqueue()`` and
+    ``DeliveryWorker._process_pending_locked()`` used to call a separate
+    ``_audit_system_contact_read()`` (its OWN
+    ``store.get_contact_destination()`` call) and THEN, independently,
+    ``resolve_destination()`` (a SECOND, unrelated
+    ``store.get_contact_destination()`` call) — two unlocked reads with no
+    shared transaction or snapshot between them. A concurrent upsert or
+    retire landing in the gap could make the audit describe a row that was
+    never actually delivered to, or — the reviewer's own repro — let the
+    delivery use a destination that observed a DIFFERENT (later) write
+    than the one the audit recorded (or never audited at all): "the
+    delivery used race-secret@example.com while list_data_access() stayed
+    empty." Reading ONCE and deriving both outputs from that SAME value
+    closes the gap structurally — there is no second read left to race
+    against the first, and no way for the returned destination and the
+    audited row to describe different snapshots.
+
+    The READ half runs under ``store.transaction(read_only=True)`` —
+    NOT a plain (write-capable) ``store.transaction()``. A write-capable
+    transaction takes SQLite's file-level RESERVED lock at ``BEGIN``
+    (see ``SqlStore.transaction``'s own docstring) for its ENTIRE
+    duration, which would make this purely-reading half of the function
+    block every OTHER connection's write for as long as it runs — and,
+    worse, DEADLOCK against the very concurrent writer this fix exists to
+    be race-safe against: that writer's own commit cannot proceed until
+    this transaction releases the lock, and this transaction was never
+    going to release it before observing whatever the test/caller was
+    waiting to see the writer commit. ``read_only=True`` takes SQLite's
+    weaker SHARED lock instead (compatible with another connection's
+    RESERVED — see that flag's own docstring) — this read still observes
+    one consistent value, and it isn't the transaction's lock STRENGTH
+    that makes the audit and the destination agree, it is that there is
+    only ONE read total, feeding both.
+
+    The AUDIT WRITE (when it fires) happens SEPARATELY, in
+    ``add_data_access``'s own transaction, exactly as it did before this
+    fix — an audit write that failed for any reason still propagates as
+    an exception rather than silently letting the destination be used
+    with no trace of it (matching ``_refuse_sensitive_read``'s OWN "every
+    access attempt leaves a trace" contract), it is simply not forced
+    into the SAME lock-holding unit as the read.
+
+    Resolution order mirrors ``resolve_destination()``'s own (kept as a
+    separate, audit-free, single-shot utility several OTHER call sites —
+    none of them the delivery worker — still use directly, see its
+    docstring):
+      1. push only — the recipient's first *active* device token (#65) —
+         audited HERE, from the SAME row this branch returns, when
+         reached (#426 round-3 review finding 1: previously never
+         audited at all, as if it weren't a stored disclosure);
+      2. an *active* registered contact destination (#60) — audited HERE,
+         from the SAME row this branch returns, when reached;
+      3. the synthesized placeholder (#59) — never audited (nothing
+         stored was disclosed).
+
+    Attributed to ``visibility_policy.SYSTEM_PRINCIPAL`` (never a
+    caller/session principal — there is none here: this runs from the
+    background worker loop and the manual drain endpoint alike, neither of
+    which acts on behalf of a signed-in user), with the given ``purpose``
+    (suffixed ``"_push_token"`` for branch 1 above, see the PUSH TOKEN
+    BRANCH section) and a ``request_id`` shared by every row ONE
+    enqueue/drain call writes (#426 review finding 3's original "one
+    request shares one safe id", generalised to one worker run).
+    """
+    token = None
+    with store.transaction(read_only=True):
+        if channel == NotificationChannel.PUSH:
+            candidate = store.active_device_token_for(recipient)
+            if candidate is not None and candidate.token:
+                token = candidate.token
+        stored = None if token is not None else store.get_contact_destination(
+            recipient, channel)
+    if token is not None:
+        # Same durable-id-allocation contract as the ContactDestination
+        # write below — see that comment and domain/privacy.py's DURABLE
+        # ID ALLOCATION section — and the SAME CONTACT_DESTINATION
+        # category/gate a DeviceToken read now shares with a
+        # ContactDestination one (#426 round-3 review finding 1).
+        store.add_data_access(DataAccessLog(
+            category=SensitiveFieldCategory.CONTACT_DESTINATION,
+            subject_type="recipient",
+            subject_id=visibility_policy.canonical_subject_id(recipient),
+            purpose=purpose + "_push_token",
+            at=clock(),
+            actor_user_id=None,
+            actor_role="system",
+            outcome=ACCESS_ALLOWED,
+            request_id=request_id))
+        return token
+    if stored is None or not stored.destination or not stored.active:
+        return destination_for(recipient, channel)
+    # `id` is deliberately left unset: the store assigns it (#426
+    # round-2 review finding 1) — see domain/privacy.py's DURABLE ID
+    # ALLOCATION section.
+    store.add_data_access(DataAccessLog(
+        category=SensitiveFieldCategory.CONTACT_DESTINATION,
+        subject_type="recipient",
+        subject_id=visibility_policy.canonical_subject_id(recipient),
+        purpose=purpose,
+        at=clock(),
+        actor_user_id=None,
+        actor_role="system",
+        outcome=ACCESS_ALLOWED,
+        request_id=request_id))
+    return stored.destination
 
 
 def channel_enabled(store, recipient: str, channel) -> bool:
@@ -124,7 +278,7 @@ def _guardian_recipient_refs(store, player_id) -> list:
             for g in store.guardian_links_for_player(player_id) if g.verified]
 
 
-def enqueue(store, notification, channels=DEFAULT_CHANNELS):
+def enqueue(store, notification, channels=DEFAULT_CHANNELS, clock=None):
     """Create the pending delivery rows for a freshly emitted notification.
 
     A channel the recipient has disabled in their preferences (#81) is skipped
@@ -136,7 +290,15 @@ def enqueue(store, notification, channels=DEFAULT_CHANNELS):
     delivery layer itself, so every existing and future PLAYER-audience
     emission site (today: substitute offers) gets it automatically without
     each call site needing to know guardians exist.
+
+    ``clock`` defaults to the real UTC clock (#426 review finding 2's
+    SYSTEM-attributed audit needs a timestamp; existing call sites — none of
+    which had a clock to pass — keep working unchanged). Every destination
+    this call resolves from a REAL stored ContactDestination shares ONE
+    request_id, minted once per call.
     """
+    clock = clock or (lambda: datetime.now(timezone.utc))
+    request_id = visibility_policy.mint_request_id()
     recipients = [recipient_ref(notification)]
     if notification.audience == NotificationAudience.PLAYER:
         recipients.extend(
@@ -146,12 +308,17 @@ def enqueue(store, notification, channels=DEFAULT_CHANNELS):
         for channel in channels:
             if not channel_enabled(store, recipient, channel):
                 continue
+            # ONE read drives both the destination and its audit (#426
+            # round-2 review finding 3) — see
+            # _resolve_and_audit_destination's own docstring.
+            destination = _resolve_and_audit_destination(
+                store, clock, recipient, channel, request_id)
             d = NotificationDelivery(
                 id=store.next_id("notif_delivery"),
                 notification_id=notification.id,
                 channel=channel,
                 recipient_ref=recipient,
-                destination=resolve_destination(store, recipient, channel),
+                destination=destination,
             )
             created.append(store.add_notification_delivery(d))
     return created
@@ -229,6 +396,11 @@ class DeliveryWorker:
         rows = self.store.pending_deliveries(self.max_attempts)
         if limit is not None:
             rows = rows[:limit]
+        # One correlation id for this WHOLE drain run (#426 review finding
+        # 2/3) — every row's re-resolution below that actually reads a
+        # stored ContactDestination shares it, mirroring the facade's own
+        # "one request shares one safe id" contract.
+        run_request_id = visibility_policy.mint_request_id()
         for d in rows:
             notification = self.store.get_notification_feed(d.notification_id)
             # Re-resolve the destination on every attempt so a contact or
@@ -236,8 +408,12 @@ class DeliveryWorker:
             # retrying deliveries (they would otherwise fail forever on the
             # placeholder stamped at enqueue time).
             if d.recipient_ref:
-                d.destination = resolve_destination(
-                    self.store, d.recipient_ref, d.channel)
+                # ONE read drives both the destination and its audit
+                # (#426 round-2 review finding 3) — see
+                # _resolve_and_audit_destination's own docstring.
+                d.destination = _resolve_and_audit_destination(
+                    self.store, self.clock, d.recipient_ref, d.channel,
+                    run_request_id)
             now = self.clock()
             d.attempts += 1
             d.last_attempt_at = now

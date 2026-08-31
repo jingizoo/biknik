@@ -1005,9 +1005,21 @@ async function checkViewport(browser, viewport) {
     // result (#331 review round 1 finding 4's "request-generation/context
     // validation" -- setupProgressFetchSeq in app.js). Route the first
     // intercepted request to a deliberately delayed STALE payload and the
-    // second to an immediate FRESH one, then fire two renders back to back
-    // so the delayed, older request is still in flight when the fast,
-    // newer one already wins.
+    // second to an immediate FRESH one, so the delayed, older request is
+    // still in flight when the fast, newer one already wins.
+    //
+    // The two renders are SEQUENCED, not fired back to back in one tick.
+    // render() now claims a monotonic `renderPass` (app.js) and a superseded
+    // pass stands down at its DOM boundary -- which is ABOVE the
+    // `loadSetupProgressCard()` call, so two renders started in the same tick
+    // legitimately produce only ONE card fetch now (the older pass never
+    // reaches its own dispatch). That collapse would make this leg vacuous:
+    // with a single request the route below only ever serves the STALE
+    // branch, and nothing about the stale-response guard gets exercised. So
+    // the second render is fired only once the first one's card fetch is
+    // genuinely in flight, which is the real shape this guard defends anyway
+    // -- a slow fetch outlasting a later one -- and is asserted non-vacuous
+    // by the request count below.
     let progressRequestCount = 0;
     await page.route("**/api/v2/setup/progress", async (route) => {
       progressRequestCount += 1;
@@ -1027,11 +1039,29 @@ async function checkViewport(browser, viewport) {
         }),
       });
     });
-    await page.evaluate(() => { switchTab("dashboard"); switchTab("dashboard"); });
+    await page.evaluate(() => switchTab("dashboard"));
+    // Barrier, not a sleep: the route handler above increments on ENTRY, so
+    // count===1 means the STALE request is genuinely in flight (and still
+    // inside its 1200ms hold). Only then does the newer render go.
+    const deadline = Date.now() + 10000;
+    while (progressRequestCount < 1) {
+      if (Date.now() > deadline) {
+        fail("the first (stale) setup-progress request was never dispatched");
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    await page.evaluate(() => switchTab("dashboard"));
     await page.waitForFunction(
       () => (document.querySelector(".dash-card .na-title") || {}).textContent
         === "FRESH-MUST-SHOW",
       null, { timeout: 5000 });
+    // Non-vacuity: this leg only proves anything if BOTH requests really were
+    // issued and really did overlap. One request would mean the newer render
+    // never dispatched and the assertion above passed for the wrong reason.
+    if (progressRequestCount !== 2) {
+      fail(`the stale-response guard leg is vacuous: expected exactly 2 `
+        + `overlapping setup-progress requests, got ${progressRequestCount}`);
+    }
     // Give the delayed first (stale) response its full window to resolve and
     // confirm it did NOT overwrite the fresh result once it lands late.
     await new Promise((r) => setTimeout(r, 1500));

@@ -42,6 +42,13 @@ def _v2_setup_permission(rest: str):
     if re.match(r"^seasons/[^/]+/(team-registrations|roll-forward|archive|reopen)$",
                 rest):
         return Permission.MANAGE_SETUP
+    # New-Season copy-forward preview/commit (#159): a Season create composed
+    # with roll-forward's own selection machinery, so it carries the SAME
+    # permission as both halves above. No id segment here (unlike the
+    # roll-forward/archive/reopen routes) -- the target Season does not exist
+    # until commit mints it, so the path names the ACTION only.
+    if re.match(r"^seasons/copy-forward/(preview|commit)$", rest):
+        return Permission.MANAGE_SETUP
     # Season-venue access (#233 Slice E): granting/revoking which Venues a
     # Season may use is a competition-side setup action, same permission as
     # season team registrations above (not MANAGE_ARENA — the Venue itself is

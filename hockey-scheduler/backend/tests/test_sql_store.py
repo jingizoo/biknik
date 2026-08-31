@@ -8,14 +8,15 @@ DATABASE_URL.
 
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Team
-from hockey_scheduler.domain.errors import NotFoundError
+from hockey_scheduler.domain import Role, Team
+from hockey_scheduler.domain.errors import ConcurrencyConflictError, NotFoundError
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import SetupService
 from hockey_scheduler.store import SqlStore, create_store
@@ -109,12 +110,12 @@ class SqlStoreParityTest(unittest.TestCase):
     def test_delivery_queue_roundtrips_on_sql(self):
         # Emission fans out to notification_deliveries; the worker drains them
         # and the sent state persists through the SQL store (#58).
-        ov = self.api.get_delivery_overview()
+        ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertGreater(ov["total"], 0)
         self.assertEqual(ov["by_status"].get("pending"), ov["total"])
         res = self.api.process_notification_deliveries()
         self.assertEqual(res["sent"], ov["total"])
-        ov2 = self.api.get_delivery_overview()
+        ov2 = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(ov2["by_status"].get("sent"), ov2["total"])
         self.assertTrue(all(d["sent_at"] for d in ov2["deliveries"]))
         # Recipient targeting (#59) persists through the SQL store too.
@@ -126,10 +127,10 @@ class SqlStoreParityTest(unittest.TestCase):
         # next emission, all through the SQL store.
         self.api.set_contact_destination(
             "scheduler", "email", "ops@contacts.invalid")
-        listed = self.api.list_contact_destinations()["contacts"]
+        listed = self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)["contacts"]
         self.assertEqual(listed[0]["destination"], "ops@contacts.invalid")
         self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
-        ov = self.api.get_delivery_overview()
+        ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         accepted_email = next(
             d for d in ov["deliveries"]
             if d["recipient_ref"] == "scheduler" and d["channel"] == "email")
@@ -139,10 +140,11 @@ class SqlStoreParityTest(unittest.TestCase):
         # A registered device token (#65) persists and overrides the push
         # placeholder on the next emission, through the SQL store.
         self.api.register_device_token("scheduler", "fcm", "tok-sql")
-        listed = self.api.list_device_tokens()["device_tokens"]
+        listed = self.api.list_device_tokens(
+            actor_role=Role.LEAGUE_ADMIN)["device_tokens"]
         self.assertEqual(listed[0]["token"], "tok-sql")
         self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
-        ov = self.api.get_delivery_overview()
+        ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         push = next(d for d in ov["deliveries"]
                     if d["recipient_ref"] == "scheduler" and d["channel"] == "push")
         self.assertEqual(push["destination"], "tok-sql")
@@ -277,6 +279,110 @@ class SqlStoreTransactionTest(unittest.TestCase):
         # The transaction rolled back: no game, and the slot is still available.
         self.assertEqual(len(store.all_games()), 0)
         self.assertEqual(store.get_ice_slot(slot.id).status.value, "available")
+
+
+class SqlStoreReadOnlyTransactionTest(unittest.TestCase):
+    """round-N+2 (PR #423) regression coverage for ``SqlStore.transaction``'s
+    ``read_only`` parameter — the fix for a real, measured CI stall: a
+    genuinely read-only transaction (``ContextService._snapshot``'s several
+    read-only entry points; ``ApiService.setup_target_accessible``) used to
+    unconditionally take SQLite's file-level RESERVED lock (``BEGIN
+    IMMEDIATE``) even though it never wrote a row, which directly contended
+    with ``_read_under_context_gate_sqlite``'s ``fresh_store`` (round-N+1
+    finding 1) holding that SAME file's RESERVED lock for the duration of a
+    scoped read's ``produce()`` call — and because ``self._lock`` (a
+    per-instance ``threading.RLock``) is held across the WHOLE busy-wait for
+    a contended ``BEGIN``, the resulting ~10s stall froze every OTHER
+    concurrent use of that store instance too, not merely the racing pair.
+    Measured directly against ``tests/test_context_read_cancel_handoff.py``'s
+    ``SqliteContextReadEpochTest`` archive/reopen-while-parked cases.
+
+    Deliberately SQLite-file-backed only (unconditionally a tempfile,
+    independent of ``TEST_DATABASE_URL``): ``read_only`` changes real locking
+    behavior on SQLite specifically — see ``SqlStore.transaction``'s own
+    docstring for why PostgreSQL and ``InMemoryStore`` are unaffected no-ops.
+    """
+
+    def setUp(self):
+        fd, self._tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(os.remove, self._tmp)
+        original = os.environ.get("HS_CONTEXT_GATE_TIMEOUT")
+
+        def restore():
+            if original is None:
+                os.environ.pop("HS_CONTEXT_GATE_TIMEOUT", None)
+            else:
+                os.environ["HS_CONTEXT_GATE_TIMEOUT"] = original
+        self.addCleanup(restore)
+
+    def test_read_only_does_not_contend_with_a_held_reserved_lock(self):
+        """THE EXACT REGRESSION, reproduced directly at the store layer: a
+        SEPARATE connection already holding RESERVED (exactly the shape
+        ``_read_under_context_gate_sqlite``'s ``fresh_store`` takes for a
+        scoped read's whole ``produce()`` duration) must not block a
+        ``read_only=True`` transaction on a DIFFERENT connection AT ALL —
+        SHARED is compatible with another connection's RESERVED (only
+        PENDING/EXCLUSIVE conflict with SHARED). ``HS_CONTEXT_GATE_TIMEOUT``
+        is lowered first so that, were this regression still present, the
+        wait would be an unmistakable multi-second stall rather than a
+        rounding-error blip — the SAME technique the CI failure's own
+        diagnosis used, at unit-test speed and without any HTTP server,
+        thread-parking harness, or synthetic CPU load."""
+        os.environ["HS_CONTEXT_GATE_TIMEOUT"] = "5"
+        holder = SqlStore(self._tmp)
+        reader = SqlStore(self._tmp)
+        self.addCleanup(holder.close)
+        self.addCleanup(reader.close)
+        with holder.transaction(isolation="SERIALIZABLE"):
+            # `holder` now holds RESERVED (BEGIN IMMEDIATE, the default
+            # read_only=False) for as long as this `with` body runs — the
+            # exact shape `fresh_store`'s held lock takes during a parked
+            # scoped read.
+            started = time.monotonic()
+            with reader.transaction(isolation="SERIALIZABLE", read_only=True):
+                pass
+            elapsed = time.monotonic() - started
+        self.assertLess(
+            elapsed, 1.0,
+            f"a read_only=True transaction waited {elapsed:.3f}s behind "
+            f"another connection's already-held RESERVED lock — this is "
+            f"the exact regression round-N+2 fixed (HS_CONTEXT_GATE_TIMEOUT "
+            f"was set to 5s, so an unfixed store would show ~5s here, not "
+            f"a rounding-error blip)")
+
+    def test_nested_write_inside_read_only_raises(self):
+        """A caller that opens ``read_only=True`` and then, inside
+        ``work()``, needs a NESTED ``transaction()`` call that requires write
+        capability must get a loud, immediate ``RuntimeError`` — never a
+        silent join that would reopen the exact SHARED->RESERVED PROMOTION
+        bug #392 already fixed (see ``SqlStore.transaction``'s own historical
+        comment on why a write-capable transaction must take RESERVED as its
+        FIRST statement, never reach it by promoting mid-transaction)."""
+        store = SqlStore(self._tmp)
+        self.addCleanup(store.close)
+        with self.assertRaises(RuntimeError):
+            with store.transaction(read_only=True):
+                with store.transaction(read_only=False):
+                    pass
+
+    def test_default_write_capable_transaction_is_unchanged(self):
+        """``read_only``'s default (``False``) must be byte-identical to the
+        pre-round-N+2 behavior: ``BEGIN IMMEDIATE``, so two write-capable
+        transactions from separate connections still mutually exclude (only
+        one may hold RESERVED at a time) and the loser is refused with the
+        SAME retryable ``ConcurrencyConflictError`` it always was. Proves
+        this fix narrowed WHICH callers get the lighter SHARED lock, not the
+        RESERVED lock genuine writers still need against EACH OTHER."""
+        os.environ["HS_CONTEXT_GATE_TIMEOUT"] = "0.3"
+        first = SqlStore(self._tmp)
+        second = SqlStore(self._tmp)
+        self.addCleanup(first.close)
+        self.addCleanup(second.close)
+        with first.transaction():   # default read_only=False -> BEGIN IMMEDIATE
+            with self.assertRaises(ConcurrencyConflictError):
+                with second.transaction():
+                    pass
 
 
 class SqlStoreReloadTest(unittest.TestCase):

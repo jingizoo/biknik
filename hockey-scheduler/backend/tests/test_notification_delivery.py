@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import DeliveryStatus, NotificationChannel
+from hockey_scheduler.domain import DeliveryStatus, NotificationChannel, Role
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import DeliveryWorker
 from hockey_scheduler.services.delivery import DEFAULT_CHANNELS, MAX_ATTEMPTS
@@ -111,7 +111,7 @@ class DeliveryQueueTest(unittest.TestCase):
         total = len(self.store.all_notification_deliveries())
         res = self.api.process_notification_deliveries()
         self.assertEqual(res["sent"], total)
-        ov = self.api.get_delivery_overview()
+        ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(ov["total"], total)
         self.assertEqual(ov["by_status"].get("sent"), total)
         self.assertEqual(ov["by_channel"].get(NotificationChannel.EMAIL.value),

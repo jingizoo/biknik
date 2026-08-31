@@ -106,6 +106,11 @@ class MigrationApplyTest(unittest.TestCase):
             # Remove it before league_seasons; deleting the migration ledger
             # below makes the adoption replay rebuild it in canonical order.
             cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
+            # 059's membership tables (#205 Slice A) are later dependents of
+            # the same hierarchy; the wiped ledger below makes the adoption
+            # replay rebuild them in canonical order too.
+            cur.execute("DROP TABLE IF EXISTS season_roster_membership_events")
+            cur.execute("DROP TABLE IF EXISTS season_roster_memberships")
             cur.execute("DROP TABLE IF EXISTS league_seasons")
             cur.execute("ALTER TABLE games DROP COLUMN league_id")
             cur.execute("ALTER TABLE season_team_registrations DROP COLUMN league_id")
@@ -180,6 +185,36 @@ class MigrationApplyTest(unittest.TestCase):
             # column that already exists and fails with "duplicate column name".
             cur.execute(
                 "ALTER TABLE user_active_context DROP COLUMN league_id")
+            # #159 review findings 2+5, migration 051: the persisted switch
+            # generation on the same row. Same reasoning as league_id above —
+            # drop it so adoption's re-run of 051's ALTER lands on a column
+            # that genuinely does not exist yet.
+            cur.execute(
+                "ALTER TABLE user_active_context DROP COLUMN generation")
+            # #423 round-N review finding 1, migration 052: the epoch fence's
+            # persisted version-counter table is a brand-new CREATE TABLE, the
+            # same shape as schedule_scenarios (050) above — drop it so
+            # adoption's re-run of 052 lands on a table that genuinely does
+            # not exist yet, rather than "table already exists".
+            cur.execute("DROP TABLE IF EXISTS epoch_fence_version")
+            # #159 review round 2, migration 053: the copy-forward commit
+            # idempotency ledger is another brand-new CREATE TABLE, same
+            # shape as epoch_fence_version (052) immediately above — drop it
+            # (its UNIQUE index goes with it) so adoption's re-run of 053
+            # lands on a table that genuinely does not exist yet.
+            cur.execute("DROP TABLE IF EXISTS season_copy_forward_commits")
+            # #205 blocker 3, migration 060: substitute_enrollments.team_id
+            # is a brand-new additive column, same shape as the seasons.status
+            # column above — drop it so adoption's re-run of 060 lands on a
+            # column that genuinely does not exist yet, rather than
+            # "duplicate column name". (Unlike the players.* columns 058
+            # adds, nothing between 040 and 060 rebuilds substitute_
+            # enrollments on SQLite, so there is no earlier table-rebuild
+            # migration to strip this one implicitly on replay the way
+            # migration 040's players_new rebuild happens to strip 058's
+            # columns — this one needs an explicit drop.)
+            cur.execute(
+                "ALTER TABLE substitute_enrollments DROP COLUMN team_id")
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -192,6 +227,8 @@ class MigrationApplyTest(unittest.TestCase):
             self.assertIn("external_ref", _table_columns(adopted, "teams"))
             self.assertTrue(  # #159 season lifecycle re-added on adoption
                 {"status", "archived_at"} <= _table_columns(adopted, "seasons"))
+            self.assertIn(  # #205 blocker 3, migration 060
+                "team_id", _table_columns(adopted, "substitute_enrollments"))
             self.assertIn("external_ref", _table_columns(adopted, "players"))
             self.assertIn("external_ref", _table_columns(adopted, "officials"))
             self.assertIn("external_ref", _table_columns(adopted, "rinks"))
@@ -209,6 +246,10 @@ class MigrationApplyTest(unittest.TestCase):
             self.assertIn("operator_organization_id",
                           _table_columns(adopted, "programs"))
             self.assertIn("league_id", _table_columns(adopted, "venues"))
+            # #159 review findings 2+5, migration 051: the persisted switch
+            # generation re-added on the per-user context row.
+            self.assertIn("generation",
+                          _table_columns(adopted, "user_active_context"))
             # #174 PR E hierarchy external_ref columns re-landed on every table
             # (post-028 names: `programs` umbrella, `leagues` grouping).
             for tbl in ("organizations", "programs", "venues", "seasons",
@@ -231,6 +272,33 @@ class MigrationApplyTest(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             self.assertIn("league_seasons", adopted_tables)
             self.assertIn("schedule_scenarios", adopted_tables)
+            # #423 round-N review finding 1, migration 052: the epoch fence's
+            # version-counter table re-created on adoption. No rows are
+            # pre-seeded (each fence key gets a row on its first bump — see
+            # the migration's own docstring), so an unbumped key correctly
+            # reads back 0 on a freshly-adopted database.
+            self.assertIn("epoch_fence_version", adopted_tables)
+            self.assertEqual(
+                adopted.current_epoch_fence_version("some-key-nobody-bumped"),
+                0,
+                "an unbumped key on a freshly-adopted database must read 0, "
+                "not raise or read something stale")
+            # #159 review round 2, migration 053: the copy-forward commit
+            # idempotency ledger re-created on adoption, same shape as the
+            # epoch fence check immediately above.
+            self.assertIn("season_copy_forward_commits", adopted_tables)
+            self.assertIsNone(
+                adopted.get_season_copy_forward_commit_by_fingerprint(
+                    "some-fingerprint-nobody-committed"),
+                "an unknown fingerprint on a freshly-adopted database must "
+                "read None, not raise or read something stale")
+            # #159 review round 3, migration 054: the immutable response
+            # snapshot column re-added on adoption too -- the whole table was
+            # dropped above (pre-053 shape), so 054's ADD COLUMN lands on a
+            # freshly re-created table exactly as it would on a genuinely
+            # legacy database that stopped at 053.
+            self.assertIn("response_snapshot",
+                          _table_columns(adopted, "season_copy_forward_commits"))
             self.assertIn("league_season_id", _table_columns(adopted, "divisions"))
             self.assertIn("program_id", _table_columns(adopted, "leagues"))
             self.assertIn("league_id", _table_columns(adopted, "teams"))
@@ -260,12 +328,26 @@ class MigrationApplyTest(unittest.TestCase):
 class MigrationSchemaParityTest(unittest.TestCase):
     """The hand-written migration SQL must match the SPECS the mapper uses."""
 
+    # Columns that may exist in the DATABASE while deliberately absent from
+    # the mapper's SPEC: fields deprecated OUT of the model/contract whose
+    # physical column is retained because migrations never drop or rewrite
+    # data (the migration policy note in sql_store.py). #273 removed
+    # ``guardian_person_id`` from Player — GuardianLink is the real guardian
+    # mechanism and no service ever read the field — and dropping the dead
+    # column is an explicit follow-up migration, at which point this entry
+    # simply becomes unnecessary (subtraction also passes once the column is
+    # gone). Anything NOT listed here still fails the drift gate.
+    _DEPRECATED_DB_ONLY_COLUMNS = {"players": {"guardian_person_id"}}
+
     def test_every_spec_table_matches_migrated_columns(self):
         store = SqlStore(":memory:")
         for spec in SPECS.values():
             with self.subTest(table=spec.table):
+                allowed_extra = self._DEPRECATED_DB_ONLY_COLUMNS.get(
+                    spec.table, set())
                 self.assertEqual(
-                    _table_columns(store, spec.table), set(spec.names),
+                    _table_columns(store, spec.table) - allowed_extra,
+                    set(spec.names),
                     f"{spec.table} columns drifted from the SPEC")
 
 

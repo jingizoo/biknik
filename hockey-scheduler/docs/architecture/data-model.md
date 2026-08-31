@@ -42,15 +42,45 @@ Game ──< AuditLog
 | --- | --- | --- |
 | id | str | `player_…` |
 | team_id | str | owning team |
-| name | str | fictional in seed data |
+| name | str | flattened DISPLAY name; **derived** ("first last") whenever the structured names below are set (#273), free-typed only on legacy rows |
 | position | Position | `GOALIE` / `DEFENSE` / `FORWARD` / `SKATER` |
 | shoots | str? | "L" / "R" (optional) |
 | jersey_number | int? | 1–98, or unset; unique among a team's **active** players (#269) |
 | is_active | bool | inactive players are not eligible |
-| guardian_person_id | str? | set for junior players |
+| external_ref | str? | stable import-matching `player_code` (#93) |
+| first_name | str? | structured name (#273); never guessed by splitting `name` |
+| last_name | str? | set/cleared together with `first_name` |
+| preferred_name | str? | optional preferred given name |
+| birthdate | str? | **private** `YYYY-MM-DD`; stripped from default facade payloads, operator opt-in only |
+| registration_number | str? | **private** stable governing-body id; same-team duplicates refused, cross-team duplicates warned |
+| skill_rating | int? | 1–7 coach rating (#287 ruling → #273); `None` = unrated, ranked last but never excluded |
 
 `position` maps to a **slot type**: `GOALIE` → goalie slot; everything else →
 skater slot.
+
+The guardian relationship is `GuardianLink` (verified, consent-recorded —
+#26/#35). The legacy `guardian_person_id` field was removed from the model
+and every payload in #273 (nothing ever read it); its dead DB column is
+retained until an explicit follow-up drop migration.
+
+## AgeEligibilityRule (#273)
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | str | `agerule_…` |
+| league_season_id | str | the LeagueSeason the rule governs |
+| version | int | append-only; (league_season_id, version) unique — rows are immutable history |
+| cutoff_month / cutoff_day | int | age is measured on this month/day in the Season's start year (Feb 29 refused) |
+| tiers | list | `{"code": "U10", "max_age": 10}`; `max_age: null` = open tier; eligible iff age at cutoff is strictly under `max_age` |
+| enforcement | str | `warn` (default) / `block`; warn-first — no consumer hard-blocks yet |
+| created_at | datetime | |
+| actor_id | str? | |
+
+A Division declares its tier via its existing `age_group` text, matched
+case-insensitively against the rule's tier codes. Evaluation answers
+eligible / ineligible / indeterminate (`no_rule`, `no_birthdate`,
+`unknown_tier`, `no_season_start`, …) and always names the exact rule
+version used; the result never contains the birthdate itself.
 
 ## Game
 
@@ -86,11 +116,39 @@ One row per player selected for / added to the game.
 | selected_by | str? | actor id |
 | selected_at | datetime | |
 | updated_at | datetime | |
+| team_side | str? | **durable** game-side attribution — the Team id this row was seated against, written at creation/re-seat from the validated `GameMembershipContext` (migration 061) |
+| seated_position | Position? | **durable** — the position this row was seated to occupy; buckets into `GOALIE`/`SKATER` via `seated_slot_type` |
+
+`team_side`/`seated_position` are what the slot engine counts a seated row
+against — never the player's *current* membership, and never the permanent
+`Player.team_id` pointer. They are `NULL` only for rows written before
+migration 061; such a row is charged as occupying on **every** side and in
+**both** buckets (fail closed — it can reduce an open count but never reopen
+one, and it never names a side). See migration 061 for the full rationale.
 
 A roster entry **occupies a slot** when its status is one of `SELECTED`,
 `CONFIRMED`, `OFFERED`, `ACCEPTED`. It frees the slot when `UNAVAILABLE` or
 `REMOVED`. It is **confirmed** (counts as a confirmed body) when `CONFIRMED`
 or `ACCEPTED`.
+
+**Player self-service into `CONFIRMED` asks two questions with two different
+answerers.** The durable row *identifies* the side and bucket in play; the
+player's *current live* membership context *authorizes* the transition. So
+`POST /api/games/{id}/availability` with `available` — the only route the UI
+offers a player — refuses when the live context resolves to a different team
+than `team_side` (`not_eligible`, `details.reason =
+"seated_side_not_live_eligible"`), and refuses when no live context resolves
+at all. One gate,
+`RosterService._authorize_seated_side`, serves both routes into `CONFIRMED`:
+re-confirming a backed-out (`UNAVAILABLE`) row, and confirming a row that
+never backed out. It runs before any store write.
+
+The two routes differ in exactly one respect, deliberately. Re-confirming
+*re-takes* a freed slot, so it additionally requires that slot to still be
+open, and refuses a pre-061 `NULL`-attribution row whose side cannot be
+identified. Confirming a still-occupying row takes nothing — `SELECTED` and
+`CONFIRMED` hold the same slot — so it applies **no** open-slot check (that
+would refuse the last seat's own confirmation) and lets a `NULL` row through.
 
 ## GameAvailability
 

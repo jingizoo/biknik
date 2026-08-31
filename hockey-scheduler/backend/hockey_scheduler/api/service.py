@@ -14,15 +14,19 @@ from enum import Enum
 from typing import Callable, List, Optional
 
 from ..domain import (
+    ACCESS_ALLOWED,
+    ACCESS_DENIED,
     AvailabilityStatus,
     CalendarFeedToken,
     ContactDestination,
+    DataAccessLog,
     DeliveryStatus,
     Game,
+    GameStatus,
     GameType,
-    DeviceToken,
     IceSlotStatus,
     IceSlotType,
+    MembershipStatus,
     NotificationAudience,
     NotificationChannel,
     NotificationKind,
@@ -35,7 +39,7 @@ from ..domain import (
     ResultStatus,
     RosterEntryStatus,
     SeasonStatus,
-    SlotType,
+    SensitiveFieldCategory,
     SubstituteStatus,
     can,
     intervals_overlap,
@@ -50,6 +54,16 @@ from ..domain.errors import (
     ScheduleConflictError,
     ValidationError,
 )
+from ..services import season_guard
+from ..services import lineup_visibility
+from ..services import visibility_policy
+# THE SERVER'S TRUSTED SIDE RESOLUTION, imported from `services/` rather than
+# from `web/scope.py` where it used to live: the Dashboard read below resolves
+# a side PER SCHEDULE ROW inside this facade, and the facade imports nothing
+# from `web/`. See `services/game_side_scope.py` for why it moved instead of
+# being copied.
+from ..services.game_side_scope import (GameAuthorization,
+                                        game_scoped_own_team_id)
 from ..services import (
     ACTOR_TYPES,
     AccountService,
@@ -73,13 +87,28 @@ from ..services import (
     material_input_snapshot,
     resolve_scenario_scope,
 )
+# round-N+1 (finding 1 Memory/SQLite rework): the SAME two process-wide
+# `ContextSwitchGate` instances `web/server.py` uses for the reader side
+# (`CONTEXT_GATE`/`LIFECYCLE_GATE`, relocated to `services/context_gate.py`
+# for exactly this reason — see that module's own "process-wide instances"
+# comment) — writer-side wraps here give Memory (and same-process SQLite) a
+# genuine hold-across-produce() guarantee for every writer the database-
+# coordinated fence already reaches, with no new deadlock class: these are
+# pure in-process objects, never held while a store lock is held.
+from ..services.context_gate import CONTEXT_GATE, LIFECYCLE_GATE
 # #411: the import-context gate must normalize a lookup key EXACTLY as the
 # commit that writes it does, or the gate is bypassable by whitespace (and
 # "NA" would stop meaning "no Club"). Imported verbatim rather than re-spelled.
+from ..services.epoch_fence import EPOCH_FENCE_GLOBAL_KEY, user_fence_key
 from ..services.setup_service import (
     _blank as _import_blank,
     _clean as _import_clean,
     _no_club as _import_no_club,
+    # #205 Slice A: the membership partial-update facade passes the service's
+    # own omitted-argument sentinel through verbatim, so "field not provided"
+    # and "explicit None clears the field" can never be conflated between the
+    # two layers (same contract update_player already uses).
+    _UNSET as _SETUP_UNSET,
 )
 from ..services.scheduler import (
     _active_game_slot_pairs,
@@ -127,6 +156,33 @@ def _serialize(obj) -> dict:
     it via ``v1_setup_adapter.registration_to_v1`` / ``game_to_v1`` so the legacy
     contract is unchanged, while non-v1 consumers see the canonical field."""
     return _jsonify(obj)
+
+
+# The #273 PRIVATE athlete-identity fields. NEVER serialized by default —
+# every Player-carrying facade payload goes through _player_dto, so a bare
+# _serialize(Player) can't quietly leak them into a coach/public response.
+_PLAYER_PRIVATE_FIELDS = ("birthdate", "registration_number")
+
+
+def _player_dto(player, include_identity: bool = False) -> dict:
+    """Serialize a Player with the #273 private identity fields stripped.
+
+    The DEFAULT shape for every facade payload that carries a Player —
+    create/edit/deactivate responses and every list — so ordinary-Coach and
+    public consumers can never receive a birthdate or governing-body
+    registration number (#273 AC[2]; the bounded-#124 owner ruling: coaches
+    get eligibility summaries, never raw protected values). Operator
+    surfaces opt in per call via ``include_identity``, to be MANAGE_SETUP-
+    gated at the HTTP layer exactly like ``include_email`` (#268).
+    ``skill_rating`` stays in the default DTO deliberately: it is the
+    coach-facing 1-7 rating #287's substitute ranking consumes, not
+    identity data.
+    """
+    row = _serialize(player)
+    if not include_identity:
+        for field in _PLAYER_PRIVATE_FIELDS:
+            row.pop(field, None)
+    return row
 
 
 def _group(rows, attr):
@@ -199,6 +255,78 @@ class _SetupMutationRefused(Exception):
     def __init__(self, payload: dict):
         super().__init__("mutation refused")
         self.payload = payload
+
+
+#: THE FLAT-LIST / ROLLUP REFUSALS (#427 final blocker). Each says WHO may
+#: read the resource, so the answer is "you are not entitled to this", never
+#: the operational claim "there is none" an empty list would make. All are
+#: `NotAuthorizedError` -> code "forbidden" -> HTTP 403.
+_PRIVATE_SIDE_REFUSAL = (
+    "You can only view your own team's roster for this game.")
+_SUBSTITUTE_REFUSAL = (
+    "Substitute enrollments are private to each team's coach and the "
+    "league office.")
+_ROSTER_STATUS_REFUSAL = (
+    "Roster status is private to each team's coach and the league office — "
+    "an assigned official reads the submitted lineup instead.")
+_AVAILABILITY_REFUSAL = (
+    "Per-player availability is private to each team's coach and the league "
+    "office — an assigned official reads the submitted lineup instead.")
+#: Round 3's two, for the last two leaves of the same dispatch. Both name a
+#: side's private candidate pool, so both say WHO may read it rather than
+#: answering with an empty pool — `candidates: []` / `addable: []` would
+#: claim this team has nobody left to call.
+_CANDIDATE_REFUSAL = (
+    "The substitute outreach queue is private to each team's coach and the "
+    "league office — an assigned official reads the submitted lineup "
+    "instead.")
+_ADDABLE_REFUSAL = (
+    "A team's addable substitute pool is private to its coach and the league "
+    "office — an assigned official reads the submitted lineup instead.")
+
+#: Key-name suffixes that mark a value as a PLAYER identity in an audit
+#: entry's free-form ``detail`` payload. Every player-bearing key the service
+#: layer writes today ends in one of them — ``subject_player_id``,
+#: ``player_ids``, ``selected_player_ids``, and the ``player_id`` inside each
+#: ``skipped``/``deferred``/``already_seated`` row of ``roster_batch_seated``.
+_PLAYER_ID_KEY_SUFFIXES = ("player_id", "player_ids")
+
+
+def _player_ids_in(value, known: set, key: str = "") -> set:
+    """Every player identity a SERIALIZED event discloses (#427 final
+    blocker) — walked recursively, because ``AuditLog.detail`` is a free-form
+    dict and identities live at several depths inside it.
+
+    TWO INDEPENDENT WAYS to recognise an identity, deliberately, because
+    either alone has a blind spot this projection cannot afford:
+
+    * BY KEY NAME (:data:`_PLAYER_ID_KEY_SUFFIXES`) — catches a player who is
+      named in ``detail`` but whom the game can no longer attribute at all,
+      e.g. a legacy NULL row's occupant. A value-only rule would not know
+      such a string was a person.
+    * BY VALUE, against ``known`` — catches an identity written under some
+      future key name that no suffix rule anticipated. A key-name-only rule
+      would let the day that field ships be the day it leaks.
+
+    A false POSITIVE here (some non-player string that happens to equal a
+    player id) costs one withheld event; a false NEGATIVE is a disclosure.
+    The asymmetry is why both rules run and why their results are unioned.
+
+    ``key`` is threaded through list recursion on purpose, so the strings
+    inside ``detail["player_ids"]`` are judged by the name of the list that
+    holds them rather than by no name at all.
+    """
+    found = set()
+    if isinstance(value, dict):
+        for k, v in value.items():
+            found |= _player_ids_in(v, known, k)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            found |= _player_ids_in(v, known, key)
+    elif isinstance(value, str):
+        if key.endswith(_PLAYER_ID_KEY_SUFFIXES) or value in known:
+            found.add(value)
+    return found
 
 
 def catch(fn: Callable):
@@ -284,9 +412,9 @@ class ApiService:
             user_id, role, scope)
         return self._context_view(program, season, league)
 
-    @catch
     def set_active_context(self, user_id, role, scope,
-                           program_id, season_id, league_id=None) -> dict:
+                           program_id, season_id, league_id=None,
+                           include_epoch=False):
         """Record a Program/Season(/League) selection.
 
         ``league_id`` is appended LAST and defaults to None (#345) so the
@@ -296,10 +424,74 @@ class ApiService:
         two-axis ``ContextService.set`` produced (``league_id`` NULL), so the
         legacy behavior — including CLEARING a previously-saved League rather
         than carrying it onto a Program/Season it was not chosen for — is
-        preserved exactly."""
-        program, season, league = self.context.set_with_league(
-            user_id, role, scope, program_id, season_id, league_id)
-        return self._context_view(program, season, league)
+        preserved exactly.
+
+        ``include_epoch=True`` (round-N review finding 3, KEYWORD-ONLY in
+        practice — every existing caller passes at most five positionals)
+        returns ``(payload, epoch)`` instead of the plain dict: the response
+        epoch derived from the SAME serializable snapshot as the write
+        (``ContextService.set_with_league_and_epoch``, PR #423 design §8.1 —
+        wired to the facade for the first time this round). Defaulted
+        ``False`` so the ~200 other callers across this codebase's test
+        suite keep this method's exact dict-only return shape untouched.
+        Used ONLY by ``web/server.py``'s ``POST /api/context`` handler.
+
+        THE RACE ``include_epoch=True`` CLOSES. That handler used to call
+        this method (one transaction, the write) and THEN a SEPARATE
+        ``ContextService.current_epoch()`` call (a second, independent
+        transaction) to build the response epoch — both inside the same
+        in-process ``CONTEXT_GATE.exclusive(user_id)`` hold, which fully
+        closes the race for two switches racing WITHIN one process, but NOT
+        across two independent replicas: replica B could commit a second
+        switch for the SAME user between replica A's write and A's separate
+        epoch read, and A would then hand its caller an epoch describing B's
+        selection rather than the tuple A's own response just rendered.
+        Folding the write and the epoch derivation into ONE ``_snapshot``
+        (what ``set_with_league_and_epoch`` already does, and already has
+        its own dedicated test coverage for) makes "the epoch matches the
+        row this response carries" true by construction rather than by the
+        in-process gate's cooperation. ``web/server.py``'s
+        ``_with_context_epoch`` is still where the epoch is ATTACHED to the
+        response dict (transport metadata, kept out of this domain-facing
+        module) — this method only hands the two values back paired.
+
+        SAME NAME, ON PURPOSE — this is a widened SIGNATURE, not a new
+        method. ``tests/test_context_switch_server_exit.py`` wraps this
+        exact bound method, by this exact name (``self._wrap(self.api,
+        "set_active_context", ...)``, four separate tests), to park a switch
+        mid-flight and assert the writer-vs-writer/reader-vs-writer ORDERING
+        the whole gate exists to prove; every one of those wrap factories
+        forwards ``*args, **kwargs`` generically, so calling this method with
+        ``include_epoch=True`` still runs through the SAME wrapped call site
+        the tests park. Adding a second, differently-named method for the
+        HTTP handler to call instead would have silently stopped exercising
+        that instrumentation for the real production path — not break
+        loudly, just never park, which is worse; a defaulted keyword
+        argument on the one name already being called is what keeps the
+        write itself as the ONE code path both concerns share.
+
+        NOT wrapped in the module-level ``@catch`` decorator (removed from
+        this method this round): ``catch``'s wrapper returns a BARE ``dict``
+        on a caught ``DomainError`` (``exc.to_dict()``), which the
+        ``include_epoch=True`` two-value return shape cannot absorb — a
+        caller unpacking ``payload, epoch = ...`` would crash trying to
+        unpack a one-key error dict. This method instead catches
+        ``DomainError`` itself, inline, and shapes it via ``exc.to_dict()``
+        — BYTE-IDENTICAL to what ``@catch`` produced — returning it ALONE
+        when ``include_epoch`` is False (preserving the exact historical
+        return type for every other caller) or paired with ``epoch=None``
+        when True. Any non-``DomainError`` exception propagates uncaught,
+        exactly matching ``@catch``'s own behavior for everything it does
+        not recognize."""
+        try:
+            program, season, league, epoch = (
+                self.context.set_with_league_and_epoch(
+                    user_id, role, scope, program_id, season_id, league_id))
+        except DomainError as exc:
+            error = exc.to_dict()
+            return (error, None) if include_epoch else error
+        payload = self._context_view(program, season, league)
+        return (payload, epoch) if include_epoch else payload
 
     def _season_option(self, season) -> dict:
         """A Season as the switcher needs it: id + name + lifecycle, with the
@@ -443,6 +635,30 @@ class ApiService:
         "ice_slot": "get_ice_slot_for_update",
         "organization": "get_organization_for_update",
     }
+
+    # PR #423 (design §8.3): the (already hyphen-folded, see
+    # setup_guarded_mutation) kinds whose guarded mutation is epoch-material
+    # — Season/Program/League/LeagueSeason lifecycle or deletion, and the
+    # season_venue_access BRIDGE kind (its Season parent's access grants are
+    # what `context_epoch`'s effective-Season resolution can depend on).
+    # `division` is DELIBERATELY excluded — it is not part of
+    # `context_epoch`'s hashed material and no epoch input traces through it
+    # (see the design's own note at §8.3).
+    #
+    # ALSO, incidentally but by design, covers row 12 (design §8.4,
+    # `transfer_team_to_league`'s `("team","league")` v2 reassignment):
+    # `_V2_REASSIGN_DEST` always adds the DESTINATION League as a second
+    # guarded target for that combo (`web/server.py`'s
+    # `_V2_REASSIGN_DEST[("team","league")] = ("league", "league_id")`, and
+    # a `league_id` is body-required for that exact combo), so `"league"`
+    # being in this set already fences that writer too — no separate
+    # `"team"` entry needed (which would over-broadly fence every OTHER
+    # guarded Team mutation, most of which do not touch `league_id` and are
+    # not epoch-material). Confirmed by `tests/test_epoch_fence.py`'s
+    # ``test_row12_team_league_transfer``, which asserts on this exact path.
+    _EPOCH_FENCE_KINDS = frozenset({
+        "season", "program", "league", "league_season", "season_venue_access",
+    })
 
     # (action, entity_type) pairs a "this user created this record" audit row
     # can legitimately carry, per canonical kind. NOT simply
@@ -1552,6 +1768,21 @@ class ApiService:
         # store's own per-instance transaction lock already serializes the
         # block.
         #
+        # read_only=True (round-N+2, PR #423): this whole block — rules 3
+        # through 6 — never writes (verified directly: every store call
+        # beneath it is a `get_*`/`all_*` read; see `SqlStore.transaction`'s
+        # own docstring for the general mechanism and
+        # `ContextService._snapshot`'s for the sibling regression this same
+        # round-N+2 fixed at the OTHER #409 preflight). This is not merely a
+        # correctness nicety here, it is A SECOND INSTANCE OF THAT SAME
+        # REGRESSION, on this exact request path: `_guarded_mutation`
+        # (`web/server.py`) reaches `_reject_target_outside_scope` ->
+        # `setup_target_allowed` -> here, UNGATED, immediately after its own
+        # `_refuse_unchosen_context` check — so fixing only the #409
+        # preflight and leaving this one at its old default (write-strength
+        # `BEGIN IMMEDIATE`) would have left the exact same class of stall
+        # reachable one call later on the identical archive/reopen request.
+        #
         # Requesting isolation is legal on the outermost transaction, and also
         # on a join whose open transaction ALREADY guarantees at least this much
         # (#369) — which is how `setup_guarded_mutation` runs this predicate,
@@ -1561,33 +1792,55 @@ class ApiService:
         # own bounded retry owns any conflict.
         #
         # WHY THERE IS STILL NO RETRY LOOP HERE, stated precisely, because the
-        # reason this comment used to give is no longer true. It said READ-ONLY
-        # at REPEATABLE READ cannot raise a serialization conflict. That remains
-        # true of SERIALIZATION conflicts, but it was never the whole set: since
-        # #392 the SQLite branch opens with `BEGIN IMMEDIATE`, so this block can
-        # now raise `ConcurrencyConflictError` from LOCK ACQUISITION — a
-        # `database is locked` at BEGIN, classified `lock_not_available` — and
-        # read-only says nothing about that. Unlike `ContextService._snapshot`
-        # this call site has no bounded retry, so the claim needed re-deciding
-        # rather than re-wording.
+        # reason this comment used to give is no longer true, TWICE over —
+        # once when #392 shipped, and again when round-N+1 shipped. It said
+        # READ-ONLY at REPEATABLE READ cannot raise a serialization conflict.
+        # That remains true of SERIALIZATION conflicts, but it was never the
+        # whole set: since #392 the SQLite branch opened with `BEGIN
+        # IMMEDIATE` regardless of intent, so this block could raise
+        # `ConcurrencyConflictError` from LOCK ACQUISITION — a `database is
+        # locked` at BEGIN, classified `lock_not_available` — and read-only
+        # said nothing about that. Unlike `ContextService._snapshot` this call
+        # site has no bounded retry, so the claim needed re-deciding rather
+        # than re-wording, and it was re-decided BELOW under a claim ("no
+        # in-process second connection exists in production") that round-N+1
+        # then made false without this comment being revisited: file-backed
+        # SQLite scoped reads (`_read_under_context_gate_sqlite`'s
+        # `fresh_store`, `web/server.py`) are now EXACTLY that second
+        # in-process connection to the LIVE file, opened on every ordinary
+        # scoped-read request, not merely in a test or a backup drill. This
+        # comment's own reachability argument was therefore already wrong by
+        # the time this predicate was next read closely enough to matter, and
+        # the fix that closed it (`read_only=True` above, round-N+2) is a
+        # response to that false claim having gone uncorrected, not merely a
+        # style pass.
         #
-        # The decision is still no retry, for reasons about reachability and
-        # about what a retry would mean:
+        # The decision is still no retry, but the reachability argument that
+        # justifies it now rests on `read_only=True`, not on "no second
+        # connection exists":
         #
-        # * Contending needs a SECOND connection to the same file. A serving
-        #   process has exactly ONE store (`create_store()` at web/server.py and
-        #   bootstrap.py), and `SqlStore._lock` — reentrant, per instance —
-        #   already serializes every transaction taken through it, so no two
-        #   in-process transactions can be at BEGIN at once. The one production
-        #   path that opens a second SQLite connection (`backup_sqlite`) opens
-        #   it on the DESTINATION file, never the live one.
-        # * Where a second connection does exist — the `*_lock_sqlite_file`
-        #   tests, or an operator pointing the backup drill at a live database —
-        #   BEGIN blocks in the busy handler for the full 5s `busy_timeout`
-        #   first. Anything that surfaces here has therefore ALREADY waited five
-        #   seconds. That is not a transient blip a tight retry would paper
-        #   over; it is a writer that is genuinely wedged, and the retryable
-        #   409 is the honest answer for the caller to act on.
+        # * `read_only=True` takes SQLite's SHARED lock (`BEGIN DEFERRED`),
+        #   not RESERVED (`BEGIN IMMEDIATE`) — and SHARED is COMPATIBLE with
+        #   another connection's already-held RESERVED (only PENDING/
+        #   EXCLUSIVE conflict with SHARED; see `SqlStore.transaction`'s own
+        #   docstring for the full argument). `fresh_store` only ever holds
+        #   RESERVED — it is itself a read, never an actual write — so this
+        #   block no longer contends with it AT ALL, regardless of how long a
+        #   scoped read's `produce()` takes. That closes the reachable-in-
+        #   production case entirely, not merely documents it.
+        # * What is left is a genuinely ACTIVE writer — one that has reached
+        #   PENDING/EXCLUSIVE to actually flush its commit, a window normally
+        #   far under a millisecond, not the open-ended duration of an
+        #   unrelated read. Where that does contend — the `*_lock_sqlite_file`
+        #   tests deliberately construct it, or a pathologically wedged real
+        #   writer could — BEGIN blocks in the busy handler for the full
+        #   `HS_CONTEXT_GATE_TIMEOUT` first. Anything that surfaces here has
+        #   therefore ALREADY waited that long. That is not a transient blip a
+        #   tight retry would paper over; it is a writer that is genuinely
+        #   wedged, and the retryable 409 is the honest answer for the caller
+        #   to act on — the ORIGINAL reasoning this comment gave, restored to
+        #   being actually true now that the false "no second connection"
+        #   premise it depended on is not what makes it true anymore.
         # * A retry here would also be dead weight on PostgreSQL, where the
         #   original read-only argument still holds in full.
         #
@@ -1595,7 +1848,8 @@ class ApiService:
         # for the instant it read, and by the time a caller acts on the answer
         # the chain may have moved. Only `setup_guarded_mutation`, which holds
         # the row locks and the transaction across the mutation, is.
-        with self.store.transaction(isolation="REPEATABLE READ"):
+        with self.store.transaction(
+                isolation="REPEATABLE READ", read_only=True):
             # -- rule 3: existence (indistinguishable from inaccessible) ---
             record = self._setup_target_record(normalized, record_id)
             if record is None:
@@ -1991,35 +2245,92 @@ class ApiService:
 
     def _guarded_attempt(self, checks, mutation, user_id, role, scope):
         """One all-or-nothing attempt. See ``setup_guarded_mutation``."""
-        with self.store.transaction(isolation="SERIALIZABLE"):
-            # #409, and FIRST — before any target row is even looked up, so a
-            # caller who has chosen nothing learns nothing about which records
-            # exist, and before any setup row is LOCKED, so ActiveContext keeps
-            # its place at the head of the repo's canonical lock order.
-            #
-            # `setup_target_accessible` judges targets against the RESOLVED
-            # tuple, and `_fallback()` resolves one for every `_GLOBAL_ROLES`
-            # caller. So the #369 gate that correctly refuses a cross-Program
-            # delete happily authorized the same delete the moment the resolve
-            # fell back — the target now sat inside the Program the fallback
-            # had just picked on the operator's behalf.
-            #
-            # RAISED, not returned: the transaction rolls back, so a refusal
-            # costs zero domain rows and zero audit rows.
-            error = self._mutation_context_error(
-                [(kind, record_id) for _index, kind, record_id, _rule
-                 in checks],
-                user_id, role, scope, lock=True)
-            if error is not None:
-                raise error
-            refused = self._authorize_setup_targets(
-                checks, user_id, role, scope)
-            if refused is not None:
-                raise _SetupTargetRefused(refused)
-            payload = mutation()
-            if isinstance(payload, dict) and "error" in payload:
-                raise _SetupMutationRefused(payload)
-            return payload, None
+        # PR #423 (design §8.3), fence key gated on whether ANY named target
+        # is epoch-material (`_EPOCH_FENCE_KINDS`) — computed ONCE, outside
+        # the transaction, and used for BOTH holds below so they can never
+        # disagree about whether this attempt is fence-material.
+        fence_needed = any(kind in self._EPOCH_FENCE_KINDS
+                           for _index, kind, _record_id, _rule in checks)
+        # round-N+1 (finding 1 Memory/SQLite rework): `LIFECYCLE_GATE.exclusive`
+        # taken HERE, OUTSIDE `store.transaction()` — never inside it. This is
+        # not a style choice: `ContextSwitchGate`'s own LOCK ORDER invariant
+        # (`services/context_gate.py`) is that this gate is level 0, strictly
+        # OUTERMOST, above the store's own lock (level 2), because a gate
+        # holder must never hold a store lock while waiting for the gate, and
+        # a store-lock holder must never wait for the gate. Acquiring it
+        # INSIDE `store.transaction()` would recreate the EXACT AB-BA hazard
+        # `SqlStore.epoch_fence_acquire_exclusive`'s own docstring documents
+        # for a real dedicated-connection SQLite lock (and, on Memory, would
+        # deadlock this thread against itself: `self._lock` is already held
+        # for the whole transaction body by the time the gate call runs, and
+        # a scoped read's `produce()` — parked mid-service, holding
+        # `LIFECYCLE_GATE` SHARED — needs that SAME `self._lock` for its own
+        # reads, so this thread would hold `self._lock` and wait on the gate,
+        # exactly what the reader is waiting on `self._lock` to release).
+        #
+        # `LIFECYCLE_GATE.exclusive(None)` (the `not fence_needed` case) is
+        # the primitive's own documented no-op — see
+        # `ContextSwitchGate.exclusive`'s falsy-key short-circuit — so an
+        # ordinary, non-epoch-material guarded mutation (most of them) pays
+        # nothing extra here.
+        #
+        # THIS REPLACES `web/server.py`'s former explicit archive/reopen-only
+        # wrap (see that dispatch site's own comment for why keeping both
+        # would have self-blocked one thread on its own outer ticket) — every
+        # `_EPOCH_FENCE_KINDS` kind now gets the SAME in-process ordering
+        # archive/reopen always had, including the 8 writers (Season/
+        # Program/League/LeagueSeason DELETE, season-venue-access revoke/
+        # delete, and — incidentally, via the destination "league" target,
+        # exactly like the database-coordinated fence already covers it, see
+        # `_EPOCH_FENCE_KINDS`'s own comment — Team/League transfer) that had
+        # NO in-process gate at all before this.
+        with LIFECYCLE_GATE.exclusive(
+                EPOCH_FENCE_GLOBAL_KEY if fence_needed else None):
+            with self.store.transaction(isolation="SERIALIZABLE"):
+                # PR #423 (design §8.3): the epoch fence's GLOBAL exclusive
+                # hold, matching "truly first" (§4.2/§4.4) — before #409's
+                # own context-error check immediately below. Bumps the
+                # persisted version counter on every backend (round-N
+                # finding 1's defense-in-depth layer, kept as a regression
+                # backstop alongside — not instead of — the in-process gate
+                # above, which is what now does the PRIMARY work of
+                # preventing a torn read's `produce()` call in the first
+                # place on Memory/SQLite; see `_read_under_context_gate`'s
+                # own docstring for the full division of labour across all
+                # three backends).
+                if fence_needed:
+                    self.store.epoch_fence_acquire_exclusive(
+                        EPOCH_FENCE_GLOBAL_KEY)
+                # #409, and FIRST — before any target row is even looked up,
+                # so a caller who has chosen nothing learns nothing about
+                # which records exist, and before any setup row is LOCKED, so
+                # ActiveContext keeps its place at the head of the repo's
+                # canonical lock order.
+                #
+                # `setup_target_accessible` judges targets against the
+                # RESOLVED tuple, and `_fallback()` resolves one for every
+                # `_GLOBAL_ROLES` caller. So the #369 gate that correctly
+                # refuses a cross-Program delete happily authorized the same
+                # delete the moment the resolve fell back — the target now
+                # sat inside the Program the fallback had just picked on the
+                # operator's behalf.
+                #
+                # RAISED, not returned: the transaction rolls back, so a
+                # refusal costs zero domain rows and zero audit rows.
+                error = self._mutation_context_error(
+                    [(kind, record_id) for _index, kind, record_id, _rule
+                     in checks],
+                    user_id, role, scope, lock=True)
+                if error is not None:
+                    raise error
+                refused = self._authorize_setup_targets(
+                    checks, user_id, role, scope)
+                if refused is not None:
+                    raise _SetupTargetRefused(refused)
+                payload = mutation()
+                if isinstance(payload, dict) and "error" in payload:
+                    raise _SetupMutationRefused(payload)
+                return payload, None
 
     def _authorize_setup_targets(self, checks, user_id, role, scope):
         """Lock every named row, then authorize every target under those locks.
@@ -3818,25 +4129,102 @@ class ApiService:
         return _serialize(game)
 
     @catch
-    def get_roster(self, game_id: str) -> List[dict]:
-        self.roster._require_game(game_id)
-        return [_serialize(e) for e in self.store.roster_for_game(game_id)]
+    def get_roster(self, game_id: str, viewer_role=None,
+                   viewer_team_id: Optional[str] = None) -> List[dict]:
+        """A game's roster entries, narrowed to what THIS caller may read
+        (#427 final blocker, owner ruling: "`/roster`: Coach/Player receives
+        strictly own-side durably attributed rows. Officials receive only the
+        two-side submitted/occupying lineup projection").
+
+        THE DEFECT THIS CLOSES. This returned ``roster_for_game`` — every
+        entry of both sides — to anyone the single
+        ``can_read_private_game_data`` gate admitted. Measured at ccdb7b4
+        over a real authenticated session: an AWAY Coach's ``GET /roster``
+        came back ``[{"player_id": "player_1", "team_side": "team_1",
+        "seated_position": "defense"}]`` — the HOME side's seat, its owner and
+        the position it occupies, one path segment around the projection that
+        had just closed ``/lineups``.
+
+        OWN-SIDE ROWS ARE THE DURABLY ATTRIBUTED ONES, tested strictly on
+        ``entry.attribution`` — the same authority and the same strictness
+        :meth:`RosterService.lineup_population` uses for its seated
+        population, and for the same reason: ``_side_data.matched_entries``
+        charges a legacy NULL-attribution row to EVERY side on purpose, so
+        reusing it here would put one player's seat on both Coaches'
+        responses. A NULL-attribution row names no side and is therefore
+        omitted from both, never guessed onto one.
+
+        AN OFFICIAL GETS THE SUBMITTED LINEUP, through the very same
+        :meth:`_submitted_lineup_rows` that projects ``/lineups`` for them —
+        not a second field list that could drift from it — plus the public
+        ``team_id`` of the side each row belongs to, without which a two-side
+        list cannot be read at all. That is a different SHAPE from the entry
+        rows every other caller gets, which is honest: the official is being
+        answered with the lineup, not with the roster table.
+
+        ``viewer_role`` of ``None`` (the facade's own default, and every
+        in-process caller) keeps the unchanged full read.
+        """
+        game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            return [_serialize(e) for e in self.store.roster_for_game(game_id)]
+        if audience == lineup_visibility.SUBMITTED_LINEUP:
+            return self._submitted_lineup_sides(game)
+        if audience == lineup_visibility.OWN_SIDE:
+            return [_serialize(e) for e in self.store.roster_for_game(game_id)
+                    if e.attribution is not None
+                    and e.attribution[0] == viewer_team_id]
+        raise NotAuthorizedError(_PRIVATE_SIDE_REFUSAL)
+
+    def _submitted_lineup_sides(self, game) -> List[dict]:
+        """BOTH sides' submitted lineup, each row tagged with its side.
+
+        The two-side projection an assigned official may read, built by
+        running each side through the SAME :meth:`_lineup_rows` +
+        :meth:`_submitted_lineup_rows` pair ``get_lineups`` runs for that
+        role. One field allow-list, one selected-only filter, two routes —
+        so ``/roster`` and ``/lineups`` cannot disagree about what an
+        official may see, which is exactly how this leak opened in the first
+        place.
+
+        ``team_id`` is added because a FLAT list of both sides is unreadable
+        without it, and it discloses nothing: which two teams are playing is
+        already the public ``GET /api/games/{id}`` fixture record."""
+        rows = []
+        for team_id in (game.home_team_id, game.away_team_id):
+            if not team_id:
+                continue  # a placeholder fixture with a side still unset
+            for row in self._submitted_lineup_rows(
+                    self._lineup_rows(game, team_id)):
+                rows.append({**row, "team_id": team_id})
+        return rows
 
     @catch
     def select_roster(self, game_id: str, player_ids: List[str],
-                      actor_id: Optional[str] = None) -> List[dict]:
-        entries = self.roster.select_roster(game_id, player_ids, actor_id)
+                      actor_id: Optional[str] = None,
+                      authorized_team_id: Optional[str] = None) -> List[dict]:
+        entries = self.roster.select_roster(
+            game_id, player_ids, actor_id,
+            authorized_team_id=authorized_team_id)
         return [_serialize(e) for e in entries]
 
     @catch
     def remove_player(self, game_id: str, player_id: str,
-                      actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.remove_player(game_id, player_id, actor_id))
+                      actor_id: Optional[str] = None,
+                      authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.remove_player(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def copy_previous_roster(self, game_id: str, team_id: Optional[str] = None,
-                             actor_id: Optional[str] = None) -> dict:
-        return self.roster.copy_previous_roster(game_id, team_id, actor_id)
+                             actor_id: Optional[str] = None,
+                             authorized_team_id: Optional[str] = None) -> dict:
+        return self.roster.copy_previous_roster(
+            game_id, team_id, actor_id,
+            authorized_team_id=authorized_team_id)
 
     @catch
     def set_roster_status(self, game_id: str, player_id: str, status: str,
@@ -3849,23 +4237,182 @@ class ApiService:
 
     # -- availability ------------------------------------------------------
     @catch
-    def get_availability(self, game_id: str) -> List[dict]:
-        self.roster._require_game(game_id)
-        return [_serialize(a) for a in self.store.availability_for_game(game_id)]
-
-    @catch
-    def get_availability_summary(self, game_id: str, team_id: str) -> dict:
+    def get_availability_summary(self, game_id: str,
+                                 team_id: Optional[str] = None,
+                                 viewer_role=None,
+                                 viewer_team_id: Optional[str] = None) -> dict:
         """Per-player availability for a team in a game (#89), bucketed into
-        available / unavailable / maybe / no_response, with counts. Private
-        (player names) — callers are gated by the same #73 access check."""
+        available / unavailable / maybe / no_response, with counts — projected
+        onto the audience this caller belongs to (#427 final blocker, round 2).
+
+        THE DEFECT THIS CLOSES, and why it is the same defect as the four
+        siblings'. This is the FIFTH leaf of the private-game family and the
+        ONLY one that reads a side from the QUERY STRING. Its narrowing was
+        spelled inline in ``web/server.py`` and named only COACH and PLAYER::
+
+            team_id = (qs.get("team_id") or [own_team])[0]
+            if role in (Role.COACH, Role.PLAYER) and own_team \\
+                    and team_id != own_team:
+
+        so an assigned OFFICIAL fell straight through it. Measured at ae21c40
+        over a real authenticated session, identically on Memory, SQLite and
+        PostgreSQL: ``GET /availability-summary`` answered an official 400
+        ("That team is not playing in this game.") while
+        ``?team_id=<home>`` answered **200** with the whole HOME candidate
+        pool — ``player_2``, ``player_3``, ``player_4``, ``player_8``,
+        ``player_9`` — carrying NAMES and per-player availability, and
+        ``?team_id=<away>`` did the same for AWAY. One path segment away, that
+        same official's ``/lineups`` carried only the submitted rows with
+        ``availability``/``sub_status``/``eligible`` stripped and
+        ``substitutes_enrolled: null``. So the projection removed exactly the
+        two classes this route handed back.
+
+        THE CLIENT HINT WAS THE SOLE SIDE SELECTOR — 400 without it, 200 with
+        it — which is the standing ruling's "Ignore client side hints"
+        defeated on the one family route that actually reads one. And the
+        SHIPPED UI fired it: ``canReadAnyPrivateGame()`` admits any
+        ``official_id`` to the Roster tab, an official's ``/lineups`` sides
+        are ``submitted_lineup`` rather than ``restricted``, so
+        ``isRestrictedSide`` was false and the tab fetched
+        ``?team_id=<the shown side>`` on every render — with the side toggle
+        switching teams. Confirmed in a real browser, not only by curl.
+
+        SO THE AUDIENCE DECIDES, exactly as it does for ``/roster``,
+        ``/roster-status``, ``/substitutes`` and ``/board``
+        (:func:`services.lineup_visibility.route_audience`):
+
+        ``FULL``
+            Unscoped operator — the hint is kept, byte-for-byte the existing
+            #89 behaviour including the "no hint, no own team" case that
+            resolves ``""`` and raises the ordinary participation
+            ``ValidationError``. Narrowing the operator would be its own
+            regression.
+        ``OWN_SIDE``
+            Coach / Player — the hint is IGNORED ENTIRELY and the TRUSTED
+            server-resolved side is used. Ignored, not refused: the four
+            siblings answer a hinted request identically to an un-hinted one,
+            and a fifth leaf that refused instead would leave "what does a
+            side hint do here" answered two different ways inside one family.
+            It is also strictly less informative — a 403 that appears only
+            for the opponent's id is itself a probe oracle for which team is
+            playing, while an unchanged own-side answer tells the caller
+            nothing they did not already have.
+        ``SUBMITTED_LINEUP`` / ``RESTRICTED``
+            Assigned official, and any caller whose own side did not resolve
+            to one of this game's two teams — **403**, never ``players: []``
+            with zero counts. This rollup IS per-player availability, the
+            thing ``_submitted_lineup_rows`` exists to remove, so there is no
+            official-shaped projection of it; and an empty summary would
+            assert "nobody on this team owes an answer", an operational claim
+            about the game rather than a fact about the reader.
+
+        ``viewer_role`` of ``None`` is the in-process default and resolves
+        ``FULL``, so every non-HTTP caller is unchanged.
+        """
         game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.OWN_SIDE:
+            return self._availability_summary_of(game, viewer_team_id)
+        if audience == lineup_visibility.FULL:
+            return self._availability_summary_of(
+                game, team_id or viewer_team_id or "")
+        raise NotAuthorizedError(_AVAILABILITY_REFUSAL)
+
+    def _availability_candidates(self, game, team_id: str) -> List["Player"]:
+        """WHO owes ``team_id`` an availability answer for ``game`` — the ONE
+        discovery both availability surfaces consume (PR #427 blocker, owner
+        comment 5387094674).
+
+        THE DEFECT THIS REPLACES. Discovery was
+        ``store.players_for_team(team_id)``, whose authority is the PERMANENT
+        ``Player.team_id`` pointer. Reproduced tri-store at head 11835a2, in
+        both mirrored directions at once: a player with pointer THIRD and an
+        active membership on this game's exact LeagueSeason/HOME was absent
+        from the HOME summary and got no reminder, while a player with
+        pointer HOME and an active THIRD membership was listed in the private
+        HOME summary and received the HOME reminder
+        (``current_member_listed=False``, ``departed_member_listed=True``,
+        ``current_member_notified=False``, ``departed_member_notified=True``,
+        one reminder sent, on Memory, SQLite and PostgreSQL alike). #205 moves
+        notifications and current eligibility onto the exact Game-LeagueSeason
+        membership; this was the last surface still answering from the pointer.
+
+        WHICH POPULATION, AND WHY IT IS NOT THE ROSTER'S. The question here is
+        "who is expected to tell this team whether they can play THIS game",
+        asked BEFORE anyone is seated and of people who may never be seated.
+        So a durable ``GameRosterEntry`` neither grants membership of this
+        population nor is required for it:
+
+        * a player can be eligible-and-unresponded while holding NO roster row
+          — that is the ordinary pre-selection case, and the whole point of
+          the summary;
+        * a roster row can be held by someone whose membership has since
+          ENDED. That row keeps its slot and its durable attribution for slot
+          accounting (``RosterService._side_data``, #205 blocker 5 round 2 —
+          re-resolving there erased attribution and admitted overfill), but
+          the person behind it is no longer a participant, so they must not
+          be asked, must not be reminded, and must not appear in a private
+          per-player summary of a team they have left.
+
+        The two surfaces therefore read DIFFERENT populations on purpose:
+        this one reads LIVE ELIGIBILITY, ``_side_data`` reads DURABLE
+        ATTRIBUTION. Neither is a fallback for the other.
+
+        BOUND vs UNBOUND is ``RosterService._players_for_game_team``'s split,
+        reused rather than re-derived so a third copy of the rule cannot
+        drift: for a LeagueSeason-bound game it is the batched
+        ``resolve_membership_contexts_for_game`` resolution — the exact
+        LeagueSeason, an eligible membership status, the membership's
+        denormalized Season agreeing, and the side's whole spine (Team,
+        Team-League, Program, a current ACTIVE registration) holding, all
+        through the shared eligibility classifier — and a bound game NEVER
+        falls back to the pointer. For an UNBOUND game (an exhibition by
+        design, or an unbound legacy row) there is no membership authority to
+        consult at all, so the permanent roster IS the pool: that is an
+        EXPLICITLY SEPARATE legacy path, not a fallback, and it is exactly
+        pre-#205 behaviour. Note the two coincide there by construction —
+        ``team_id`` is checked to be one of this game's two sides first, so
+        every player the pointer pool yields resolves an unbound context on
+        that same side.
+
+        LOCKS. This runs wherever its caller runs. :meth:`remind_unresponded`
+        calls it INSIDE the one transaction that already holds the canonical
+        Season row lock, which is what makes the recipient list linearizable
+        with the governed membership mutations:
+        ``SetupService.set_season_roster_membership_status`` locks the
+        membership row AND, via ``_require_active_season``, that SAME Season
+        row. The read surface calls it unlocked, exactly as before — an
+        availability rollup is a read, and #427's read half deliberately
+        checks identity without taking the write guard's lock.
+        """
         if team_id not in (game.home_team_id, game.away_team_id):
             raise ValidationError("That team is not playing in this game.")
+        return [player for player, _ctx
+                in self.roster._players_for_game_team(game, team_id)]
+
+    def _availability_summary_of(self, game, team_id: str) -> dict:
+        """The summary computed off an ALREADY-RESOLVED Game row.
+
+        Split out of :meth:`get_availability_summary` for PR #427 so
+        :meth:`remind_unresponded` can compute its recipient list from the row
+        it holds under the canonical Season lock, rather than from a second,
+        earlier, unlocked read of the same Game.
+
+        ONE DISCOVERY, TWO CONSUMERS. The player identities come from
+        :meth:`_availability_candidates`, and ``remind_unresponded`` derives
+        its recipients from THIS summary rather than discovering its own — so
+        the private read surface and the notification audience are the same
+        set by construction and cannot drift into disagreeing about who is on
+        this team for this game.
+        """
+        game_id = game.id
+        candidates = self._availability_candidates(game, team_id)
         avail = {a.player_id: a
                  for a in self.store.availability_for_game(game_id)}
         counts = {"available": 0, "unavailable": 0, "maybe": 0, "no_response": 0}
         players = []
-        for p in sorted(self.store.players_for_team(team_id), key=lambda x: x.name):
+        for p in sorted(candidates, key=lambda x: x.name):
             a = avail.get(p.id)
             status = a.availability_status.value if a else "no_response"
             if status == "pending":  # never-responded reads as no_response
@@ -3877,124 +4424,292 @@ class ApiService:
 
     @catch
     def remind_unresponded(self, game_id: str, team_id: str,
-                           actor_id: Optional[str] = None) -> dict:
+                           actor_id: Optional[str] = None,
+                           authorized_team_id: Optional[str] = None) -> dict:
         """Nudge the players who haven't set availability (#89): emit one
         player-targeted AVAILABILITY_REMINDER per no-response player, so the
         reminder actually reaches them (delivery honors each player's channel
         preferences, #81). Returns the number of players reminded — a no-op
-        (emitting nothing) when everyone has already responded."""
-        summary = self.get_availability_summary(game_id, team_id)
-        if isinstance(summary, dict) and summary.get("error"):
-            return summary
-        unresponded = [p for p in summary["players"]
-                       if p["status"] == "no_response"]
-        _rg = self.store.get_game(game_id)
+        (emitting nothing) when everyone has already responded.
+
+        ONE TRANSACTION, AND THE GAME IS RE-FETCHED INSIDE IT (PR #427 ruling
+        4). Every read this method decides on — which Season authorizes it,
+        whether ``team_id`` is even playing in this Game, and WHO is
+        unresponded — now happens under the canonical Season row lock, and the
+        notifications are written in that same transaction.
+
+        THE HOLE THIS CLOSES. The previous shape called
+        ``get_availability_summary`` and ``store.get_game`` OUTSIDE the
+        transaction and then guarded the *stale* row: ``guard_game_season``
+        was handed an object read before any lock existed, so it resolved and
+        locked whatever Season that object's ``league_season_id`` named at
+        that moment. A concurrent writer that rebound the Game to another
+        competition in the window between — the same check/use gap the fifteen
+        RosterService mutation sites close by rebinding to the row the guard
+        returns — left this site locking a Season that no longer authorizes
+        the Game, and it then wrote reminders under it. The recipient list was
+        stale by the same window: players whose team assignment or availability
+        changed after the summary read were reminded (or missed) against a
+        world that had moved on.
+
+        The fix is the roster family's, reused rather than re-derived:
+        ``RosterService._guard_active_season`` locks the canonical Season,
+        re-fetches the Game under that lock, and re-runs the guard when the
+        fresh row's identity columns actually moved — so the row this method
+        goes on to use is the one the held lock actually authorizes. It is
+        deliberately the SAME helper the fifteen bound mutation sites call:
+        emitting a notification is a Season-owned write like any other, and a
+        second hand-written copy of this sequence is exactly what #427
+        collapsed.
+
+        WHO the recipients are is a SEPARATE question from WHICH ROW they are
+        read off, and the round that established the transaction above only
+        answered the second one (owner comment 5387094674). The recipient list
+        was still discovered by ``store.players_for_team`` — the permanent
+        ``Player.team_id`` pointer — so under a correct lock, on the correct
+        row, the reminder went to the player who had LEFT this side and not to
+        the one currently rostered on it. Discovery is now
+        :meth:`_availability_candidates`, the exact game-scoped membership,
+        consumed through the SAME summary the private read surface returns:
+        one discovery, two consumers, so the audience of a notification and
+        the contents of a private response cannot disagree. The transaction
+        and lock structure below is UNCHANGED — and it is what makes this
+        discovery linearizable with the governed membership mutations, which
+        take the very same canonical Season row lock."""
         with self.store.transaction():
-            # #159 — no reminders may be generated for an archived Season's
-            # Game; lock the Season and emit inside one transaction.
-            if _rg is not None and _rg.season_id:
-                self.setup._require_active_season(_rg.season_id)
+            # A LOCATOR read only — `_guard_active_season` returns the row
+            # re-fetched under the Season lock, and everything below uses that
+            # row. #159: no reminders may be generated for an archived
+            # Season's Game. PR #427: WHICH Season is the shared guard's
+            # answer, never `game.season_id` — this site carried the identical
+            # falsy-skip/wrong-row defect as the two service guard families,
+            # so a bound Game with a NULL or drifted `season_id` emitted
+            # reminders against an archived competition, having locked nothing.
+            game = self.roster._guard_active_season(
+                self.roster._require_game(game_id))
+            # Recipients determined from the LOCKED row, inside the same
+            # transaction that writes the notifications. Participation is
+            # re-checked here too: `team_id` must be playing in the Game as it
+            # stands under the lock, not as the caller's earlier read saw it.
+            # THE COACH GATE, under the SAME Season lock the reminders are
+            # written beneath (#205). `scope_violation` already refuses an
+            # explicit foreign `team_id` at the preflight, but the ruling is
+            # that the preflight "cannot be the authoritative write gate" —
+            # so the team this method is about to notify is revalidated here,
+            # inside the transaction and before the first `_push_notification`.
+            #
+            # COMPARAND: the REQUESTED team itself. This command targets a
+            # SIDE rather than a row, and it creates new state (notification
+            # + delivery rows) for that side, so "is this side mine?" is the
+            # whole question and there is no durable row to consult.
+            self.roster._require_authorized_team(
+                authorized_team_id, team_id, "team")
+            summary = self._availability_summary_of(game, team_id)
+            unresponded = [p for p in summary["players"]
+                           if p["status"] == "no_response"]
             for p in unresponded:
                 _push_notification(
                     self.store, self.roster.clock,
                     NotificationKind.AVAILABILITY_REMINDER,
                     NotificationAudience.PLAYER, "Availability reminder",
                     "Please confirm your availability for this game.",
-                    audience_ref=p["player_id"], game_id=game_id)
+                    audience_ref=p["player_id"], game_id=game.id)
         return {"reminded": len(unresponded)}
 
     @catch
     def set_availability(self, game_id: str, player_id: str,
                          availability_status: str, response_source: str = "player",
-                         actor_id: Optional[str] = None) -> dict:
+                         actor_id: Optional[str] = None,
+                         authorized_team_id: Optional[str] = None) -> dict:
         av = self.roster.set_availability(
             game_id, player_id,
             _parse_enum(AvailabilityStatus, availability_status,
                         "availability_status"),
             response_source, actor_id,
+            authorized_team_id=authorized_team_id,
         )
         return _serialize(av)
 
     # -- substitutes -------------------------------------------------------
     @catch
-    def get_substitutes(self, game_id: str) -> List[dict]:
-        self.roster._require_game(game_id)
-        return [_serialize(s) for s in self.store.substitutes_for_game(game_id)]
+    def get_substitutes(self, game_id: str, viewer_role=None,
+                        viewer_team_id: Optional[str] = None) -> List[dict]:
+        """A game's substitute enrollments, narrowed to this caller (#427
+        final blocker, owner ruling: "`/substitutes`: Coach/Player receives
+        strictly own-side durably owned rows; officials are refused. Legacy
+        NULL attribution is omitted, never guessed").
+
+        THE DEFECT THIS CLOSES. This returned ``substitutes_for_game`` —
+        both sides' whole substitute workflow — to every caller the single
+        ``can_read_private_game_data`` gate admitted. Measured at ccdb7b4:
+        an AWAY Coach's ``GET /substitutes`` came back
+        ``[{"player_id": "player_6", "status": "enrolled",
+        "team_id": "team_1"}]``, and an ASSIGNED OFFICIAL's leaked the same
+        row — the very substitute state ``_submitted_lineup_status`` nulls
+        out one route over.
+
+        OFFICIALS ARE REFUSED OUTRIGHT rather than given a narrowed list.
+        There is no official-shaped projection of this resource: the
+        enrollment IS the substitute workflow, which is the thing an official
+        must not recover. A refusal is also the only honest answer available
+        to a flat list — ``[]`` would assert "no substitutes are enrolled in
+        this game", an operational claim about both teams that the caller is
+        not entitled to and that may well be false.
+
+        OWN-SIDE MEANS DURABLY OWNED: ``enrollment.team_id``, the side the row
+        was ADMITTED on, which is the same authority
+        :meth:`RosterService.lineup_population` keys its substitute
+        population on. A legacy pre-060 NULL owner is omitted from BOTH
+        sides — it cannot name its owner, and current membership answers a
+        different question than "which side was this row admitted on".
+        """
+        game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            return [_serialize(s)
+                    for s in self.store.substitutes_for_game(game_id)]
+        if audience == lineup_visibility.OWN_SIDE:
+            return [_serialize(s)
+                    for s in self.store.substitutes_for_game(game_id)
+                    if s.team_id is not None and s.team_id == viewer_team_id]
+        raise NotAuthorizedError(_SUBSTITUTE_REFUSAL)
 
     @catch
     def enroll_substitute(self, game_id: str, player_id: str,
-                          actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.enroll_substitute(game_id, player_id, actor_id))
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.enroll_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def withdraw_substitute(self, game_id: str, player_id: str,
-                            actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.withdraw_substitute(game_id, player_id, actor_id))
+                            actor_id: Optional[str] = None,
+                            authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.withdraw_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def offer_substitute(self, game_id: str, player_id: str,
                          actor_id: Optional[str] = None,
-                         expires_at: Optional[str] = None) -> dict:
+                         expires_at: Optional[str] = None,
+                         authorized_team_id: Optional[str] = None) -> dict:
         return _serialize(self.roster.offer_substitute(
             game_id, player_id, actor_id,
             offer_expires_at=_parse_dt(expires_at, "expires_at"),
+            authorized_team_id=authorized_team_id,
         ))
 
     @catch
     def accept_substitute(self, game_id: str, player_id: str,
-                          actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.accept_substitute(game_id, player_id, actor_id))
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.accept_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def decline_substitute(self, game_id: str, player_id: str,
-                           actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.decline_substitute(game_id, player_id, actor_id))
+                           actor_id: Optional[str] = None,
+                           authorized_team_id: Optional[str] = None) -> dict:
+        return _serialize(self.roster.decline_substitute(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def add_substitute_to_roster(self, game_id: str, player_id: str,
-                                 actor_id: Optional[str] = None) -> dict:
+                                 actor_id: Optional[str] = None,
+                                 authorized_team_id: Optional[str] = None) -> dict:
         return _serialize(
-            self.roster.add_substitute_to_roster(game_id, player_id, actor_id)
+            self.roster.add_substitute_to_roster(
+                game_id, player_id, actor_id,
+                authorized_team_id=authorized_team_id)
         )
 
     # -- roster status -----------------------------------------------------
     @catch
-    def get_roster_status(self, game_id: str) -> dict:
-        return self.roster.compute_roster_status(game_id).to_dict()
+    def get_roster_status(self, game_id: str, viewer_role=None,
+                          viewer_team_id: Optional[str] = None) -> dict:
+        """One side's roster status, for the side THIS caller is entitled to
+        (#427 final blocker, owner ruling: "`/roster-status`: Coach/Player
+        receives only the trusted own-side status. Ignore client side hints").
+
+        THE DEFECT THIS CLOSES, and it was the sharpest of the three: this
+        called ``compute_roster_status(game_id)`` with NO team, so it
+        hard-coded the HOME side for every caller — the identical defect
+        ``get_board`` had, still live one route away after ``get_board`` was
+        fixed. Measured at ccdb7b4: an AWAY Coach received
+        ``team_id=team_1`` and ``substitutes_enrolled=1``, a complete private
+        status block for the side that is not theirs, needing no player id at
+        all. ``?team_id=team_2`` was ignored entirely, so the AWAY Coach could
+        not even ask for their own.
+
+        NO CLIENT HINT IS READ, here or in ``web/server.py``. The side comes
+        from ``game_scoped_own_team_id`` and nowhere else, so a Coach cannot
+        name the opponent and a Player cannot name anyone.
+
+        AN OFFICIAL IS REFUSED, on the evidence that the Game Sheet does not
+        need this route: no file under ``web/static/`` fetches
+        ``/roster-status`` at all — the Game Sheet reads ``/lineups``, whose
+        official projection already carries the slot counts an official
+        needs, with the substitute state removed by
+        :meth:`_submitted_lineup_status`. Serving a second, substitute-
+        bearing status block here would hand back on this route precisely the
+        ``substitutes_enrolled`` count that one nulls out, which is the
+        sibling-pivot this blocker exists to close. The ruling permits either
+        projection or refusal "if this endpoint is unnecessary for Game
+        Sheet"; it is unnecessary, so it is refused.
+
+        AN UNSCOPED OPERATOR IS UNCHANGED — still the home-side default, not
+        narrowed and not widened; no hint is honoured for them either, so
+        this route gained no new side-selection surface at all.
+        """
+        game = self.roster._require_game(game_id)
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            return self.roster.compute_roster_status(game_id).to_dict()
+        if audience == lineup_visibility.OWN_SIDE:
+            return self.roster.compute_roster_status(
+                game_id, viewer_team_id).to_dict()
+        raise NotAuthorizedError(_ROSTER_STATUS_REFUSAL)
 
     @catch
     def auto_build_roster(self, game_id: str, team_id: Optional[str] = None,
-                          actor_id: Optional[str] = None) -> dict:
-        """Demo helper: select + confirm a full roster for one side.
+                          actor_id: Optional[str] = None,
+                          authorized_team_id: Optional[str] = None) -> dict:
+        """Select + confirm a roster for one side, up to the game's targets.
 
         Picks the team's goalies and skaters up to the game's targets so a
         newly-scheduled game becomes immediately playable by the roster flow.
         ``team_id`` defaults to the home side (#25); a team not playing in the
-        game is rejected. Raises if the team has no players (empty state).
-        """
-        game = self.roster._require_game(game_id)
-        team_id = team_id or game.home_team_id
-        if team_id not in (game.home_team_id, game.away_team_id):
-            raise ValidationError("That team is not playing in this game.")
-        players = self.store.players_for_team(team_id)
-        if not players:
-            raise ValidationError(
-                "Team has no players yet. Add or import players first."
-            )
-        goalies = [p for p in players if p.slot_type == SlotType.GOALIE]
-        skaters = [p for p in players if p.slot_type == SlotType.SKATER]
-        selected = ([g.id for g in goalies[:game.target_goalies]]
-                    + [s.id for s in skaters[:game.target_skaters]])
-        self.roster.select_roster(game_id, selected, actor_id)
-        for pid in selected:
-            self.roster.set_availability(game_id, pid, AvailabilityStatus.AVAILABLE)
-        status = self.roster.compute_roster_status(game_id, team_id).to_dict()
+        game is rejected. Raises if the team has no candidates at all (empty
+        state).
+
+        THE SEATING ITSELF NOW LIVES IN ``RosterService.auto_build_roster``
+        (PR #427) — see it for the candidate cohort, the one-transaction
+        lock/revalidate/partition/seat order, and why the response has to
+        carry player identity. What is left here is the presentation this
+        endpoint has always added on top: the resulting roster status plus
+        the coach-friendly short-roster classification.
+
+        The response is the batch result MERGED WITH that status, so
+        ``seated``/``skipped``/``deferred``/``already_seated``/
+        ``candidate_count`` are ADDITIVE — every existing caller reading
+        ``status``/``open_*_slots``/``short_roster`` is unaffected."""
+        result = self.roster.auto_build_roster(
+            game_id, team_id, actor_id,
+            authorized_team_id=authorized_team_id)
+        status = self.roster.compute_roster_status(
+            game_id, result["team_id"]).to_dict()
         # Coach-friendly classification of a short roster.
         status["missing_goalies"] = status["open_goalie_slots"]
         status["missing_skaters"] = status["open_skater_slots"]
         status["short_roster"] = (status["open_goalie_slots"] > 0
                                   or status["open_skater_slots"] > 0)
-        return status
+        return {**status, **result}
 
     @catch
     def publish_game(self, game_id: str, actor_id: Optional[str] = None) -> dict:
@@ -4050,18 +4765,80 @@ class ApiService:
 
     # -- screen view-model -------------------------------------------------
     @catch
-    def get_board(self, game_id: str) -> dict:
-        """Everything the Game Detail screen needs in one call.
+    def get_board(self, game_id: str, team_id: Optional[str] = None,
+                  viewer_role=None) -> dict:
+        """Everything the Game Detail screen needs, for ONE side, in one call.
 
-        Groups every team player into selected / substitute / available so
+        Groups that side's players into selected / substitute / available so
         the iPhone UI can render Coach and Player views without extra round
-        trips. This is a UI convenience over the contract endpoints; it does
-        not introduce new domain rules.
+        trips.
+
+        WHICH SIDE — THE CALLER'S OWN, RESOLVED BY THE SERVER (#427 blocker,
+        owner ruling comment 5394947899). This used to read
+        ``game.home_team_id`` unconditionally for EVERY caller, while the HTTP
+        gate (``can_read_private_game_data``) admits an AWAY Coach or Player
+        because their team participates in this game. Reproduced tri-store
+        over a real authenticated session: an AWAY Coach received the HOME
+        side's private player pool and a ``status`` block whose ``team_id``
+        named HOME. The docstring called this "a UI convenience over the
+        contract endpoints"; a convenience cannot override the private-data
+        boundary.
+
+        ``team_id`` is the TRUSTED side ``web/server.py`` resolves through
+        ``resolve_private_game_read`` — never a client-supplied value.
+
+        THE HOME DEFAULT IS AUDIENCE-BOUND (#427 round 2, blocker 1). It used
+        to be applied to EVERY caller, and applied BEFORE the projection was
+        chosen, so ``team_id=None`` from a team-scoped caller became a full
+        HOME read rather than a refusal. Measured on the head this corrects: a
+        direct ``Role.COACH`` call with ``team_id=None`` answered
+        ``team_id=team_1, projection=full, restricted=false`` with HOME's
+        identities, and the same shape was reachable over HTTP whenever a
+        Coach/Player lost their side between admission and projection. The
+        default now survives ONLY for an audience with no side of its own BY
+        DESIGN — an unscoped operator, an assigned official, an in-process
+        caller (:func:`services.lineup_visibility.default_side_permitted`).
+        A COACH or PLAYER who arrives with no side, or with a side that is not
+        one of this game's two, is RESTRICTED: no ``status``, no ``players``,
+        no notifications, no audit, and ``team_id: null`` — the response never
+        names a side it is not answering for.
+
+        ``RosterService.lineup_population`` still rejects a team that is not
+        playing in this game, so a bad value fails closed there too.
+
+        ``viewer_role`` selects the projection for a caller with no side of
+        their own: an assigned OFFICIAL gets the submitted-lineup projection
+        (no candidates, no availability, no substitute state), everyone else
+        the full private side. See :mod:`services.lineup_visibility`.
         """
         game = self.roster._require_game(game_id)
-        status = self.roster.compute_roster_status(game_id).to_dict()
-
-        rows = self._lineup_rows(game_id, game.home_team_id)
+        if team_id is None and not lineup_visibility.default_side_permitted(
+                viewer_role):
+            # A TEAM-SCOPED caller with no resolved side. Refused, never
+            # defaulted — see this method's docstring. Over HTTP the shared
+            # `resolve_private_game_read` boundary has already answered 403,
+            # so this is the facade's own fence for a direct caller.
+            projection = lineup_visibility.RESTRICTED
+        else:
+            team_id = team_id or game.home_team_id
+            projection = lineup_visibility.side_projections(
+                viewer_role, team_id, game.home_team_id, game.away_team_id)
+            projection = (projection["home"] if team_id == game.home_team_id
+                          else projection["away"])
+        if projection == lineup_visibility.RESTRICTED:
+            # A team-scoped caller with a missing or nonparticipant side.
+            # `team_id` is cleared as well: a restricted board must not name
+            # the side it declined to answer for, which is exactly what the
+            # HOME default used to do.
+            team_id = None
+            status, rows = None, None
+        else:
+            status = self.roster.compute_roster_status(
+                game_id, team_id).to_dict()
+            rows = self._lineup_rows(game, team_id)
+            if projection == lineup_visibility.SUBMITTED_LINEUP:
+                status = self._submitted_lineup_status(status)
+                rows = self._submitted_lineup_rows(rows)
 
         notifications = [
             {"type": n.type.value, "audience": n.audience, "message": n.message,
@@ -4074,72 +4851,332 @@ class ApiService:
              "detail": a.detail}
             for a in self.store.audit_for_game(game_id)
         ]
+        audience = lineup_visibility.route_audience(
+            viewer_role, team_id, game.home_team_id, game.away_team_id)
+        audit_scope, notifications, audit = self._activity_projection(
+            game_id, audience, team_id, notifications, audit)
         return {
             "game": _serialize(game),
+            # WHICH side this board is about, stated explicitly. It used to be
+            # inferable only from `status.team_id`, which is exactly the field
+            # that named HOME to an AWAY Coach — and which is `null` under a
+            # restricted projection.
+            "team_id": team_id,
+            "projection": projection,
+            "restricted": projection == lineup_visibility.RESTRICTED,
             "status": status,
             "players": rows,
+            # WHICH activity this caller is being shown, stated explicitly for
+            # the same reason `projection` is: a consumer must never have to
+            # infer withholding from a short list. See
+            # :meth:`_activity_projection`.
+            "audit_scope": audit_scope,
             "notifications": notifications,
             "audit": audit,
-            "audit_count": len(audit),
+            # COUNTED OVER WHAT WAS SENT, never over what was withheld — a
+            # count of the full game-wide log would be a covert cardinality
+            # oracle telling a scoped Coach exactly how much opponent activity
+            # they are not being shown (owner ruling: `audit_count` "must not
+            # survive as a covert cardinality oracle over omitted rows").
+            "audit_count": None if audit is None else len(audit),
         }
 
-    def _lineup_rows(self, game_id: str, team_id: str) -> list:
-        """Group a team's players into selected / substitute / available."""
-        roster = {e.player_id: e for e in self.store.roster_for_game(game_id)}
-        avail = {a.player_id: a for a in self.store.availability_for_game(game_id)}
-        subs = {s.player_id: s for s in self.store.substitutes_for_game(game_id)}
+    #: Withheld entirely — the caller is entitled to NONE of this game's
+    #: activity, so all three fields are ``null`` rather than empty. An empty
+    #: list asserts "this game has had no activity", which is a different and
+    #: false operational claim.
+    ACTIVITY_WITHHELD = "withheld"
+
+    def _activity_projection(self, game_id, audience, team_id,
+                             notifications, audit):
+        """WHICH of a game's notification/audit events this caller may read
+        (#427 final blocker, owner ruling comment 5394947899).
+
+        THE DEFECT THIS CLOSES. ``/board``'s ``notifications`` and ``audit``
+        blocks were built from ``notifications_for_game``/``audit_for_game``
+        — GAME-WIDE reads — and were never projected, so the very response
+        whose ``team_id`` correctly named the AWAY Coach's own side still
+        carried HOME's private workflow in the two collections underneath it.
+        Measured at ccdb7b4 over a real authenticated session: an AWAY Coach
+        received ``{'player_6': 'HOME enrolled substitute'}`` in
+        ``notifications`` and the HOME ``roster_selected`` /
+        ``availability_set`` entries in ``audit``.
+
+        THE ATTRIBUTION RULE, in one sentence: an event is RETAINED for side
+        ``S`` only when every player identity it discloses is durably
+        attributed to ``S``, and it discloses at least one.
+
+        Both halves are load-bearing.
+
+        * EVERY identity, not just the subject. ``subject_player_id`` is not
+          the only identity an event carries: ``roster_selected`` has no
+          subject at all and names its players in ``detail.player_ids``, and
+          ``roster_batch_seated`` names four more lists of them. Attributing
+          on the subject alone would have retained the exact
+          ``{"action":"roster_selected","detail":{"player_ids":["player_1"]}}``
+          entry the reviewer measured leaking. See :func:`_player_ids_in` for
+          how identities are recovered from the free-form ``detail``.
+        * AT LEAST ONE, so an event that names nobody is withheld rather than
+          shown to both sides. A game-wide event genuinely cannot be
+          attributed to a side, and the ruling's rule for that case is
+          omission — "never guess a side".
+
+        DURABLY means :meth:`RosterService.durable_game_sides`: the seat's
+        stored ``attribution`` and the enrollment's stored ``team_id``, never
+        live membership and never the permanent pointer. A legacy NULL row,
+        and a player whose durable records disagree, name no side — so every
+        event about them is withheld from BOTH sides.
+
+        WHY THE FILTER CANNOT UNDER-COUNT ITSELF INTO A LEAK: because the
+        retained set contains only events all of whose identities are the
+        caller's OWN side, nothing about the opponent survives — not a row,
+        not a subject, and not a count of either.
+
+        An ASSIGNED OFFICIAL has no side of their own here and is not
+        entitled to either side's workflow state (they receive the submitted
+        lineup, and "an official referees the game, they do not manage
+        anyone's roster"), so all three fields are withheld outright. An
+        UNSCOPED OPERATOR keeps the full game-wide collections, unchanged.
+        """
+        if audience == lineup_visibility.FULL:
+            return lineup_visibility.FULL, notifications, audit
+        if audience != lineup_visibility.OWN_SIDE:
+            return self.ACTIVITY_WITHHELD, None, None
+        sides = self.roster.durable_game_sides(game_id)
+        known = self._game_player_universe(game_id, sides)
+
+        def own(events):
+            kept = []
+            for event in events:
+                disclosed = _player_ids_in(event, known)
+                if disclosed and all(sides.get(pid) == team_id
+                                     for pid in disclosed):
+                    kept.append(event)
+            return kept
+
+        return lineup_visibility.OWN_SIDE, own(notifications), own(audit)
+
+    def _game_player_universe(self, game_id, sides) -> set:
+        """Every player id this game is known to mention anywhere.
+
+        Used as the VALUE half of :func:`_player_ids_in`'s two-way identity
+        recovery, so a player id sitting in ``detail`` under some future key
+        name that no suffix rule anticipates is still recognised as an
+        identity — and, being unattributable or opponent-attributed, still
+        withholds its event. Deliberately wider than ``sides``: a player with
+        NO durable side must still be RECOGNISED, precisely so the event that
+        names them is withheld rather than silently passed through."""
+        known = set(sides)
+        known.update(e.player_id for e in self.store.roster_for_game(game_id))
+        known.update(s.player_id
+                     for s in self.store.substitutes_for_game(game_id))
+        known.update(a.player_id
+                     for a in self.store.availability_for_game(game_id))
+        return known
+
+    _GROUP_OF_SOURCE = {"roster": "selected", "substitute": "substitute",
+                        "candidate": "available"}
+
+    def _lineup_rows(self, game, team_id: str) -> list:
+        """Serialize ONE side's lineup population for the UI.
+
+        A THIN SERIALIZER, deliberately. WHO is on this side, WHICH authority
+        put them there, and WHICH position/jersey values are authoritative are
+        all business rules, and they live in
+        :meth:`RosterService.lineup_population` — the same delegation
+        :meth:`_availability_candidates` already makes to
+        ``_players_for_game_team``, and for the same reason: the two private
+        game surfaces must not each keep their own idea of who is on a team
+        for a game. Read that method for the four populations, the strict
+        side tests, the legacy-NULL omission rule and the ordering.
+
+        This method's only remaining jobs are the group label, the
+        availability join (which is per-``(game, player)``, not per-side, so
+        it has no side authority to get wrong) and the JSON shape.
+
+        ``position``/``jersey_number`` COME OFF THE ROW, never off
+        ``row.player``. On a bound game those are the seated/enrollment/
+        membership values; ``jersey_number`` is ``null`` when no seasonal
+        value exists rather than the permanent pointer's. Only the unbound
+        exhibition branch puts permanent values in these fields, and it does
+        so inside the service, on its own explicit branch.
+        """
+        avail = {a.player_id: a
+                 for a in self.store.availability_for_game(game.id)}
         rows = []
-        for p in self.store.players_for_team(team_id):
-            entry = roster.get(p.id)
-            a = avail.get(p.id)
-            s = subs.get(p.id)
-            backed_out = entry is not None and not entry.status.occupies_slot
-            active_sub = s is not None and s.status in (
-                SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED
-            )
-            if entry is not None:
-                group = "selected"
-            elif active_sub:
-                group = "substitute"
-            else:
-                group = "available"
+        for row in self.roster.lineup_population(game, team_id):
+            entry, sub = row.entry, row.enrollment
+            a = avail.get(row.player.id)
             rows.append({
-                "id": p.id,
-                "name": p.name,
-                "position": p.position.value,
-                "slot_type": p.slot_type.value,
-                "jersey_number": p.jersey_number,
-                "group": group,
+                "id": row.player.id,
+                "name": row.player.name,
+                "position": row.position.value,
+                "slot_type": row.position.slot_type.value,
+                "jersey_number": row.jersey_number,
+                "group": self._GROUP_OF_SOURCE[row.source],
                 "roster_status": entry.status.value if entry else None,
-                "backed_out": backed_out,
+                "backed_out": (entry is not None
+                               and not entry.status.occupies_slot),
                 "availability": a.availability_status.value if a else "pending",
-                "sub_status": s.status.value if s else None,
+                "sub_status": sub.status.value if sub else None,
+                # LIVE eligibility for THIS side, so the UI can show a
+                # durable row that has become unseatable as exactly that —
+                # visible for cleanup, labelled ineligible, and NOT offered
+                # an add/seat control the service would refuse (owner ruling,
+                # comment 5394947899).
+                "eligible": row.eligible,
             })
         return rows
 
-    @catch
-    def get_lineups(self, game_id: str) -> dict:
-        """Both sides' lineups + independent status for a game (#25).
+    #: The submitted-lineup field set an assigned official may read. Built as
+    #: an ALLOW-list, not a deny-list: a future private field added to
+    #: `_lineup_rows` is withheld from officials until someone deliberately
+    #: names it here, rather than leaking the day it ships.
+    #:
+    #: ``backed_out`` is kept in the list although :meth:`_submitted_lineup_rows`
+    #: now makes it INVARIANTLY ``false`` for an official (#427 round 2,
+    #: blocker 3): the field is part of the row shape every other caller
+    #: receives, and dropping it for one audience would make the two shapes
+    #: differ in a second way for no gain. That the value can only be
+    #: ``false`` is asserted, not assumed.
+    _SHEET_PLAYER_FIELDS = ("id", "name", "position", "slot_type",
+                            "jersey_number", "group", "roster_status",
+                            "backed_out")
 
-        Home and away rosters are managed separately; this returns each side's
-        team, roster status, and player groups in one call for the roster UI.
+    @classmethod
+    def _submitted_lineup_rows(cls, rows: list) -> list:
+        """The rows that actually OCCUPY A SLOT on a side's sheet, stripped of
+        workflow state.
+
+        THE DEFECT THIS CLOSES (#427 round 2, blocker 3). This filtered on
+        ``group == "selected"`` alone — the DISPLAY GROUP — and
+        :meth:`_lineup_rows` keeps a seated row in that group after its
+        occupant has gone unavailable or been removed, flagging it
+        ``backed_out: true`` so a coach's own screen can still show it for
+        cleanup. So an official's Game Sheet carried players who are not on
+        it. Exact-head repro: mark the selected player unavailable, then
+        ``get_lineups(..., viewer_role=Role.OFFICIAL)`` still returned that
+        player with ``roster_status: "unavailable", backed_out: true`` — on
+        ``/board``, ``/lineups`` AND ``/roster``, because all three share this
+        one helper. That exceeds the accepted submitted/occupying projection:
+        it is the side's historical roster workflow, not the current sheet.
+
+        OCCUPANCY IS THE EXISTING PREDICATE, NOT A NEW ONE.
+        ``RosterEntryStatus.occupies_slot`` (SELECTED / CONFIRMED / OFFERED /
+        ACCEPTED) is what ``RosterService._side_data`` already counts slots
+        with, and ``_lineup_rows`` has already applied it per row: ``backed_out``
+        IS ``not entry.status.occupies_slot``. Filtering on that field reuses
+        the one answer rather than deriving a second one here that could drift
+        from it. ``group == "selected"`` is retained as well and is exactly
+        equivalent to "this row came from a roster ENTRY" (``_GROUP_OF_SOURCE``
+        maps the seated population and only it to that label), so the two
+        clauses read as what they are: a seated row, still holding its slot.
+
+        Of the surviving rows, only the fields the Game Sheet renders.
+        ``availability`` (a private per-player answer), ``sub_status``
+        (substitute workflow state) and ``eligible`` (live membership state)
+        are all dropped.
+        """
+        return [{k: row[k] for k in cls._SHEET_PLAYER_FIELDS}
+                for row in rows
+                if row["group"] == "selected" and not row["backed_out"]]
+
+    @staticmethod
+    def _submitted_lineup_status(status: dict) -> dict:
+        """The slot counts, with SUBSTITUTE STATE removed.
+
+        Three fields disclose it and all three are neutralised: the
+        ``substitutes_enrolled`` count; the ``needs_substitute`` state, which
+        exists precisely to say a substitute pool is standing by; and the
+        derived ``message``, whose two open-slot forms end "Substitutes are
+        available — coach decision needed." and "No substitutes enrolled."
+
+        The underlying operational fact an official DOES need — this side is
+        short N goalies and M skaters — survives intact, reported through
+        :meth:`RosterService.open_slot_phrase`, which is the same sentence
+        with the substitute clause removed rather than a second wording that
+        could drift from it."""
+        out = dict(status)
+        out["substitutes_enrolled"] = None
+        if out["status"] in (GameStatus.NEEDS_SUBSTITUTE.value,
+                             GameStatus.OPEN_SLOT.value):
+            out["status"] = GameStatus.OPEN_SLOT.value
+            out["action_required"] = False
+            out["message"] = RosterService.open_slot_phrase(
+                out["open_goalie_slots"], out["open_skater_slots"])
+        return out
+
+    @catch
+    def get_lineups(self, game_id: str, viewer_role=None,
+                    viewer_team_id: Optional[str] = None) -> dict:
+        """Both sides' lineups + independent status for a game (#25), each
+        side projected to what THIS caller may read (#427 blocker, owner
+        ruling comment 5394947899).
+
+        THE DEFECT THIS CLOSES. Every authenticated caller who passed the
+        single ``can_read_private_game_data`` gate received BOTH sides in
+        full: the opponent's candidate pool, every candidate's private
+        availability answer, and the opponent's substitute workflow state.
+        That gate proves only that the caller belongs to *a* team in this
+        game; it carries no team-level narrowing at all (the route registry
+        records this route ``scope_axis="none"``). Reproduced tri-store over
+        a real authenticated Coach session.
+
+        THREE PROJECTIONS, chosen by :func:`services.lineup_visibility.
+        side_projections` from the caller's role and the side the SERVER
+        resolved for them (``viewer_team_id``, from
+        ``game_scoped_own_team_id`` — never a client-supplied side):
+
+        * UNSCOPED OPERATOR — both sides in full, unchanged.
+        * COACH / PLAYER — their OWN side in full; the opponent RESTRICTED.
+        * ASSIGNED OFFICIAL — both sides' SUBMITTED LINEUP, which is what the
+          Game Sheet needs, and neither side's unselected candidates,
+          availability or substitute state.
+
+        A RESTRICTED SIDE IS NOT AN EMPTY ROSTER. It keeps its public
+        ``team_id``/``team_name`` and carries ``restricted: true`` with
+        ``status`` and ``players`` set to ``null`` — never ``[]``, which both
+        screens already render as the genuinely different operational claim
+        "no lineup submitted". Every side, restricted or not, carries the
+        ``restricted`` flag and a ``projection`` label, so a consumer never
+        has to infer redaction from a missing key.
+
+        ``officials``, ``result`` and the public ``game`` record are unchanged
+        for every caller: they are the shared, non-side-private facts of the
+        fixture.
         """
         game = self.roster._require_game(game_id)
+        projections = lineup_visibility.side_projections(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
 
-        def side(team_id):
+        def side(team_id, projection):
             team = self.store.get_team(team_id)
-            return {
+            out = {
                 "team_id": team_id,
                 "team_name": team.name if team else team_id,
-                "status": self.roster.compute_roster_status(game_id, team_id).to_dict(),
-                "players": self._lineup_rows(game_id, team_id),
+                "projection": projection,
+                "restricted": projection == lineup_visibility.RESTRICTED,
             }
+            if projection == lineup_visibility.RESTRICTED:
+                out["restricted_reason"] = "opponent_private"
+                out["status"] = None
+                out["players"] = None
+                return out
+            status = self.roster.compute_roster_status(
+                game_id, team_id).to_dict()
+            rows = self._lineup_rows(game, team_id)
+            if projection == lineup_visibility.SUBMITTED_LINEUP:
+                status = self._submitted_lineup_status(status)
+                rows = self._submitted_lineup_rows(rows)
+            out["status"] = status
+            out["players"] = rows
+            return out
 
         result = self.store.result_for_game(game_id)
         return {
             "game": _serialize(game),
-            "home": side(game.home_team_id),
-            "away": side(game.away_team_id),
+            "home": side(game.home_team_id, projections["home"]),
+            "away": side(game.away_team_id, projections["away"]),
             "officials": self._official_rows(game_id),
             "result": _serialize(result) if result is not None else None,
         }
@@ -4308,49 +5345,120 @@ class ApiService:
 
     @catch
     def process_notification_deliveries(self) -> dict:
-        """Drain the pending delivery queue through the mock sender."""
+        """Drain the pending delivery queue through the mock sender.
+
+        Returns only a run summary (counts) — never a delivery row, so no
+        raw destination reaches this response. The WORKER's own re-resolution
+        of each row's stored destination (needed to actually send) is
+        policy+audit-gated separately, attributed to the SYSTEM principal
+        (#426 review finding 2) — see ``services/delivery.py``.
+        """
         return self.delivery.process_pending()
 
     @catch
-    def retry_notification_delivery(self, delivery_id: str) -> dict:
+    def retry_notification_delivery(self, delivery_id: str,
+                                    actor_role=None, actor_user_id=None,
+                                    request_id=None) -> dict:
         """Requeue a failed/dead-lettered delivery for another attempt (#80).
 
         Resets the attempt budget and clears the dead-letter/error state so the
         worker will pick it up again. A sent delivery is not requeued (nothing
         to retry); an ignored one is — the operator explicitly asked for it.
+
+        The response echoes the row's STORED destination (#426 review
+        finding 2: "retry/ignore return the same raw _delivery_row") — gated
+        and audited exactly like ``set_contact_destination_active``'s
+        read-back: the policy check runs FIRST (before the row lookup, so an
+        unauthorized caller can't distinguish existing from missing ids),
+        and the disclosure is recorded in the SAME transaction as the
+        mutation it accompanies.
         """
-        d = self.store.get_notification_delivery(delivery_id)
-        if d is None:
-            raise NotFoundError("Delivery not found.")
-        if d.status == DeliveryStatus.SENT:
-            raise ValidationError("A delivered notification has nothing to retry.")
-        d.status = DeliveryStatus.PENDING
-        d.attempts = 0
-        d.last_error = None
-        d.dead_lettered_at = None
-        d.next_attempt_at = self.roster.clock()
-        self.store.save_notification_delivery(d)
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "retry_notification_delivery",
+                actor_user_id, label, request_id)
+        with self.store.transaction():
+            d = self.store.get_notification_delivery(delivery_id)
+            if d is None:
+                raise NotFoundError("Delivery not found.")
+            if d.status == DeliveryStatus.SENT:
+                raise ValidationError(
+                    "A delivered notification has nothing to retry.")
+            d.status = DeliveryStatus.PENDING
+            d.attempts = 0
+            d.last_error = None
+            d.dead_lettered_at = None
+            d.next_attempt_at = self.roster.clock()
+            self.store.save_notification_delivery(d)
+            self._record_sensitive_read(
+                category, [("recipient", d.recipient_ref)],
+                "retry_notification_delivery", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._delivery_row(d)
 
     @catch
-    def ignore_notification_delivery(self, delivery_id: str) -> dict:
-        """Mark a delivery as ignored so the worker never retries it (#80)."""
-        d = self.store.get_notification_delivery(delivery_id)
-        if d is None:
-            raise NotFoundError("Delivery not found.")
-        if d.status == DeliveryStatus.SENT:
-            # A completed delivery is history; rewriting it to "won't deliver"
-            # would corrupt the record. Mirror retry's sent-row guard.
-            raise ValidationError("A delivered notification cannot be ignored.")
-        d.status = DeliveryStatus.IGNORED
-        d.next_attempt_at = None
-        self.store.save_notification_delivery(d)
+    def ignore_notification_delivery(self, delivery_id: str,
+                                     actor_role=None, actor_user_id=None,
+                                     request_id=None) -> dict:
+        """Mark a delivery as ignored so the worker never retries it (#80).
+
+        Same policy+audit gate as ``retry_notification_delivery`` — see its
+        docstring (#426 review finding 2).
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "ignore_notification_delivery",
+                actor_user_id, label, request_id)
+        with self.store.transaction():
+            d = self.store.get_notification_delivery(delivery_id)
+            if d is None:
+                raise NotFoundError("Delivery not found.")
+            if d.status == DeliveryStatus.SENT:
+                # A completed delivery is history; rewriting it to "won't
+                # deliver" would corrupt the record. Mirror retry's
+                # sent-row guard.
+                raise ValidationError(
+                    "A delivered notification cannot be ignored.")
+            d.status = DeliveryStatus.IGNORED
+            d.next_attempt_at = None
+            self.store.save_notification_delivery(d)
+            self._record_sensitive_read(
+                category, [("recipient", d.recipient_ref)],
+                "ignore_notification_delivery", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._delivery_row(d)
 
     @catch
-    def get_delivery_overview(self) -> dict:
-        """Delivery-queue counts by status and channel, for observability."""
-        rows = self.store.all_notification_deliveries()
+    def get_delivery_overview(self, actor_role=None, actor_user_id=None,
+                              request_id=None) -> dict:
+        """Delivery-queue counts by status and channel, for observability —
+        PLUS every delivery row, including its stored destination (#426
+        review finding 2: "get_delivery_overview() returned it while
+        list_data_access() remained empty"). Policy-gated and audited
+        exactly like ``list_contact_destinations``: one row per distinct
+        disclosed recipient, or a single collection-level row when the
+        queue is empty.
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "get_delivery_overview",
+                actor_user_id, label, request_id)
+        with self.store.transaction():
+            rows = self.store.all_notification_deliveries()
+            subjects = (sorted({("recipient", d.recipient_ref) for d in rows})
+                       or [("recipient", "*")])
+            self._record_sensitive_read(
+                category, subjects, "get_delivery_overview",
+                actor_user_id, label, ACCESS_ALLOWED, request_id)
         by_status: dict = {}
         by_channel: dict = {}
         for d in rows:
@@ -5047,6 +6155,182 @@ class ApiService:
                     "This official no longer exists.",
                     {"reason": "scope_subject_missing", "official_id": official_id})
 
+    # -- sensitive-read policy + audit (#124; #426 review) ------------------
+    #
+    # The facade is where every read of a protected field category passes
+    # through the visibility policy (services/visibility_policy.py) and emits
+    # a durable DataAccessLog row — synchronously, inside the same store
+    # transaction as the read it records, matching the repo's "everything is
+    # auditable" and snapshot-consistency invariants. The one category with
+    # stored data behind it today is CONTACT_DESTINATION (#60's registry);
+    # birthdate/registration land with #273 and route through the same gate.
+    #
+    # Recorded as its own log — NEVER AuditLog/SetupAuditLog — and the row
+    # never carries the protected value (domain/privacy.py).
+    #
+    # PRINCIPAL PROPAGATION (#426 review finding 1). Every HTTP call site now
+    # passes the ONE session-resolved Role web/server.py's _resolve_role()
+    # produced for this request (never None — a missing/invalid session is
+    # an HTTP error decided BEFORE the facade is ever called) plus the
+    # server-minted per-request correlation id. The former no-actor
+    # "operator_boundary" shape — a missing principal silently treated as
+    # RAW-authorized for CONTACT_DESTINATION — is RETIRED: a missing or
+    # unparseable principal now fails closed exactly like any other unknown
+    # one (visibility_policy.NO_PRINCIPAL / "unknown"), distinguished only
+    # in the audit row's label, never in what it is granted. The one
+    # surviving non-Role principal, visibility_policy.SYSTEM_PRINCIPAL, is a
+    # trusted, explicit, non-string sentinel for legitimate background code
+    # (the delivery worker, #426 review finding 2) — see that module's
+    # PRINCIPALS section.
+
+    #: actor_role label recorded when a caller passed a role claim that parses
+    #: to no known Role: the policy fails closed on it, and the durable row
+    #: records the fact without copying arbitrary caller input into the log.
+    _PRIVACY_UNKNOWN_ROLE = "unknown"
+
+    #: Thin delegations to services/visibility_policy.py's sanitizers (#426
+    #: review finding 3) — shared with services/delivery.py's SYSTEM-
+    #: attributed worker audit (finding 2), which cannot import THIS module
+    #: without a circular import, so the real logic lives there, not here.
+    _mint_request_id = staticmethod(visibility_policy.mint_request_id)
+    _safe_request_id = staticmethod(visibility_policy.safe_request_id)
+    _canonical_subject_id = staticmethod(visibility_policy.canonical_subject_id)
+
+    @classmethod
+    def _privacy_principal(cls, actor_role):
+        """Resolve a facade ``actor_role`` argument to ``(role, label)``
+        (#426 review finding 1).
+
+        ``actor_role`` is either a real :class:`Role` (enum or its string
+        value — the ONLY shape an HTTP-originated call passes, since
+        ``web/server.py``'s ``_resolve_role()`` never reaches a sensitive
+        route with ``role=None``) or ``visibility_policy.SYSTEM_PRINCIPAL``
+        (the explicit sentinel for trusted, non-HTTP background/worker
+        callers). Anything else — ``None`` (no principal supplied) or an
+        unparseable string — fails closed: there is no more "missing
+        principal defaults to RAW" carve-out. The two failure shapes are
+        labelled distinctly (``NO_PRINCIPAL`` vs ``"unknown"``) purely so an
+        audit row explains WHY nothing was resolved; both grant nothing.
+        """
+        if actor_role is visibility_policy.SYSTEM_PRINCIPAL:
+            return actor_role, "system"
+        if isinstance(actor_role, Role):
+            return actor_role, actor_role.value
+        if actor_role is None:
+            return None, visibility_policy.NO_PRINCIPAL
+        try:
+            role = Role(actor_role)
+        except ValueError:
+            return None, cls._PRIVACY_UNKNOWN_ROLE
+        return role, role.value
+
+    @staticmethod
+    def _sensitive_read_allowed(role, category) -> bool:
+        """The ONE predicate every sensitive-read gate in this facade uses
+        (#426 review finding 1) — a straight delegation to the policy
+        module. No special-casing here for a missing/unknown principal:
+        ``role`` is a real Role, the SYSTEM_PRINCIPAL sentinel, or None, and
+        ``visibility_policy.may_read_raw`` already fails closed on anything
+        it does not explicitly grant."""
+        return visibility_policy.may_read_raw(role, category)
+
+    def _record_sensitive_read(self, category, subjects, purpose,
+                               actor_user_id, actor_role_label, outcome,
+                               request_id, *, durable=False) -> None:
+        """Append one DataAccessLog row per subject.
+
+        ``durable=False`` (the default): callers hold the store transaction
+        that makes the rows atomic with the ALLOWED read they record — this
+        is the disclosure path, and an audit row for a read that never
+        happened (because the surrounding transaction rolled back) must not
+        survive either. ``durable=True`` is for REFUSALS
+        (``_refuse_sensitive_read``): a denial has no disclosure to stay
+        atomic with, and must survive regardless of what any ambient
+        transaction later does (#426 review finding 4) — see
+        ``add_data_access_durable`` on both stores.
+
+        Every subject id and the shared request id are passed through the
+        canonicalization/validation boundary (#426 review finding 3) before
+        they ever reach the store.
+
+        ``id`` is deliberately left unset (#426 round-2 review finding 1):
+        the STORE assigns it, at the same moment it assigns ``seq``, never
+        here — eagerly allocating it in THIS ambient transaction is exactly
+        the bug that fix closes (see ``domain/privacy.py``'s DURABLE ID
+        ALLOCATION section and ``add_data_access_durable`` on both stores).
+        """
+        at = self.roster.clock()
+        write = (self.store.add_data_access_durable if durable
+                else self.store.add_data_access)
+        for subject_type, subject_id in subjects:
+            write(DataAccessLog(
+                category=category,
+                subject_type=subject_type,
+                subject_id=self._canonical_subject_id(subject_id),
+                purpose=purpose,
+                at=at,
+                actor_user_id=actor_user_id,
+                actor_role=actor_role_label,
+                outcome=outcome,
+                request_id=request_id))
+
+    def _refuse_sensitive_read(self, category, purpose, actor_user_id,
+                               actor_role_label, request_id):
+        """Record the refused attempt DURABLY, then raise the refusal (#124:
+        an unauthorized read attempt produces an audit row AND a denial).
+
+        The denial row is written through ``add_data_access_durable``
+        (#426 review finding 4) — NOT a plain nested ``transaction()``: a
+        nested ``transaction()`` call JOINS whatever ambient transaction the
+        caller may already have open, so a forbidden result followed by an
+        OUTER failure used to leave zero denial rows. The durable write
+        survives that outer failure by construction (see
+        ``add_data_access_durable``'s own docstring on both stores). One
+        collection-level ``("recipient", "*")`` subject — a refused caller
+        learned nothing, so no per-subject rows are enumerated (the
+        enumeration itself would be a disclosure vector).
+
+        The message names ``category`` generically (#424 audit-wiring):
+        this method now gates BIRTHDATE and REGISTRATION_NUMBER reads too,
+        not only CONTACT_DESTINATION, so a hardcoded "contact destinations"
+        message would misdescribe a refused eligibility or duplicate-report
+        call. ``details["category"]`` already carried the real machine-
+        readable category value before this change; the human-readable text
+        now agrees with it instead of always naming the first category this
+        method was ever used for.
+        """
+        self._record_sensitive_read(
+            category, [("recipient", "*")], purpose,
+            actor_user_id, actor_role_label, ACCESS_DENIED, request_id,
+            durable=True)
+        raise NotAuthorizedError(
+            "Your role can't read this protected data.",
+            {"reason": "sensitive_read_denied", "category": category.value,
+             "request_id": request_id})
+
+    def _audit_transport_denial(self, category, purpose, actor_user_id,
+                                actor_role) -> None:
+        """Durably audit a sensitive-route DENIAL decided ENTIRELY at the
+        HTTP transport boundary (#426 review finding 1) — by
+        ``web/server.py``'s own ``_operator_only()``/``authorize()`` gate,
+        before any facade method (whose own ``_refuse_sensitive_read``
+        already covers this) ever runs. The transport-boundary counterpart
+        to ``_refuse_sensitive_read``, not a second mechanism: both funnel
+        through the SAME ``_record_sensitive_read`` ``durable=True`` path,
+        with the SAME collection-level, value-free ``("recipient", "*")``
+        subject — a refused caller never learns which subjects exist.
+
+        ``actor_role`` may be ``None`` (no session at all resolved) —
+        ``_privacy_principal`` labels that ``NO_PRINCIPAL``, exactly like
+        every other missing-principal attempt, never a disclosure. Called
+        directly from ``web/server.py`` — the SAME reach-in convention
+        ``_mint_request_id``/``_privacy_principal`` already established.
+        """
+        role, label = self._privacy_principal(actor_role)
+        self._record_sensitive_read(
+            category, [("recipient", "*")], purpose, actor_user_id, label,
+            ACCESS_DENIED, self._mint_request_id(), durable=True)
+
     # -- contact registry (#60) --------------------------------------------
     @staticmethod
     def _contact_row(c) -> dict:
@@ -5055,9 +6339,38 @@ class ApiService:
                 "label": c.label, "active": c.active}
 
     @catch
-    def list_contact_destinations(self) -> dict:
-        rows = [self._contact_row(c)
-                for c in self.store.all_contact_destinations()]
+    def list_contact_destinations(self, actor_role=None, actor_user_id=None,
+                                  request_id=None) -> dict:
+        """Every stored contact destination — a bulk read of protected values
+        (#124: CONTACT_DESTINATION), policy-gated and audited.
+
+        ``actor_role``/``actor_user_id`` must be the ONE session-resolved
+        principal ``web/server.py`` produced for this HTTP request (#426
+        review finding 1) — there is no more no-argument default-allow
+        shape; an absent ``actor_role`` now fails closed like any other
+        unrecognised principal (see ``_privacy_principal``). Leaves durable
+        DataAccessLog rows: one per disclosed recipient, or a single
+        ``("recipient", "*")`` row when the registry is empty — every access
+        attempt leaves a trace. Audit emission happens INSIDE the same store
+        transaction as the read, so the subjects recorded and the rows
+        returned come from one consistent snapshot.
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "list_contact_destinations",
+                actor_user_id, label, request_id)
+        with self.store.transaction():
+            rows = [self._contact_row(c)
+                    for c in self.store.all_contact_destinations()]
+            subjects = (sorted({("recipient", r["recipient_ref"])
+                                for r in rows})
+                        or [("recipient", "*")])
+            self._record_sensitive_read(
+                category, subjects, "list_contact_destinations",
+                actor_user_id, label, ACCESS_ALLOWED, request_id)
         rows.sort(key=lambda r: (r["recipient_ref"], r["channel"]))
         return {"contacts": rows}
 
@@ -5065,7 +6378,38 @@ class ApiService:
     def set_contact_destination(self, recipient_ref: str, channel: str,
                                 destination: str, label=None) -> dict:
         """Register (or update the value of) a recipient/channel's real
-        destination."""
+        destination.
+
+        The fetch-then-save is wrapped in ``transaction()`` (#426 review
+        finding 4) so this write takes SQLite's ``BEGIN IMMEDIATE`` lock
+        upfront, the SAME discipline ``set_contact_destination_active``
+        uses: without it, this write's own implicit per-statement
+        transaction has to PROMOTE from a read lock to a write lock
+        mid-statement when it races a connection that already holds
+        RESERVED (e.g. the toggle's own locked fetch) — and SQLite
+        deliberately refuses to honour ``busy_timeout`` for that specific
+        promotion, failing with "database is locked" immediately instead
+        of waiting. Taking the write lock as the FIRST statement (exactly
+        like every other guarded write in this codebase) lets a genuinely
+        concurrent caller correctly SERIALIZE behind this one instead.
+
+        The initial existence check is a PLAIN read; the row that is
+        actually mutated is re-fetched via ``get_contact_destination_for_
+        update`` (#426 review finding 4 round-2) before being written back.
+        SQLite's ``BEGIN IMMEDIATE`` (above) already makes this a no-op
+        there, but on PostgreSQL a plain read is NOT blocked by another
+        transaction's row lock (only a genuine write is) — so without the
+        re-fetch, this method could read a row an in-flight
+        ``set_contact_destination_active`` is about to change, then block
+        only at its OWN ``UPDATE``, and finally write back every OTHER
+        field (this method only ever means to change destination/label)
+        from that now-stale snapshot once the lock is free — silently
+        reverting the toggle's already-committed change. That is the exact
+        "lost update" shape finding 4 named, now closed on this side too:
+        re-fetching AFTER the row lock is held guarantees ``existing``
+        reflects the true current row before any field of it is echoed
+        back unchanged.
+        """
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
         self._reject_dangling_recipient(recipient_ref)
@@ -5078,26 +6422,31 @@ class ApiService:
             raise ValidationError("A destination is required.")
         if ch == NotificationChannel.EMAIL and "@" not in destination:
             raise ValidationError("An email destination must contain '@'.")
-        existing = self.store.get_contact_destination(recipient_ref, ch)
-        if existing is not None:
-            # Deliberately does NOT touch `active` (#232 review 6): a
-            # retired row must stay retired through an ordinary value edit —
-            # only the MANAGE_SETUP-gated set_contact_destination_active can
-            # reactivate one. Without this, a wider-permissioned caller
-            # could silently undo a retirement by editing the destination.
-            existing.destination = destination
-            existing.label = label
-            self.store.save_contact_destination(existing)
-            return self._contact_row(existing)
-        c = ContactDestination(
-            id=self.store.next_id("contact"), recipient_ref=recipient_ref,
-            channel=ch, destination=destination, label=label)
-        self.store.add_contact_destination(c)
-        return self._contact_row(c)
+        with self.store.transaction():
+            existing = self.store.get_contact_destination(recipient_ref, ch)
+            if existing is not None:
+                existing = self.store.get_contact_destination_for_update(
+                    existing.id)
+                # Deliberately does NOT touch `active` (#232 review 6): a
+                # retired row must stay retired through an ordinary value edit —
+                # only the MANAGE_SETUP-gated set_contact_destination_active can
+                # reactivate one. Without this, a wider-permissioned caller
+                # could silently undo a retirement by editing the destination.
+                existing.destination = destination
+                existing.label = label
+                self.store.save_contact_destination(existing)
+                return self._contact_row(existing)
+            c = ContactDestination(
+                id=self.store.next_id("contact"), recipient_ref=recipient_ref,
+                channel=ch, destination=destination, label=label)
+            self.store.add_contact_destination(c)
+            return self._contact_row(c)
 
     @catch
     def set_contact_destination_active(self, contact_id: str, active: bool,
-                                       actor_id: Optional[str] = None) -> dict:
+                                       actor_id: Optional[str] = None,
+                                       actor_role=None,
+                                       request_id=None) -> dict:
         """Retire (or reactivate) a contact destination (#232 review 4).
 
         A durable, audited lifecycle toggle — never a delete. Retiring a row
@@ -5109,26 +6458,51 @@ class ApiService:
         is. Restricted to Player/Official-scoped rows, same as the delete
         lifecycle it serves — not a general contact-management surface for
         other recipient kinds (team, guardian, …).
+
+        The RESPONSE echoes the row including its STORED destination — a
+        value the caller did not submit — so this is also a sensitive read
+        (#124): gated by the same policy as ``list_contact_destinations``
+        (checked FIRST, before the row lookup, so an unauthorized caller
+        can't distinguish existing from missing ids) and recorded as a
+        DataAccessLog row inside the mutation's own transaction — a rolled
+        back toggle whose response never reached the caller leaves no
+        phantom read row. Its sibling ``set_contact_destination`` is
+        deliberately NOT gated here: its response contains only the
+        caller's own submitted values (the upsert overwrites before it
+        echoes), so no stored protected value is disclosed.
+
+        FETCH-MUTATE-AUDIT IS ONE ATOMIC UNIT (#426 review finding 4): the
+        row is looked up via ``get_contact_destination_for_update`` INSIDE
+        this method's own transaction, not before it opens — a stale
+        pre-read fetched before the transaction started (the prior shape)
+        could be silently overwritten by a concurrent
+        ``set_contact_destination`` upsert that commits in the gap, toggling
+        (and disclosing) that stale value instead of the true current one.
+        Locking the row for the fetch (a real row lock on PostgreSQL; the
+        whole-transaction file/process lock on SQLite/Memory) fully orders
+        this toggle against any concurrent write to the SAME row.
         """
-        c = next((row for row in self.store.all_contact_destinations()
-                  if row.id == contact_id), None)
-        if c is None:
-            raise NotFoundError(f"Contact destination {contact_id} not found.")
-        if not (c.recipient_ref.startswith("player:")
-                or c.recipient_ref.startswith("official:")):
-            raise ValidationError(
-                "Only Player/Official-scoped contact destinations can be "
-                "retired through this action.",
-                {"reason": "recipient_not_cleanup_eligible",
-                 "recipient_ref": c.recipient_ref})
-        if active:
-            self._reject_dangling_recipient(c.recipient_ref)
-        # The mutation itself must happen INSIDE the transaction (#232 review
-        # 6): the in-memory store snapshots state at entry, so mutating `c`
-        # beforehand would already be reflected in that snapshot — a forced
-        # audit failure would then roll back to the already-mutated state
-        # instead of the true pre-image.
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "set_contact_destination_active",
+                actor_id, label, request_id)
         with self.store.transaction():
+            c = self.store.get_contact_destination_for_update(contact_id)
+            if c is None:
+                raise NotFoundError(
+                    f"Contact destination {contact_id} not found.")
+            if not (c.recipient_ref.startswith("player:")
+                    or c.recipient_ref.startswith("official:")):
+                raise ValidationError(
+                    "Only Player/Official-scoped contact destinations can be "
+                    "retired through this action.",
+                    {"reason": "recipient_not_cleanup_eligible",
+                     "recipient_ref": c.recipient_ref})
+            if active:
+                self._reject_dangling_recipient(c.recipient_ref)
             c.active = bool(active)
             self.store.save_contact_destination(c)
             self.setup._audit(
@@ -5136,6 +6510,13 @@ class ApiService:
                 else "contact_destination_retired",
                 "contact_destination", contact_id, actor_id,
                 {"recipient_ref": c.recipient_ref, "channel": c.channel.value})
+            # Read-back disclosure of the stored destination (#124) — same
+            # transaction/lock as the fetch+mutation, see the docstring.
+            self._record_sensitive_read(
+                SensitiveFieldCategory.CONTACT_DESTINATION,
+                [("recipient", c.recipient_ref)],
+                "set_contact_destination_active", actor_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._contact_row(c)
 
     # -- notification preferences (#81) ------------------------------------
@@ -5358,6 +6739,27 @@ class ApiService:
                          self.roster.clock(), calendar_name=name)
 
     # -- device token registry (#65) ---------------------------------------
+    #
+    # A raw device token is, for audit purposes, the SAME kind of protected
+    # value a ContactDestination's raw destination is — #426 round-3 review
+    # finding 1: "DeviceToken is architecturally the same class of problem
+    # ContactDestination already solved ... reuse that exact same
+    # boundary/mechanism ... rather than building a second parallel one".
+    # ``list_device_tokens``/``set_device_token_active`` below therefore
+    # route through the IDENTICAL policy+audit gate ``list_contact_
+    # destinations``/``set_contact_destination_active`` use — same
+    # ``SensitiveFieldCategory.CONTACT_DESTINATION`` category (not a new
+    # one), same ``_privacy_principal``/``_sensitive_read_allowed``/
+    # ``_refuse_sensitive_read``/``_record_sensitive_read`` calls, same
+    # sanitizers — just a different stored row shape underneath.
+    #
+    # ``register_device_token`` is deliberately NOT gated, for the SAME
+    # reason ``set_contact_destination`` (its ContactDestination sibling)
+    # is not: on both the create AND the reactivate-existing path, its
+    # response only ever echoes the ``token`` value the CALLER just
+    # submitted in this SAME call — never a stored value the caller didn't
+    # already have — so it discloses nothing new and is not a sensitive
+    # read.
     @staticmethod
     def _device_token_row(t) -> dict:
         return {"id": t.id, "recipient_ref": t.recipient_ref,
@@ -5365,16 +6767,59 @@ class ApiService:
                 "label": t.label, "active": t.active}
 
     @catch
-    def list_device_tokens(self) -> dict:
-        rows = [self._device_token_row(t)
-                for t in self.store.all_device_tokens()]
+    def list_device_tokens(self, actor_role=None, actor_user_id=None,
+                           request_id=None) -> dict:
+        """Every stored device token — a bulk read of protected values
+        (#124/#426 round-3 review finding 1: CONTACT_DESTINATION, the same
+        category a raw stored ContactDestination read uses), policy-gated
+        and audited exactly like ``list_contact_destinations`` (see that
+        method's own docstring for the full contract this mirrors).
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "list_device_tokens", actor_user_id, label,
+                request_id)
+        with self.store.transaction():
+            rows = [self._device_token_row(t)
+                    for t in self.store.all_device_tokens()]
+            subjects = (sorted({("recipient", r["recipient_ref"])
+                                for r in rows})
+                       or [("recipient", "*")])
+            self._record_sensitive_read(
+                category, subjects, "list_device_tokens",
+                actor_user_id, label, ACCESS_ALLOWED, request_id)
         rows.sort(key=lambda r: (r["recipient_ref"], not r["active"], r["id"]))
         return {"device_tokens": rows}
 
     @catch
     def register_device_token(self, recipient_ref: str, provider: str,
                               token: str, label=None) -> dict:
-        """Register (or reactivate) a real push device token for a recipient."""
+        """Register (or reactivate) a real push device token for a recipient.
+
+        THE UPSERT IS ONE ATOMIC STATEMENT (#426 round-4 review finding 1):
+        ``store.upsert_device_token`` uses migration 055's UNIQUE index on
+        (recipient_ref, token) and a real ``INSERT ... ON CONFLICT ... DO
+        UPDATE`` so two concurrent registrations of the SAME
+        (recipient_ref, token) pair can never both observe "no row" and
+        insert two rows — and a concurrent ``set_device_token_active``
+        toggle of the SAME row (which now takes a real row lock via
+        ``get_device_token_for_update``) is fully ordered against this
+        write rather than silently overwriting it with a stale in-memory
+        copy. Replaces the previous unlocked ``get_device_token_by_value``
+        -> ``save_device_token``/``add_device_token`` shape, which
+        performed its read and its write as two independent, unlocked
+        operations with no transaction around either — see
+        ``store.upsert_device_token``'s own docstring for the full
+        mechanism. Wrapped in ``store.transaction()`` for Memory-store
+        parity (its equivalent find-or-create is two dict operations, not
+        atomic on its own — see ``InMemoryStore.upsert_device_token``);
+        harmless and consistent with every other mutating method here on
+        the SQL backends, where the upsert statement is already atomic by
+        itself.
+        """
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
         self._reject_dangling_recipient(recipient_ref)
@@ -5389,28 +6834,66 @@ class ApiService:
             raise ValidationError(
                 "That looks like a placeholder token — register a real device "
                 "token from the provider.")
-        existing = self.store.get_device_token_by_value(recipient_ref, token)
-        if existing is not None:
-            existing.provider = provider
-            existing.label = label
-            existing.active = True
-            self.store.save_device_token(existing)
-            return self._device_token_row(existing)
-        t = DeviceToken(
-            id=self.store.next_id("devtok"), recipient_ref=recipient_ref,
-            provider=provider, token=token, label=label, active=True)
-        self.store.add_device_token(t)
+        with self.store.transaction():
+            t = self.store.upsert_device_token(recipient_ref, provider, token, label)
         return self._device_token_row(t)
 
     @catch
-    def set_device_token_active(self, token_id: str, active: bool) -> dict:
-        t = self.store.get_device_token(token_id)
-        if t is None:
-            raise NotFoundError("Device token not found.")
-        if active:
-            self._reject_dangling_recipient(t.recipient_ref)
-        t.active = bool(active)
-        self.store.save_device_token(t)
+    def set_device_token_active(self, token_id: str, active: bool,
+                                actor_id: Optional[str] = None,
+                                actor_role=None, request_id=None) -> dict:
+        """Retire (or reactivate) a device token.
+
+        The RESPONSE echoes the row including its STORED raw token — a
+        value the caller did not submit — so this is also a sensitive read
+        (#124/#426 round-3 review finding 1), gated by the SAME policy as
+        ``list_device_tokens``/``set_contact_destination_active`` (checked
+        FIRST, before the row lookup, so an unauthorized caller can't
+        distinguish existing from missing ids) and recorded as a
+        DataAccessLog row inside the mutation's own transaction — a
+        rolled-back toggle whose response never reached the caller leaves
+        no phantom read row. Mirrors ``set_contact_destination_active``'s
+        exact shape; see that method's own docstring.
+
+        FETCH-MUTATE-AUDIT IS ONE ATOMIC UNIT, ROW-LOCKED (#426 round-4
+        review finding 1): the row is looked up via
+        ``get_device_token_for_update`` — unlike its ContactDestination
+        sibling before round-2's fix, this used to be a PLAIN
+        ``get_device_token`` read with no lock at all. On PostgreSQL, a
+        plain read is not blocked by another transaction's row lock (only a
+        genuine write is), so a concurrent ``register_device_token``
+        re-registration of the SAME token value could commit a new
+        provider/label in the gap between this read and this method's own
+        ``UPDATE``, and this method's stale full-row ``save_device_token``
+        would then silently overwrite that committed change back to the
+        value it read before the race — the exact "lost update" the review
+        described. Locking the row for the fetch (a real row lock on
+        PostgreSQL; the whole-transaction file/process lock on
+        SQLite/Memory) fully orders this toggle against
+        ``upsert_device_token``'s own conflict-resolution lock on the SAME
+        row, in EITHER commit order — see that method's own docstring.
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "set_device_token_active", actor_id, label,
+                request_id)
+        with self.store.transaction():
+            t = self.store.get_device_token_for_update(token_id)
+            if t is None:
+                raise NotFoundError("Device token not found.")
+            if active:
+                self._reject_dangling_recipient(t.recipient_ref)
+            t.active = bool(active)
+            self.store.save_device_token(t)
+            # Read-back disclosure of the stored token (#124) — same
+            # transaction as the fetch+mutation, see the docstring.
+            self._record_sensitive_read(
+                category, [("recipient", t.recipient_ref)],
+                "set_device_token_active", actor_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._device_token_row(t)
 
     # -- user accounts (#67) ------------------------------------------------
@@ -5432,7 +6915,22 @@ class ApiService:
     @catch
     def set_user_account_active(self, account_id: str, active: bool,
                                 actor_id: Optional[str] = None) -> dict:
-        account = self.accounts.set_active(account_id, active, actor_id=actor_id)
+        # round-N+1 (finding 1 Memory/SQLite rework, design §8.2 row 3):
+        # `CONTEXT_GATE.exclusive`, OUTSIDE `AccountService.set_active`'s own
+        # `@_transactional` — same key convention as the context-switch
+        # writer (`web/server.py`'s `POST /api/context` handler): the RAW
+        # account id, not `user_fence_key(...)`'s "user:"-prefixed form,
+        # because `CONTEXT_GATE` is a separate gate OBJECT from the
+        # database-coordinated fence and shares no key namespace with it —
+        # only ever compared against other calls through this SAME gate.
+        # Released before `_account_row` renders the response, matching
+        # every other gate hold in this codebase. A deactivation can change
+        # what THIS account's own scoped reads resolve to (a deactivated
+        # login is refused entirely) exactly like a context switch, so the
+        # same per-user gate — not the global one — is the correct match.
+        with CONTEXT_GATE.exclusive(account_id):
+            account = self.accounts.set_active(
+                account_id, active, actor_id=actor_id)
         return self._account_row(account)
 
     @catch
@@ -5440,8 +6938,14 @@ class ApiService:
                                   actor_id: Optional[str] = None) -> dict:
         """Repair/change an account's scope binding (#266) — e.g. rebind an
         unscoped or dangling-team Coach to a real team. Audited."""
-        account = self.accounts.rebind_account_scope(
-            account_id, scope, actor_id=actor_id)
+        # round-N+1 (finding 1 Memory/SQLite rework, design §8.2 row 2): same
+        # placement/reasoning as `set_user_account_active` immediately
+        # above — a scope rebind can move which Program/Season/League this
+        # account's own scoped reads resolve to, exactly like a context
+        # switch.
+        with CONTEXT_GATE.exclusive(account_id):
+            account = self.accounts.rebind_account_scope(
+                account_id, scope, actor_id=actor_id)
         return self._account_row(account)
 
     @catch
@@ -5607,61 +7111,159 @@ class ApiService:
             return "The roster for this game is locked."
         return None
 
-    def _opportunity_base_dict(self, g, player) -> dict:
+    def _opportunity_base_dict(self, g, player, ctx=None) -> dict:
         """The fields a substitute opportunity carries in both the Home list
         (#107) and the detail view (#110) — kept in one place so the two
-        surfaces can't drift on the shared shape."""
-        team = self.store.get_team(player.team_id) if player.team_id else None
-        opp_id = self._opponent_team_id(g, player.team_id)
+        surfaces can't drift on the shared shape.
+
+        Both the surfaced TEAM and the surfaced POSITION come off ONE
+        :class:`~hockey_scheduler.services.roster_service.GameMembershipContext`
+        — membership-resolved for a LeagueSeason-bound game, permanent
+        pointer for an unbound one — resolved here or handed in by a caller
+        that already has it (#205 review blocker 2: never two independent
+        reads).
+
+        A BOUND game whose context does NOT resolve raises ``NotFoundError``
+        rather than labelling the row from the permanent pointer. It used to
+        fall back (``team_for_game(...) or player.team_id``), which could
+        name a team that is not even in this game and then read a
+        permanent-pointer position beside it. Every caller reaches this with
+        an eligible game (the Home lists are pre-filtered;
+        ``get_substitute_opportunity`` resolves the context itself and 404s
+        first), so the raise is the guard, not a new user-visible state."""
+        if ctx is None:
+            ctx = self.roster.resolve_membership_context(g, player)
+        if ctx is None:
+            raise NotFoundError("Opportunity not found.")
+        team_id = ctx.team_id
+        team = self.store.get_team(team_id) if team_id else None
+        opp_id = self._opponent_team_id(g, team_id)
         opp_team = self.store.get_team(opp_id) if opp_id else None
         return {
             "game_id": g.id,
-            "team_name": team.name if team else player.team_id,
+            "team_name": team.name if team else team_id,
             "opponent_name": opp_team.name if opp_team else None,
             "start_time": g.start_time.isoformat() if g.start_time else None,
             "venue_name": self._venue_name_for_game(g),
             "rink_name": g.rink,
-            "position_needed": player.position.slot_type.value,
+            # #205 review blocker 2: the season-scoped position for THIS
+            # game, off the SAME context that named the team above.
+            "position_needed": ctx.slot_type.value,
         }
 
     @catch
     def get_player_home(self, player_id: str, user_id: Optional[str] = None) -> dict:
         """The signed-in player's home screen (#107): next game, attendance
         status, team roster status, substitute opportunities, and unread
-        notification count — all scoped to this player only."""
+        notification count — all scoped to this player only.
+
+        THE SIDE IS THE SERVER'S RESOLUTION, NOT THE POINTER (#205, round 6).
+        ``next_game.team_id``/``team_name``/``opponent_name``/``team_status``
+        were all derived from ``Player.team_id``, the permanent pointer.
+        ``team_status`` is the player-facing rendering of the SAME per-side
+        enum the private-game family spent five rounds binding to the trusted
+        resolution — ``_PLAYER_TEAM_STATUS`` maps ``needs_substitute`` to
+        ``"sub_search"`` and ``open_slot`` to ``"short"`` — so for a MOVER
+        (pointer and seasonal membership naming different teams) this served
+        the OPPONENT's private per-side state, and served it to the linked
+        guardian too, since :meth:`get_guardian_home` calls this method once
+        per verified junior.
+
+        MEASURED at b1cc02d on Memory, SQLite and real PostgreSQL, over real
+        authenticated sessions, with the two sides made to genuinely DIFFER
+        (HOME ``needs_substitute`` / AWAY ``open_slot``). Mover ``player_6``,
+        pointer ``team_1`` (HOME), membership and ``game_scoped_own_team_id``
+        both ``team_2`` (AWAY)::
+
+            /api/games/{id}/roster-status  ->  team_2  open_slot
+            /api/me/player-home            ->  team_1 "Home" vs "Away",
+                                               team_status "sub_search"
+
+        Identical on all three backends, and identical inside
+        ``/api/me/guardian/home`` for a guardian verified for that junior.
+
+        THE ENTITLEMENT RULE, and it is decided by MEMBERSHIP, never by the
+        pointer: the side is ``game_scoped_own_team_id`` against THIS game —
+        the one resolution ``web/scope.can_read_private_game_data``, the
+        private-game dispatch and the Dashboard schedule row all use, and the
+        one whose own module documents this pointer as stale "in either
+        direction". A pointer that has OUTLIVED the membership grants
+        nothing: the game is not selected (see
+        :meth:`RosterService._plays_in`), so there is no ``next_game`` and
+        neither side's private state is served. The subject is the
+        session-resolved player, never a request field, and there is no side
+        parameter for a caller to name.
+
+        IT IS A CORRECTNESS FIX AS WELL. The same pointer named the Mover's
+        OPPONENT as their team on their own Dashboard — ``app.js`` renders
+        ``${team_name} vs ${opponent_name}`` — and addressed their "I'm In" /
+        "Can't Play" POST to ``next_game.game_id``, the game the pointer
+        chose.
+
+        GAME SELECTION MOVED TO THE SAME AUTHORITY. ``next_game`` and
+        ``today_count`` now choose WHICH games this page is about through
+        :meth:`RosterService._plays_in` (``team_for_game``), because a Mover
+        handed the wrong game cannot be rescued by resolving the side
+        correctly within it. Both halves fall back to the permanent pointer
+        for a game with NO LeagueSeason binding, so exhibitions and unbound
+        legacy rows are byte-for-byte unchanged."""
         player = self.store.get_player(player_id)
         if player is None:
             raise NotFoundError("Player not found.")
-        team = self.store.get_team(player.team_id) if player.team_id else None
 
         next_game = self.roster.find_next_game_for_player(player_id)
         next_game_dto = None
+        # The SERVER's per-game resolution for the SIGNED-IN subject — the
+        # same function every other private per-side read of this game goes
+        # through. The subject comes from `player_id`, which `web/server.py`
+        # takes from the SESSION scope and never from a query parameter, so
+        # no caller can name a side here.
         if next_game is not None:
-            my_team_id = player.team_id
-            opponent_id = self._opponent_team_id(next_game, my_team_id)
-            opponent = self.store.get_team(opponent_id) if opponent_id else None
-            rstatus = self.roster.compute_roster_status(next_game.id, my_team_id)
-            # Only this player's own roster entry + availability are needed —
-            # single-player lookups, not a full _lineup_rows pass over the team.
-            entry = self.store.roster_entry_for_player(next_game.id, player_id)
-            avail = self.store.availability_for_player(next_game.id, player_id)
-            my_row = {
-                "backed_out": entry is not None and not entry.status.occupies_slot,
-                "availability": (avail.availability_status.value
-                                 if avail else "pending"),
-            }
-            next_game_dto = {
-                "game_id": next_game.id, "team_id": my_team_id,
-                "team_name": team.name if team else my_team_id,
-                "opponent_name": opponent.name if opponent else None,
-                "start_time": next_game.start_time.isoformat()
-                             if next_game.start_time else None,
-                "venue_name": self._venue_name_for_game(next_game),
-                "rink_name": next_game.rink,
-                "attendance_status": self._player_attendance_status(my_row),
-                "team_status": self._PLAYER_TEAM_STATUS.get(
-                    rstatus.status.value, "not_responded"),
-            }
+            my_team_id = game_scoped_own_team_id(
+                Role.PLAYER, None, player_id,
+                GameAuthorization.of(next_game), self.store)
+            # FAIL-CLOSED, and unreachable by construction rather than a new
+            # user-visible state: `find_next_game_for_player` selected this
+            # game through the SAME membership authority (`_plays_in` ->
+            # `team_for_game`), so a game it returned always resolves a side.
+            # The guard is what stops a future caller reintroducing the
+            # fallback — the same reasoning `position_for_game` gives for its
+            # own unreachable raise. It matters because an unresolved side
+            # here would reach `_opponent_team_id(g, None)` -> `home_team_id`
+            # and `compute_roster_status(gid, None)` -> the producer's home
+            # default: this very leak, by the back door.
+            if my_team_id is not None:
+                team = self.store.get_team(my_team_id)
+                opponent_id = self._opponent_team_id(next_game, my_team_id)
+                opponent = (self.store.get_team(opponent_id)
+                            if opponent_id else None)
+                rstatus = self.roster.compute_roster_status(
+                    next_game.id, my_team_id)
+                # Only this player's own roster entry + availability are
+                # needed — single-player lookups, not a full _lineup_rows
+                # pass over the team.
+                entry = self.store.roster_entry_for_player(
+                    next_game.id, player_id)
+                avail = self.store.availability_for_player(
+                    next_game.id, player_id)
+                my_row = {
+                    "backed_out": (entry is not None
+                                   and not entry.status.occupies_slot),
+                    "availability": (avail.availability_status.value
+                                     if avail else "pending"),
+                }
+                next_game_dto = {
+                    "game_id": next_game.id, "team_id": my_team_id,
+                    "team_name": team.name if team else my_team_id,
+                    "opponent_name": opponent.name if opponent else None,
+                    "start_time": next_game.start_time.isoformat()
+                                 if next_game.start_time else None,
+                    "venue_name": self._venue_name_for_game(next_game),
+                    "rink_name": next_game.rink,
+                    "attendance_status": self._player_attendance_status(my_row),
+                    "team_status": self._PLAYER_TEAM_STATUS.get(
+                        rstatus.status.value, "not_responded"),
+                }
 
         opportunities = [self._opportunity_base_dict(g, player)
                          for g in self.roster.list_substitute_opportunities(player_id)]
@@ -5706,8 +7308,16 @@ class ApiService:
         """Operator creates an unverified guardian↔junior link (#35) — the
         first HTTP-reachable path for this; previously only deterministic
         demo seeding could create one."""
-        return _serialize(self.guardians.link_guardian(
-            guardian_user_id, player_id, actor_id=actor_id))
+        # round-N+1 (finding 1 Memory/SQLite rework, design §8.7 row 16):
+        # `LIFECYCLE_GATE.exclusive`, OUTSIDE `GuardianService.link_guardian`'s
+        # own `@_transactional` — this writer's affected user (the guardian)
+        # is found only by a lookup the writer performs itself, so it takes
+        # the GLOBAL key exactly like the database-coordinated fence already
+        # does (see `GuardianService.link_guardian`'s own docstring for why).
+        with LIFECYCLE_GATE.exclusive(EPOCH_FENCE_GLOBAL_KEY):
+            link = self.guardians.link_guardian(
+                guardian_user_id, player_id, actor_id=actor_id)
+        return _serialize(link)
 
     @catch
     def verify_guardian_link(self, link_id: str, consent_method: str,
@@ -5722,8 +7332,12 @@ class ApiService:
             raise ValidationError(
                 "consent_method is required to verify a guardian link "
                 "(e.g. 'signed_form', 'verbal_confirmed', 'email_reply').")
-        return _serialize(self.guardians.verify_link(
-            link_id, actor_id=actor_id, consent_method=consent_method))
+        # round-N+1 (design §8.7 row 17): same placement/reasoning as
+        # `create_guardian_link` immediately above.
+        with LIFECYCLE_GATE.exclusive(EPOCH_FENCE_GLOBAL_KEY):
+            link = self.guardians.verify_link(
+                link_id, actor_id=actor_id, consent_method=consent_method)
+        return _serialize(link)
 
     @catch
     def list_guardian_links(self) -> List[dict]:
@@ -5739,12 +7353,17 @@ class ApiService:
         if player is None:
             raise NotFoundError("Player not found.")
         game = self.store.get_game(game_id)
-        # Only a player on one of the participating teams may view the
-        # opportunity — don't confirm another team's game to a non-participant.
-        if game is None or player.team_id not in (
-                game.home_team_id, game.away_team_id):
+        # Only a player who RESOLVES to one of the participating teams may
+        # view the opportunity — don't confirm another team's game to a
+        # non-participant. Resolution is membership-based for a
+        # LeagueSeason-bound game and permanent-pointer for an unbound one
+        # (#205 cutover, RosterService.team_for_game).
+        ctx = (self.roster.resolve_membership_context(game, player)
+               if game is not None else None)
+        if game is None or ctx is None:
             raise NotFoundError("Opportunity not found.")
-        rstatus = self.roster.compute_roster_status(game_id, player.team_id)
+        team_id = ctx.team_id
+        rstatus = self.roster.compute_roster_status(game_id, team_id)
         enrollment = self.store.substitute_for_player(game_id, player_id)
         status = enrollment.status if enrollment else None
         can_accept = can_withdraw = can_accept_offer = can_decline_offer = False
@@ -5756,7 +7375,7 @@ class ApiService:
             # predicate so this pre-disable can't drift from accept_substitute;
             # decline only needs a mutable game.
             offer_block = self.roster.substitute_offer_block_reason(
-                player_id, game_id, enrollment, rstatus)
+                player_id, game_id, enrollment, rstatus, ctx=ctx)
             can_accept_offer = offer_block is None
             can_decline_offer = self._mutable_block(game) is None
             blocked = offer_block
@@ -5766,10 +7385,11 @@ class ApiService:
             withdraw_block = self._mutable_block(game)
             can_withdraw, blocked = withdraw_block is None, withdraw_block
         else:
-            reason = self.roster.substitute_block_reason(player_id, game_id, rstatus)
+            reason = self.roster.substitute_block_reason(
+                player_id, game_id, rstatus, ctx=ctx)
             can_accept, blocked = reason is None, reason
         return {
-            **self._opportunity_base_dict(game, player),
+            **self._opportunity_base_dict(game, player, ctx=ctx),
             "roster_status": rstatus.status.value,
             "team_status": self._PLAYER_TEAM_STATUS.get(
                 rstatus.status.value, "not_responded"),
@@ -5783,17 +7403,84 @@ class ApiService:
             "blocked_reason": blocked,
         }
 
+    def _workflow_side(self, game, team_id, viewer_role, viewer_team_id,
+                       refusal: str) -> str:
+        """WHICH SIDE's substitute-workflow pool this caller may read — the
+        shared adjudication behind ``get_substitute_candidates`` and
+        ``get_addable_substitutes`` (#427 final blocker, round 3).
+
+        ONE function rather than two copies precisely because these two
+        routes are the same question asked of two populations: who is already
+        enrolled and could be offered, and who is eligible and could be
+        enrolled. They were the last two leaves of the private-game dispatch
+        binding a side their own way, and a second copy of "which side is the
+        caller's" is what this blocker exists to remove — not something to
+        reintroduce twice while removing it.
+
+        ``FULL``
+            Unscoped operator — the client hint is KEPT, and when it is
+            absent the caller's own resolved side is used before the
+            service-layer home default, byte-for-byte the pre-existing #112 /
+            #114 behaviour. Narrowing an operator would be its own
+            regression: they may read either side anyway.
+        ``OWN_SIDE``
+            Coach (a Player never reaches here — MANAGE_ROSTER refuses them
+            at the route) — the hint is IGNORED and the TRUSTED
+            server-resolved side is used, so a hinted call is byte-identical
+            to an un-hinted one exactly as it is on the other five siblings.
+            THIS IS THE BEHAVIOUR CHANGE: the route used to answer a hinted
+            call **differently** (403 for the opponent's id), which both
+            contradicted the contract round 2 shipped for this very route and
+            made the hint a probe whose answer varied with the side named.
+            Ignoring is also what makes the service layer's silent
+            ``team_id or game.home_team_id`` fallback unreachable for a
+            scoped caller: the trusted side is always passed, so HOME can
+            never be served to an AWAY Coach by default.
+        ``SUBMITTED_LINEUP`` / ``RESTRICTED``
+            Refused — never ``candidates: []`` / ``addable: []``, which
+            asserts "this team has nobody to call", an operational claim
+            about the team rather than a fact about the reader.
+
+            NOT REACHABLE THROUGH TODAY'S DISPATCH, and deliberately kept:
+            the MANAGE_ROSTER capability gate refuses an official and a
+            player before the facade is called. That is a ROLE-PERMISSION
+            table agreeing with the side rule by coincidence, and the whole
+            lesson of this blocker is that the side rule must not be
+            contingent on a check that lives somewhere else and can change
+            without it. ``tests/test_private_game_sibling_routes.py`` drives
+            this branch at the FACADE, so it is proven rather than assumed.
+
+        ``viewer_role`` of ``None`` is the in-process default and resolves
+        ``FULL``, so every non-HTTP caller is unchanged."""
+        audience = lineup_visibility.route_audience(
+            viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.OWN_SIDE:
+            return viewer_team_id
+        if audience == lineup_visibility.FULL:
+            return team_id or viewer_team_id or game.home_team_id
+        raise NotAuthorizedError(refusal)
+
     @catch
     def get_substitute_candidates(self, game_id: str,
-                                  team_id: Optional[str] = None) -> dict:
+                                  team_id: Optional[str] = None,
+                                  viewer_role=None,
+                                  viewer_team_id: Optional[str] = None) -> dict:
         """The coach outreach queue for a game/team (#112): open slots by
         position plus the ordered substitute candidates (who can be offered
-        right now). Operator-facing — gated at the route by MANAGE_ROSTER +
-        team scope."""
+        right now) — projected onto the audience this caller belongs to
+        (#427 final blocker, round 3; see :meth:`_workflow_side`).
+
+        THE ROWS THEMSELVES are already durably attributed: round 2 made this
+        queue and ``/substitutes`` name the SAME set by keying both on
+        ``SubstituteEnrollment.team_id`` (see
+        ``RosterService.list_substitute_candidates``). What was still bound
+        the old way is WHICH SIDE the caller is asking about, and that is
+        what moves here."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError("Game not found.")
-        team_id = team_id or game.home_team_id
+        team_id = self._workflow_side(game, team_id, viewer_role,
+                                      viewer_team_id, _CANDIDATE_REFUSAL)
         rstatus = self.roster.compute_roster_status(game_id, team_id)
         return {
             "game_id": game_id, "team_id": team_id,
@@ -5806,16 +7493,25 @@ class ApiService:
 
     @catch
     def get_addable_substitutes(self, game_id: str,
-                                team_id: Optional[str] = None) -> dict:
+                                team_id: Optional[str] = None,
+                                viewer_role=None,
+                                viewer_team_id: Optional[str] = None) -> dict:
         """Active same-team players a coach could add as a substitute
         candidate right now (#114) — the roster the outreach queue's own
         Enroll doesn't cover, since enroll_substitute only ever runs from the
-        player's own self-service action. Operator-facing — gated at the
-        route the same way get_substitute_candidates is."""
+        player's own self-service action. Projected onto the caller's
+        audience by the SAME :meth:`_workflow_side` the outreach queue uses
+        (#427 final blocker, round 3).
+
+        This list is a side's private candidate pool WITH NAMES — the same
+        class of data ``_submitted_lineup_rows`` strips one path segment
+        away — so it is bound by the same rule and refused rather than
+        emptied for an audience that may not read it."""
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError("Game not found.")
-        team_id = team_id or game.home_team_id
+        team_id = self._workflow_side(game, team_id, viewer_role,
+                                      viewer_team_id, _ADDABLE_REFUSAL)
         rstatus = self.roster.compute_roster_status(game_id, team_id)
         return {
             "game_id": game_id, "team_id": team_id,
@@ -5826,17 +7522,26 @@ class ApiService:
 
     @catch
     def add_substitute_candidate(self, game_id: str, player_id: str,
-                                 actor_id: Optional[str] = None) -> dict:
+                                 actor_id: Optional[str] = None,
+                                 authorized_team_id: Optional[str] = None) -> dict:
         return _serialize(self.roster.add_substitute_candidate(
-            game_id, player_id, actor_id))
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id))
 
     @catch
     def assign_official(self, game_id: str, official_id: str, role: str,
                         actor_id: Optional[str] = None,
                         override_unavailable: bool = False) -> dict:
-        a = self.setup.assign_official(
-            game_id, official_id, _parse_enum(OfficialRole, role, "role"),
-            actor_id, override_unavailable=override_unavailable)
+        # round-N+1 (finding 1 Memory/SQLite rework, design §8.5 row 13):
+        # `LIFECYCLE_GATE.exclusive`, OUTSIDE `SetupService.assign_official`'s
+        # own `@_transactional` — the assigned Official's own scoped reads
+        # can be affected, and that user is found only by a lookup, so this
+        # takes the GLOBAL key exactly like the database-coordinated fence
+        # already does (see `SetupService.assign_official`'s own docstring).
+        with LIFECYCLE_GATE.exclusive(EPOCH_FENCE_GLOBAL_KEY):
+            a = self.setup.assign_official(
+                game_id, official_id, _parse_enum(OfficialRole, role, "role"),
+                actor_id, override_unavailable=override_unavailable)
         return _serialize(a)
 
     # -- official availability (#88) ---------------------------------------
@@ -5876,7 +7581,12 @@ class ApiService:
     @catch
     def unassign_official(self, assignment_id: str,
                           actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.unassign_official(assignment_id, actor_id))
+        # round-N+1 (design §8.5 row 14): same placement/reasoning as
+        # `assign_official` above — an unassignment is an authorization
+        # WITHDRAWAL for the affected Official's own scoped reads.
+        with LIFECYCLE_GATE.exclusive(EPOCH_FENCE_GLOBAL_KEY):
+            a = self.setup.unassign_official(assignment_id, actor_id)
+        return _serialize(a)
 
     # -- results & standings (#31) -----------------------------------------
     @catch
@@ -5944,18 +7654,22 @@ class ApiService:
             return None, None
         return league_season, season
 
-    def _division_matches_active_context(self, division_id, program, season,
-                                         league):
-        """Whether ``division_id``'s validated LeagueSeason -> Season ->
-        Program chain matches the ACTIVE resolved tuple.
+    def _league_season_matches_active_context(self, league_season, ls_season,
+                                              program, season, league):
+        """Whether a validated ``LeagueSeason -> Season -> Program`` chain
+        matches the ACTIVE resolved tuple. The ONE comparison behind BOTH
+        operator standings reads (per-Division and LeagueSeason-wide, #202) —
+        shared rather than transcribed so the two route contracts cannot drift
+        into disagreeing about who may read which table.
 
         Program is the hard ceiling, and a Season MUST be active and match
         EXACTLY (#367 owner ruling: "Season-bound rows must match the active
         Season; a Program-only context returns EMPTY for Season-bound data").
-        Standings are Season-bound by construction — a Division reaches its
-        Season only through its LeagueSeason — so a Program-only context can
-        never satisfy this and returns the generic empty shape for EVERY
-        Division, indistinguishably from a nonexistent one.
+        Standings are Season-bound by construction — both a Division and a
+        League reach their Season only through a LeagueSeason — so a
+        Program-only context can never satisfy this and takes the caller's
+        generic not-here answer for EVERY target, indistinguishably from a
+        nonexistent one.
 
         An earlier revision enforced the Season axis only ``if season is not
         None``, which silently WIDENED the read exactly where it should have
@@ -5978,15 +7692,31 @@ class ApiService:
         authorized, which is exactly the leak #369 review flags."""
         if program is None or season is None:
             return False
-        league_season, div_season = self._division_league_season_chain(
-            division_id)
-        if league_season is None or div_season.program_id != program.id:
+        if league_season is None or ls_season is None:
+            return False
+        if ls_season.program_id != program.id:
             return False
         if league_season.season_id != season.id:
             return False
         if league is not None and league_season.league_id != league.id:
             return False
         return True
+
+    def _division_matches_active_context(self, division_id, program, season,
+                                         league):
+        """Whether ``division_id``'s validated LeagueSeason -> Season ->
+        Program chain matches the ACTIVE resolved tuple. Resolving the chain
+        is the Division-specific part; the comparison itself is the shared
+        ``_league_season_matches_active_context``, which carries the rules and
+        the reasoning behind each axis.
+
+        A dangling chain (no Division, no LeagueSeason, or no Season) is
+        ``(None, None)`` and never matches, so it takes the same generic empty
+        standings shape a nonexistent ``division_id`` does."""
+        league_season, div_season = self._division_league_season_chain(
+            division_id)
+        return self._league_season_matches_active_context(
+            league_season, div_season, program, season, league)
 
     @catch
     def get_standings(self, division_id: str, user_id=None, role=None,
@@ -6117,15 +7847,56 @@ class ApiService:
                         key=lambda x: (-x["pts"], -x["gd"], -x["gf"], x["team_name"]))
         return {"division_id": division_id, "standings": ranked}
 
+    def _league_season_not_found_error(self) -> dict:
+        """The ONE not-here answer this route has. Returned both for a
+        LeagueSeason that does not exist and for one outside the caller's
+        active tuple, from the same expression so the two can never be told
+        apart by a byte (#202)."""
+        return {"error": {
+            "code": "not_found",
+            "message": "No such league in that season."}}
+
     @catch
-    def get_league_season_standings(self, league_id: str,
-                                    season_id: str) -> dict:
+    def get_league_season_standings(self, league_id: str, season_id: str,
+                                    user_id=None, role=None,
+                                    scope=None) -> dict:
         """LeagueSeason-wide standings (#283 Slice D): one table across ALL of a
         LeagueSeason's Divisions (and its division-less teams), from FINAL
         results of REGULAR games only. The per-Division ``get_standings`` view
         stays available; this is the League-level aggregate the permanent model
         makes first-class. Same points model (win=2/tie=1/loss=0) and ordering.
+
+        This is the OPERATOR view: ``public_only=False`` counts UNPUBLISHED
+        games' final results and fails closed on a drifted Game by returning a
+        ``data_integrity_error`` naming it. It is therefore not an alias for
+        ``get_public_league_season_standings`` and never can be — the public
+        variant skips unpublished Games precisely so a draft result cannot leak
+        by aggregation or through that error (#83). Measured on a seeded store
+        the two agree exactly until one unpublished Game carries a final
+        result, which is why "the payloads look identical" is not a safe reason
+        to serve this one unauthenticated.
+
+        #202 scoping, the SAME contract as ``get_standings`` one level down:
+        when a real user context is supplied (``role`` is not ``None`` — the
+        HTTP route always supplies one), the named LeagueSeason must match the
+        caller's ACTIVE resolved tuple, not merely be *some* LeagueSeason the
+        caller is broadly authorized for. A mismatch returns the identical
+        ``not_found`` a nonexistent (league, season) pair already returns, so
+        an inaccessible-from-here LeagueSeason is indistinguishable from one
+        that does not exist. Called with no arguments beyond the ids (the
+        default), performs no ownership check — unchanged behavior for existing
+        direct/internal callers, which is what keeps the service-level history
+        and integrity tests addressing the computation rather than the gate.
         """
+        if role is not None:
+            ls = self.store.league_season_for(league_id, season_id)
+            program, active_season, league = self.context.resolve_with_league(
+                user_id, role, scope)
+            ls_season = (self.store.get_season(ls.season_id)
+                         if ls is not None else None)
+            if not self._league_season_matches_active_context(
+                    ls, ls_season, program, active_season, league):
+                return self._league_season_not_found_error()
         return self._standings_for_league_season(
             league_id, season_id, public_only=False)
 
@@ -6150,9 +7921,7 @@ class ApiService:
         """
         ls = self.store.league_season_for(league_id, season_id)
         if ls is None:
-            return {"error": {
-                "code": "not_found",
-                "message": "No such league in that season."}}
+            return self._league_season_not_found_error()
         # Roster membership in THIS LeagueSeason is the registration's canonical
         # ``league_season_id`` (every row from ``registrations_for_league_season``
         # already has it). Whether the Team's CURRENT permanent ``league_id`` must
@@ -7194,9 +8963,42 @@ class ApiService:
     def _guard_active_seasons(self, season_ids) -> None:
         """Row-lock every distinct Season in canonical (sorted) order and
         guard it read-only (#159). Sorted order avoids lock-order deadlocks
-        across a multi-Season batch; MUST run inside a store.transaction()."""
+        across a multi-Season batch; MUST run inside a store.transaction().
+
+        Takes SEASON IDS, and callers holding GAMES must not derive them by
+        reading ``g.season_id`` — that is the denormalized column PR #427's
+        blocker is about, and this helper's ``if s`` filter would silently drop
+        a bound Game whose copy of it is NULL, leaving that Game's archived
+        competition unguarded for the whole batch. Use
+        :meth:`_guard_active_game_seasons` instead."""
         for sid in sorted({s for s in season_ids if s}):
             self.setup._require_active_season(sid)
+
+    def _guard_active_game_seasons(self, games) -> None:
+        """The GAME-shaped form of :meth:`_guard_active_seasons` (PR #427).
+
+        Same contract — every distinct Season row-locked in canonical sorted
+        order, read-only guarded, inside the caller's transaction — but the
+        Season each Game is judged against is the one its LEAGUESEASON names,
+        resolved through the single shared
+        :func:`season_guard.guard_game_season`, so a batch cannot reach a
+        conclusion the equivalent single-Game path would refuse.
+
+        Two passes, and the split is load-bearing. Pass one only RESOLVES each
+        Game's authorizing Season (a plain read) so the distinct ids can be
+        locked in sorted order — the deadlock-avoidance property this helper
+        exists for, which per-Game guarding in arrival order would lose. Pass
+        two then runs the full guard per Game: its ``FOR UPDATE`` is an
+        idempotent re-lock of a row this transaction already holds, and it is
+        where the archive state and the ``game.season_id`` comparison are
+        actually decided — under the lock, never off pass one's read."""
+        games = [g for g in games if g is not None]
+        planned = {season_guard.game_season_authority_id(self.store, g)
+                   for g in games}
+        for sid in sorted(s for s in planned if s):
+            self.setup._require_active_season(sid)
+        for game in sorted(games, key=lambda g: g.id):
+            season_guard.guard_game_season(self.store, game)
 
     @catch
     def commit_draft_schedule(self, division_id: str = None,
@@ -8187,12 +9989,14 @@ class ApiService:
            Seasons of unauthorized candidates would run
            `_require_active_season` against a foreign Season and turn its
            `season_read_only` refusal into an existence oracle;
-        3. the **Season** rows named by that plan (`_guard_active_seasons`,
-           sorted);
+        3. the **Season** rows named by that plan
+           (`_guard_active_game_seasons`, sorted) -- each Game judged against
+           the Season its LeagueSeason names, never against its own
+           denormalized `season_id` column (PR #427);
         4. the **Game** rows (`get_game_for_update`, sorted).
 
         Season BEFORE Game is load-bearing. An earlier revision locked Games
-        first and left `_guard_active_seasons` to the callers afterwards, which
+        first and left the Season guard to the callers afterwards, which
         reversed the order every single-Game path already uses:
         `SetupService.publish_game` and `delete_game` lock the Season through
         `_guard_game_season` and only then touch the Game. A batch discard and
@@ -8242,7 +10046,7 @@ class ApiService:
             # the identity-less path (caught by
             # `test_season_lifecycle...test_reminders_and_draft_batches_blocked`).
             legacy = self._select_draft_targets(drafts, game_ids, all_drafts)
-            self._guard_active_seasons([g.season_id for g in legacy])
+            self._guard_active_game_seasons(legacy)
             return legacy
         # -- step 2: the pre-lock locator, authorized before anything is
         # locked. Selection applies first so an explicit id list plans only
@@ -8250,14 +10054,34 @@ class ApiService:
         planned = [g for g in self._select_draft_targets(
             drafts, game_ids, all_drafts)
             if self._game_in_active_tuple(g, program, season, league)]
-        planned_seasons = {g.season_id for g in planned if g.season_id}
-        # Each planned Game's EXACT Season, kept per row rather than as a set:
-        # a set only answers "is this Season one we locked", which a row that
-        # moved between two Seasons the batch happens to hold would pass.
-        planned_season_of = {g.id: g.season_id for g in planned}
+        # Each planned Game's EXACT identity pair, kept per row rather than as
+        # a set: a set only answers "is this Season one we locked", which a row
+        # that moved between two Seasons the batch happens to hold would pass.
+        # This snapshot answers the DRIFT question below ("did this row move
+        # between the locator read and the lock"); it is NOT the authority for
+        # which Season to guard — see step 3.
+        #
+        # PR #427: BOTH columns are snapshotted, not `season_id` alone.
+        # `league_season_id` is now the column the authority is keyed on —
+        # `season_guard.guard_game_season` resolves the LeagueSeason and locks
+        # the Season IT names — so a rebinding that moves `league_season_id`
+        # to a different competition moves the authorizing Season with it,
+        # and a `season_id`-only comparison cannot see that at all. The two
+        # columns are also independently writable (`games.league_season_id`
+        # and `games.season_id` are both nullable TEXT with no FK and no
+        # CHECK), so the pair is the identity that has to hold still, not
+        # either half of it.
+        planned_identity_of = {
+            g.id: (g.league_season_id, g.season_id) for g in planned}
 
-        # -- step 3: SEASONS first, sorted, matching every other path.
-        self._guard_active_seasons(planned_seasons)
+        # -- step 3: SEASONS first, sorted, matching every other path. PR #427:
+        # the Season each Game is guarded against is the one its LeagueSeason
+        # names, so this passes the GAMES and lets the shared guard resolve
+        # them. Passing `{g.season_id …}` was the batch's copy of the blocker's
+        # defect: a planned draft whose denormalized column was NULL dropped
+        # out of the set entirely and its archived competition went unguarded
+        # for the whole batch, and a drifted one locked a sibling Season.
+        self._guard_active_game_seasons(planned)
 
         # -- step 4: then the Games, sorted, so two concurrent batches take
         # them in one global order and cannot deadlock against each other.
@@ -8268,15 +10092,28 @@ class ApiService:
             # stand under the lock, never as the pre-lock scan saw them.
             if locked is None or not locked.is_draft:
                 continue
-            # The Season comparison runs HERE -- immediately after the lock and
-            # BEFORE authorization. Authorization would otherwise drop the
+            # The IDENTITY comparison runs HERE -- immediately after the lock
+            # and BEFORE authorization. Authorization would otherwise drop the
             # changed row silently: a Game whose Season moved while its other
             # parents still name the old one has a DISAGREEING parent graph, so
             # `_game_in_active_tuple` answers False and `continue`s, and this
             # raise is never reached. The batch would then carry on writing to
             # ice this transaction never locked, and the drift would look
-            # exactly like an ordinary out-of-tuple row.
-            if locked.season_id != planned_season_of[game_id]:
+            # exactly like an ordinary out-of-tuple row. That ordering is the
+            # whole point of this line's position and must not be moved below
+            # the authorization filter.
+            #
+            # PR #427: EITHER column drifting is the race. A rebinding that
+            # changes `league_season_id` while leaving `season_id` alone is
+            # invisible to a `season_id`-only comparison, yet it moves the
+            # authorizing Season — step 3 locked the Season the OLD binding
+            # named, so the batch would go on to write this row under a lock
+            # it does not hold for the row's current competition. Raising
+            # `placement_raced` rolls the whole attempt back; the retry
+            # re-plans from the committed rows, and step 3 then locks the
+            # Season the NEW binding names.
+            if ((locked.league_season_id, locked.season_id)
+                    != planned_identity_of[game_id]):
                 raise ConcurrencyConflictError(
                     "A draft game's season changed while processing the "
                     "request; please retry.",
@@ -8587,6 +10424,164 @@ class ApiService:
             return False
         return True
 
+    #: The Dashboard schedule row's roster-status block when the caller is
+    #: entitled to NO side of that game. The ``roster_status`` key is ABSENT
+    #: — not ``null``, not an enum value — and an explicit marker says so.
+    #:
+    #: WHY A MARKER AND NOT JUST OMISSION. ``roster_status`` is a string enum
+    #: and every consumer of it in ``web/static/app.js`` asks the same kind of
+    #: question: ``["roster_confirmed", "locked"].includes(g.roster_status)``.
+    #: A missing key and a ``null`` both answer that ``false``, which renders
+    #: as the badge "Roster open" and the checklist line "Roster — not
+    #: confirmed": restricted data represented as an EMPTY OPERATIONAL STATE,
+    #: the exact failure the owner's ruling names, and a false claim about the
+    #: other team rather than a true one about the reader. The flag is what
+    #: lets the screen say "not shown" instead of guessing, and it is present
+    #: on EVERY row — entitled or not — so a consumer never has to infer
+    #: withholding from a missing key.
+    _ROSTER_STATUS_WITHHELD = {"roster_status_restricted": True,
+                               "roster_status_team_id": None}
+
+    def _schedule_roster_status(self, game, role, scoped_team_id,
+                                scoped_player_id) -> dict:
+        """The Dashboard schedule row's roster-status fields, for the side
+        THIS caller is entitled to IN THIS GAME (#205 blocker, round 4).
+
+        IT TAKES SCALARS, NEVER THE SESSION MAPPING (#427 round 23, the
+        owner's ruling, and this is the defect that ruling names). Until this
+        round the signature was ``(game, role, scope)`` and the mapping was
+        projected HERE, inside the loop, once per schedule row. The gate
+        module's own boundary had already stopped taking a mapping — and this
+        facade surface still took one whole, one file away, so every spelling
+        the projection was built to end was available again and BOTH static
+        audits stayed green, because neither of them reads this function.
+
+        MEASURED AT ``6903eeb``, both of the owner's variants, each spelled
+        as two lines of this method's own body and each driven over real
+        authenticated sessions on a real socket, on Memory, SQLite and real
+        PostgreSQL alike. ``thirdcoach`` — a Coach of ``team_3``, which
+        plays in NEITHER game — received, on BOTH schedule rows,
+        ``roster_status_restricted: false`` and the HOME side's own private
+        status: ``needs_substitute``/``team_1`` on the first game and
+        ``awaiting_responses``/``team_2`` on the second (the fixture swaps
+        the sides, so "HOME" is a different team in each row and a home
+        default is right in neither). The unmutated control at the same
+        commit answered them the withheld marker on all six cells. And BOTH
+        static audits were green on both variants — this file's own
+        ``services/side_provenance.py`` guard, 44 tests, and
+        ``EveryAdmissionBranchIsDerivedAndCarriesAnAuthority._audit()``,
+        which returned ``[]``.
+
+        WHAT THE FIX IS. The projection now happens at the FIRST EXECUTABLE
+        LINES of :meth:`get_demo_overview`, before any other call, and what
+        crosses into this method is two immutable ids. Neither variant can
+        be written against this signature: there is no mapping here to
+        mutate and none to shadow. The rule that would have caught them —
+        the resolver-caller inventory — no longer permits a ``.get(...)`` in
+        the argument list at all; see
+        ``tests/test_authenticated_side_noninterference``'s
+        ``test_the_owners_two_facade_variants_are_refused_by_name``, and
+        ``tests/test_overview_schedule_side``'s
+        ``TheFacadeProjectsBeforeAnyOtherCall``, which drives both variants
+        as executable falsifiers.
+
+        THE DEFECT THIS CLOSES, and it is the owner's shape verbatim. The
+        schedule loop called ``compute_roster_status(g.id)`` with NO team, and
+        that method applies ``team_id = team_id or game.home_team_id`` — the
+        identical silent home default this blocker spent three rounds removing
+        from ``get_board``, ``/roster-status`` and
+        ``list_substitute_candidates``. There was no participation gate, no
+        side narrowing, no audience test and no ``APP_MODE`` gate: the "demo"
+        in the path is historical, and ``web/static/app.js`` fetches this
+        route unconditionally on every render pass for every role. Reproduced
+        tri-store over real authenticated sessions with the two sides made to
+        DIFFER (HOME ``needs_substitute`` / AWAY ``open_slot``): an AWAY
+        Coach, an AWAY Player, an assigned official, a linked guardian AND a
+        coach of a third team not playing in the game each received
+        ``roster_status: "needs_substitute"`` — HOME's value — while
+        ``/roster-status`` one route away answered them ``team_2``,
+        ``team_2``, 403, 403 and 403 respectively.
+
+        A PER-ROW DECISION, not one side for the response. This is a
+        CROSS-GAME list: a Coach is in some of these games and not others, and
+        their side is HOME in one and AWAY in the next. So the side is
+        resolved per row, from ``game_scoped_own_team_id`` against THAT game,
+        and classified by the SAME ``lineup_visibility.route_audience`` the
+        seven leaves of the private-game family use — so the Dashboard and
+        ``/roster-status`` cannot describe one caller two ways.
+
+        ``FULL`` — an unscoped operator (or an in-process caller with no role,
+            the facade's own default) keeps exactly what they have today: the
+            home-side status, unchanged. Narrowing them would be its own
+            regression. The side is now NAMED rather than left to be inferred.
+
+        ``OWN_SIDE`` — a Coach or Player playing in this game gets THEIR OWN
+            side's status. This is a fix, not only a redaction: an AWAY
+            Coach's Dashboard used to report the opponent's roster as their
+            own, and their own "Rosters to confirm" tile counted the wrong
+            team's.
+
+        EVERYONE ELSE IS WITHHELD — and that includes an ASSIGNED OFFICIAL,
+        for whom ``route_audience`` returns ``SUBMITTED_LINEUP`` on the
+        family's own leaves. Three reasons, and the first is decisive:
+
+        1. THIS ROUTE HAS NO PER-GAME ASSIGNMENT GATE. The family's leaves sit
+           behind ``can_read_private_game_data``, which is what makes
+           ``SUBMITTED_LINEUP`` mean "an official ASSIGNED TO THIS GAME" —
+           :func:`services.lineup_visibility.route_audience` says so in its
+           own comment. The schedule here is scoped to a Program/Season/League
+           and lists every game in it, assigned or not. Honouring the label
+           would serve an official private state for games they were never
+           assigned to: strictly WIDER than the family, which is the same
+           complaint that put this route in scope.
+        2. THERE IS NO HONEST SINGLE-SIDE ANSWER. An official's entitlement is
+           a per-side submitted-lineup projection; this field is ONE enum for
+           the whole game. Picking a side to attach it to is the guess the
+           blocker exists to remove.
+        3. IT WOULD DEFEAT :meth:`_submitted_lineup_status` ONE ROUTE AWAY.
+           The value this field carries at HEAD is ``needs_substitute``, which
+           that method neutralises by name — its own docstring calls it "the
+           needs_substitute state, which exists precisely to say a substitute
+           pool is standing by". Serving it here recovers through a sibling
+           exactly what the projection removes.
+
+        NOTHING RENDERS IT FOR THEM, either, which is why withholding costs no
+        screen: ``gateChrome()`` hides Dashboard, Activity and Scheduler from
+        every role without ``manage_roster``/``manage_schedule`` — an
+        official, a player, a guardian and a viewer all — and the official's
+        own surfaces are My Assignments and the Game Sheet, which reads
+        ``/lineups``, where the projection already governs. The one surface
+        that renders ``roster_status`` and is reachable by them is the
+        ungated Games list, an operator readiness checklist, which now renders
+        the marker rather than a guess.
+        """
+        # PROJECTED BY THE CALLER, NOT HERE (#427 round 23). The two ids
+        # arrived as the parameters above, taken at the first executable
+        # lines of `get_demo_overview`; this method never sees the mapping
+        # they came out of, so there is nothing here for a later statement to
+        # mutate between the projection and the decision.
+        own_side = game_scoped_own_team_id(
+            role, scoped_team_id, scoped_player_id,
+            GameAuthorization.of(game), self.store)
+        audience = lineup_visibility.route_audience(
+            role, own_side, game.home_team_id, game.away_team_id)
+        if audience == lineup_visibility.FULL:
+            side = game.home_team_id
+        elif audience == lineup_visibility.OWN_SIDE:
+            side = own_side
+        else:
+            return dict(self._ROSTER_STATUS_WITHHELD)
+        return {
+            "roster_status": self.roster.compute_roster_status(
+                game.id, side).status.value,
+            "roster_status_restricted": False,
+            # WHICH side this enum describes, stated rather than inferred —
+            # the same correction `get_board` made when it started returning
+            # an explicit `team_id`. For an unscoped operator this names the
+            # home default that has always been silently applied.
+            "roster_status_team_id": side,
+        }
+
     def get_demo_overview(self, user_id=None, role=None, scope=None) -> dict:
         """Assemble the League/Arena/Schedule/Public view for the E2E demo.
 
@@ -8658,6 +10653,32 @@ class ApiService:
         (tests exercising other subsystems) keeps using unchanged; only the
         HTTP route's own per-user Dashboard read opts into scoping.
         """
+        # THE PROJECTION, AT THE FIRST EXECUTABLE LINES OF THIS METHOD AND
+        # BEFORE ANY OTHER CALL (#427 round 23, the owner's ruling). The
+        # session mapping is read HERE, ONCE, into two immutable scalar ids,
+        # and the per-row entitlement decision below is taken from those and
+        # from nothing else. `_schedule_roster_status` accepts scalars only.
+        #
+        # WHY "BEFORE ANY OTHER CALL" IS THE RULE AND NOT A PREFERENCE. This
+        # method calls `self.context.resolve_with_league(user_id, role,
+        # scope)` — which is handed the mapping itself — and then DOZENS
+        # more calls before the schedule loop. No count is given here on
+        # purpose: three independent measurements of "how many" disagreed
+        # (30, 37 and 38 calls; 42 and 43 statements) because the answer
+        # depends entirely on where the slice is cut, and this file's rule
+        # is that a number in a docstring is MEASURED or absent. What is
+        # load-bearing is not the count but the shape — that ANY call at
+        # all sits there. Projecting inside
+        # that loop — which is what it used to do, one file away from a gate
+        # module that had already stopped taking the mapping — left every
+        # one of those calls sitting between
+        # the session's mapping arriving and the entitlement decision reading
+        # it, and "which of these calls mutates a shared mapping" is not a
+        # question a source tree answers. Taking the two ids first removes
+        # the question rather than answering it: after these two lines
+        # nothing this method does can change what the rows are decided by.
+        scoped_team_id = (scope or {}).get("team_id")
+        scoped_player_id = (scope or {}).get("player_id")
         program = league = None
         in_scope_season_ids = None  # None == no Program scoping active (legacy)
         if role is not None:
@@ -8842,7 +10863,10 @@ class ApiService:
             if not _in_scope_game(g):
                 continue
             div = divisions.get(g.division_id)
-            rstatus = self.roster.compute_roster_status(g.id)
+            # WHICH SIDE'S roster status THIS caller may read, decided PER ROW
+            # (#205 blocker, round 4). See `_schedule_roster_status`.
+            row_status = self._schedule_roster_status(
+                g, role, scoped_team_id, scoped_player_id)
             venue_name = None
             slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
             if slot and slot.rink_id in rinks:
@@ -8851,6 +10875,11 @@ class ApiService:
             g_active = self._active_officials(g.id)
             g_result = self.store.result_for_game(g.id)
             schedule.append({
+                # `roster_status` is spread FIRST so a withheld row simply has
+                # no such key at all — see `_schedule_roster_status`. Written
+                # ahead of the literal fields rather than merged after them
+                # so nothing below can be shadowed by it.
+                **row_status,
                 "game_id": g.id,
                 "home_team_id": g.home_team_id,
                 "away_team_id": g.away_team_id,
@@ -8861,7 +10890,6 @@ class ApiService:
                 "ice_slot_id": g.ice_slot_id,
                 "rink_name": g.rink, "venue_name": venue_name,
                 "start_time": g.start_time.isoformat(),
-                "roster_status": rstatus.status.value,
                 "published": g.published,
                 "cancelled": g.cancelled,  # Games view offers Cancel, not Delete (#215)
                 # Officials summary for the Games operations checklist (#30).
@@ -9387,7 +11415,15 @@ class ApiService:
         # not select) and BEFORE any Venue is resolved or serialized (so the
         # cross-Program candidate directory is never even built for a
         # destination whose grant would fail `season_archived` anyway).
-        if active_season.status == SeasonStatus.ARCHIVED:
+        #
+        # Asked through `season_is_read_only` -- the SAME predicate
+        # `require_active_season` refuses the grant on, and the SAME one
+        # `get_setup_hierarchy_v2` reports per Season as `read_only`. The
+        # refusal is byte-for-byte the rule it always was; what changes is that
+        # the client's skip-this-read guard and this refusal are now one
+        # expression, so they cannot drift apart into a request that is always
+        # answered 404.
+        if self.setup.season_is_read_only(active_season):
             raise NotFoundError(f"Season {season_id} not found.")
         season = active_season
         granted = {a.venue_id for a in
@@ -10447,6 +12483,33 @@ class ApiService:
                     not in league_ids]
                 season_nodes.append({
                     "id": s.id, "name": s.name, "leagues": league_nodes,
+                    # ADDITIVE (#159 follow-up). Whether this Season refuses
+                    # writes, answered by `season_guard.season_is_read_only` --
+                    # the SAME predicate `require_active_season` refuses every
+                    # Season-owned write on, and the same one
+                    # `get_venue_grant_candidates` refuses the grant-candidate
+                    # READ on.
+                    #
+                    # It is here because the client needs the fact in the SAME
+                    # PASS as the tree it is iterating. app.js gated the
+                    # candidate fetch on `/api/context/options`' cached
+                    # `selected.read_only`, and that cache is written only when
+                    # the options are re-fetched -- so between an archive of the
+                    # SELECTED Season and the next options load, the guard read
+                    # "writable", the request went out, and the server answered
+                    # its deliberate 404. Nothing invalidated the cache because
+                    # nothing had to: staleness was possible by construction.
+                    # Carried on the Season row the client is already looping
+                    # over, the guard's input and the server's decision come
+                    # from one read of one store, so they cannot disagree.
+                    #
+                    # A BOOL, not the raw `status`. Shipping the status would
+                    # hand the client the raw material and let it re-derive the
+                    # rule -- a second notion of "archived" living in JavaScript,
+                    # free to drift from this one. `status` remains available on
+                    # the Season ENTITY DTO for surfaces that render lifecycle;
+                    # this structural tree ships the DECISION.
+                    "read_only": self.setup.season_is_read_only(s),
                     "needs_assignment": {
                         "divisions_without_league": [
                             {"id": d.id, "name": d.name, "age_group": d.age_group,
@@ -10700,6 +12763,89 @@ class ApiService:
             rows.append(row)
         return {"venue_access": rows}
 
+    # -- season roster memberships (#205 Slice A) ---------------------------
+    # Facade only: these are not yet wired to HTTP routes. Endpoint wiring —
+    # routes, authz/scope resolution per #202's contract, and the
+    # api-contract.md entries — lands with the consumer-cutover slice, per
+    # the project layering rule (api/ maps 1:1 to future REST endpoints and
+    # a web framework is wired on top later without touching domain logic).
+
+    @catch
+    def create_season_roster_membership(
+            self, player_id: str, league_season_id: str, team_id: str,
+            status: str = MembershipStatus.ACTIVE.value,
+            position: Optional[str] = None,
+            jersey_number=_SETUP_UNSET, shoots=_SETUP_UNSET,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.create_season_roster_membership(
+            player_id, league_season_id, team_id, status=status,
+            position=position, jersey_number=jersey_number, shoots=shoots,
+            reason=reason, actor_id=actor_id))
+
+    @catch
+    def set_season_roster_membership_status(
+            self, membership_id: str, status: str,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> dict:
+        # #205 review round 2 (owner product ruling, overriding round 1
+        # finding 5's shipped "actor_id + reason" floor): a terminal target
+        # (released/transferred) is UNCONDITIONALLY refused here — a
+        # NotAuthorizedError @catch turns into {"error": {"code":
+        # "forbidden", ...}} below, never satisfiable by any actor_id or
+        # reason value. The authorized transfer/release/deadline-policy/
+        # override workflow #212 places in a later #205 slice is what will
+        # eventually replace this refusal. See SetupService.
+        # set_season_roster_membership_status's docstring.
+        return _serialize(self.setup.set_season_roster_membership_status(
+            membership_id, status, reason=reason, actor_id=actor_id))
+
+    @catch
+    def update_season_roster_membership(
+            self, membership_id: str, *, position=_SETUP_UNSET,
+            jersey_number=_SETUP_UNSET, shoots=_SETUP_UNSET,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> dict:
+        return _serialize(self.setup.update_season_roster_membership(
+            membership_id, position=position, jersey_number=jersey_number,
+            shoots=shoots, reason=reason, actor_id=actor_id))
+
+    @catch
+    def get_season_roster_membership(self, membership_id: str) -> dict:
+        membership = self.store.get_season_roster_membership(membership_id)
+        if membership is None:
+            raise NotFoundError(f"Membership {membership_id} not found.")
+        return _serialize(membership)
+
+    @catch
+    def list_season_roster_memberships(
+            self, season_id: Optional[str] = None,
+            league_season_id: Optional[str] = None,
+            team_id: Optional[str] = None,
+            player_id: Optional[str] = None) -> dict:
+        """Memberships by exactly one scope axis: a Season, a
+        (LeagueSeason, Team) pair, or a player. An unfiltered dump of every
+        membership across all Seasons is deliberately not offered."""
+        if season_id:
+            rows = self.store.memberships_for_season(season_id)
+        elif league_season_id and team_id:
+            rows = self.store.memberships_for_league_season_team(
+                league_season_id, team_id)
+        elif player_id:
+            rows = self.store.memberships_for_player(player_id)
+        else:
+            raise ValidationError(
+                "Provide season_id, player_id, or league_season_id + team_id.",
+                {"reason": "membership_filter_required"})
+        return {"memberships": [_serialize(m) for m in rows]}
+
+    @catch
+    def list_season_roster_membership_events(self, membership_id: str) -> dict:
+        if self.store.get_season_roster_membership(membership_id) is None:
+            raise NotFoundError(f"Membership {membership_id} not found.")
+        return {"events": [_serialize(e) for e in
+                           self.store.events_for_membership(membership_id)]}
+
     @catch
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
                                    selections: Optional[list] = None,
@@ -10724,6 +12870,63 @@ class ApiService:
                 "skipped": result["skipped"],
                 "registrations": [self._registration_dict(r)
                                   for r in result["registrations"]]}
+
+    # New-Season copy-forward (#159): preview then atomically create a Season
+    # AND carry forward Team/League registrations from a source Season in one
+    # guarded step. Modeled on preview_ice_availability/commit_ice_availability
+    # (#158)'s fingerprint pattern; see SetupService.preview_new_season_copy_
+    # forward for the full division-carry-forward contract.
+    @catch
+    def preview_new_season_copy_forward(
+            self, program_id: str = None, name: str = None,
+            start_date: Optional[str] = None, end_date: Optional[str] = None,
+            source_season_id: str = None, selections: Optional[list] = None,
+            actor_id: Optional[str] = None) -> dict:
+        return self.setup.preview_new_season_copy_forward(
+            program_id=program_id, name=name, start_date=start_date,
+            end_date=end_date, source_season_id=source_season_id,
+            selections=selections, actor_id=actor_id)
+
+    @catch
+    def commit_new_season_copy_forward(
+            self, program_id: str = None, name: str = None,
+            start_date: Optional[str] = None, end_date: Optional[str] = None,
+            source_season_id: str = None, selections: Optional[list] = None,
+            copy_forward_fingerprint: Optional[str] = None,
+            actor_id: Optional[str] = None) -> dict:
+        result = self.setup.commit_new_season_copy_forward(
+            program_id=program_id, name=name, start_date=start_date,
+            end_date=end_date, source_season_id=source_season_id,
+            selections=selections,
+            copy_forward_fingerprint=copy_forward_fingerprint,
+            actor_id=actor_id)
+        # #159 review round 4 (owner P1 finding 2): prefer the FROZEN
+        # season_id/league_id the service resolved and snapshotted once at
+        # commit time (``registration_identities``) over ``_registration_
+        # dict``'s own live LeagueSeason lookup, which returns null for
+        # either field the instant that binding is later deleted --
+        # exactly the read this facade otherwise performs on every call,
+        # replay included. Applies uniformly to a FRESH commit's own
+        # response too (not only a replay), so what a commit returns right
+        # now and what a later replay of the SAME fingerprint returns can
+        # never drift apart, by construction — see SetupService.
+        # _copy_forward_registration_identities, the sole producer of this
+        # map.
+        identities = result.get("registration_identities") or {}
+        registrations = []
+        for r in result["registrations"]:
+            row = self._registration_dict(r)
+            identity = identities.get(r.id)
+            if identity is not None:
+                row["season_id"] = identity.get("season_id")
+                row["league_id"] = identity.get("league_id")
+            registrations.append(row)
+        return {
+            "committed": True,
+            "season": _serialize(result["season"]),
+            "registrations": registrations,
+            "totals": result["totals"],
+        }
 
     @catch
     def list_season_team_registrations(self, season_id: str) -> dict:
@@ -10818,7 +13021,11 @@ class ApiService:
     @catch
     def delete_player(self, player_id: str,
                       actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.delete_player(player_id, actor_id))
+        # #273 review round 2 finding 1: every Player-carrying payload routes
+        # through _player_dto, including a delete's echoed row — a bare
+        # _serialize here quietly carried the private birthdate/registration
+        # number back to whatever caller issued the delete.
+        return _player_dto(self.setup.delete_player(player_id, actor_id))
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     @catch
@@ -10878,7 +13085,11 @@ class ApiService:
     @catch
     def assign_player_team(self, player_id: str, team_id: str,
                            actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.assign_player_team(player_id, team_id, actor_id))
+        # #273 review round 2 finding 1: same _player_dto routing as every
+        # other Player-carrying payload — a move's echoed row must never
+        # carry the private birthdate/registration number either.
+        return _player_dto(self.setup.assign_player_team(
+            player_id, team_id, actor_id))
 
     @catch
     def assign_program_organization(self, program_id: str,
@@ -11034,24 +13245,42 @@ class ApiService:
         return out
 
     @catch
-    def create_player(self, team_id: str, name: str, position: str,
+    def create_player(self, team_id: str, name: Optional[str] = None,
+                      position: str = None,
                       jersey_number: Optional[int] = None,
                       email: Optional[str] = None,
                       shoots: Optional[str] = None,
                       is_active: bool = True,
-                      actor_id: Optional[str] = None) -> dict:
+                      actor_id: Optional[str] = None,
+                      first_name: Optional[str] = None,
+                      last_name: Optional[str] = None,
+                      preferred_name: Optional[str] = None,
+                      birthdate: Optional[str] = None,
+                      registration_number: Optional[str] = None,
+                      skill_rating: Optional[int] = None) -> dict:
         # Pass position through raw: the service's canonical _validate_position
         # parses/validates it with a field-level invalid_position error (#268
         # review), so create and edit share one validator and the same field.
-        return _serialize(self.setup.add_player(
+        # #273: either flattened `name` or structured first+last (one shared
+        # service contract); the response is the default Player DTO, which
+        # strips the private birthdate/registration_number like every other
+        # facade payload — the operator list re-reads them via its explicit
+        # opt-in.
+        return _player_dto(self.setup.add_player(
             team_id, name, position,
             jersey_number=jersey_number, email=email, shoots=shoots,
-            is_active=is_active, actor_id=actor_id))
+            is_active=is_active, actor_id=actor_id,
+            first_name=first_name, last_name=last_name,
+            preferred_name=preferred_name, birthdate=birthdate,
+            registration_number=registration_number,
+            skill_rating=skill_rating))
 
     @catch
     def list_players(self, team_id: Optional[str] = None,
-                     include_email: bool = False, user_id=None, role=None,
-                     scope=None) -> List[dict]:
+                     include_email: bool = False,
+                     user_id=None, role=None,
+                     scope=None, *,
+                     include_identity: bool = False) -> List[dict]:
         """#369 self-audit: when a real user context is supplied, the
         unfiltered list narrows to Teams in the caller's ACTIVE Program.
 
@@ -11064,43 +13293,161 @@ class ApiService:
         the same reasoning makes a cross-Program answer wrong. Called with no
         user context (the default), behavior is unchanged for existing
         internal callers.
+
+        ``include_identity`` (#273) is KEYWORD-ONLY, appended after every
+        pre-existing positional parameter (#273 review round 2 finding 1): an
+        earlier revision inserted it before ``user_id``, so an unchanged
+        legacy positional call like ``list_players("t1", False,
+        "legacy-user")`` silently reinterpreted its own third argument as
+        ``include_identity="legacy-user"`` — a truthy string that opted the
+        call into both private fields AND dropped ``user_id`` (defeating the
+        #369 Program-scoping gate below, since ``role`` then never arrives
+        either). Keyword-only closes both holes at once: no positional slot
+        can ever reach this parameter again.
+
+        When ``include_identity`` is set (#424 round-N owner review finding
+        2), the Player read that embeds BIRTHDATE/REGISTRATION_NUMBER into
+        the returned rows runs INSIDE the SAME ``with self.store.
+        transaction():`` block as the ALLOWED audit write, not as a separate
+        already-autocommitted statement beforehand — mirroring
+        ``list_contact_destinations``'/``get_delivery_overview``'s own
+        "read + record in one transaction" shape, so the two commit or roll
+        back together instead of being two independent units of work.
+        ``resolve_with_league`` runs BEFORE that transaction opens, not
+        inside it: it takes its own SERIALIZABLE snapshot as the OUTERMOST
+        transaction (``context_service.py``'s own contract — a nested join
+        can never RAISE the isolation of an already-open plain
+        transaction), and Program/League scoping carries no BIRTHDATE/
+        REGISTRATION_NUMBER sensitivity of its own, so hoisting it out
+        reintroduces none of finding 2's gap.
         """
-        players = (self.store.players_for_team(team_id) if team_id
-                  else self.store.all_players())
-        # The Program ceiling applies to BOTH forms. An earlier revision
-        # scoped only the unfiltered form (`team_id is None and role is not
-        # None`), which left an IDOR: `?team_id=<another Program's team>`
-        # skipped the gate entirely and returned that Team's players -- and,
-        # on this MANAGE_SETUP route, their emails. `team_id` is a caller-
-        # supplied identifier, so it selects WHICH rows to consider; it can
-        # never be evidence of authorization for them.
-        if role is not None:
+        program = league = None
+        scope_resolved = role is not None
+        if scope_resolved:
             program, _season, league = self.context.resolve_with_league(
                 user_id, role, scope)
-            if program is None:
-                players = []
-            else:
-                # A selected League narrows here too, via the Team's REAL
-                # permanent competition League (`Team.league_id`, #283 -- not
-                # any of the legacy `league_id` fields that store a Program).
-                # Players are League-narrowable in a way Clubs/Organizations/
-                # Venues are not, and the rest of the surface already treats
-                # them that way: get_setup_progress's "roster" workflow and
-                # the Setup roster summary both League-filter players, and
-                # get_setup_overview_v2 League-narrows teams. Leaving the
-                # Players card Program-wide contradicted its own screen.
-                in_scope = {t.id for t in self.store.all_teams()
-                            if t.program_id == program.id
-                            and (league is None or t.league_id == league.id)}
-                players = [p for p in players if p.team_id in in_scope]
-        rows = [_serialize(p) for p in players]
-        # The Player DTO deliberately carries no email (it reaches coach/roster
-        # views). Only the MANAGE_SETUP-gated operator list opts in, so the edit
-        # drawer (#268) can prefill the current address without ever exposing it
-        # on a coach/public payload.
+
+        def _fetch_rows():
+            players = (self.store.players_for_team(team_id) if team_id
+                      else self.store.all_players())
+            # The Program ceiling applies to BOTH forms. An earlier revision
+            # scoped only the unfiltered form (`team_id is None and role is
+            # not None`), which left an IDOR: `?team_id=<another Program's
+            # team>` skipped the gate entirely and returned that Team's
+            # players -- and, on this MANAGE_SETUP route, their emails.
+            # `team_id` is a caller-supplied identifier, so it selects WHICH
+            # rows to consider; it can never be evidence of authorization
+            # for them.
+            if scope_resolved:
+                if program is None:
+                    scoped = []
+                else:
+                    # A selected League narrows here too, via the Team's
+                    # REAL permanent competition League (`Team.league_id`,
+                    # #283 -- not any of the legacy `league_id` fields that
+                    # store a Program). Players are League-narrowable in a
+                    # way Clubs/Organizations/Venues are not, and the rest
+                    # of the surface already treats them that way:
+                    # get_setup_progress's "roster" workflow and the Setup
+                    # roster summary both League-filter players, and
+                    # get_setup_overview_v2 League-narrows teams. Leaving
+                    # the Players card Program-wide contradicted its own
+                    # screen.
+                    in_scope = {t.id for t in self.store.all_teams()
+                               if t.program_id == program.id
+                               and (league is None
+                                    or t.league_id == league.id)}
+                    scoped = [p for p in players if p.team_id in in_scope]
+                players = scoped
+            # The default Player DTO carries no email and (#273) no
+            # birthdate or registration number — it reaches coach/roster
+            # views. Only the MANAGE_SETUP-gated operator list opts in
+            # (include_email for the #268 edit drawer; include_identity for
+            # the #273 identity fields), so private values never ride a
+            # coach/public payload.
+            return players, [_player_dto(p, include_identity=include_identity)
+                             for p in players]
+
+        # include_identity's own read is a sensitive read of the BIRTHDATE
+        # and REGISTRATION_NUMBER categories (#424 audit-wiring: this opt-in
+        # built the DTO fields but never routed them through the #426
+        # policy+audit boundary include_email uses two branches below — a
+        # facade-only gap, since no HTTP route reaches this flag yet).
+        # BIRTHDATE and REGISTRATION_NUMBER are checked as two INDEPENDENT
+        # categories, not one combined gate: they happen to resolve
+        # identically per role today (see visibility_policy._POLICY), but
+        # the two enum members exist separately on purpose, and checking
+        # them independently keeps this mechanism correct the day a role's
+        # grants for the two fields diverge. Same mask-not-refuse shape as
+        # include_email (the player LIST itself is not privacy-gated, only
+        # the identity columns are): an allowed category keeps its already-
+        # built field value and gets one ALLOWED audit row per disclosed
+        # player; a denied category is masked back to None on every row and
+        # gets one durable, collection-level DENIED row — never a broken
+        # listing.
+        if include_identity:
+            with self.store.transaction():
+                players, rows = _fetch_rows()
+                request_id = self._safe_request_id(None)
+                identity_role, identity_label = self._privacy_principal(role)
+                identity_categories = (
+                    (SensitiveFieldCategory.BIRTHDATE, "birthdate"),
+                    (SensitiveFieldCategory.REGISTRATION_NUMBER,
+                     "registration_number"))
+                allowed_categories = [
+                    category for category, _field in identity_categories
+                    if self._sensitive_read_allowed(identity_role, category)]
+                denied_categories = [
+                    (category, field) for category, field in
+                    identity_categories if category not in allowed_categories]
+                if allowed_categories:
+                    subjects = [("recipient", f"player:{p.id}")
+                               for p in players] or [("recipient", "*")]
+                    for category in allowed_categories:
+                        self._record_sensitive_read(
+                            category, subjects, "list_players_identity",
+                            user_id, identity_label, ACCESS_ALLOWED,
+                            request_id)
+                for category, field in denied_categories:
+                    for row in rows:
+                        row[field] = None
+                    self._record_sensitive_read(
+                        category, [("recipient", "*")],
+                        "list_players_identity", user_id, identity_label,
+                        ACCESS_DENIED, request_id, durable=True)
+        else:
+            players, rows = _fetch_rows()
+        # include_email's own read below IS a sensitive read of the SAME
+        # CONTACT_DESTINATION category the contacts registry gates (#426
+        # review finding 2: "Player-email reads... also read or return
+        # stored destinations outside this gate") — policy-checked and
+        # audited using the SAME `role`/`user_id` this method already
+        # threads through for Program scoping. Masks rather than refuses on
+        # denial (the player LIST itself is not privacy-gated, only the
+        # email column is), so an unauthorized `include_email=True` caller
+        # still gets the roster, just with every email blanked — one
+        # durable denial row, not a broken listing.
         if include_email:
-            for player, row in zip(players, rows):
-                row["email"] = self.setup.active_player_email(player.id)
+            request_id = self._safe_request_id(None)
+            email_role, email_label = self._privacy_principal(role)
+            category = SensitiveFieldCategory.CONTACT_DESTINATION
+            if self._sensitive_read_allowed(email_role, category):
+                with self.store.transaction():
+                    subjects = []
+                    for player, row in zip(players, rows):
+                        row["email"] = self.setup.active_player_email(player.id)
+                        subjects.append(("recipient", f"player:{player.id}"))
+                    self._record_sensitive_read(
+                        category, subjects or [("recipient", "*")],
+                        "list_players_email", user_id, email_label,
+                        ACCESS_ALLOWED, request_id)
+            else:
+                for row in rows:
+                    row["email"] = None
+                self._record_sensitive_read(
+                    category, [("recipient", "*")], "list_players_email",
+                    user_id, email_label, ACCESS_DENIED, request_id,
+                    durable=True)
         return rows
 
     @catch
@@ -11117,9 +13464,11 @@ class ApiService:
         """
         kwargs = {key: fields[key]
                   for key in ("name", "position", "jersey_number", "shoots",
-                              "email")
+                              "email", "first_name", "last_name",
+                              "preferred_name", "birthdate",
+                              "registration_number", "skill_rating")
                   if key in fields}
-        return _serialize(self.setup.update_player(
+        return _player_dto(self.setup.update_player(
             player_id, actor_id=actor_id, **kwargs))
 
     @catch
@@ -11127,8 +13476,277 @@ class ApiService:
                           actor_id: Optional[str] = None,
                           reason: Optional[str] = None) -> dict:
         """Deactivate/reactivate a Player without deleting history (#270)."""
-        return _serialize(self.setup.set_player_active(
+        return _player_dto(self.setup.set_player_active(
             player_id, active, actor_id=actor_id, reason=reason))
+
+    # -- athlete identity + age eligibility (#273) -----------------------
+
+    @catch
+    def set_age_eligibility_rule(self, league_season_id: str,
+                                 cutoff_month=None, cutoff_day=None,
+                                 tiers=None, enforcement=None,
+                                 actor_id: Optional[str] = None) -> dict:
+        """Append the next VERSION of a LeagueSeason's cutoff/age-tier rule.
+
+        Warn-first (#273): ``enforcement`` defaults to ``"warn"``; nothing in
+        this slice hard-blocks on it. Rule rows are immutable history — the
+        response carries the version so eligibility answers stay
+        reproducible.
+        """
+        return _serialize(self.setup.set_age_eligibility_rule(
+            league_season_id, cutoff_month, cutoff_day, tiers,
+            enforcement=enforcement, actor_id=actor_id))
+
+    @catch
+    def list_age_eligibility_rules(self,
+                                   league_season_id: str) -> List[dict]:
+        """Every rule version for one LeagueSeason, ascending (audit/history
+        view; rules contain no athlete data)."""
+        return [_serialize(rule) for rule in
+                self.store.age_eligibility_rules_for_league_season(
+                    league_season_id)]
+
+    @catch
+    def evaluate_player_eligibility(self, player_id: str, division_id: str,
+                                    include_details: bool = False,
+                                    actor_role=None,
+                                    actor_user_id=None) -> dict:
+        """Is this athlete age-eligible for this Division? (#273 AC[1])
+
+        The DEFAULT response is the Coach-safe eligibility SUMMARY the
+        bounded-#124 owner ruling requires — status / reason / tier /
+        rule version / enforcement — never the birthdate (which no mode of
+        this method returns). ``include_details`` adds the derived
+        ``age_at_cutoff`` + ``cutoff_date`` for operator surfaces, to be
+        MANAGE_SETUP-gated at the HTTP layer like ``include_email``.
+
+        TWO INDEPENDENT tiers, gated separately (#424 round-N owner review
+        finding 3 — fixes a bug where a single ``may_read_summary`` check
+        covered the WHOLE response, so an authorized ``include_details=True``
+        call from ANY SUMMARY-holding caller — i.e. ``COACH`` — returned the
+        operator-only detail fields too, even though ``COACH`` never holds
+        ``may_read_raw`` for BIRTHDATE):
+
+        * The base SUMMARY response (``status``/``reason``/``tier_code``/
+          ``max_age``/rule identity) is gated on ``visibility_policy.
+          may_read_summary`` — the response is derived SUMMARY-fidelity data
+          (the raw birthdate is never returned by any mode of this method),
+          matching the exact grant ``COACH`` holds for this category. This
+          gate covers the WHOLE method, not just ``include_details`` — the
+          default response is itself derived from a read of the athlete's
+          birthdate, so an unauthorized caller must not reach even the
+          summary shape. Refuses the WHOLE call on denial, the same as
+          ``player_duplicate_report``: there is no separate field to mask
+          here the way ``list_players`` masks identity columns on an
+          otherwise-legitimate roster row — the entire SUMMARY payload IS
+          the gated summary, so a partial result would be meaningless.
+        * ``age_at_cutoff``/``cutoff_date`` — the operator-only detail
+          fields this method's own docstring already called out as "for
+          operator surfaces, to be MANAGE_SETUP-gated" — additionally
+          require ``visibility_policy.may_read_raw`` for BIRTHDATE (the
+          exact grant ``LEAGUE_ADMIN`` holds and ``COACH`` does not). Unlike
+          the SUMMARY gate, this one MASKS rather than refuses: a caller who
+          passes SUMMARY but not RAW still gets its legitimate SUMMARY
+          response, just with the two detail fields omitted — the same
+          mask-not-refuse shape ``list_players`` uses for its own extra
+          columns on an otherwise-legitimate row, since the SUMMARY portion
+          remains meaningful on its own (unlike the whole-call case above,
+          where there is no meaningful SUMMARY-minus-something to return).
+
+        Both outcomes are audited via ``_record_sensitive_read`` — a
+        deliberate decision to keep #426's "audit every sensitive read"
+        posture uniform across fidelity levels rather than carve out a
+        silent exception for SUMMARY reads; if that proves too noisy in
+        practice, dropping either ALLOWED audit is a one-line change. The
+        detail-tier's DENIED row is written ``durable=True`` (like every
+        other masked-field denial in this facade), because the surrounding
+        call still succeeds — there is no enclosing refusal for it to stay
+        atomic with.
+
+        ``actor_role``/``actor_user_id`` are purely additive (no existing
+        caller passed them before this method had a way to).
+
+        The sensitive read (#424 round-N owner review finding 2) —
+        ``self.setup.evaluate_player_age_eligibility``'s internal
+        ``self.store.get_player(player_id)`` — runs INSIDE the SAME
+        ``with self.store.transaction():`` block as the ALLOWED audit
+        write(s) below, not as a separate already-autocommitted statement
+        beforehand, mirroring ``list_contact_destinations``'/
+        ``get_delivery_overview``'s own "read + record in one transaction"
+        shape.
+        """
+        request_id = self._safe_request_id(None)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.BIRTHDATE
+        if not visibility_policy.may_read_summary(role, category):
+            self._refuse_sensitive_read(
+                category, "evaluate_player_eligibility", actor_user_id,
+                label, request_id)
+        raw_allowed = (visibility_policy.may_read_raw(role, category)
+                      if include_details else None)
+        with self.store.transaction():
+            result = self.setup.evaluate_player_age_eligibility(
+                player_id, division_id)
+            self._record_sensitive_read(
+                category, [("recipient", f"player:{player_id}")],
+                "evaluate_player_eligibility", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
+            if include_details:
+                subjects = [("recipient", f"player:{player_id}")]
+                if raw_allowed:
+                    self._record_sensitive_read(
+                        category, subjects,
+                        "evaluate_player_eligibility_details",
+                        actor_user_id, label, ACCESS_ALLOWED, request_id)
+                else:
+                    self._record_sensitive_read(
+                        category, subjects,
+                        "evaluate_player_eligibility_details",
+                        actor_user_id, label, ACCESS_DENIED, request_id,
+                        durable=True)
+        if not include_details or not raw_allowed:
+            for key in ("age_at_cutoff", "cutoff_date"):
+                result.pop(key, None)
+        return result
+
+    @catch
+    def player_duplicate_report(self,
+                                team_id: Optional[str] = None,
+                                actor_role=None, actor_user_id=None,
+                                request_id=None) -> dict:
+        """Duplicate-candidate warnings (#273 AC[4]) — operator tooling.
+
+        Read-only; never merges and never matches by name alone. Carries
+        registration-number values (they are what an operator de-duplicates
+        by), so this is a REGISTRATION_NUMBER sensitive read (#424 audit-
+        wiring), policy-checked and audited like every other sensitive read
+        in this facade — its future HTTP route is MANAGE_SETUP-gated like
+        the include_email/include_identity opt-ins; it is never part of a
+        coach/public payload.
+
+        It is ALSO a BIRTHDATE sensitive read (#424 round-N owner review
+        finding 1): ``SetupService.player_duplicate_report``'s
+        ``same_name_same_team_undisambiguated`` "proven different" check
+        compares ``a.birthdate != b.birthdate`` for every same-name/same-team
+        pair it considers, and its ``same_name_same_birthdate`` warning is
+        keyed on the birthdate itself — never echoed into either warning
+        (see that method's own docstring), but read and compared nonetheless.
+        This codebase's own #426 audit philosophy is "value READ from the
+        store", not "value returned to the caller" (see ``list_players``'s
+        ``include_email`` docstring, which cites #426 review finding 2 for
+        exactly this read-vs-echo distinction) — so BIRTHDATE and
+        REGISTRATION_NUMBER are checked as two INDEPENDENT categories here,
+        mirroring ``list_players``'s ``identity_categories`` tuple, each one
+        refusing the WHOLE call on denial (not list_players's mask-not-
+        refuse shape): the birthdate comparison is intrinsic to every
+        warning shape this method can produce (even a report with zero
+        birthdate-typed warnings reached that verdict BY comparing
+        birthdates), so a caller without BIRTHDATE access would get a report
+        whose completeness it cannot evaluate — a masked/silently-narrowed
+        report here would misrepresent what was actually checked, exactly
+        the same reasoning the REGISTRATION_NUMBER gate below already uses.
+
+        Unlike ``list_players``'s mask-not-refuse identity gate, an
+        unauthorized caller gets the WHOLE call refused (``_refuse_
+        sensitive_read``), not a partial/masked report: this method's own
+        internal ``same_name_same_team_undisambiguated`` disambiguation
+        already compares raw registration_number AND birthdate values
+        across every row it considers (never echoing either into THAT
+        warning, but reading them nonetheless), so there is no warning
+        shape this method can produce without both a REGISTRATION_NUMBER
+        and a BIRTHDATE read — a masked partial result would misrepresent
+        what was actually checked, not just hide one field.
+
+        ``actor_role``/``actor_user_id``/``request_id`` are purely additive
+        (no existing caller passed them before this method had a way to);
+        every existing internal caller is updated to route a real principal
+        through here now that the boundary exists.
+
+        AUDIT SUBJECTS (#424 round-N+1 owner review finding A): every ALLOWED
+        row is audited against the FULL player collection
+        ``SetupService.player_duplicate_report`` actually reads for this
+        ``team_id`` — every player in it, whether or not that player ends up
+        implicated in an emitted warning — never a set inferred from the
+        warnings themselves. ``by_registration``/``by_name_birthdate`` inside
+        that method dereference EVERY row's ``registration_number``/
+        ``birthdate`` unconditionally to build their grouping keys, so a
+        player who is examined but never collides with another row (a
+        singleton registration number, a unique name) is read exactly as
+        much as one who ends up in a warning; deriving subjects only from
+        warning ``player_ids`` (the pre-fix shape) silently dropped every
+        such player from the ledger even though the read happened. The two
+        categories share one ``subjects`` list, mirroring ``list_players``'s
+        own ALLOWED-identity block (lines ~12066-12068 above) exactly rather
+        than the DENIED-only always-``"*"`` shape used elsewhere in this
+        file: this method has no DENIED branch of its own (an unauthorized
+        caller is refused before any row is ever read, immediately above),
+        so every write it makes here is an ALLOWED disclosure and belongs to
+        the same per-subject convention ``list_players`` already established
+        for that case. Falls back to the collection-level ``("recipient",
+        "*")`` subject only when the collection itself is empty — never as a
+        size/convenience shortcut.
+
+        The sensitive read (#424 round-N owner review finding 2) — the SAME
+        ``players_for_team``/``all_players`` collection
+        ``SetupService.player_duplicate_report`` reads internally, fetched
+        here a second time (once for auditing, once inside the setup-service
+        call) against the SAME already-open transaction so both observe one
+        snapshot — runs INSIDE the SAME ``with self.store.transaction():``
+        block as the ALLOWED audit writes below, not as a separate already-
+        autocommitted statement beforehand, mirroring ``list_contact_
+        destinations``'/``get_delivery_overview``'s own "read + record in
+        one transaction" shape.
+
+        ISOLATION (#424 round-N+1 owner review finding B, PostgreSQL two-
+        connection proof): fetching the SAME collection TWICE inside one
+        transaction — once here for ``subjects``, once again inside
+        ``self.setup.player_duplicate_report``'s own call for ``warnings`` —
+        is two SEPARATE statements on the same connection, not one shared
+        read. Under PostgreSQL's default READ COMMITTED (this store's
+        ``transaction()`` default when ``isolation`` is not given), each
+        statement independently sees the latest COMMITTED data as of ITS
+        OWN start, not the transaction's start — so a concurrent INSERT
+        landing between these two statements can make the SECOND read
+        (``warnings``) reference a player the FIRST read (``subjects``)
+        never saw, reproducing a narrower version of finding A's own gap
+        under real contention. ``isolation="REPEATABLE READ"`` closes this:
+        PostgreSQL takes its snapshot at the transaction's first statement
+        and holds it for every later statement in the SAME transaction
+        regardless of what commits afterward, so both reads are
+        guaranteed to observe the identical collection. SQLite already
+        gets this for free (``BEGIN IMMEDIATE``'s file-level RESERVED lock
+        serializes the whole transaction against any other writer, per
+        ``transaction()``'s own docstring); raising this to REPEATABLE
+        READ is a no-op there and on Memory (single global lock for
+        the transaction's duration) — see
+        ``test_sensitive_read_audit_race.PostgresSnapshotConsistencyTest
+        .test_player_duplicate_report_snapshot_consistent_under_race``
+        for the two-real-connection proof this closes.
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        birthdate_category = SensitiveFieldCategory.BIRTHDATE
+        registration_category = SensitiveFieldCategory.REGISTRATION_NUMBER
+        for category in (birthdate_category, registration_category):
+            if not self._sensitive_read_allowed(role, category):
+                self._refuse_sensitive_read(
+                    category, "player_duplicate_report", actor_user_id,
+                    label, request_id)
+        with self.store.transaction(isolation="REPEATABLE READ"):
+            players = (self.store.players_for_team(team_id) if team_id
+                      else self.store.all_players())
+            warnings = self.setup.player_duplicate_report(team_id)
+            subjects = [("recipient", f"player:{p.id}")
+                       for p in players] or [("recipient", "*")]
+            self._record_sensitive_read(
+                registration_category, subjects,
+                "player_duplicate_report", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
+            self._record_sensitive_read(
+                birthdate_category, subjects,
+                "player_duplicate_report", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
+        return {"warnings": warnings}
 
     @catch
     def create_game(self, season_id: str, division_id: str, home_team_id: str,
@@ -11187,7 +13805,10 @@ class ApiService:
             if not isinstance(text, str):
                 raise ValidationError(f"{name}_csv must be a CSV text string.")
             sheets[name] = parse_csv_text(text)
-        return validate_import(sheets, store=self.store)
+        # today (#273): from the setup service's injected clock, so the
+        # dry-run's future-birthdate answer matches the commit's exactly.
+        return validate_import(sheets, store=self.store,
+                               today=self.setup.clock().date())
 
     # ====================================================================
     # Pilot onboarding import — teams + players commit (#93)

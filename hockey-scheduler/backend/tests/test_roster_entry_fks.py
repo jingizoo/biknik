@@ -37,6 +37,15 @@ from hockey_scheduler.store.sql_store import migrate
 UTC = timezone.utc
 _VERSION = "027_roster_entry_fks"
 
+# Migrations AFTER 027 that ALTER game_roster_entries, and the columns they
+# add. ``_downgrade_027`` must take these down WITH 027 (see its docstring):
+# 027's SQLite half rebuilds the table from a column list frozen at 027, so
+# replaying it on top of a later ALTER drops that ALTER's columns for good.
+# Keep the two tuples in step, and extend both the next time this table
+# gains a column.
+_POST_027_MIGRATIONS = ("061_roster_entry_durable_attribution",)
+_POST_027_COLUMNS = ("team_side", "seated_position")
+
 
 def _entry(eid, game="g1", player="p1"):
     now = datetime(2026, 1, 1, tzinfo=UTC)
@@ -89,6 +98,24 @@ def _downgrade_027(store):
     Postgres drops the named constraints; SQLite rebuilds the table without them
     (recreating the Slice 3B indexes). 027 changed nothing but the FKs, so this is
     a single-step downgrade — dangling rows can then be planted before it re-runs.
+
+    IT IS NOT A DOWNGRADE OF 027 ALONE, and cannot be. 027's SQLite half
+    rebuilds ``game_roster_entries`` from a hand-written CREATE carrying the
+    column list AS OF 027 — correct on a real upgrade path, where 027 runs
+    before anything that adds a column, and never replayed in production
+    because ``schema_migrations`` is authoritative. Replaying it here, on
+    top of a database that has since had columns ADDED, silently drops
+    them; and because the later migration is still recorded it never
+    re-runs to put them back, so the next ``_insert`` fails with "no column
+    named …".
+
+    So every later migration that ALTERs this same table is downgraded
+    alongside 027 (columns dropped, version un-recorded) and the subsequent
+    ``migrate()`` replays the whole chain in FORWARD ORDER — 027's rebuild,
+    then their ALTERs — which is the only order any of them is correct in.
+    ``_POST_027_COLUMNS`` is that list; #205 blocker 5's migration 061
+    (``team_side``/``seated_position``) is the first entry, and the next
+    ALTER on this table belongs there too.
     """
     with store.transaction():
         cur = store.conn.cursor()
@@ -97,6 +124,9 @@ def _downgrade_027(store):
                         "DROP CONSTRAINT IF EXISTS fk_roster_game")
             cur.execute("ALTER TABLE game_roster_entries "
                         "DROP CONSTRAINT IF EXISTS fk_roster_player")
+            for col in _POST_027_COLUMNS:
+                cur.execute("ALTER TABLE game_roster_entries "
+                            f"DROP COLUMN IF EXISTS {col}")
         else:
             cur.execute("PRAGMA defer_foreign_keys = ON")
             cur.execute(
@@ -118,6 +148,12 @@ def _downgrade_027(store):
                         "WHERE game_id IS NOT NULL AND player_id IS NOT NULL")
         cur.execute(store.dialect.sql(
             "DELETE FROM schema_migrations WHERE version = ?"), (_VERSION,))
+        # ...and every later migration that ALTERs this same table, so the
+        # subsequent migrate() replays the whole chain in forward order.
+        for follower in _POST_027_MIGRATIONS:
+            cur.execute(store.dialect.sql(
+                "DELETE FROM schema_migrations WHERE version = ?"),
+                (follower,))
 
 
 def _fk_names(store):

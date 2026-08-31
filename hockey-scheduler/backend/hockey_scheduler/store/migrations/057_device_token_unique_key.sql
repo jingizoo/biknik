@@ -1,0 +1,55 @@
+-- At most one DeviceToken row per (recipient_ref, token) (#426 round-4
+-- review finding 1) -- the atomic DB backstop for register_device_token's
+-- upsert.
+--
+-- NUMBERING NOTE (parallel lanes): originally authored as
+-- 055_device_token_unique_key (054 was claimed by PR #427; confirmed via
+-- `git log --all` and `gh pr list` before numbering it 055). At #426's own
+-- merge time, main had independently advanced with PR #430's copy-forward
+-- idempotency ledger, whose own 055_copy_forward_request_identity collided
+-- on the same filename. Resolved per the queue agreement by renumbering
+-- this file past main's claimed 053-055, to 057 (see 056_data_access_log.sql
+-- for the sibling 053 collision, renumbered the same way). No functional
+-- statement below changed; only the version stem (filename, and its
+-- references in sql_store.py's _ATOMIC_PRE_MIGRATION_CHECKS and the
+-- device-token regression tests' ``_VERSION`` sentinels) moved from 055
+-- to 057.
+--
+-- register_device_token's own upsert key IS (recipient_ref, token) --
+-- confirmed by its docstring and by test_device_tokens.py's
+-- test_register_is_upsert_and_reactivates -- but before this round the
+-- store enforced that key ONLY in application code: an unlocked
+-- get_device_token_by_value() read followed by a separate save/insert
+-- outside any transaction. Two concurrent FIRST registrations of the same
+-- (recipient_ref, token) could each observe "no row" and both INSERT,
+-- landing two rows for what the application treats as one logical
+-- registration. This index makes the natural-key invariant hold in the
+-- database itself, exactly like migration 038's active-jersey index or
+-- migration 045's ice-slot-time index: a losing concurrent INSERT is
+-- translated to the same stable IntegrityConflictError those already
+-- established (db_errors.translate_db_exception's generic unique_violation
+-- fallback) -- though store.upsert_device_token's own INSERT ... ON
+-- CONFLICT ... DO UPDATE (sql_store.py) is written to never actually reach
+-- that path under a genuine race: the conflict resolves INSIDE the one
+-- atomic statement instead of failing outward.
+--
+-- Both columns are nullable at the schema level (migration 001 declares
+-- neither NOT NULL), and both SQLite and PostgreSQL treat NULLs as
+-- distinct in a unique index, so the partial predicate makes explicit
+-- exactly what this index enforces -- mirroring migration 047's identical
+-- reasoning for official_availability's (official_id, start_time,
+-- end_time). In practice every row reaching this table today was written
+-- by register_device_token, which already rejects a blank recipient_ref/
+-- token before ever reaching the store (ValidationError) -- the predicate
+-- is a defensive match to the schema's actual nullability, not evidence
+-- that a NULL row is expected.
+--
+-- Forward-only, so existing data may already violate this: registers
+-- assert_no_duplicate_device_tokens (see _PRE_MIGRATION_CHECKS), which
+-- reports the conflicting row ids before this DDL runs, rather than an
+-- opaque index error -- deliberately never the (recipient_ref, token)
+-- value itself, a live push credential this check must not copy into a
+-- startup/deployment log (#426 round-5 review finding 1).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_device_tokens_recipient_token
+    ON device_tokens (recipient_ref, token)
+    WHERE recipient_ref IS NOT NULL AND token IS NOT NULL;

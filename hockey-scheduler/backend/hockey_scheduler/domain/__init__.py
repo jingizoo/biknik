@@ -6,6 +6,7 @@ from .enums import (
     GameType,
     IceSlotStatus,
     IceSlotType,
+    MembershipStatus,
     NotificationAudience,
     NotificationChannel,
     NotificationKind,
@@ -68,6 +69,7 @@ from .models import (
 )
 from .setup_models import (
     ActiveContext,
+    AgeEligibilityRule,
     CalendarFeedToken,
     Club,
     ContactDestination,
@@ -98,6 +100,9 @@ from .setup_models import (
     Rink,
     ScheduleScenario,
     Season,
+    SeasonCopyForwardCommit,
+    SeasonRosterMembership,
+    SeasonRosterMembershipEvent,
     SeasonTeamRegistration,
     SeasonVenueAccess,
     SetupAuditLog,
@@ -109,6 +114,36 @@ from .jersey import (
     MIN_JERSEY_NUMBER,
     jersey_number_error,
     parse_jersey_cell,
+)
+from .privacy import (
+    ACCESS_ALLOWED,
+    ACCESS_DENIED,
+    DataAccessLog,
+    SensitiveFieldCategory,
+    VALID_OUTCOMES,
+)
+from .identity import (
+    MAX_NAME_PART_LENGTH,
+    MAX_REGISTRATION_NUMBER_LENGTH,
+    MAX_SKILL_RATING,
+    MIN_SKILL_RATING,
+    derive_display_name,
+    normalize_birthdate,
+    normalize_name_part,
+    normalize_preferred_name,
+    normalize_registration_number,
+    normalize_skill_rating,
+    normalized_name_key,
+    plan_effective_registration_state,
+)
+from .eligibility import (
+    ENFORCEMENT_MODES,
+    age_on,
+    evaluate_age_eligibility,
+    match_tier,
+    normalize_age_tiers,
+    normalize_cutoff,
+    normalize_enforcement,
 )
 from .time_utils import intervals_overlap
 
@@ -170,6 +205,7 @@ __all__ = [
     "Team",
     # setup models
     "ActiveContext",
+    "AgeEligibilityRule",
     "Club",
     "Division",
     "GuardianLink",
@@ -188,6 +224,9 @@ __all__ = [
     "GameResult",
     "ResultStatus",
     "SeasonStatus",
+    "MembershipStatus",
+    "SeasonRosterMembership",
+    "SeasonRosterMembershipEvent",
     "Notification",
     "NotificationRecipient",
     "NotificationDelivery",
@@ -202,6 +241,12 @@ __all__ = [
     "ScheduleScenario",
     "Season",
     "SetupAuditLog",
+    # privacy foundation (#124)
+    "ACCESS_ALLOWED",
+    "ACCESS_DENIED",
+    "DataAccessLog",
+    "SensitiveFieldCategory",
+    "VALID_OUTCOMES",
     "TeamLeagueMigrationDecision",
     "FactoryResetEvent",
     "FactoryResetChallenge",
@@ -218,4 +263,25 @@ __all__ = [
     "MAX_JERSEY_NUMBER",
     "jersey_number_error",
     "parse_jersey_cell",
+    # athlete identity (#273)
+    "MAX_NAME_PART_LENGTH",
+    "MAX_REGISTRATION_NUMBER_LENGTH",
+    "MIN_SKILL_RATING",
+    "MAX_SKILL_RATING",
+    "derive_display_name",
+    "normalize_birthdate",
+    "normalize_name_part",
+    "normalize_preferred_name",
+    "normalize_registration_number",
+    "normalize_skill_rating",
+    "normalized_name_key",
+    "plan_effective_registration_state",
+    # age eligibility (#273)
+    "ENFORCEMENT_MODES",
+    "age_on",
+    "evaluate_age_eligibility",
+    "match_tier",
+    "normalize_age_tiers",
+    "normalize_cutoff",
+    "normalize_enforcement",
 ]

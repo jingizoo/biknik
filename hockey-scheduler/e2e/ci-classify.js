@@ -13,7 +13,8 @@
 //   * other backend Python / SQL migrations -> the DB matrix (memory+SQLite and
 //     PostgreSQL) — migrations keep the full DB matrix, never a single backend;
 //   * front-end (served static assets) or e2e journeys -> frontend-check + browser;
-//   * hockey docs / markdown only -> no heavy job;
+//   * hockey docs / markdown only -> no heavy job, but still the cheap live
+//     PR-body consistency gate;
 //   * a path that is unambiguously the SIBLING root project (this is a monorepo)
 //     -> no hockey job (skip-safe); anything NOT recognized as hockey or sibling
 //     still falls through to `unknown` -> full matrix, so an omitted sibling path
@@ -108,7 +109,14 @@ function categorize(file) {
 }
 
 function full(reason) {
-  return { test: true, postgres: true, frontend_check: true, browser_smoke: true, reason: "full:" + reason };
+  return {
+    test: true,
+    postgres: true,
+    frontend_check: true,
+    browser_smoke: true,
+    pr_body_check: true,
+    reason: "full:" + reason,
+  };
 }
 
 // files: array of repo-relative paths. eventName: the GitHub event name.
@@ -138,12 +146,24 @@ function classify(files, eventName) {
     if (c === "backend_api" || c === "frontend" || c === "e2e") {
       frontend_check = true; browser_smoke = true;
     }
-    // 'docs' and 'sibling' contribute no heavy job (a hockey-docs-only or
-    // sibling-project-only PR runs just the cheap classifier). Mixed PRs take
-    // the union, so a sibling change alongside a hockey change still runs the
-    // hockey job the hockey change needs.
+    // 'docs' and 'sibling' contribute no heavy job. Mixed PRs take the union,
+    // so a sibling change alongside a hockey change still runs the hockey job
+    // the hockey change needs.
   }
-  return { test, postgres, frontend_check, browser_smoke, reason: cats.join(",") };
+  // The live PR-body contract belongs to every Hockey Scheduler PR, including
+  // docs-only changes, rather than to the classifier-gated front-end job. The
+  // only safe skip is a diff made exclusively from positively recognized
+  // sibling-project paths. Unknown and empty diffs take the `full()` exits
+  // above and therefore fail closed to true.
+  const pr_body_check = [...set].some((c) => c !== "sibling");
+  return {
+    test,
+    postgres,
+    frontend_check,
+    browser_smoke,
+    pr_body_check,
+    reason: cats.join(","),
+  };
 }
 
 module.exports = { classify, categorize };
@@ -168,6 +188,7 @@ if (require.main === module) {
     `postgres=${r.postgres}`,
     `frontend_check=${r.frontend_check}`,
     `browser_smoke=${r.browser_smoke}`,
+    `pr_body_check=${r.pr_body_check}`,
   ];
   if (process.env.GITHUB_OUTPUT) {
     fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.join("\n") + "\n");

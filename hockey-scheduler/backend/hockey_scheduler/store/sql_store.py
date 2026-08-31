@@ -6,6 +6,7 @@ across SQLite and Postgres: TEXT/INTEGER columns only, datetimes stored as
 ISO-8601 text, booleans as 0/1, and dict payloads as JSON text.
 """
 
+import copy
 import json
 import os
 import threading
@@ -30,11 +31,13 @@ from ..domain import (
     SchedulingPolicy,
     PolicyScopeType,
     ActiveContext,
+    AgeEligibilityRule,
     GameResult,
     League,
     LeagueSeason,
     Program,
     ContactDestination,
+    DataAccessLog,
     DeliveryStatus,
     DeviceToken,
     FactoryResetChallenge,
@@ -66,8 +69,13 @@ from ..domain import (
     GuardianLink,
     InstallationState,
     RosterRole,
+    MembershipStatus,
     Season,
+    SensitiveFieldCategory,
     ScheduleScenario,
+    SeasonCopyForwardCommit,
+    SeasonRosterMembership,
+    SeasonRosterMembershipEvent,
     SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
@@ -80,22 +88,27 @@ from ..domain import (
     Team,
     UserAccount,
     Venue,
+    VALID_OUTCOMES,
 )
 from ..domain.enums import NotificationType
-from ..domain.errors import IntegrityConflictError
+from ..domain.errors import IntegrityConflictError, ValidationError
 from .db import connect
 from .db_errors import (
     DependentDeleteConflict,
     dependent_delete_conflict,
+    translate_copy_forward_commit_conflict_exception,
     translate_db_exception,
     translate_ice_slot_conflict_exception,
     translate_ice_slot_time_conflict_exception,
+    translate_membership_conflict_exception,
     translate_player_jersey_exception,
     translate_program_org_fk_exception,
     translate_reassignment_fk_exception,
+    translate_registration_number_exception,
     translate_venue_hierarchy_fk_exception,
 )
 from .integrity_checks import (
+    MigrationDataError,
     assert_competition_hierarchy_reset_ready,
     assert_competition_reset_ready_c1b,
     assert_iceslot_venue_fks_ready,
@@ -103,6 +116,7 @@ from .integrity_checks import (
     assert_reassignment_fks_ready,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
+    assert_no_duplicate_device_tokens,
     assert_no_duplicate_ice_slot_times,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
@@ -113,6 +127,7 @@ from .integrity_checks import (
     assert_roster_refs_exist,
     assert_venue_season_access_backfill_ready,
     assert_player_jersey_constraints_ready,
+    assert_season_roster_membership_backfill_ready,
 )
 
 
@@ -138,6 +153,18 @@ def _bool():
 def _jsonc():
     return (lambda v: json.dumps(v or {}),
             lambda v: json.loads(v) if v else {})
+
+
+def _jsonl():
+    """JSON-encoded LIST column (e.g. SeasonCopyForwardCommit registrations,
+    AgeEligibilityRule.tiers).
+
+    Like ``_jsonc`` but list-biased: an EMPTY list is a legitimate value
+    (a copy-forward commit that created zero registrations), so this must
+    round-trip ``[]`` as ``[]`` rather than folding it into ``{}`` the way
+    ``_jsonc``'s dict-biased ``v or {}`` would."""
+    return (lambda v: json.dumps(v if v is not None else []),
+            lambda v: json.loads(v) if v else [])
 
 
 class Col:
@@ -171,8 +198,16 @@ class Spec:
 
 
 SPECS = {
-    # Child of the permanent scheduling hierarchy; keep it before its parents
-    # so SQLite factory-reset deletion follows child-first FK order.
+    # Children of the permanent scheduling hierarchy; keep them before their
+    # parents so SQLite factory-reset deletion follows child-first FK order
+    # (events before memberships, memberships before players/teams/seasons).
+    SeasonRosterMembershipEvent: Spec(
+        SeasonRosterMembershipEvent, "season_roster_membership_events",
+        {"at": _dt(), "detail": _jsonc()}),
+    SeasonRosterMembership: Spec(
+        SeasonRosterMembership, "season_roster_memberships",
+        {"status": _enum(MembershipStatus), "position": _enum(Position),
+         "effective_from": _dt(), "effective_to": _dt()}),
     ScheduleScenario: Spec(
         ScheduleScenario, "schedule_scenarios",
         {"request_input": _jsonc(), "proposal": _jsonc(),
@@ -184,8 +219,25 @@ SPECS = {
     League: Spec(League, "leagues"),
     LeagueSeason: Spec(LeagueSeason, "league_seasons"),
     Division: Spec(Division, "divisions"),
+    # Child of league_seasons (#273); before its parent for the factory-reset
+    # child-first deletion order, like the other LeagueSeason children here.
+    AgeEligibilityRule: Spec(
+        AgeEligibilityRule, "age_eligibility_rules",
+        {"tiers": _jsonl(), "created_at": _dt()}),
     SeasonTeamRegistration: Spec(
         SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
+    SeasonCopyForwardCommit: Spec(
+        SeasonCopyForwardCommit, "season_copy_forward_commits",
+        # request_identity: no codec override (#159 review round 5) -- the
+        # field is now ALREADY a canonical JSON string by the time it
+        # reaches here (SetupService._copy_forward_canonical_json), so it
+        # is stored as plain TEXT via Col's default identity codec rather
+        # than being JSON-encoded a SECOND time through _jsonc(), which
+        # would wrap it in an extra layer of quoting/escaping for no
+        # benefit -- the string itself is already the immutable, portable
+        # representation this TEXT column exists to hold.
+        {"registration_ids": _jsonl(), "committed_at": _dt(),
+         "response_snapshot": _jsonc()}),
     TeamLeagueMigrationDecision: Spec(
         TeamLeagueMigrationDecision, "team_league_migration_decisions"),
     SeasonVenueAccess: Spec(
@@ -210,6 +262,9 @@ SPECS = {
                           {"roster_role": _enum(RosterRole),
                            "selection_source": _enum(SelectionSource),
                            "status": _enum(RosterEntryStatus),
+                           # #205 blocker 5 durable attribution (migration
+                           # 061). team_side: plain TEXT, no codec.
+                           "seated_position": _enum(Position),
                            "selected_at": _dt(), "updated_at": _dt()}),
     GameAvailability: Spec(GameAvailability, "game_availability",
                            {"availability_status": _enum(AvailabilityStatus),
@@ -219,13 +274,16 @@ SPECS = {
                                 "status": _enum(SubstituteStatus),
                                 "enrolled_at": _dt(), "offered_at": _dt(),
                                 "offer_expires_at": _dt(), "accepted_at": _dt(),
-                                "declined_at": _dt()}),
+                                "declined_at": _dt()}),  # team_id: plain TEXT, no codec
     AuditLog: Spec(AuditLog, "audit_logs",
                    {"action": _enum(AuditAction), "at": _dt(), "detail": _jsonc()}),
     NotificationEvent: Spec(NotificationEvent, "notification_events",
                             {"type": _enum(NotificationType), "at": _dt()}),
     SetupAuditLog: Spec(SetupAuditLog, "setup_audit_logs",
                         {"at": _dt(), "detail": _jsonc()}),
+    DataAccessLog: Spec(DataAccessLog, "data_access_logs",
+                        {"category": _enum(SensitiveFieldCategory),
+                         "at": _dt()}),
     FactoryResetEvent: Spec(
         FactoryResetEvent, "factory_reset_events",
         {"started_at": _dt(), "completed_at": _dt(),
@@ -384,6 +442,15 @@ def _load_migrations(backend=None):
 # (#201): a constraint migration first reports any existing rows that would
 # violate it, so an upgrade fails with the offending records named rather than
 # an opaque driver error. Keyed by migration version (filename stem).
+#
+# These run ONCE, read-only, BEFORE this migration's own transaction even
+# opens (see ``migrate`` below) — sound for a point-in-time data-shape audit
+# against a table nothing else is concurrently racing to write in a way that
+# matters here. ``057_device_token_unique_key`` is deliberately NOT in this
+# dict: device_tokens is actively written by a running application (possibly
+# a different replica already upgraded, or an old one not yet upgraded), so
+# its check needs the stronger, atomic guarantee ``_ATOMIC_PRE_MIGRATION_
+# CHECKS`` below provides instead (#426 round-6 review finding 2).
 _PRE_MIGRATION_CHECKS = {
     "022_one_active_game_per_slot": assert_no_duplicate_active_ice_slots,
     "023_one_roster_row_per_player": assert_no_duplicate_roster_players,
@@ -403,6 +470,32 @@ _PRE_MIGRATION_CHECKS = {
     "047_official_import_unique_keys":
         assert_officials_availability_import_constraints_ready,
     "048_rink_external_ref_unique": assert_no_duplicate_rink_external_refs,
+    "059_season_roster_membership":
+        assert_season_roster_membership_backfill_ready,
+}
+
+# Migrations whose pre-check must be ATOMIC with their own DDL with respect
+# to a concurrent writer on a specific table (#426 round-6 review finding 2).
+#
+# The review reproduced this exact window with two real PostgreSQL
+# connections: connection A's ``assert_no_duplicate_device_tokens`` ran
+# BEFORE any transaction/lock existed and returned clean; connection B then
+# committed a fresh duplicate; A's later ``CREATE UNIQUE INDEX`` discovered
+# it and PostgreSQL raised a raw ``UniqueViolation`` whose ``DETAIL`` text
+# named the conflicting ``(recipient_ref, token)`` pair verbatim — a live
+# push credential, straight into whatever captures a startup traceback.
+#
+# Unlike ``_PRE_MIGRATION_CHECKS`` above, the check function here runs
+# INSIDE ``_apply_migration``'s own transaction, AFTER a lock excluding
+# concurrent writers on ``lock_table`` is taken (see ``_apply_migration``) —
+# so no writer can land a fresh violation in the window between "check
+# passed" and "DDL applied": the lock closes the window the round-5 fix
+# (naming only safe row ids) could not, because round-5 never addressed
+# WHEN the check ran relative to the DDL, only WHAT it was allowed to say.
+# Keyed by migration version; value is ``(check_fn, lock_table)``.
+_ATOMIC_PRE_MIGRATION_CHECKS = {
+    "057_device_token_unique_key":
+        (assert_no_duplicate_device_tokens, "device_tokens"),
 }
 
 
@@ -421,8 +514,13 @@ def migrate(conn, dialect) -> None:
     all-or-nothing; it is never an in-place no-op. Take a backup before upgrading.
 
     A version with a registered pre-migration check (``_PRE_MIGRATION_CHECKS``)
-    runs that check first; it raises (aborting the upgrade) if existing data
-    would violate the constraint the migration adds.
+    runs that check first, read-only, before this migration's own transaction
+    opens; it raises (aborting the upgrade) if existing data would violate the
+    constraint the migration adds. A version in ``_ATOMIC_PRE_MIGRATION_CHECKS``
+    instead runs its check INSIDE the migration's own transaction, behind a lock
+    that excludes concurrent writers on a named table, for the migrations where
+    a plain pre-transaction check would leave a real TOCTOU window open (#426
+    round-6 review finding 2) — see ``_apply_migration``.
 
     Each pending version's statements and its ledger row are applied as one
     atomic unit, so a migration that fails part-way (e.g. a SQLite table rebuild)
@@ -437,18 +535,132 @@ def migrate(conn, dialect) -> None:
     for version, statements in _load_migrations(dialect.backend):
         if version in applied:
             continue
+        atomic_check = _ATOMIC_PRE_MIGRATION_CHECKS.get(version)
+        if atomic_check is not None:
+            _apply_migration(conn, dialect, version, statements,
+                             atomic_check=atomic_check)
+            continue
         check = _PRE_MIGRATION_CHECKS.get(version)
         if check is not None:
             check(conn)  # read-only; safe to run before opening the txn
         _apply_migration(conn, dialect, version, statements)
 
 
-def _apply_migration(conn, dialect, version, statements) -> None:
-    """Run one migration's statements plus its ledger row in a single txn."""
+def _sanitize_atomic_check_ddl_exception(exc: BaseException):
+    """A sanitized :class:`MigrationDataError` for a raw unique-violation
+    surfacing from an ``atomic_check`` migration's own DDL, or ``None`` for
+    anything else — the caller re-raises the original unchanged (#426
+    round-6 review finding 2, belt and suspenders UNDERNEATH the
+    ``LOCK TABLE``/``BEGIN IMMEDIATE`` fix in ``_apply_migration``, which is
+    what actually prevents this from firing in normal operation).
+
+    Reuses :func:`~.db_errors.translate_db_exception` — already audited to
+    never place driver text, SQL, or a constraint/table/column name in its
+    generic message — rather than a second, parallel detection path here.
+    Only a ``unique_violation`` classification is treated as this scenario;
+    anything else ``translate_db_exception`` recognizes (e.g. a concurrency
+    failure) or does not recognize at all returns ``None``, so an unrelated
+    failure during an ``atomic_check`` migration's DDL keeps surfacing
+    exactly as it always has.
+
+    The statements an ``atomic_check`` migration executes are that one
+    migration's own DDL and nothing else, so a unique-violation at this
+    exact call site can only be the constraint that DDL itself is adding —
+    there is no ambiguity to resolve about WHICH constraint fired, unlike
+    the multi-constraint call sites ``db_errors.py``'s other translators
+    disambiguate by name.
+    """
+    translated = translate_db_exception(exc)
+    if translated is None or translated.details.get("reason") != "unique_violation":
+        return None
+    return MigrationDataError(
+        "Cannot apply this migration's uniqueness constraint: a "
+        "conflicting row was written during the upgrade window. This "
+        "migration's own pre-check and DDL run under a lock that excludes "
+        "concurrent writers on the affected table, so this should not be "
+        "reachable in normal operation -- if it recurs, retry the upgrade "
+        "and check for a writer bypassing that lock.")
+
+
+def _atomic_check_lock_hook(version: str) -> None:
+    """No-op by default — a TEST SEAM ONLY (#426 round-6 review finding 2).
+
+    ``_apply_migration`` calls this from inside ``body()``, immediately
+    after an ``atomic_check`` migration's writer-excluding lock has been
+    acquired (``LOCK TABLE`` on PostgreSQL / ``BEGIN IMMEDIATE`` on SQLite)
+    and before ``check_fn`` runs. A test can monkeypatch this to pause here
+    and, with a REAL second connection, prove that a concurrent writer
+    genuinely blocks (or is genuinely rejected) until this migration's
+    transaction concludes — a deterministic barrier, not a timing
+    coincidence. Never used by production code, which leaves this at its
+    default no-op.
+    """
+    return None
+
+
+def _apply_migration(conn, dialect, version, statements, atomic_check=None) -> None:
+    """Run one migration's statements plus its ledger row in a single txn.
+
+    ``atomic_check``, when given, is a ``(check_fn, lock_table)`` pair (#426
+    round-6 review finding 2). ``check_fn`` runs from INSIDE ``body()`` below
+    — i.e. inside this transaction, and (see the per-backend branches below)
+    AFTER a lock excluding concurrent writers on ``lock_table`` has been
+    taken — so no writer can land a fresh violation in the window between
+    "check passed" and "this migration's DDL applied". This is what actually
+    closes the review's reproduced TOCTOU window; the two backend branches
+    below each explain how they provide that lock.
+
+    As a defensive backstop UNDERNEATH that lock (not a replacement for it —
+    engine error message formats such as PostgreSQL's ``DETAIL`` text are not
+    fully within this codebase's control, so this is belt and suspenders in
+    case a future edit narrows the lock's scope), a statement failing with a
+    raw unique-violation while ``atomic_check`` is active is caught and
+    re-raised as a sanitized :class:`~.integrity_checks.MigrationDataError`
+    instead of allowed to propagate with driver text intact. Anything else —
+    any other exception shape, or any failure when ``atomic_check`` is
+    ``None`` — is untouched, exactly as before.
+
+    The re-raise happens OUTSIDE the ``except`` block that caught the raw
+    driver exception, not `raise translated from exc` (or even
+    ``from None``) at that same spot (#426 round-7 review). While still
+    inside the handler, CPython's implicit exception chaining sets
+    ``translated.__context__`` to the raw exception regardless of the
+    ``from`` clause — ``from None``/``from exc`` only control ``__cause__``
+    and ``__suppress_context__``, so a structured logger that walks
+    ``__context__`` directly (ignoring ``__suppress_context__``, which only
+    the *default* traceback printer and well-behaved loggers respect) could
+    still reach the driver's ``DETAIL`` text (e.g. a live push token).
+    Deferring the raise to after the handler has exited means there is no
+    exception being handled at the moment ``translated`` is raised, so
+    nothing gets attached: ``__context__`` comes out actually ``None``, not
+    merely suppressed — confirmed empirically (see test coverage) and not
+    just asserted from the docs. ``from None`` is kept too, for
+    explicitness and as a second, independent guarantee on ``__cause__``.
+    """
     def body():
         cur = conn.cursor()
+        if atomic_check is not None:
+            check_fn, _lock_table = atomic_check
+            # By the time body() runs, the lock is already held on both
+            # backends (LOCK TABLE / BEGIN IMMEDIATE, just before this
+            # call) — see the per-backend branches below.
+            _atomic_check_lock_hook(version)
+            check_fn(conn)
         for stmt in statements:
-            cur.execute(stmt)
+            translated = None
+            try:
+                cur.execute(stmt)
+            except Exception as exc:
+                translated = (_sanitize_atomic_check_ddl_exception(exc)
+                             if atomic_check is not None else None)
+                if translated is None:
+                    raise
+                # Do NOT `raise translated from exc` here — see the
+                # docstring above. `translated` is only recorded; the
+                # actual raise happens below, after this `except` block
+                # (and the raw `exc` it caught) has gone out of scope.
+            if translated is not None:
+                raise translated from None
         cur.execute(dialect.sql(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)"),
             (version, _utcnow().isoformat()))
@@ -458,6 +670,18 @@ def _apply_migration(conn, dialect, version, statements) -> None:
         # runs inside an outer transaction (e.g. the demo reset), this opens a
         # savepoint rather than a second transaction.
         with conn.transaction():
+            if atomic_check is not None:
+                _, lock_table = atomic_check
+                # SHARE ROW EXCLUSIVE conflicts with ROW EXCLUSIVE — the lock
+                # every INSERT/UPDATE/DELETE takes — so any concurrent writer
+                # on lock_table blocks until THIS transaction concludes
+                # (commit OR rollback), closing exactly the window a bare
+                # pre-transaction check leaves open. Ordinary reads (ACCESS
+                # SHARE) are unaffected. Taken BEFORE check_fn runs (inside
+                # body(), called next) so the check itself — not just the
+                # DDL after it — is covered.
+                conn.cursor().execute(
+                    f"LOCK TABLE {lock_table} IN SHARE ROW EXCLUSIVE MODE")
             body()
     elif conn.in_transaction:
         # Already inside a transaction (e.g. reset_schema called within the demo
@@ -509,6 +733,16 @@ def _apply_migration(conn, dialect, version, statements) -> None:
             # IMMEDIATE deletes the invariant instead of documenting it, and it
             # is free: interleaved cold builds of the full migration set, 32
             # samples each, median 34.90ms plain vs 35.00ms IMMEDIATE.
+            # For an ``atomic_check`` migration, this line is ALSO what gives
+            # SQLite the same guarantee the PostgreSQL branch above gets from
+            # ``LOCK TABLE``: BEGIN IMMEDIATE takes SQLite's RESERVED lock,
+            # which blocks (or, absent an explicit busy_timeout, immediately
+            # rejects) ANY other connection's attempt to begin its own write
+            # — a coarser, whole-database lock rather than one table, but it
+            # still means no writer can complete a conflicting write between
+            # here and this transaction's conclusion. body() (next) runs
+            # check_fn from inside that same window (#426 round-6 review
+            # finding 2).
             conn.execute("BEGIN IMMEDIATE")
             body()
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -526,6 +760,29 @@ def _apply_migration(conn, dialect, version, statements) -> None:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# The epoch fence's bounded wait (PR #423 redesign) reuses the SAME
+# operator-configurable timeout ContextSwitchGate already exposes
+# (services/context_gate.py's HS_CONTEXT_GATE_TIMEOUT / DEFAULT_WAIT_TIMEOUT
+# = 10.0), rather than adding a second knob -- see the design's §4.5. The
+# name/default are duplicated here, not imported: store/ imports nothing from
+# services/ anywhere in this codebase (services/ imports FROM store/, never
+# the reverse), and this is a five-line env lookup, not a shared mechanism.
+# tests/test_epoch_fence.py asserts these two literals stay identical.
+_EPOCH_FENCE_TIMEOUT_ENV = "HS_CONTEXT_GATE_TIMEOUT"
+_EPOCH_FENCE_DEFAULT_TIMEOUT = 10.0
+
+
+def _epoch_fence_timeout_seconds() -> float:
+    raw = os.environ.get(_EPOCH_FENCE_TIMEOUT_ENV)
+    if not raw:
+        return _EPOCH_FENCE_DEFAULT_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _EPOCH_FENCE_DEFAULT_TIMEOUT
+    return value if value > 0 else _EPOCH_FENCE_DEFAULT_TIMEOUT
 
 
 class SqlStore:
@@ -559,6 +816,13 @@ class SqlStore:
         # guaranteed and refused when it would need more. None outside a
         # transaction, and outside one it is meaningless.
         self._txn_isolation = None
+        # Whether the OPEN outermost transaction promised read_only=True
+        # (round-N+2 regression fix, PR #423) — mirrors ``_txn_isolation``'s
+        # own admit/refuse shape: a nested join asking for write capability
+        # is refused when the open transaction is read-only, and admitted
+        # otherwise. None outside a transaction, and outside one it is
+        # meaningless (same convention as ``_txn_isolation``).
+        self._txn_read_only = None
         # Re-resolver for the no-row-lock parent-delete FK race (#201 Slice 3),
         # set by the service via set_dependent_conflict_resolver. Invoked by the
         # OUTERMOST transaction() only after rollback, so the itemised
@@ -566,6 +830,11 @@ class SqlStore:
         # the losing delete was nested inside a caller's transaction() and the
         # connection was transaction-aborted mid-flight.
         self._dependent_conflict_resolver = None
+        # Rows queued by add_data_access_durable() while nested inside an
+        # ambient transaction, to be flushed once that transaction has FULLY
+        # concluded (#426 review finding 4) — see transaction()'s outermost
+        # finally and add_data_access_durable()'s own docstring.
+        self._pending_durable_data_access = []
         migrate(self.conn, self.dialect)
 
     def set_dependent_conflict_resolver(self, resolver) -> None:
@@ -583,7 +852,7 @@ class SqlStore:
         self._dependent_conflict_resolver = resolver
 
     @contextmanager
-    def transaction(self, isolation=None):
+    def transaction(self, isolation=None, read_only=False):
         """Atomic multi-write block: commit on success, roll back on error.
 
         Reentrant (#215): only the outermost ``transaction()`` opens and
@@ -602,10 +871,62 @@ class SqlStore:
         one SERIALIZABLE transaction around an authorization computation that
         itself asks for SERIALIZABLE (the context selector) and REPEATABLE READ
         (the target chain walk), and both are already guaranteed by the outer
-        one. On SQLite it is a no-op: ``self._lock`` serializes every
-        transaction taken through THIS store, and the ``BEGIN IMMEDIATE``
-        below serializes this connection against any other one on the same
-        file — together that is already strictly stronger than SERIALIZABLE.
+        one. On SQLite ``isolation`` is itself a no-op (kept only so a caller
+        can state its intent and so the nested-join rank check above still
+        applies): ``self._lock`` serializes every transaction taken through
+        THIS store, and — for a WRITE-capable transaction — SQLite's own
+        ``BEGIN IMMEDIATE`` serializes this connection against any other one on
+        the same file; together that is already strictly stronger than
+        SERIALIZABLE. See ``read_only`` for the READ-only case, which is
+        strictly weaker at the SQLite engine level (a SHARED file lock, not
+        RESERVED) but — see below — no weaker in the isolation it actually
+        delivers to the caller.
+
+        ``read_only`` (round-N+2 regression fix, PR #423) is this caller's OWN
+        promise that ``work()`` will perform no write of any kind — never
+        inferred, always stated explicitly by the caller, because getting it
+        wrong has two very different failure modes depending on direction (see
+        the SQLite branch below for the one that is silent-until-a-write and
+        therefore the one to fear). It is the mechanism-level fix for a real,
+        measured regression: ``ContextService._snapshot`` used to open EVERY
+        one of its transactions — including its several genuinely read-only
+        entry points (``resolve``, ``options``, and the #409 preflight's
+        ``resolve_saved_with_league(lock=False)``) — at full write strength
+        (``isolation=SERIALIZABLE`` on a store whose SQLite branch, below,
+        unconditionally ran ``BEGIN IMMEDIATE`` regardless of what ``isolation``
+        even was). ``BEGIN IMMEDIATE`` takes SQLite's file-level RESERVED
+        lock, which a #409 preflight — itself just an ordinary, unrelated
+        request's FIRST cheap check, taken with no other lock held — has no
+        reason to need, and which directly CONTENDS with
+        ``_read_under_context_gate_sqlite``'s ``fresh_store`` (a completely
+        different request's scoped read, round-N+1 finding 1) holding that
+        exact same file's RESERVED lock for the deliberately-unbounded
+        duration of whatever ``produce()`` does. Measured directly (not
+        estimated): with a scoped read parked mid-``produce()``, an unrelated
+        archive/reopen request's #409 preflight — merely constructing the 409
+        refusal, reading no target row — took 10.7-10.8s to even ATTEMPT its
+        target lookup, the FULL ``HS_CONTEXT_GATE_TIMEOUT`` busy-wait, and
+        because that whole wait runs with THIS store's ``self._lock`` held
+        (below), every other concurrent use of this SAME store instance —
+        including totally unrelated reads — stalled for the identical
+        10.7-10.8s window. On a loaded CI runner that is enough of the test's
+        20s HTTP client timeout to tip over into an outright failure.
+
+        ``read_only=True`` does not weaken isolation for the caller: SQLite
+        guarantees no dirty reads and no torn view regardless of which lock
+        strength a transaction holds, because acquiring even the WEAKER
+        SHARED lock (what a read-only transaction takes here) already blocks
+        every other connection from reaching EXCLUSIVE — the lock a writer
+        MUST hold to actually mutate a page of the file — for as long as this
+        transaction keeps its SHARED lock, i.e. for its entire duration. A
+        concurrent writer can still acquire RESERVED (signal intent) and even
+        queue behind this read at PENDING, but it cannot complete its commit
+        until every SHARED holder, this one included, releases. So a
+        read-only transaction's view is exactly as consistent for its own
+        duration as a write-capable one's — SHARED is simply COMPATIBLE with
+        another connection's already-held RESERVED (only PENDING/EXCLUSIVE
+        conflict with SHARED), which is the one and only reason it does not
+        contend with ``fresh_store`` the way ``BEGIN IMMEDIATE`` did.
         """
         if isolation is not None and isolation not in _ISOLATION_LEVELS:
             raise ValueError(f"unsupported isolation level: {isolation!r}")
@@ -618,6 +939,12 @@ class SqlStore:
                         "transaction; a nested join cannot raise the isolation "
                         f"of the open one ({self._txn_isolation!r} < "
                         f"{isolation!r})")
+                if not read_only and self._txn_read_only:
+                    raise RuntimeError(
+                        "transaction(read_only=False) cannot join an "
+                        "already-open read_only=True transaction; a nested "
+                        "caller that needs to write must not be nested inside "
+                        "one that promised it would not")
                 self._txn_depth += 1
                 try:
                     yield
@@ -641,6 +968,7 @@ class SqlStore:
             self._reconnect_if_lost()
             self._txn_depth = 1
             self._txn_isolation = isolation
+            self._txn_read_only = read_only
             try:
                 try:
                     if self.dialect.paramstyle == "pyformat":  # psycopg manages it
@@ -710,7 +1038,80 @@ class SqlStore:
                             # genuinely contended writer now blocks in the busy
                             # handler at BEGIN — where SQLite *does* honour the
                             # timeout — instead of failing on contact.
-                            self.conn.execute("BEGIN IMMEDIATE")
+                            #
+                            # round-N+1 (finding 1 SQLite rework): the busy
+                            # handler's OWN bound is set HERE, immediately
+                            # before every single outermost BEGIN — not once
+                            # at connection-open — and re-READS
+                            # `HS_CONTEXT_GATE_TIMEOUT` FRESH each time,
+                            # matching the SAME "the SAME configured knob
+                            # every layer of this mechanism uses" contract
+                            # Postgres's `SET LOCAL lock_timeout` (in
+                            # `epoch_fence_acquire_exclusive`) already keeps.
+                            # `PRAGMA busy_timeout` is a CONNECTION-level
+                            # setting with no `SET LOCAL`-style auto-reset, so
+                            # setting it ONCE at `__init__` was tried first and
+                            # measured to be WRONG: a test (or an operator)
+                            # that changes the env var AFTER a long-lived
+                            # store's connection already exists (exactly
+                            # `test_a_waiter_cannot_block_forever_on_a_read_
+                            # that_never_returns`'s own shape — the store is
+                            # built once in `setUpClass`, the env var is
+                            # lowered to 0.4s inside the test method) would
+                            # silently keep the OLD value forever, compounding
+                            # through this method's own bounded retry loop
+                            # (`_GUARDED_MUTATION_RETRIES`/
+                            # `_MAX_SNAPSHOT_RETRIES`, 10 attempts) into a
+                            # multi-minute stall the test's own PATIENCE
+                            # budget could not absorb. Re-setting it here,
+                            # every time, is cheap (a local, in-memory
+                            # connection setting — no I/O) and makes this
+                            # store behave exactly like `ContextSwitchGate`,
+                            # which re-reads its own env var on every
+                            # construction and additionally lets a caller
+                            # mutate `wait_timeout` directly at runtime.
+                            #
+                            # round-N+2 (regression fix): `read_only=True`
+                            # takes `BEGIN DEFERRED` here instead — a SHARED
+                            # lock, not RESERVED — and is the ONE exception to
+                            # "always IMMEDIATE" above. It does not reopen the
+                            # promotion bug that paragraph describes, because
+                            # that bug is specifically a PROMOTION failure
+                            # (SHARED -> RESERVED mid-transaction, at a
+                            # caller's first write) and a `read_only=True`
+                            # caller is a caller that has PROMISED `work()`
+                            # performs no write at all — there is no promotion
+                            # to fail, ever, by construction. What it buys:
+                            # this transaction's SHARED lock is compatible
+                            # with another connection's already-held RESERVED
+                            # (only PENDING/EXCLUSIVE conflict with SHARED),
+                            # so a genuinely read-only transaction — e.g. the
+                            # #409 preflight's `ContextService._snapshot`
+                            # calls, see `read_only`'s own docstring above —
+                            # no longer contends with
+                            # `_read_under_context_gate_sqlite`'s `fresh_store`
+                            # holding RESERVED for the duration of a scoped
+                            # read's `produce()` call, which is what the
+                            # regression this fixes actually measured: an
+                            # unrelated read-only transaction busy-waiting the
+                            # full `HS_CONTEXT_GATE_TIMEOUT` for a RESERVED
+                            # lock it never needed, with `self._lock` held for
+                            # that whole wait — the reentrant lock is held
+                            # across this ENTIRE `BEGIN`/`yield`/`commit`
+                            # sequence (see the field's own comment at
+                            # `self._lock`'s assignment in `__init__`), not
+                            # merely across the `BEGIN` statement, so the
+                            # busy-wait this branch used to do unconditionally
+                            # was never a purely-SQLite-engine-level delay: it
+                            # froze this Python store instance for every OTHER
+                            # caller too, for as long as it lasted.
+                            busy_ms = max(
+                                1, int(_epoch_fence_timeout_seconds() * 1000))
+                            self.conn.execute(
+                                f"PRAGMA busy_timeout = {busy_ms}")
+                            self.conn.execute(
+                                "BEGIN DEFERRED" if read_only
+                                else "BEGIN IMMEDIATE")
                             yield
                             self.conn.commit()
                         except Exception:
@@ -751,6 +1152,35 @@ class SqlStore:
             finally:
                 self._txn_depth = 0
                 self._txn_isolation = None
+                self._txn_read_only = None
+                # #426 review finding 4: flush any DataAccessLog rows queued
+                # by add_data_access_durable() while nested inside the
+                # transaction that JUST concluded — commit or rollback makes
+                # no difference, a durable row is never contingent on the
+                # ambient unit's own outcome. Runs here (not in the `except`
+                # above) so it fires on the plain-success path too, and AFTER
+                # depth/isolation are reset so the flush's own nested
+                # transaction() calls are themselves genuinely outermost.
+                if self._pending_durable_data_access:
+                    self._flush_pending_durable_data_access()
+
+    def _flush_pending_durable_data_access(self) -> None:
+        """Insert every queued durable row, each in its OWN fresh commit
+        (#426 review finding 4) — swapped out first so a flush triggered
+        from inside this very flush's nested transaction() calls can never
+        re-process the same rows.
+
+        Routed through ``_insert_data_access`` (#426 round-2 review
+        finding 1), the SAME id/seq-allocating insert path every other
+        write uses — so a queued row's id is allocated HERE, in this fresh,
+        independent, already-clean-of-any-rollback transaction, never in
+        the (possibly doomed) ambient transaction that queued it.
+        """
+        pending, self._pending_durable_data_access = (
+            self._pending_durable_data_access, [])
+        for entry in pending:
+            with self.transaction():
+                self._insert_data_access(entry)
 
     def _enrich_jersey_conflict(self, exc) -> None:
         """Add the conflicting player to a rolled-back jersey conflict (#292).
@@ -894,6 +1324,12 @@ class SqlStore:
                 cur.execute(f"DROP TABLE IF EXISTS levels{cascade}")
                 cur.execute(f"DROP TABLE IF EXISTS counters{cascade}")
                 cur.execute(f"DROP TABLE IF EXISTS schema_migrations{cascade}")
+                # Round-N review finding 1: outside SPECS (an administrative
+                # counter, not a domain model — see migration 052), so it
+                # needs the SAME explicit drop `levels`/`counters` get above,
+                # or a re-migrate after `schema_migrations` is gone would try
+                # to CREATE TABLE a table that never went away and fail.
+                cur.execute(f"DROP TABLE IF EXISTS epoch_fence_version{cascade}")
             finally:
                 # defer_foreign_keys resets itself at COMMIT; only the standalone
                 # foreign_keys toggle needs restoring here.
@@ -1094,7 +1530,13 @@ class SqlStore:
         return rows[0] if rows else None
 
     # -- id generation -----------------------------------------------------
-    def next_id(self, prefix: str) -> str:
+    def next_seq(self, prefix: str) -> int:
+        """Increment and return the RAW per-prefix counter (#205 review round
+        1 finding 4) — the same counter :meth:`next_id` formats into a
+        string id, exposed here so a caller that also needs a genuinely
+        sortable integer (e.g. ``SeasonRosterMembershipEvent.seq``) can mint
+        both from ONE atomic step rather than drawing two different
+        numbers."""
         with self._lock:
             cur = self._exec(
                 "INSERT INTO counters(prefix, value) VALUES (?, 1) "
@@ -1102,7 +1544,10 @@ class SqlStore:
                 "RETURNING value", (prefix,))
             row = cur.fetchone()
         # sqlite3.Row and psycopg dict_row both support key access.
-        return f"{prefix}_{row['value']}"
+        return row["value"]
+
+    def next_id(self, prefix: str) -> str:
+        return f"{prefix}_{self.next_seq(prefix)}"
 
     # -- teams / players ---------------------------------------------------
     def _write_team(self, write, team):
@@ -1132,6 +1577,14 @@ class SqlStore:
         except Exception as exc:
             translated = translate_player_jersey_exception(
                 exc, player.team_id, player.jersey_number)
+            # ux_players_team_registration_number (migration 058, #273 review
+            # round 2 finding 2): the database backstop for the same-team
+            # registration-number invariant, checked after the jersey
+            # violation (a different unique index on this same table) so a
+            # non-match falls through cleanly to it.
+            if translated is None:
+                translated = translate_registration_number_exception(
+                    exc, player.team_id, player.registration_number)
             # players.team_id → teams(id) (migration 040): a race-losing write
             # onto a concurrently-deleted team surfaces as the same stable
             # conflict the service raises when it validates the team (#201 Slice 2).
@@ -1408,6 +1861,82 @@ class SqlStore:
             (team_id, season_id))
         return rows[0] if rows else None
 
+    # -- season roster memberships (#205 Slice A) --------------------------
+    def _write_season_roster_membership(self, write, m):
+        # A race lost to either 059 partial unique index (authoritative
+        # active membership per (player, Season); active jersey per
+        # (LeagueSeason, Team)) surfaces as the SAME stable conflict the
+        # service pre-checks raise — mirrors _write_player exactly.
+        try:
+            return write(m)
+        except Exception as exc:
+            translated = translate_membership_conflict_exception(exc, m)
+            if translated is not None:
+                raise translated from exc
+            raise
+    def add_season_roster_membership(self, m):
+        return self._write_season_roster_membership(self._insert, m)
+    def get_season_roster_membership(self, membership_id):
+        return self._get(SeasonRosterMembership, membership_id)
+    def get_season_roster_membership_for_update(self, membership_id):
+        return self._get_for_update(SeasonRosterMembership, membership_id)
+    def save_season_roster_membership(self, m):
+        return self._write_season_roster_membership(self._update, m)
+    def all_season_roster_memberships(self):
+        return self._query(SeasonRosterMembership, order="id")
+    def memberships_for_player(self, player_id):
+        return self._query(SeasonRosterMembership, "player_id = ?",
+                           (player_id,), order="id")
+    def memberships_for_season(self, season_id):
+        return self._query(SeasonRosterMembership, "season_id = ?",
+                           (season_id,), order="id")
+    def memberships_for_league_season_team(self, league_season_id, team_id):
+        return self._query(
+            SeasonRosterMembership, "league_season_id = ? AND team_id = ?",
+            (league_season_id, team_id), order="id")
+    def memberships_for_team(self, team_id):
+        """EVERY membership row naming this Team, at ANY LeagueSeason and in
+        ANY status — see ``InMemoryStore.memberships_for_team`` for why the
+        #427 auto-fill cohort needs it unfiltered. ``order="id"`` matches the
+        rest of this class; the SERVICE imposes the real, cross-backend
+        ordering, and must not inherit this TEXT-column one."""
+        return self._query(SeasonRosterMembership, "team_id = ?",
+                           (team_id,), order="id")
+    def active_memberships_for_player_in_season(self, player_id, season_id):
+        """Every AUTHORITATIVE (status = 'active') membership at this
+        (player, Season) key. Always 0 or 1 here — migration 059's
+        ``ux_srm_active_player_season`` makes a second impossible to insert —
+        but returning a list gives InMemoryStore's own (unenforced)
+        equivalent a uniform contract callers can share, mirroring
+        ``registrations_for_team_in_league_season`` (#331 round 19)."""
+        return self._query(
+            SeasonRosterMembership,
+            "player_id = ? AND season_id = ? AND status = ?",
+            (player_id, season_id, MembershipStatus.ACTIVE.value), order="id")
+    def open_memberships_for_player_in_league_season(self, player_id,
+                                                     league_season_id):
+        """Every NON-terminal membership at this (player, LeagueSeason) key —
+        the open stint(s). Terminal rows (released/transferred) are history
+        and excluded, so a new stint after a release/transfer is creatable."""
+        return self._query(
+            SeasonRosterMembership,
+            "player_id = ? AND league_season_id = ? AND status NOT IN (?, ?)",
+            (player_id, league_season_id, MembershipStatus.RELEASED.value,
+             MembershipStatus.TRANSFERRED.value), order="id")
+
+    # Append-only (#205): events have add + list only — no update, no delete.
+    def add_season_roster_membership_event(self, event):
+        return self._insert(event)
+    def events_for_membership(self, membership_id):
+        # ORDER BY seq (#205 review round 1 finding 4), never id: id is TEXT,
+        # so a lexical sort puts "srme_10" before "srme_2" past 9 events for
+        # one membership, and the injected-clock tests (and a fast operator)
+        # can produce IDENTICAL "at" timestamps too. seq is a real integer
+        # minted from the same counter as id, so it is the one column that
+        # both engines compare numerically and that always breaks a tie.
+        return self._query(SeasonRosterMembershipEvent, "membership_id = ?",
+                           (membership_id,), order="seq")
+
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(self, decision):
         return self._insert(decision)
@@ -1583,6 +2112,14 @@ class SqlStore:
     def all_scheduling_policies(self):
         return self._query(SchedulingPolicy, order="id")
 
+    # -- versioned age eligibility rules (#273) --------------------------
+    def add_age_eligibility_rule(self, rule): return self._insert(rule)
+    def get_age_eligibility_rule(self, rule_id):
+        return self._get(AgeEligibilityRule, rule_id)
+    def age_eligibility_rules_for_league_season(self, league_season_id):
+        return self._query(AgeEligibilityRule, "league_season_id = ?",
+                           (league_season_id,), order="version")
+
     # -- immutable schedule scenarios (#378) -----------------------------
     def add_schedule_scenario(self, scenario): return self._insert(scenario)
     def get_schedule_scenario(self, scenario_id):
@@ -1597,6 +2134,192 @@ class SqlStore:
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
+
+    # -- sensitive-read audit (#124; ordering/validation/durability #426) ---
+    #: Dedicated ``counters`` row for the audit log's own monotonic ordering
+    #: key — deliberately NOT an id prefix (``next_id`` already owns the
+    #: ``daccess`` prefix for row ids; this is a SEPARATE counter, see
+    #: domain/privacy.py's ORDERING section).
+    _DATA_ACCESS_SEQ_PREFIX = "__data_access_seq__"
+
+    def _next_data_access_seq(self) -> int:
+        """Atomically issue the next ordering key, via the SAME ``counters``
+        table primitive ``next_id`` uses (``INSERT ... ON CONFLICT DO
+        UPDATE ... RETURNING``) — no new store mechanism, just a private
+        counter row `next_id` never hands out as a prefix to callers."""
+        with self._lock:
+            cur = self._exec(
+                "INSERT INTO counters(prefix, value) VALUES (?, 1) "
+                "ON CONFLICT(prefix) DO UPDATE SET value = counters.value + 1 "
+                "RETURNING value", (self._DATA_ACCESS_SEQ_PREFIX,))
+            row = cur.fetchone()
+        return row["value"]
+
+    @staticmethod
+    def _validate_data_access(entry) -> None:
+        """Closed-vocabulary guard (#426 review finding 5), enforced in
+        Python BEFORE the write in addition to migration 053's own CHECK
+        constraints — so the same rejection happens on every backend, not
+        only the ones with an engine to ask, and a caller gets a clear
+        domain error rather than a raw driver exception either way."""
+        cat = entry.category
+        cat_value = cat.value if isinstance(cat, SensitiveFieldCategory) else cat
+        if cat_value not in {c.value for c in SensitiveFieldCategory}:
+            raise ValidationError(
+                f"Unknown sensitive-field category {cat_value!r}.")
+        if entry.outcome not in VALID_OUTCOMES:
+            raise ValidationError(
+                f"Unknown DataAccessLog outcome {entry.outcome!r}.")
+
+    def _insert_data_access(self, entry) -> "DataAccessLog":
+        """Assign the id (if the caller left it unset), validate, assign the
+        persisted ordering key, and insert — the ONE code path
+        ``add_data_access``, ``add_data_access_durable``'s non-nested branch,
+        AND the durable-write flush (below) all fall through to, so none of
+        the three can skip a check or an allocation the others apply.
+
+        The id assignment (#426 round-2 review finding 1) happens HERE,
+        immediately before insert, in every one of those three call
+        contexts — never earlier, in particular never in
+        ``add_data_access_durable``'s NESTED branch, which queues the entry
+        and defers reaching this method at all until flush time, once the
+        ambient transaction that could still roll back has FULLY concluded.
+        See ``domain/privacy.py``'s DURABLE ID ALLOCATION section for why:
+        an id allocated any earlier could be handed out by a ``counters``
+        row this same still-open ambient transaction later rolls back,
+        orphaning it from the durable row it named.
+        """
+        if entry.id is None:
+            entry.id = self.next_id("daccess")
+        self._validate_data_access(entry)
+        entry.seq = self._next_data_access_seq()
+        return self._insert(entry)
+
+    def add_data_access(self, entry):
+        # A real transaction() wrap (not merely self._lock), reentrant with
+        # any ambient caller transaction: a raw driver exception (e.g. a
+        # UNIQUE violation from _validate_data_access's own uniqueness
+        # check racing a concurrent duplicate) must come out through
+        # transaction()'s own translate_db_exception boundary as a stable
+        # IntegrityConflictError, not an untranslated driver exception —
+        # exactly like every other store write.
+        with self.transaction():
+            return self._insert_data_access(entry)
+
+    def add_data_access_durable(self, entry):
+        """Write a DataAccessLog row that survives regardless of what any
+        AMBIENT (already-open, possibly nested) transaction on THIS store
+        instance later does — including a later rollback (#426 review
+        finding 4: "the denial helper's OWN transaction joins an outer
+        transaction... a forbidden result followed by an outer failure left
+        zero denial rows").
+
+        Not nested right now (``_txn_depth == 0``): commits immediately, in
+        its own dedicated transaction — the common case (an HTTP request
+        refused with no ambient caller transaction at all).
+
+        Nested (``_txn_depth > 0``): a Python-level join here (like every
+        other nested ``transaction()`` call) would still be subject to the
+        OUTER transaction's eventual commit/rollback — precisely finding 4's
+        bug — so instead of joining, the row is QUEUED and flushed, in its
+        OWN fresh transaction, from ``transaction()``'s own outermost
+        ``finally`` (below) once the ambient transaction has FULLY
+        concluded, whichever way it concludes. This is the "failure-safe
+        transaction lifecycle hook" the review names as an accepted
+        alternative to a second physical connection — the same shape as
+        ``_dependent_conflict_resolver``'s existing "invoked only from the
+        OUTERMOST transaction()'s post-conclusion handler" contract.
+
+        The id (like ``seq``) is deliberately NOT assigned in the nested
+        branch (#426 round-2 review finding 1) — ``_insert_data_access``
+        (called from the non-nested branch, and again from the flush below)
+        is the ONLY place either is allocated, always immediately before
+        the actual insert, so neither can ever be allocated inside a
+        transaction that might still roll back out from under the queued
+        row. Category/outcome are still checked eagerly here so a malformed
+        entry fails loudly at the ORIGINAL call site.
+
+        The QUEUED row is a private detached copy (#426 round-2 review
+        finding 4), made HERE before it is ever appended to
+        ``_pending_durable_data_access``. The non-nested branch needs no
+        such copy — by the time ``_insert_data_access`` returns, the row is
+        already a committed database row, and no further Python-side
+        mutation of the object handed back can retroactively change it, the
+        SAME "differs from Memory" immunity finding 4 describes. But a
+        QUEUED row is NOT yet in the database — it is a plain Python object
+        sitting in ``_pending_durable_data_access`` until the ambient
+        transaction concludes and the flush below actually inserts it — so
+        without this copy, mutating the caller's ``entry`` (or the value
+        this method returns) at ANY point before that flush would change
+        what eventually gets persisted, even on this store.
+        """
+        with self._lock:
+            if self._txn_depth == 0:
+                with self.transaction():
+                    return self._insert_data_access(entry)
+            else:
+                self._validate_data_access(entry)
+                self._pending_durable_data_access.append(copy.copy(entry))
+        return copy.copy(entry)
+
+    def list_data_access(self, subject_type=None, subject_id=None,
+                         category=None):
+        """Sensitive-read rows, optionally filtered to one subject and/or one
+        category — the "who read this person's data" query (#124).
+
+        Ordered by ``seq`` (#426 review finding 5), NOT ``id``: ``id`` is the
+        textual ``daccess_<n>`` label, and SQL's ``ORDER BY id`` sorts that
+        LEXICOGRAPHICALLY (``daccess_10`` before ``daccess_2``) — a real,
+        observed corruption of chronological order once the count crosses a
+        digit boundary. ``seq`` is a persisted INTEGER assigned once, atomic
+        with the insert, and UNIQUE (migration 053) — a stable, immutable,
+        collision-free chronological key on every backend.
+        """
+        clauses, params = [], []
+        if subject_type is not None:
+            clauses.append("subject_type = ?")
+            params.append(subject_type)
+        if subject_id is not None:
+            clauses.append("subject_id = ?")
+            params.append(subject_id)
+        if category is not None:
+            clauses.append("category = ?")
+            params.append(category.value
+                          if isinstance(category, SensitiveFieldCategory)
+                          else category)
+        return self._query(DataAccessLog, " AND ".join(clauses) or None,
+                           tuple(params), order="seq")
+
+    # -- copy-forward commit idempotency ledger (#159 review round 2) ------
+    def _write_season_copy_forward_commit(self, write, row):
+        try:
+            return write(row)
+        except Exception as exc:
+            # One committed Season per copy_forward_fingerprint (migration
+            # 053): a race-losing INSERT — sequential replay or a genuine
+            # concurrent commit racing on the SAME fingerprint — is
+            # translated to a stable conflict rather than a raw driver
+            # error; the commit path treats it as an idempotent replay
+            # (#159 review round 2).
+            dup = translate_copy_forward_commit_conflict_exception(exc)
+            if dup is not None:
+                raise dup from exc
+            raise
+
+    def add_season_copy_forward_commit(self, row):
+        return self._write_season_copy_forward_commit(self._insert, row)
+
+    def get_season_copy_forward_commit_by_fingerprint(self, fingerprint):
+        return self._first(SeasonCopyForwardCommit,
+                           "copy_forward_fingerprint = ?", (fingerprint,))
+
+    def season_copy_forward_commits_for_season(self, season_id):
+        """Every ledger row naming ``season_id`` (#159 review round 3) --
+        mirrors ``season_venue_access_for_season``'s shape so
+        ``delete_season`` can itemize it the same way as its other
+        dependency groups."""
+        return self._query(SeasonCopyForwardCommit, "season_id = ?",
+                           (season_id,), order="id")
 
     def add_factory_reset_event(self, event): return self._insert(event)
     def all_factory_reset_events(self):
@@ -1799,6 +2522,13 @@ class SqlStore:
     # -- contact registry (#60) --------------------------------------------
     def add_contact_destination(self, c): return self._insert(c)
     def save_contact_destination(self, c): return self._update(c)
+    def get_contact_destination_for_update(self, contact_id):
+        """Like ``_get_for_update`` — a row lock so a concurrent upsert
+        (``set_contact_destination``) or another toggle of the SAME
+        contact_id is fully ordered before or after this transaction, never
+        interleaved with a stale pre-read (#426 review finding 4)."""
+        return self._get_for_update(ContactDestination, contact_id)
+
     def get_contact_destination(self, recipient_ref, channel):
         rows = self._query(
             ContactDestination, "recipient_ref = ? AND channel = ?",
@@ -1812,6 +2542,79 @@ class SqlStore:
     def save_device_token(self, t): return self._update(t)
     def get_device_token(self, token_id):
         return self._get(DeviceToken, token_id)
+    def get_device_token_for_update(self, token_id):
+        """Like ``get_contact_destination_for_update`` — a row lock so a
+        concurrent ``upsert_device_token`` (``register_device_token``'s
+        re-registration path) targeting the SAME row is fully ordered
+        before or after this transaction, never interleaved with a stale
+        pre-read (#426 round-4 review finding 1)."""
+        return self._get_for_update(DeviceToken, token_id)
+
+    # Migration 055's partial unique index predicate, repeated verbatim in
+    # every ON CONFLICT target below: both PostgreSQL and SQLite require an
+    # ON CONFLICT clause targeting a PARTIAL unique index to restate that
+    # index's own WHERE clause exactly, or neither engine will recognize it
+    # as the conflict arbiter (PostgreSQL raises "there is no unique or
+    # exclusion constraint matching the ON CONFLICT specification"; SQLite's
+    # UPSERT docs state the same requirement). recipient_ref/token are
+    # always non-null in practice — register_device_token rejects a blank
+    # value before ever reaching the store — so this predicate is always
+    # true at insert time; it exists to satisfy the arbiter match, not to
+    # filter anything.
+    _DEVICE_TOKEN_CONFLICT_TARGET = (
+        "(recipient_ref, token) WHERE recipient_ref IS NOT NULL "
+        "AND token IS NOT NULL")
+
+    def upsert_device_token(self, recipient_ref, provider, token, label):
+        """Insert-or-update a DeviceToken keyed by its natural key
+        (recipient_ref, token) as ONE atomic statement (#426 round-4 review
+        finding 1).
+
+        Migration 055's UNIQUE index on (recipient_ref, token) backstops
+        this in the database, and ``INSERT ... ON CONFLICT ... DO UPDATE``
+        resolves a concurrent duplicate INSIDE that single statement — so
+        two concurrent FIRST registrations of the same pair can never both
+        observe "no row" and both insert, the way the previous
+        ``get_device_token_by_value()`` read followed by a separate,
+        unlocked ``save_device_token``/``add_device_token`` outside any
+        transaction could.
+
+        This also closes the toggle-vs-reregistration lost update the
+        review described: PostgreSQL's conflict detection takes a real row
+        lock on the existing row before applying the UPDATE branch — the
+        SAME kind of lock ``get_device_token_for_update`` takes explicitly
+        for ``set_device_token_active`` — so the two writer paths are fully
+        ordered against each other on the SAME physical row in EITHER
+        commit order: whichever transaction reaches the row second blocks
+        until the first commits or rolls back, then acts on the now-
+        current values instead of a stale pre-race snapshot.
+
+        Always sets ``active=True``, mirroring the previous upsert's exact
+        contract on both its insert and reactivate branches — see
+        ``register_device_token``'s own docstring and
+        ``test_device_tokens.test_register_is_upsert_and_reactivates``.
+        The returned row's ``id`` is the EXISTING row's id on a conflict
+        (``id`` is deliberately excluded from the UPDATE SET list below),
+        never the freshly allocated candidate id that conflict discarded.
+        """
+        spec = SPECS[DeviceToken]
+        candidate = DeviceToken(
+            id=self.next_id("devtok"), recipient_ref=recipient_ref,
+            provider=provider, token=token, label=label, active=True)
+        vals = [c.to_db(getattr(candidate, c.name)) for c in spec.cols]
+        ph = ", ".join("?" for _ in spec.cols)
+        setp = ", ".join(f"{c.name} = excluded.{c.name}" for c in spec.cols
+                         if c.name not in ("id", "recipient_ref", "token"))
+        with self._lock:
+            cur = self._exec(
+                f"INSERT INTO {spec.table} ({', '.join(spec.names)}) "
+                f"VALUES ({ph}) "
+                f"ON CONFLICT {self._DEVICE_TOKEN_CONFLICT_TARGET} "
+                f"DO UPDATE SET {setp} "
+                f"RETURNING {', '.join(spec.names)}", vals)
+            row = cur.fetchone()
+        return self._row_to_obj(DeviceToken, row)
+
     def get_device_token_by_value(self, recipient_ref, token):
         rows = self._query(
             DeviceToken, "recipient_ref = ? AND token = ?",
@@ -1948,6 +2751,369 @@ class SqlStore:
     # arbitrary but STABLE namespace, so these advisory locks can never
     # collide with another feature's.
     _ACTIVE_CONTEXT_LOCK_NAMESPACE = 0x4143      # "AC"
+
+    # The epoch fence's advisory-lock namespaces (PR #423 redesign). A NEW,
+    # DEDICATED pair -- deliberately NOT reusing _ACTIVE_CONTEXT_LOCK_NAMESPACE.
+    # The #386 mutex above and this fence protect different concerns (the
+    # ActiveContext row's first-insert race, vs. reader/writer epoch-visibility
+    # ordering) that happen to often be keyed by the same user_id; sharing a
+    # namespace would over-serialize the two for no correctness benefit and
+    # would make pg_locks contention undiagnosable (two different concerns
+    # showing up as one key).
+    _EPOCH_FENCE_USER_NAMESPACE = 0x4645         # "FE" -- per-user fence keys
+    _EPOCH_FENCE_GLOBAL_NAMESPACE = 0x4C43       # "LC" -- the one global key
+    _EPOCH_FENCE_GLOBAL_OBJID = 0                # the only objid used there
+    # Byte-identical to services.epoch_fence.EPOCH_FENCE_GLOBAL_KEY.
+    # Duplicated, not imported -- see _epoch_fence_timeout_seconds' comment on
+    # why store/ never imports from services/. tests/test_epoch_fence.py
+    # asserts the two literals stay equal.
+    _EPOCH_FENCE_GLOBAL_KEY = "season-lifecycle"
+
+    def _epoch_fence_lock_target(self, key: str):
+        """``(namespace, fixed_objid)`` for ``key`` -- ``fixed_objid`` is the
+        pinned ``_EPOCH_FENCE_GLOBAL_OBJID`` for the one global key (no hash
+        needed: it is the ONLY objid ever used in that namespace, so there is
+        zero collision risk for the single key that guards every
+        Season/Program/League/LeagueSeason writer), or ``None`` for every
+        other (per-user) key, telling the caller to hash ``key`` itself via
+        ``hashtext()`` -- the SAME mechanism ``_lock_active_context_mutex``
+        above already uses. ``hashtext`` collisions there are possible and
+        harmless (see that method's own docstring): correctness never depends
+        on the key being unique, only on it being the SAME for one user.
+        """
+        if key == self._EPOCH_FENCE_GLOBAL_KEY:
+            return self._EPOCH_FENCE_GLOBAL_NAMESPACE, self._EPOCH_FENCE_GLOBAL_OBJID
+        return self._EPOCH_FENCE_USER_NAMESPACE, None
+
+    def epoch_fence_acquire_exclusive(self, key: str) -> None:
+        """Take the EXCLUSIVE side of the epoch fence for ``key`` (PR #423),
+        AND bump the persisted version counter every backend's readers can
+        optimistically validate against (round-N review finding 1).
+
+        MUST be called as a statement inside an already-open
+        ``self.transaction()`` -- ideally the FIRST statement, per the
+        per-writer transaction-boundary guidance in the design (§8). Blocks
+        (bounded by the same operator-configurable timeout
+        ``ContextSwitchGate`` already uses,
+        ``_epoch_fence_timeout_seconds()`` above) until no shared OR exclusive
+        holder exists for ``key``; auto-released at this transaction's
+        commit/rollback -- no separate release call, so nothing can leak it.
+
+        THE VERSION BUMP (round-N review finding 1) runs on EVERY backend,
+        unconditionally -- see ``current_epoch_fence_version``'s own
+        docstring for the read side and migration 052 for why this is keyed
+        PER FENCE KEY (mirroring the advisory lock's own per-user/global
+        split) rather than one shared counter. It is a portable UPSERT on
+        ``self.conn``, i.e. a statement inside the SAME transaction as
+        everything else this writer does, so it commits or rolls back
+        atomically WITH the writer's own row mutation -- a reader can never
+        observe the bump without the mutation, or the mutation without the
+        bump. This is what closes the SQLite/Memory torn-read window
+        WITHOUT holding any lock across a reader's ``produce()`` call (the
+        AB-BA deadlock class the SQLite no-op below exists to avoid): the
+        reader instead samples this counter, FOR THE SAME KEY, before and
+        after, with no lock held in between at all, and discards if it
+        moved -- see ``web/server.py``'s ``_read_under_context_gate``.
+
+        ON POSTGRESQL, ``SET LOCAL lock_timeout`` now runs BEFORE the UPSERT,
+        not only before the advisory-lock SELECT that used to be the first
+        thing bounded. The UPSERT is a REAL ROW WRITE, unlike the advisory
+        lock, so two concurrent exclusive acquisitions for the SAME key
+        contend on that row's lock too -- putting the bound only around the
+        advisory lock left THAT contention UNBOUNDED, so a racer could block
+        past the fence's own configured timeout on the row lock alone, and
+        by the time it unblocked (the holder having since committed) sail
+        through the now-uncontended advisory lock and reach real business
+        logic instead of failing closed on schedule. Measured directly, not
+        merely reasoned about: ``tests/test_write_race_hardening.py``'s
+        ``test_unassign_vs_unassign_single_effect`` pins the loser's error as
+        a ``ConcurrencyConflictError`` from the BOUNDED wait, and regressed to
+        a plain ``NotFoundError`` from real business logic when the bound
+        was ordered after the UPSERT instead of before it.
+
+        SQLite: the ADVISORY-LOCK half below is a no-op (unchanged from
+        before this round). This transaction's own outermost ``BEGIN IMMEDIATE``
+        (see ``transaction()`` above) already took the database file's write
+        lock as the FIRST statement of the whole unit, before any read this
+        method's caller could have made -- there is nothing further to
+        acquire, and that write lock's own busy_timeout +
+        ``lock_not_available`` -> ``ConcurrencyConflictError`` translation
+        already gives exactly the bounded-wait-then-retryable-conflict
+        behavior this method would otherwise have to build from scratch.
+        This is not merely a convenient simplification: a real, DEDICATED
+        second connection was tried first and measured to DEADLOCK-class-
+        livelock against ``epoch_fence_acquire_shared``'s own reader side --
+        SQLite's exclusive-at-commit wait and a dedicated reader connection's
+        SHARED hold are the SAME lock axis (the file's own state machine),
+        unlike PostgreSQL's advisory locks, which are a separate axis from
+        row/self._lock entirely. A reader holding that dedicated connection's
+        SHARED lock while ALSO needing ``self._lock`` for its own subsequent
+        store calls, racing a writer holding ``self._lock`` (inside
+        ``transaction()``) while blocked in ``self.conn.commit()`` waiting
+        for that SAME SHARED lock to release, is a genuine cross-primitive
+        AB-BA cycle -- measured directly as a 50+ second stall via a real
+        ``ThreadingHTTPServer`` test before being reverted in favor of this
+        no-op. See ``epoch_fence_acquire_shared``'s own docstring for the
+        full account and the resulting, deliberate scope reduction for
+        file-backed SQLite.
+
+        PostgreSQL: ``SET LOCAL lock_timeout`` (auto-reset at this
+        transaction's end, so it can never leak onto a LATER, unrelated
+        transaction sharing ``self.conn``) bounds a genuinely BLOCKING
+        ``pg_advisory_xact_lock`` -- no manual poll loop is written here.
+        PostgreSQL's own lock manager already implements "bounded blocking
+        wait, timeout raises" for a blocking advisory-lock acquisition
+        exactly as it does for a row lock (verified directly against a real
+        server before this was wired in: a contended
+        ``pg_advisory_xact_lock`` under ``lock_timeout`` raises within the
+        bound, carrying sqlstate 55P03). On timeout the raised error
+        propagates out of this method, through the caller's open
+        ``transaction()``, whose EXISTING exception boundary
+        (``translate_db_exception``) already classifies 55P03 as
+        ``lock_not_available`` and raises ``ConcurrencyConflictError`` --
+        exactly what the caller's existing bounded retry loop
+        (``setup_guarded_mutation`` / ``ContextService._snapshot``) already
+        catches. Nothing new to catch here.
+        """
+        # PostgreSQL: bound EVERYTHING this method can block on with the SAME
+        # operator-configurable timeout, set FIRST — before the version-bump
+        # UPSERT below, not only before the advisory-lock SELECT. The UPSERT
+        # is a REAL ROW WRITE (unlike the advisory lock, which touches no
+        # table), so two concurrent exclusive acquisitions for the SAME key
+        # now ALSO contend on that row's lock; setting the bound here first
+        # means that contention fails closed on the SAME configured timeout
+        # rather than blocking UNBOUNDED (the ordering that shipped first,
+        # and that measurably broke this writer-side bound — a genuinely
+        # blocking row-lock wait ahead of the bounded advisory lock let a
+        # racer sail through with the advisory lock trivially free by the
+        # time it got there, reaching real business logic instead of timing
+        # out; see ``tests/test_write_race_hardening.py``'s
+        # ``test_unassign_vs_unassign_single_effect`` for the exact
+        # regression this ordering fixes). ``LOCAL``: see the pre-existing
+        # advisory-lock comment (now below) for why — auto-resets at this
+        # transaction's end so it can never leak onto a later, unrelated one
+        # sharing ``self.conn``.
+        if self.backend == "postgres":
+            bound_ms = max(1, int(_epoch_fence_timeout_seconds() * 1000))
+            self._exec(f"SET LOCAL lock_timeout = '{bound_ms}ms'")
+        # Round-N review finding 1: unconditional, every backend. Portable
+        # UPSERT (the same idiom next_id()'s own counters table uses): a
+        # key's first bump inserts the row at version 1, every later bump
+        # for the SAME key increments the existing one. On PostgreSQL this
+        # is now bounded by the ``lock_timeout`` set immediately above; on
+        # SQLite the whole transaction is already serialized by ``BEGIN
+        # IMMEDIATE``/``self._lock`` before this statement can even run, so
+        # there is nothing further for it to block on there.
+        self._exec(
+            "INSERT INTO epoch_fence_version(fence_key, version) "
+            "VALUES (?, 1) ON CONFLICT(fence_key) DO UPDATE "
+            "SET version = epoch_fence_version.version + 1", (key,))
+        if self.backend != "postgres":
+            return
+        namespace, fixed_objid = self._epoch_fence_lock_target(key)
+        if fixed_objid is not None:
+            self._exec("SELECT pg_advisory_xact_lock(?, ?)",
+                       (namespace, fixed_objid))
+        else:
+            self._exec("SELECT pg_advisory_xact_lock(?, hashtext(?))",
+                       (namespace, key))
+
+    @contextmanager
+    def epoch_fence_acquire_shared(self, key: str):
+        """Take the SHARED side of the epoch fence for ``key`` (PR #423).
+
+        MUST be called OUTSIDE any ``self.transaction()``. Returns a context
+        manager; blocks (bounded, see above) until no EXCLUSIVE holder exists
+        for ``key`` -- any number of concurrent shared holders may coexist.
+        Released explicitly on context-manager exit, independent of any
+        ``self.transaction()`` lifetime -- may span several, or none, which is
+        the whole point: it is what lets a scoped read's epoch comparison AND
+        its dependent service call be ordered as one unit against a writer's
+        commit, without holding ``self._lock``/a single wide transaction
+        across an unbounded dependent call (see ``server.py``'s
+        ``_read_under_context_gate`` and the design's §4.3-4.4 for why).
+
+        Acquired on a connection SEPARATE from ``self.conn`` -- opened fresh
+        for this call and closed when the hold releases. This is what makes
+        it safe ON POSTGRES: a slow ``produce()`` call held on its own
+        connection never touches ``self._lock``, so it can never stall
+        unrelated same-process store traffic (the exact concern
+        ``context_service.py``'s and ``server.py``'s own comments name for
+        why an earlier revision of this fix, a shared ``store.transaction()``,
+        was rejected), and a reader can never deadlock against a writer
+        waiting to get into ``self._lock`` -- a Postgres advisory lock is a
+        SEPARATE axis from ``self._lock``/row locks entirely, so the writer's
+        wait for it never depends on ``self._lock`` being released at all.
+
+        THIS DOES NOT HOLD ON SQLITE, and SQLite therefore does NOT use a
+        dedicated connection here -- see ``epoch_fence_acquire_exclusive``'s
+        own docstring for the concrete deadlock hazard measured directly (not
+        merely reasoned about) before this was scoped down: SQLite has only
+        ONE lock axis (the file's own SHARED/RESERVED/PENDING/EXCLUSIVE state
+        machine), and ``self.conn``'s commit -- which needs EXCLUSIVE --
+        already runs INSIDE ``self._lock``. A dedicated reader connection
+        holding SHARED on that SAME axis, while ALSO needing ``self._lock``
+        for its own subsequent store calls (``current_epoch()``/``produce()``
+        both do), is a genuine AB-BA cycle between the file lock and
+        ``self._lock`` -- not merely a theoretical one: measured directly as
+        a 50+ second stall (bounded, not infinite, because SQLite's own
+        busy_timeout eventually lets the writer's transaction fail and
+        release ``self._lock`` -- but only after ``_snapshot``/
+        ``setup_guarded_mutation``'s full retry budget, and CPython's RLock
+        gives no fairness guarantee against the SAME thread re-entering on
+        each retry, so this is a real livelock hazard, not just a slow path).
+
+        On timeout, PROCEEDS ANYWAY -- fails OPEN, exactly matching
+        ``ContextSwitchGate``'s existing, deliberate choice
+        (``context_gate.py:117-123``): a scoped read that can't get a fence
+        hold must not be able to lock an operator out of a context switch or
+        a Season lifecycle change. Yields ``True`` if the hold was genuinely
+        acquired, ``False`` if it failed open -- tests use this to assert the
+        happy path actually exercised the lock rather than silently timing
+        out every time.
+
+        A falsy ``key`` acquires nothing (mirrors ``_context_read_hold``'s
+        existing falsy-``user_id`` short-circuit, ``context_gate.py:249-252``).
+
+        ``self.is_memory_backed`` (SQLite ``:memory:``/empty path) would ALSO
+        be a no-op for its OWN, separate reason even if file-backed SQLite
+        used a real dedicated connection: ``sqlite3``'s ``:memory:``
+        databases are PER-CONNECTION-PRIVATE (confirmed directly: a fresh
+        ``connect(":memory:")`` opens a blank, unmigrated database, not a
+        second handle onto ``self.conn``'s data), so "a dedicated connection
+        to the SAME store" is not merely unnecessary there, it is INCOHERENT:
+        there is no second connection that could see what the first one
+        holds. ``self._lock`` already fully serializes every
+        ``transaction()`` this ONE store instance ever runs (the same
+        reasoning ``is_memory_backed`` already exists for elsewhere in this
+        class), which is the strongest guarantee available and exactly
+        ``InMemoryStore.epoch_fence_acquire_shared``'s own justification.
+        """
+        if not key:
+            yield None
+            return
+        if self.backend != "postgres":
+            # SQLite (both :memory: and file-backed) -- a documented no-op;
+            # see the deadlock-hazard paragraph above for file-backed, and
+            # the PER-CONNECTION-PRIVATE paragraph for :memory:. On
+            # file-backed SQLite this is a real, stated scope reduction from
+            # the design's original ask: same-PROCESS ordering stays fully
+            # covered by the kept ContextSwitchGate holds (unchanged,
+            # web/server.py), but a genuinely independent SECOND PROCESS
+            # sharing the same SQLite file is not ordered against by this
+            # primitive this round. PostgreSQL -- the actual deployment
+            # target -- gets the real, tested, cross-process mechanism below.
+            yield True
+            return
+        with self._epoch_fence_shared_postgres(key) as held:
+            yield held
+
+    @contextmanager
+    def _epoch_fence_shared_postgres(self, key: str):
+        namespace, fixed_objid = self._epoch_fence_lock_target(key)
+        bound_ms = max(1, int(_epoch_fence_timeout_seconds() * 1000))
+        conn, _dialect, _path = connect(self._url)
+        acquired = False
+        try:
+            # set_config, not `SET lock_timeout = %s` -- PostgreSQL does not
+            # accept a bind parameter as a SET value (a literal or `$n` isn't
+            # valid there); set_config is the parametrized equivalent.
+            # `is_local=false`: this connection is single-purpose and
+            # short-lived (opened fresh for this call, closed on release), so
+            # a session-wide setting on it is equivalent to a transaction-local
+            # one and needs no enclosing transaction to apply.
+            conn.execute("SELECT set_config('lock_timeout', %s, false)",
+                        (f"{bound_ms}ms",))
+            if fixed_objid is not None:
+                conn.execute("SELECT pg_advisory_lock_shared(%s, %s)",
+                            (namespace, fixed_objid))
+            else:
+                conn.execute("SELECT pg_advisory_lock_shared(%s, hashtext(%s))",
+                            (namespace, key))
+            acquired = True
+            yield True
+        except Exception as exc:                                # noqa: BLE001
+            # Duck-typed, exactly like db_errors.py's own classification --
+            # psycopg need not be importable here. Only the TIMEOUT case
+            # (55P03, "lock_not_available") fails open; anything else
+            # propagates unchanged so an unrecognized failure surfaces as a
+            # real error rather than being silently swallowed.
+            if getattr(exc, "sqlstate", None) != "55P03":
+                conn.close()
+                raise
+            yield False
+        finally:
+            if acquired:
+                try:
+                    if fixed_objid is not None:
+                        conn.execute(
+                            "SELECT pg_advisory_unlock_shared(%s, %s)",
+                            (namespace, fixed_objid))
+                    else:
+                        conn.execute(
+                            "SELECT pg_advisory_unlock_shared(%s, hashtext(%s))",
+                            (namespace, key))
+                except Exception:                                # noqa: BLE001
+                    pass    # never let a release failure mask the caller's own
+            conn.close()
+
+    def current_epoch_fence_version(self, key: str) -> int:
+        """The CURRENT value of the persisted epoch-fence version counter FOR
+        ``key`` (round-N review finding 1) — the optimistic-validation read
+        side, for a caller (``web/server.py``'s ``_read_under_context_gate``)
+        that samples this once before deriving its epoch and once more after
+        its dependent ``produce()`` call returns, discarding if the two
+        disagree.
+
+        KEYED THE SAME WAY THE ADVISORY LOCK IS (``user:<id>`` /
+        ``EPOCH_FENCE_GLOBAL_KEY``) — see migration 052's own docstring for
+        why a single shared counter was tried and reverted: it made an
+        UNRELATED user's own writer (their own context switch, say) discard
+        every OTHER user's concurrently in-flight scoped read, which breaks
+        the cross-user independence ``ContextSwitchGate`` exists to bound. A
+        reader therefore samples exactly the two keys it also takes the
+        SHARED advisory-lock side for (its own user key, plus the one global
+        key) — see the two call sites in ``_read_under_context_gate``.
+
+        A key nobody has ever bumped has NO ROW — this reads that as ``0``,
+        the same value a freshly-migrated, explicitly-zeroed row would give,
+        so there is no "does the row exist yet" branch for a caller to get
+        wrong; see migration 052's own comment on why no rows are pre-seeded.
+
+        A PLAIN, LOCK-FREE READ, deliberately. ``self.conn`` is opened
+        ``autocommit=True`` on PostgreSQL and with ``isolation_level = None``
+        on SQLite (``store/db.py``), so a bare ``SELECT`` run outside any
+        ``self.transaction()`` — exactly how every call site here calls this
+        — is its own implicit transaction and always observes the LATEST
+        value any other connection has committed, precisely like
+        ``next_id()``'s own counter table. No dedicated second connection,
+        no advisory lock, nothing that could deadlock against a concurrent
+        ``produce()`` needing ``self._lock`` — the whole point of this
+        mechanism (see ``epoch_fence_acquire_exclusive``'s docstring) is that
+        NEITHER side of the check ever holds a lock across the caller's own
+        unbounded work.
+
+        Only ``self._lock`` is taken, and only for the instant of the read
+        itself — the same grain as ``_get``/``next_id`` — so two concurrent
+        callers on this ONE store instance (the shared web-server case) never
+        tear each other's read, and neither can be blocked for longer than a
+        single SELECT.
+
+        MUST NOT be called with THIS store's own ``transaction()`` already
+        open if the caller needs the truly-latest cross-connection value: an
+        open SERIALIZABLE/REPEATABLE READ transaction on PostgreSQL would
+        then read that transaction's own frozen snapshot rather than the live
+        row. ``_read_under_context_gate`` never holds one open across this
+        call, by construction — it calls this before ``current_epoch()``
+        opens (and closes) its own snapshot, and again after ``produce()``
+        returns, never from inside either.
+        """
+        with self._lock:
+            cur = self._exec(
+                "SELECT version FROM epoch_fence_version WHERE fence_key = ?",
+                (key,))
+            row = cur.fetchone()
+        return row["version"] if row else 0
 
     def _lock_active_context_mutex(self, user_id):
         """Take the per-user ActiveContext MUTEX for this transaction (#386).
@@ -2128,7 +3294,17 @@ class SqlStore:
         same statement, so the three axes can never be persisted half-updated:
         a caller that selects Program+Season without a League overwrites any
         previously-saved League with NULL rather than leaving a stale one bound
-        to a context it may not belong to."""
+        to a context it may not belong to.
+
+        ``generation`` (#159 review findings 2+5, migration 051) is written
+        verbatim from ``ctx`` — the CALLER (``ContextService``) computes
+        current+1 by reading the row inside the same serializable transaction
+        that wraps this write, so two concurrent writers correctly serialize
+        into two distinct successive values via that transaction's isolation
+        (a retry on conflict, same as every other read-then-write this
+        service does) rather than this method re-deriving it from whatever it
+        can see here, which would be a second, potentially-stale read of the
+        same fact."""
         with self.transaction():
             # #386 — take the SAME per-user mutex the authorizing readers
             # take, so a context switch and a write authorized against the
@@ -2144,14 +3320,17 @@ class SqlStore:
             self._lock_active_context_mutex(ctx.id)
             self._exec(
                 "INSERT INTO user_active_context "
-                "(id, program_id, season_id, updated_at, league_id) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "(id, program_id, season_id, updated_at, league_id, "
+                "generation) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (id) DO UPDATE SET "
                 "program_id = excluded.program_id, "
                 "season_id = excluded.season_id, "
                 "updated_at = excluded.updated_at, "
-                "league_id = excluded.league_id",
+                "league_id = excluded.league_id, "
+                "generation = excluded.generation",
                 (ctx.id, ctx.program_id, ctx.season_id,
                  ctx.updated_at.isoformat() if ctx.updated_at else None,
-                 getattr(ctx, "league_id", None)))
+                 getattr(ctx, "league_id", None),
+                 getattr(ctx, "generation", 0) or 0))
         return ctx

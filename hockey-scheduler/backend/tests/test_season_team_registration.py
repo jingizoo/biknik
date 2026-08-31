@@ -212,6 +212,11 @@ class SeasonRegistrationPersistenceTest(unittest.TestCase):
         # reopen alongside 021 and 028. Migration 050 is a hierarchy child, so
         # rewind it first and replay it after the parents as well.
         cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
+        # Migration 059's membership tables (#205 Slice A) are hierarchy
+        # children as well — rewind them first and un-record 059 below so the
+        # reopen replays it after its parents.
+        cur.execute("DROP TABLE IF EXISTS season_roster_membership_events")
+        cur.execute("DROP TABLE IF EXISTS season_roster_memberships")
         cur.execute("DROP INDEX IF EXISTS ix_leagues_program")
         cur.execute("ALTER TABLE leagues ADD COLUMN season_id TEXT")
         cur.execute("UPDATE leagues SET season_id = (SELECT MIN(ls.season_id) "
@@ -275,7 +280,8 @@ class SeasonRegistrationPersistenceTest(unittest.TestCase):
         cur.execute("DELETE FROM schema_migrations WHERE version IN "
                     "('021_permanent_teams', '028_competition_reset', "
                     "'035_competition_hierarchy_reset', "
-                    "'050_schedule_scenarios')")
+                    "'050_schedule_scenarios', "
+                    "'059_season_roster_membership')")
         store.conn.commit()
         del api, store
 

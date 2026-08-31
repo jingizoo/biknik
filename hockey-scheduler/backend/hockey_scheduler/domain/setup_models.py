@@ -13,6 +13,7 @@ from .enums import (
     DeliveryStatus,
     IceSlotStatus,
     IceSlotType,
+    MembershipStatus,
     NotificationAudience,
     NotificationChannel,
     NotificationKind,
@@ -20,6 +21,7 @@ from .enums import (
     OfficialAvailabilityStatus,
     OfficialRole,
     PolicyScopeType,
+    Position,
     RescheduleStatus,
     ResultStatus,
     SeasonStatus,
@@ -139,6 +141,127 @@ class SeasonTeamRegistration:
 
 
 @dataclass
+class SeasonCopyForwardCommit:
+    """Idempotency ledger for new-Season copy-forward commits (#159 review
+    round 2: double-submit/retry blocker). One row per SUCCESSFUL
+    ``commit_new_season_copy_forward`` call, keyed by the exact
+    ``copy_forward_fingerprint`` that produced it -- migration 053's
+    ``ux_season_copy_forward_commits_fingerprint`` UNIQUE index is the
+    atomic backstop: a second commit (sequential replay OR a genuine
+    concurrent race) that reuses the same fingerprint loses this row's
+    INSERT, and the service treats that as an idempotent request for the
+    SAME result this row already records -- never a second Season (mirrors
+    ``commit_ice_availability``'s own idempotent-duplicate handling, #158,
+    adapted for a write target -- a brand-new Season -- that has no natural
+    dedup key of its own).
+
+    ``registration_ids`` is the EXACT set of SeasonTeamRegistration rows
+    this commit created, snapshotted so a later idempotent replay returns
+    precisely what the original commit produced -- not whatever a season's
+    registrations happen to look like by the time the replay lands (an
+    operator could legitimately register more teams into the new Season in
+    between). ``rolled_forward``/``skipped`` are copied from the same
+    original call for the identical reason: ``skipped`` in particular has
+    no row of its own to re-derive from current state.
+
+    ``response_snapshot`` (#159 review round 3, owner P1) is the
+    FULLY-RESOLVED response payload itself -- ``{"season": {...},
+    "registrations": [{...}, ...], "totals": {...}}``, every value already
+    JSON-safe -- captured in the SAME transaction as the Season and
+    registrations it describes. ``registration_ids`` above still names
+    which rows were created (kept for that record and for any external
+    reader that wants the raw ids), but it is no longer how a replay is
+    built: re-deriving the response by re-fetching those ids' CURRENT rows
+    was the root cause of a whole class of bugs -- the source Team getting
+    unregistered, the target registration getting deleted, or the target
+    Season itself getting deleted all silently changed what a replay of an
+    old, already-successful commit returned, or broke it outright. A
+    replay now deserializes ``response_snapshot`` directly and touches
+    neither the ``seasons`` nor ``season_team_registrations`` tables at
+    all, so it is immune to every later mutation of either. Each
+    registration entry ALSO freezes its ``season_id``/``league_id`` (#159
+    review round 4, owner P1 finding 2), resolved via its LeagueSeason
+    ONCE at commit time -- see ``SetupService._copy_forward_result_from_
+    ledger_row``, which stops re-deriving them through a live LeagueSeason
+    lookup on every replay.
+
+    ``request_identity`` (#159 review round 4, owner P1 finding 1) is the
+    RAW caller-supplied identity this commit was actually validated
+    against -- ``{"actor_id":, "program_id":, "name":, "start_date":,
+    "end_date":, "source_season_id":, "selections":}`` -- captured
+    verbatim, with no store lookup and no normalization, in the SAME
+    transaction as ``response_snapshot``. Before this round, the early-
+    replay shortcut trusted ANY caller-supplied ``copy_forward_fingerprint``
+    that happened to match this row, regardless of who was asking or what
+    they actually submitted: a second actor, submitting an entirely
+    different Program/Season/selections/name, who reused another actor's
+    already-committed fingerprint received that OTHER actor's full
+    response verbatim -- the submitted request was never checked against
+    what the fingerprint was actually bound to. A replay must now match
+    this stored identity, canonicalized the same way, before the
+    ``response_snapshot`` is ever returned; see
+    ``SetupService._copy_forward_request_identity_matches``.
+
+    Stored as the CANONICAL JSON STRING itself (#159 review round 5, owner
+    P1 finding 1) -- ``SetupService._copy_forward_canonical_json`` applied
+    to the raw dict above, the SAME canonicalization ``copy_forward_
+    fingerprint`` is already hashed from -- rather than the raw, still-
+    mutable dict a naive reading of "captured verbatim" two paragraphs up
+    might suggest. A plain Python ``str`` is immutable by construction, so
+    once this field is set it can never be affected by a later mutation of
+    whatever mutable ``selections`` list/dicts the ORIGINAL caller passed
+    to ``commit_new_season_copy_forward`` and may still hold a reference to
+    -- closing a real bug where ``InMemoryStore`` retained that dict BY
+    REFERENCE: mutating the caller's own list after commit silently
+    changed what the "frozen" ledger identity appeared to be, so replaying
+    the original fingerprint with the mutated list wrongly matched. SQLite/
+    PostgreSQL never had this hazard (their JSON write already copied the
+    value); this collapses Memory onto the exact same guarantee by
+    construction, with no reliance on any store remembering to copy on
+    every read/write boundary. See ``SetupService._copy_forward_request_
+    identity`` and ``_copy_forward_request_identity_matches``.
+    """
+    id: str
+    copy_forward_fingerprint: str
+    season_id: str
+    actor_id: Optional[str] = None
+    registration_ids: list = field(default_factory=list)
+    rolled_forward: int = 0
+    skipped: int = 0
+    committed_at: Optional[datetime] = None
+    response_snapshot: dict = field(default_factory=dict)
+    request_identity: str = ""
+
+
+@dataclass
+class AgeEligibilityRule:
+    """A VERSIONED age-tier/cutoff rule for one :class:`LeagueSeason` (#273).
+
+    The structured replacement for the free-text ``Division.age_group``
+    convention: a cutoff (month/day in the Season's start year) plus tier
+    definitions (``[{"code": "U10", "max_age": 10}, ...]``; ``max_age`` None =
+    open tier). Rows are immutable — updating the rule appends the next
+    ``version`` for the same ``league_season_id`` — so an eligibility answer
+    can always name (and reproduce under) the exact rule version it used,
+    matching the owner's versioned-policy ruling on epic #205.
+
+    ``enforcement`` is the #273 warn-first switch: ``"warn"`` (default;
+    eligibility is surfaced, nothing is blocked) or ``"block"`` (consumers may
+    hard-refuse). No consumer hard-blocks in this slice; the mode is stored
+    and reported so the later wiring is a policy flip, not a schema change.
+    """
+    id: str
+    league_season_id: str
+    version: int
+    cutoff_month: int
+    cutoff_day: int
+    tiers: list = field(default_factory=list)
+    enforcement: str = "warn"
+    created_at: Optional[datetime] = None
+    actor_id: Optional[str] = None
+
+
+@dataclass
 class TeamLeagueMigrationDecision:
     """An operator-supplied permanent-League assignment for a Team whose
     historical registrations span more than one League (#283 migration 035).
@@ -177,6 +300,88 @@ class SeasonVenueAccess:
     season_id: str
     venue_id: str
     active: bool = True
+
+
+@dataclass
+class SeasonRosterMembership:
+    """One athlete's participation stint for one Team in one Season (#205
+    Slice A).
+
+    Hangs off the permanent Team + LeagueSeason spine: ``league_season_id``
+    names the Team's own League's participation in the Season (never a
+    re-created League), and ``team_id`` must be a Team of that League with an
+    active :class:`SeasonTeamRegistration` there — both enforced in the
+    service layer, mirroring registration rule 7. ``season_id`` is carried
+    denormalized (service-enforced equal to the LeagueSeason's ``season_id``)
+    so the ONE database-expressible uniqueness rule — at most one
+    ``active`` membership per (player, Season), migration 059's partial
+    unique index — needs no join. ``affiliate`` rows are the governed call-up
+    exception and sit outside that rule.
+
+    ``player_id`` keys the membership to the existing Player identity: #205's
+    durable-athlete substrate arrives with #273, which preserves Player ids,
+    so this column is the forward-compatible identity key today and the
+    compatibility map's join column for backfilled rows (``srm_legacy_*``
+    ids, migration 059).
+
+    ``position`` / ``jersey_number`` / ``shoots`` are SEASON-SCOPED (#269
+    becomes (LeagueSeason, Team)-scoped for memberships): they describe this
+    stint, not the permanent Player row, which keeps its own fields until the
+    consumer cutover retires them. ``effective_from``/``effective_to`` bound
+    the stint; a backfilled row has ``effective_from`` NULL — first-class
+    "predates membership tracking", never a fabricated date. A row whose
+    status ``is_terminal`` (released/transferred) is immutable history; a
+    later stint for the same player is a NEW row, so rows accumulate as the
+    transfer/release history the epic requires. Fine-grained changes append
+    :class:`SeasonRosterMembershipEvent` rows via the service layer.
+    """
+    id: str
+    player_id: str
+    league_season_id: str
+    season_id: str
+    team_id: str
+    status: MembershipStatus = MembershipStatus.ACTIVE
+    position: Optional[Position] = None
+    jersey_number: Optional[int] = None
+    shoots: Optional[str] = None
+    effective_from: Optional[datetime] = None
+    effective_to: Optional[datetime] = None
+
+
+@dataclass
+class SeasonRosterMembershipEvent:
+    """Append-only history entry for one :class:`SeasonRosterMembership`
+    (#205 Slice A) — the immutable record of Team/jersey/position/status
+    changes the epic requires, kept per-membership (queryable by workflow
+    slices) alongside the global ``SetupAuditLog`` trail.
+
+    Append-only BY CONSTRUCTION: no store exposes an update or delete for
+    these rows, and the service layer writes one on every membership
+    mutation it performs. ``detail`` carries the machine-readable
+    field-by-field before/after values; ``reason`` is the operator-supplied
+    justification (required by the future transfer/release workflows, opt-in
+    here). Backfilled memberships (migration 059) start with an EMPTY
+    history rather than a fabricated "created" event, because the migration
+    has no honest timestamp or actor for one.
+
+    ``seq`` (#205 review round 1 finding 4) is a real monotonic integer
+    ordering key, minted alongside ``id`` from the same counter
+    (``store.next_seq("srme")`` — ``id`` is ``f"srme_{seq}"``). ``at`` alone
+    cannot order history: an injected clock (tests) or a fast operator can
+    produce several events with an IDENTICAL timestamp, and ``id`` cannot
+    stand in either — it is TEXT, so a lexical ``ORDER BY id`` puts
+    ``srme_10`` before ``srme_2``. ``events_for_membership`` orders by
+    ``seq`` so Memory/SQLite/PostgreSQL agree on true creation order past 9
+    events, durably (persisted, survives a restart).
+    """
+    id: str
+    membership_id: str
+    action: str
+    at: datetime
+    actor_id: Optional[str] = None
+    reason: Optional[str] = None
+    detail: dict = field(default_factory=dict)
+    seq: int = 0
 
 
 @dataclass
@@ -609,12 +814,22 @@ class ActiveContext:
     binding — the context never creates one implicitly, and never stands in for
     the Program/Season-shared invariant enforced elsewhere.
 
-    **Field order is deliberately append-only.** ``league_id`` is declared LAST,
-    after ``updated_at``, rather than in hierarchy order after ``season_id``:
-    callers already construct this dataclass with four POSITIONAL arguments
-    (``ActiveContext("u", "p", "s", ts)``), so inserting a field ahead of
-    ``updated_at`` would silently reinterpret an existing caller's timestamp as
-    a League id. Read the logical hierarchy from the docstring, not from the
+    ``generation`` (#159 review findings 2+5, migration 051) is a MONOTONIC
+    counter, atomically incremented by ``ContextService.set``/``set_with_
+    league`` on EVERY commit for this user — independent of the wall clock,
+    unlike ``updated_at``, which two commits landing in the same tick can
+    share. It backfills to 0 for every pre-migration row. Consulted by
+    ``services/context_epoch.py`` alongside the EFFECTIVE resolved tuple so
+    an A -> B -> A round trip moves the epoch even when the tuple returns to
+    where it started; see that module for why the tuple alone is not enough.
+
+    **Field order is deliberately append-only.** ``league_id`` and
+    ``generation`` are declared LAST, after ``updated_at``, rather than in
+    hierarchy order after ``season_id``: callers already construct this
+    dataclass with four POSITIONAL arguments (``ActiveContext("u", "p", "s",
+    ts)``), so inserting a field ahead of ``updated_at`` would silently
+    reinterpret an existing caller's timestamp as a League id or a
+    generation. Read the logical hierarchy from the docstring, not from the
     field order.
     """
     id: str
@@ -622,6 +837,7 @@ class ActiveContext:
     season_id: Optional[str]
     updated_at: datetime
     league_id: Optional[str] = None
+    generation: int = 0
 
 
 @dataclass

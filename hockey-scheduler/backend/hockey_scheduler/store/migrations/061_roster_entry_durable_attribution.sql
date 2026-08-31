@@ -1,0 +1,98 @@
+-- Durable game-side attribution on GameRosterEntry (#205 blocker 5, round 2).
+--
+-- WHAT THESE COLUMNS ARE. The SIDE a roster row was seated against and the
+-- POSITION it was seated to occupy, recorded at the moment the row was
+-- created or re-seated, from the SAME validated GameMembershipContext that
+-- authorized the seating. They are not a cache and not a fallback -- they
+-- are THE record of what this row occupies, authoritative for the lifetime
+-- of the row.
+--
+-- THE DEFECT (owner comment 5370391045). _side_data re-resolved EVERY
+-- historical/accepted roster row through the player's CURRENT eligible
+-- membership: a row counted against a side only while
+-- resolve_membership_contexts_for_game still returned a context naming that
+-- side. A legitimate membership status change therefore ERASED a seated
+-- row's game-side attribution without removing or transitioning the row.
+-- Reproduced on Memory/SQLite/PostgreSQL with facade mutation only: HOME
+-- target_skaters=1; P1 permanent pointer THIRD, ACTIVE membership HOME;
+-- enroll->offer->accept P1 (HOME reads full); then
+-- set_season_roster_membership_status(P1, 'inactive'). HOME immediately
+-- reported open_skater_slots=1 / confirmed_skaters=0 / status='draft'
+-- ("No players selected yet.") while P1's GameRosterEntry was still
+-- ACCEPTED with occupies_slot=True -- and P2's offer AND accept then both
+-- succeeded, leaving TWO occupying rows against a one-skater target.
+--
+-- THE RULE. A roster row's side and bucket come off the ROW. Slot
+-- enforcement (_require_open_slot, via _slot_summaries) and reporting
+-- (compute_roster_status/_derive_status) read the SAME durable value, so an
+-- accepted row can never be simultaneously occupying in storage and absent
+-- from the governed count. Live membership resolution still decides
+-- ELIGIBILITY (who may enroll, be offered, accept, re-confirm) and still
+-- decides which SUBSTITUTE ENROLLMENTS belong to a side -- an enrollment is
+-- a live candidacy, not a seating -- but it no longer decides where an
+-- already-seated body counts.
+--
+-- WHY DURABLE ATTRIBUTION AND NOT AN ATOMIC ENTRY TRANSITION. The owner
+-- ruled (2026-08-22) between the two sanctioned shapes: the roster row
+-- carries its own attribution. Transitioning the roster entry whenever a
+-- membership changes was explicitly NOT chosen and must not be
+-- reintroduced.
+--
+-- team_side  -- the Team id this row was seated against. On a
+--               LeagueSeason-bound game that is the resolved
+--               SeasonRosterMembership's team; on an unbound game
+--               (exhibitions, unbound legacy rows) the context is the
+--               permanent player.team_id pointer, exactly as it has always
+--               been there.
+-- seated_position -- the Position this row was seated to occupy, which
+--               GameRosterEntry.seated_slot_type buckets into GOALIE or
+--               SKATER. Stored because the bucket has the identical defect:
+--               it was read off the live context too (ctx.slot_type), so a
+--               row whose context vanished had no bucket at all. For a
+--               substitute seating it is the ENROLLMENT's position -- the
+--               very bucket _require_open_slot was called with -- so the
+--               slot the gate checked and the slot the row is counted in
+--               can never be two different slots.
+--
+-- NULL FAILS CLOSED, AND NEVER GUESSES (owner ruling, 2026-08-22).
+-- Additive and portable: two nullable columns, no rebuild, no index, NO
+-- BACKFILL. They are NULL for every roster row written before this
+-- migration, and there is no honest value to backfill WITH. Replaying the
+-- permanent player.team_id pointer answers a team that was never the
+-- seating side on a bound game (where eligibility resolves through
+-- SeasonRosterMembership and ignores the pointer entirely -- that is the
+-- "Mover" shape this whole blocker is about); and membership history cannot
+-- be time-travelled either, since backfilled memberships carry no
+-- effective_from and no events by design, and terminal rows do not record
+-- an effective_to. Fabricating a value would be exactly the guess these
+-- columns exist to eliminate.
+--
+-- So a NULL-attributed row is treated as OCCUPYING A SLOT ON EVERY SIDE OF
+-- ITS GAME, IN BOTH SLOT BUCKETS, for as long as its status occupies a slot
+-- at all. That is deliberately the most conservative reading available:
+--
+--   * it never names a side, so it cannot attribute the row to the WRONG
+--     side -- the failure mode the owner ruling forbids;
+--   * it consults NO live state -- not the membership, not the permanent
+--     pointer, not even Player.position -- so there is no lookup that could
+--     answer the opposite team, and none that could change under it later;
+--   * it can only ever REDUCE an open count, so it is incapable of
+--     reopening a slot and therefore incapable of admitting the overfill
+--     this blocker is about.
+--
+-- The cost is deliberate and accepted: such a row over-refuses. It holds a
+-- slot on the opposing side and in the bucket it cannot really occupy, so a
+-- game carrying legacy rows can report slots full that are genuinely open
+-- and will refuse offers/accepts/Coach-adds against them. That is loud and
+-- recoverable (an operator sees a wrong count and can re-seat the row
+-- through select_roster/add_substitute_to_roster, which writes real
+-- attribution); silently reopening the slot is neither. For the same reason
+-- set_availability's re-confirm-after-back-out REFUSES outright on a
+-- NULL-attributed row rather than re-deriving a side to gate against:
+-- re-confirming is precisely "take a slot back", and a slot whose side is
+-- unknown must not be taken.
+--
+-- Forward-only. Rollback reality: reverting application code does not drop
+-- these columns; dropping them is a separate manual database operation.
+ALTER TABLE game_roster_entries ADD COLUMN team_side TEXT;
+ALTER TABLE game_roster_entries ADD COLUMN seated_position TEXT;

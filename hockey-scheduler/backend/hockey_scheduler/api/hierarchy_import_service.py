@@ -106,8 +106,11 @@ class ApiService(_BaseApiService):
 
     @catch
     def get_hierarchy_import_dry_run(self, sheets_csv: dict) -> dict:
+        # today (#273): from the setup service's injected clock, so the
+        # dry-run's future-birthdate answer matches the commit's exactly.
         return validate_hierarchy_import(
-            self._parse_hierarchy_payload(sheets_csv), self.store)
+            self._parse_hierarchy_payload(sheets_csv), self.store,
+            today=self.setup.clock().date())
 
     @catch
     def commit_hierarchy_import(self, sheets_csv: dict,

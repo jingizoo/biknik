@@ -120,6 +120,12 @@ const PROD_ENV = {
   APP_MODE: "production",
   BOOTSTRAP_ADMIN_USER: ADMIN,
   BOOTSTRAP_ADMIN_PASSWORD: PW,
+  // Required in production (#159 review finding 4): serve() now fails
+  // closed at startup without it rather than falling back to an unkeyed
+  // context-epoch hash. Test-only value, well above the 32-byte floor;
+  // never a real deployment secret.
+  HS_CONTEXT_EPOCH_SECRET:
+    "e2e-harness-context-epoch-secret-do-not-use-in-production",
 };
 
 async function bootAsAdmin(page, base, label) {

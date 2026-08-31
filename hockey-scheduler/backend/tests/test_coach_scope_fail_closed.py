@@ -589,8 +589,24 @@ class CoachScopeHttpTest(unittest.TestCase):
     def test_later_team_assignment_is_reflected_in_scope_and_access(self):
         # #160 lifecycle: a Player account created while the player is teamless
         # shows NO team scope and is denied private reads (fail closed); once the
-        # player is assigned a team, both the surfaced scope (frontend hint) and
-        # the read gate reflect it live — no stale player_id-only lockout.
+        # player is assigned a team, the surfaced scope (frontend hint) reflects
+        # it live — no stale player_id-only lockout.
+        #
+        # #205 blocker 1 split this test's ORIGINAL single "assignment" step in
+        # two, because the private-READ gate and the cosmetic scope hint now
+        # resolve from two different sources for a LeagueSeason-bound game
+        # (``self.gid`` is bound — the seed's own game). BEFORE: both the
+        # scope hint (``user_view``, ``web/auth.py``) and the read gate
+        # (``can_read_private_game_data``) read the SAME permanent
+        # ``player.team_id`` pointer, so one raw ``store.save_player`` pointer
+        # edit flipped both at once. AFTER: ``user_view``'s hint is
+        # deliberately still the raw pointer (cosmetic only, #73 review —
+        # never itself an authorization gate), but the read gate now resolves
+        # through the game-scoped ``SeasonRosterMembership`` the substitute
+        # workflow uses (``RosterService.team_for_game``) — a bare pointer
+        # edit is exactly the import-shaped row #205's own model says must
+        # NOT silently re-scope eligibility, so it no longer suffices to grant
+        # a read; a real (governed) season membership does.
         store = srv.STATE.api.store
         store.add_player(Player(id="p_late", team_id=None, name="Late",
                                 position=Position.FORWARD))
@@ -608,14 +624,29 @@ class CoachScopeHttpTest(unittest.TestCase):
         self.assertNotIn("team_id", login["user"]["scope"])
         status, _ = self._req(c, "GET", f"/api/games/{self.gid}/board")
         self.assertEqual(status, 403)
-        # Assign the player to the home team, then a fresh login reflects it.
+        # Assign the player's PERMANENT pointer to the home team — the
+        # cosmetic scope hint reflects it live on the very next login, exactly
+        # as before #205 blocker 1.
         store.save_player(Player(id="p_late", team_id=self.home, name="Late",
                                  position=Position.FORWARD))
         c2 = self._client()
         _, login2 = self._req(c2, "POST", "/api/auth/login",
                               {"username": "player_late", "password": "pw"})
         self.assertEqual(login2["user"]["scope"].get("team_id"), self.home)
+        # But the pointer alone no longer grants the private READ (#205
+        # blocker 1) — no season membership has been opened yet.
         status, _ = self._req(c2, "GET", f"/api/games/{self.gid}/board")
+        self.assertEqual(status, 403)
+        # Opening the GOVERNED season membership on the home team, for the
+        # game's own LeagueSeason, is what actually grants the read.
+        ls_id = store.get_game(self.gid).league_season_id
+        m = srv.STATE.api.create_season_roster_membership(
+            "p_late", ls_id, self.home, actor_id="test_admin")
+        self.assertNotIn("error", m, m)
+        c3 = self._client()
+        self._req(c3, "POST", "/api/auth/login",
+                 {"username": "player_late", "password": "pw"})
+        status, _ = self._req(c3, "GET", f"/api/games/{self.gid}/board")
         self.assertEqual(status, 200)
 
     def test_player_cannot_be_rebound_to_foreign_team_over_http(self):

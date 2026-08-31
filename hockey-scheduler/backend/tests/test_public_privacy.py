@@ -5,6 +5,7 @@ import unittest
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 from helpers import BACKEND, cookie_from_set_cookie  # noqa: F401  (sets up sys.path)
 
@@ -103,6 +104,37 @@ class ProductionPublicPrivacyTest(_HttpBase):
                                  cookie=f"{srv.SESSION_COOKIE}=bogus")
         self.assertEqual(status, 401)
 
+    def test_global_official_directory_is_never_anonymous(self):
+        """Protect the installation-wide pool, not #367's scoped overview.
+
+        ``/api/demo/overview`` has a separate owner-approved contract: it may
+        return Officials joined through the caller's active-context home Club
+        or an in-scope assignment. This test deliberately targets the global
+        ``all_officials()`` read used by the assignment picker.
+        """
+        # Use the service facade rather than one store implementation's
+        # private dictionary shape. This class runs against the demo Memory
+        # fixture; backend-parity coverage belongs to the store matrix.
+        official = srv.STATE.api.get_officials()[0]
+        protected_values = (official["id"], official["name"])
+
+        with mock.patch.object(
+                srv.STATE.api, "get_officials",
+                wraps=srv.STATE.api.get_officials) as get_officials:
+            for label, cookie in (
+                    ("missing", None),
+                    ("invalid", f"{srv.SESSION_COOKIE}=bogus")):
+                with self.subTest(cookie=label):
+                    status, body = self._get("/api/officials", cookie=cookie)
+                    self.assertEqual(status, 401)
+                    self.assertEqual(body["error"]["code"], "unauthorized")
+                    self.assertNotIn("officials", body)
+                    blob = json.dumps(body)
+                    for value in protected_values:
+                        self.assertNotIn(value, blob)
+
+        get_officials.assert_not_called()
+
     # -- role/scope authorization (#73 review) -----------------------------
     def _get_as(self, account_id, role, scope, path):
         # Create a real account with this role/scope, then issue a store-backed
@@ -169,6 +201,18 @@ class ProductionPublicPrivacyTest(_HttpBase):
         # A logged-in player can read its team's private game data; once the
         # operator deactivates the Player, the SAME session cookie is denied —
         # the private-read gate fails closed AND the scoped account is retired.
+        #
+        # #205 blocker 1: the seed's own game is LeagueSeason-bound, so the
+        # private-read gate now resolves eligibility through a real
+        # ``SeasonRosterMembership`` (``RosterService.team_for_game``), not
+        # the permanent ``player.team_id`` pointer alone — a raw
+        # ``store.add_player`` (no facade parity dual-write) opens no such
+        # membership, so this dedicated player now ALSO needs one, or the
+        # very first (still-active) read this test pins would 403 for the
+        # wrong reason (no membership) rather than the one under test
+        # (deactivation). The #270 ``is_active`` fail-closed check this test
+        # is actually about is untouched -- it still runs before any
+        # membership resolution (see ``_player_team_for_game``).
         from hockey_scheduler.domain import Player, Position, Role
         g = self._game()
         store = srv.STATE.api.store
@@ -177,6 +221,11 @@ class ProductionPublicPrivacyTest(_HttpBase):
         away_player = "dp_test_player"
         store.add_player(Player(id=away_player, team_id=g.away_team_id,
                                 name="Departing Player", position=Position.FORWARD))
+        if g.league_season_id:
+            m = srv.STATE.api.create_season_roster_membership(
+                away_player, g.league_season_id, g.away_team_id,
+                actor_id="admin")
+            self.assertNotIn("error", m, m)
         acct = srv.STATE.api.accounts.create_account(
             username="u_dp", password="scoped-account-pw", role=Role.PLAYER,
             scope={"player_id": away_player, "team_id": g.away_team_id})
@@ -199,6 +248,11 @@ class ProductionPublicPrivacyTest(_HttpBase):
         # active account + live session, once reactivated, keeps that account
         # inactive and the session revoked — the private read stays denied until
         # the operator reactivates the ACCOUNT separately.
+        # #205 blocker 1: same reasoning as
+        # test_deactivated_player_session_loses_private_read above -- this
+        # dedicated player needs a real season membership too, so the FINAL
+        # "fresh login reads the private data" assertion exercises the #270
+        # reactivation behavior under test, not an unrelated membership gap.
         from hockey_scheduler.domain import Player, Position, Role
         g = self._game()
         store = srv.STATE.api.store
@@ -208,6 +262,10 @@ class ProductionPublicPrivacyTest(_HttpBase):
         store.add_player(Player(id=pid, team_id=g.away_team_id,
                                 name="Returning Player",
                                 position=Position.FORWARD))
+        if g.league_season_id:
+            m = srv.STATE.api.create_season_roster_membership(
+                pid, g.league_season_id, g.away_team_id, actor_id="admin")
+            self.assertNotIn("error", m, m)
         acct = srv.STATE.api.accounts.create_account(
             username="u_reacc", password="scoped-account-pw", role=Role.PLAYER,
             scope={"player_id": pid, "team_id": g.away_team_id})
@@ -284,15 +342,24 @@ class DemoPublicPrivacyTest(_HttpBase):
                                   cookie=cookie)
             self.assertEqual(status, 200, sub)
 
+        status, body = self._get("/api/officials", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["officials"])
+
     def test_headerless_demo_player_data_now_signed_out(self):
         # A cookieless demo request no longer silently becomes the operator:
         # player data requires a session.
         for sub in PLAYER_DATA_SUBS:
             status, _ = self._get(f"/api/games/{self.game_id}/{sub}")
             self.assertEqual(status, 401, sub)
+        status, _ = self._get("/api/officials")
+        self.assertEqual(status, 401)
 
     def test_invalid_cookie_still_rejected_in_demo(self):
         status, _ = self._get(f"/api/games/{self.game_id}/roster",
+                              cookie=f"{srv.SESSION_COOKIE}=bogus")
+        self.assertEqual(status, 401)
+        status, _ = self._get("/api/officials",
                               cookie=f"{srv.SESSION_COOKIE}=bogus")
         self.assertEqual(status, 401)
 

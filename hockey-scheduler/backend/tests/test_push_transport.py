@@ -8,6 +8,7 @@ from hockey_scheduler.domain import (
     DeliveryStatus,
     NotificationChannel,
     NotificationDelivery,
+    Role,
 )
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import (
@@ -159,11 +160,11 @@ class PushTransportTest(unittest.TestCase):
 
     def test_apiservice_reflects_push_mode(self):
         store, _, _ = build_full_demo_store()
-        default_ov = ApiService(store).get_delivery_overview()
+        default_ov = ApiService(store).get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(default_ov["push_mode"], "dry_run")
         self.assertIsNone(default_ov["push_provider"])
         api = ApiService(store, push_transport=push_transport_from_env(PUSH_ENV))
-        ov = api.get_delivery_overview()
+        ov = api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(ov["push_mode"], "live")
         self.assertEqual(ov["push_provider"], "fcm")
 

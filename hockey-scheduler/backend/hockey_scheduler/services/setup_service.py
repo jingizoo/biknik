@@ -14,6 +14,7 @@ from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..domain import (
+    AgeEligibilityRule,
     Club,
     ContactDestination,
     Division,
@@ -42,9 +43,13 @@ from ..domain import (
     RescheduleStatus,
     Organization,
     PolicyScopeType,
+    MembershipStatus,
     Rink,
     SchedulingPolicy,
     Season,
+    SeasonCopyForwardCommit,
+    SeasonRosterMembership,
+    SeasonRosterMembershipEvent,
     SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
@@ -56,18 +61,38 @@ from ..domain import (
 )
 from ..domain.jersey import MAX_JERSEY_NUMBER, MIN_JERSEY_NUMBER
 from ..domain.shooting import VALID_SHOOTS, normalize_shoots
+from ..domain.identity import (
+    derive_display_name,
+    normalize_birthdate,
+    normalize_name_part,
+    normalize_preferred_name,
+    normalize_registration_number,
+    normalize_skill_rating,
+    normalized_name_key,
+    MAX_NAME_PART_LENGTH,
+    MAX_SKILL_RATING,
+    MIN_SKILL_RATING,
+)
+from ..domain.eligibility import (
+    evaluate_age_eligibility,
+    normalize_age_tiers,
+    normalize_cutoff,
+    normalize_enforcement,
+)
 from ..domain.errors import (
     ConcurrencyConflictError,
     DivisionMismatchError,
     HasDependenciesError,
     IntegrityConflictError,
     InvalidTransitionError,
+    NotAuthorizedError,
     NotEligibleError,
     NotFoundError,
     ScheduleConflictError,
     ValidationError,
 )
 from ..store import InMemoryStore
+from .epoch_fence import EPOCH_FENCE_GLOBAL_KEY
 from .import_validator import validate_import, validate_official_availability
 from .ice_availability import (plan_ice_windows, parse_hhmm,
                                curfew_instant, WEEKDAY_NAMES)
@@ -78,6 +103,14 @@ from .league_scope import (
     registered_team_ids_in_division as _registered_team_ids,
     team_registration_valid,
     team_season_participation,
+)
+from .membership_spine import (
+    # ONE spine rule, shared with the READ-time resolver (#205 review blocker
+    # 2). This predicate used to be defined right here, private to the
+    # write-time guards below, while ``RosterService`` had no spine check at
+    # all; it now lives in ``membership_spine`` so a read-time refusal and a
+    # write-time refusal can never disagree about what a broken key is.
+    missing_or_unequal as _missing_or_unequal,
 )
 from .notifier import push as _push_notification
 
@@ -130,6 +163,22 @@ def _parse_iso_utc(value) -> Optional[datetime]:
 
 
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# #205 Slice A membership lifecycle sets (review round 3 blocker 2).
+#
+# PARKED — the stint is open but holds no roster place: it was set aside and
+# can be brought back. A parked row's spine was validated when the row was
+# BORN and never since, so any move OUT of one is a revival that must
+# re-prove the spine still holds.
+_PARKED_MEMBERSHIP_STATUSES = frozenset({
+    MembershipStatus.INACTIVE, MembershipStatus.INJURED})
+# REVIVING — the targets ``create_season_roster_membership`` requires a full
+# valid spine for, so a parked row may only re-enter one on a spine that is
+# still valid. Exactly the three statuses ``_assert_membership_spine_valid``
+# has always named in its own contract.
+_REVIVING_MEMBERSHIP_STATUSES = frozenset({
+    MembershipStatus.ACTIVE, MembershipStatus.APPLICANT,
+    MembershipStatus.AFFILIATE})
 
 
 def resolve_timezone(name):
@@ -491,10 +540,16 @@ class SetupService:
                     if operator_organization_id else None)
         return program
 
-    @_transactional
-    def create_season(self, program_id: str, name: str,
-                      start_date=None, end_date=None,
-                      actor_id: Optional[str] = None) -> Season:
+    def _resolve_season_creation(self, program_id: str, name: str,
+                                 start_date, end_date):
+        """Read-only resolution shared by ``create_season`` and the new-Season
+        copy-forward preview/commit (#159): Program exists, timezone-anchored
+        date parsing (#272), end >= start. No write of its own — extracted
+        verbatim from ``create_season`` so the copy-forward preview can run
+        the IDENTICAL checks before the target Season exists (to build its
+        fingerprint) and commit can re-run them again under its own locks,
+        without a caller ever risking drift from ``create_season``'s own
+        rules. Returns ``(program, cleaned_name, start, end)``."""
         program = self.store.get_program(program_id)
         if program is None:
             raise NotFoundError(f"Program {program_id} not found.")
@@ -509,8 +564,16 @@ class SetupService:
             raise ValidationError(
                 "end_date cannot be before start_date.",
                 {"reason": "end_before_start", "field": "end_date"})
+        return program, self._require_name(name), start, end
+
+    @_transactional
+    def create_season(self, program_id: str, name: str,
+                      start_date=None, end_date=None,
+                      actor_id: Optional[str] = None) -> Season:
+        _program, clean_name, start, end = self._resolve_season_creation(
+            program_id, name, start_date, end_date)
         season = Season(id=self.store.next_id("season"), program_id=program_id,
-                        name=self._require_name(name), start_date=start, end_date=end)
+                        name=clean_name, start_date=start, end_date=end)
         self.store.add_season(season)
         self._audit("season_created", "season", season.id, actor_id,
                     {"league_id": program_id})
@@ -524,13 +587,54 @@ class SetupService:
         through here."""
         return require_active_season(self.store, season_id)
 
-    def _guard_game_season(self, game) -> None:
+    def _guard_game_season(self, game):
         """Guard a Game-owned mutation against its archived Season (#159).
-        Row-locks + checks the Game's Season so no write lands on a Game whose
-        Season is archived. Takes the already-fetched Game (preserving each
-        caller's own not-found semantics); a Season-less legacy Game is a no-op."""
-        if game is not None and game.season_id:
-            require_active_season(self.store, game.season_id)
+        Row-locks + checks the Season that AUTHORIZES this Game so no write
+        lands on a Game whose competition is archived. Takes the
+        already-fetched Game (preserving each caller's own not-found
+        semantics) and returns it RE-FETCHED under that lock; ``None`` in,
+        ``None`` out.
+
+        WHICH Season that is used to be answered here, with ``if
+        game.season_id:`` — the same falsy-skip/wrong-row defect
+        ``RosterService._guard_active_season`` carried, in a second copy that
+        could drift from it. Both now call the ONE shared
+        :func:`season_guard.guard_game_season`, which resolves the Game's
+        LeagueSeason, locks and archive-checks the Season IT names, and only
+        then compares ``game.season_id`` to it (PR #427 blocker 5379031499).
+        See that function for the precedence and for why an unbound EXHIBITION
+        keeps using its own ``season_id``.
+
+        The RE-FETCH is the second half of the owner's correction: the caller's
+        pre-lock read is a locator, and a concurrent ``cancel_game`` /
+        ``move_game`` / ``archive_season`` commits under this very Season lock,
+        so the row a caller goes on to mutate must be the one read AFTER the
+        lock was taken. A caller's ``None`` still passes straight through (its
+        own not-found handling runs next), but a Game that VANISHED between the
+        locator read and the lock is a real ``NotFoundError`` here rather than
+        a stale object the caller would resurrect by saving. It carries
+        ``reason="game_missing"`` — the detail ``_move_game_locked``'s own
+        post-lock re-fetch already used for exactly this outcome, so
+        centralizing the re-fetch neither invents a new code nor drops the one
+        that existed."""
+        if game is None:
+            return None
+        season_guard.guard_game_season(self.store, game)
+        fresh = self.store.get_game(game.id)
+        if fresh is None:
+            raise NotFoundError(f"Game {game.id} not found.",
+                                details={"reason": "game_missing"})
+        # Re-verify the identity on the fresh row, but only when its identity
+        # columns actually moved — same reasoning as
+        # ``RosterService._guard_active_season``: unconditional re-running
+        # would re-lock the same Season on every mutation for nothing, while
+        # skipping it would let a Game whose binding changed between the
+        # locator read and the lock be written under a Season that is no
+        # longer its authority.
+        if (fresh.league_season_id != game.league_season_id
+                or fresh.season_id != game.season_id):
+            season_guard.guard_game_season(self.store, fresh)
+        return fresh
 
     def _policy_scope_lock_plan(self, rink_ids, season_ids) -> dict:
         """#318 review — pre-lock LOCATOR for every policy scope the placement
@@ -772,6 +876,19 @@ class SetupService:
         return season_guard.season_is_historical(
             season, self.clock() if now is None else now)
 
+    def season_is_read_only(self, season) -> bool:
+        """Does this Season refuse writes? — the service-layer entry point to
+        :func:`season_guard.season_is_read_only`, the SAME predicate
+        ``_require_active_season`` refuses on.
+
+        Sits beside ``season_is_historical`` and is deliberately not it: this
+        one takes no clock, because an elapsed ``end_date`` makes a Season
+        history to READ but does not make it read-only to WRITE. Exposed so a
+        read that ADVERTISES the refusal (``get_setup_hierarchy_v2``'s per-Season
+        ``read_only``) is answered by the refusal's own authority instead of by
+        a second copy of the expression."""
+        return season_guard.season_is_read_only(season)
+
     def _lock_league_for_binding(self, league_id: str) -> League:
         """Row-lock an existing permanent League before binding it to a Season
         (#159 concurrency). This establishes the FIRST half of the canonical
@@ -875,10 +992,12 @@ class SetupService:
         it removes a single ``LeagueSeason`` binding so an operator can, in turn,
         delete a permanent League (which blocks on its bindings — deletions are
         dependency-gated with no silent cascades). It is itself dependency-gated:
-        a binding that still owns Divisions, registrations, or Games is refused
-        (resolve those first), and it fails closed with ``season_archived`` on an
-        archived Season so read-only history is never rewritten. All checks run
-        before the single delete, so a refused unbind changes nothing."""
+        a binding that still owns Divisions, registrations, Games, schedule
+        scenarios, or age-eligibility rule history (#273 review round 2 finding 3)
+        is refused (resolve those first), and it fails closed with
+        ``season_archived`` on an archived Season so read-only history is never
+        rewritten. All checks run before the single delete, so a refused unbind
+        changes nothing."""
         ls = self.store.get_league_season(league_season_id)
         if ls is None:
             raise NotFoundError(
@@ -907,6 +1026,26 @@ class SetupService:
                  if g.league_season_id == league_season_id]
         scenarios = [s for s in self.store.all_schedule_scenarios()
                      if s.league_season_id == league_season_id]
+        # #273 review round 2 finding 3: age-eligibility rule history is now
+        # an itemized dependent too. Previously this delete overlooked rule
+        # rows entirely, so removing a LeagueSeason left its
+        # age_eligibility_rules orphaned — pointing at a binding that no
+        # longer existed, with no operator-facing signal that history would
+        # be stranded. Also the SAME invariant migration 058's new FK on
+        # age_eligibility_rules.league_season_id now enforces at the
+        # database level (a DB-level backstop against a create-rule-vs-
+        # delete-binding race this service-level gate alone cannot close —
+        # this itemized check is still what gives an operator a friendly,
+        # actionable refusal instead of a raw constraint error on the
+        # non-race path).
+        rules = self.store.age_eligibility_rules_for_league_season(
+            league_season_id)
+        # #205 review round 1 finding 2 — a membership's league_season_id is
+        # a REQUIRED (non-nullable) foreign key onto this exact row, the same
+        # shape team registrations/games above already block on regardless of
+        # status; ANY membership (even released/transferred history) blocks.
+        memberships = [m for m in self.store.all_season_roster_memberships()
+                      if m.league_season_id == league_season_id]
         self._block_if_dependents(
             "league_season", league_season_id, "season binding", [
                 self._dep_group("division", divisions, lambda d: d.name),
@@ -914,7 +1053,11 @@ class SetupService:
                                 lambda r: self._team_name(r.team_id)),
                 self._dep_group("game", games, self._matchup),
                 self._dep_group("schedule scenario", scenarios,
-                                lambda s: s.name)])
+                                lambda s: s.name),
+                self._dep_group("age eligibility rule", rules,
+                                lambda r: f"v{r.version}"),
+                self._dep_group("roster membership", memberships,
+                                self._membership_label)])
         self.store.delete_league_season(league_season_id)
         self._audit("league_season_deleted", "league_season", league_season_id,
                     actor_id, {"league_id": ls.league_id,
@@ -1449,6 +1592,7 @@ class SetupService:
                         existing.id, actor_id,
                         {"season_id": season_id, "team_id": team_id,
                          "division_id": existing.division_id, "reactivated": True})
+            self._mirror_memberships_for_registration(existing, actor_id)
             return existing
         reg = SeasonTeamRegistration(
             id=self.store.next_id("streg"), league_season_id=ls.id,
@@ -1458,7 +1602,98 @@ class SetupService:
                     reg.id, actor_id,
                     {"season_id": season_id, "team_id": team_id,
                      "division_id": reg.division_id})
+        self._mirror_memberships_for_registration(reg, actor_id)
         return reg
+
+    # -- permanent-model parity dual-write (#205 substitute cutover) -------
+    #
+    # Substitute eligibility now RESOLVES through SeasonRosterMembership for
+    # every LeagueSeason-bound game, and migration 059 backfilled the stints
+    # the permanent model implied for rows that existed at migration time:
+    # active player x actively-registered team x non-archived Season. These
+    # two hooks are that same rule applied at CREATE time, on the two
+    # service edges that produce a new (player, registered-team, Season)
+    # participation — a player added to a Team (add_player) and a Team
+    # (re)registered into a Season (register_team_for_season). Without
+    # them, every player or registration created after 059 would be
+    # silently ineligible to substitute in bound games until an operator
+    # hand-opened a stint.
+    #
+    # Precedence rule of the transition: the SEASONAL record wins wherever
+    # it has explicitly said something. A player who already holds an open
+    # membership on this LeagueSeason, or an authoritative ACTIVE
+    # membership anywhere else in the Season (a recorded transfer), is left
+    # exactly as recorded — the permanent pointer no longer overrides it.
+    # Deliberately NOT mirrored, and why:
+    #   * imports (store-level bulk player writes) — the "imports over to
+    #     seasonal membership" cutover is its own Release-2 slice;
+    #   * assign_player_team — a mid-season permanent-pointer move must NOT
+    #     silently re-scope seasonal eligibility; that is precisely the
+    #     governed transfer workflow of a later #205 slice;
+    #   * set_player_active reactivation of a pre-059-inactive player —
+    #     059 deliberately minted no stint for parked players, and
+    #     reactivating one is an operator decision whose stint should be
+    #     opened explicitly.
+
+    def _open_parity_membership(self, player, league_season_id: str,
+                                team_id: str, actor_id) -> None:
+        """Open the ACTIVE stint the permanent model implies for one
+        (active player, actively-registered team, LeagueSeason) edge,
+        unless the seasonal record already says otherwise. Reuses
+        create_season_roster_membership wholesale (transaction() is
+        reentrant, #215) so spine checks, uniqueness, the per-membership
+        event and the audit entry are the real ones — an auto-opened stint
+        carries the same rigor and history as an operator-created one. A
+        genuine conflict it does not pre-clear (e.g. a seasonal jersey
+        clash) propagates and rolls back the caller's whole write: fail
+        closed, never a player row the seasonal model rejects."""
+        if self.store.open_memberships_for_player_in_league_season(
+                player.id, league_season_id):
+            return  # this stint already exists (any non-terminal status)
+        ls = self.store.get_league_season(league_season_id)
+        if ls is not None and self.store.active_memberships_for_player_in_season(
+                player.id, ls.season_id):
+            return  # recorded transfer elsewhere in this Season wins
+        self.create_season_roster_membership(
+            player.id, league_season_id, team_id,
+            reason="auto-opened for permanent-model parity (#205 cutover)",
+            actor_id=actor_id)
+
+    def _mirror_memberships_for_registration(self, reg, actor_id) -> None:
+        """Registration edge of the parity dual-write: the Team's ACTIVE
+        players each get their stint for the newly (re)activated
+        registration's Season — the create-time image of 059's
+        player x registration x Season join. Skips nothing silently except
+        what the seasonal record already governs (see above)."""
+        ls = self.store.get_league_season(reg.league_season_id)
+        season = (self.store.get_season(ls.season_id)
+                  if ls is not None else None)
+        if season is None or season.status is not SeasonStatus.ACTIVE:
+            return
+        for player in sorted(self.store.players_for_team(reg.team_id),
+                             key=lambda p: p.id):
+            if player.is_active:
+                self._open_parity_membership(
+                    player, reg.league_season_id, reg.team_id, actor_id)
+
+    def _mirror_memberships_for_new_player(self, player, actor_id) -> None:
+        """Player edge of the parity dual-write: an ACTIVE player added to
+        a Team opens their stint in each non-archived Season the Team is
+        actively registered in. A player created inactive opens nothing —
+        a parked player holds no current participation (059's own
+        deliberate exclusion)."""
+        if not player.is_active:
+            return
+        for reg in self.store.all_season_team_registrations():
+            if not reg.active or reg.team_id != player.team_id:
+                continue
+            ls = self.store.get_league_season(reg.league_season_id)
+            season = (self.store.get_season(ls.season_id)
+                      if ls is not None else None)
+            if season is None or season.status is not SeasonStatus.ACTIVE:
+                continue
+            self._open_parity_membership(
+                player, reg.league_season_id, reg.team_id, actor_id)
 
     def _candidate_registration_league_id(self, team, division_id,
                                           league_id) -> Optional[str]:
@@ -1729,7 +1964,21 @@ class SetupService:
                 "published or moved until it is repaired.",
                 {"reason": "regular_game_missing_league_season",
                  "game_id": game.id, "league_season_id": ls_id})
-        if game.season_id and ls.season_id != game.season_id:
+        # PR #427 blocker: this comparison is UNCONDITIONAL, exactly like the
+        # `league_id` one below. It is the SAME argument #331 review round 24
+        # already made for that line, applied to the column round 23 left
+        # guarded: `game.season_id` is explicitly Optional with a nullable
+        # `games.season_id` column carrying no FK and no CHECK, so `None` is
+        # not "a legacy row to be lenient with", it is precisely the corrupted
+        # shape the guard let through. By this point the game is REGULAR
+        # (exhibitions returned far above) and `ls` is a real LeagueSeason, so
+        # the correct invariant is plain equality — a bound game whose Season
+        # is missing is drift, not a legacy case. Guarding it behind
+        # truthiness meant a store-written NULL evaded the check entirely
+        # while `league_season_id` still named the competition, which is the
+        # authority split the owner's blocker describes. The stored value is
+        # reported as-is (including `None`) so remediation sees the row.
+        if ls.season_id != game.season_id:
             raise ValidationError(
                 "This game's league-season belongs to a different season; "
                 "it cannot be published or moved until it is repaired.",
@@ -1981,6 +2230,16 @@ class SetupService:
                 if self._season_of_league_season(reg.league_season_id)})
         to_move = []          # (reg, season_id) pairs eligible to move
         blocked = []          # {registration_id, season_id, affected_game_ids}
+        # #205 review round 1 finding 2 — {registration_id, season_id,
+        # affected_membership_ids}: a LIVE membership still names the OLD
+        # (LeagueSeason, Team) pair this transfer is about to move the
+        # registration OFF of. Moving/superseding underneath it would leave
+        # the membership's league_season_id naming a League the Team no
+        # longer plays in (Team<->LeagueSeason disagreement) — exactly the
+        # stranding the review demonstrated. Terminal rows are closed
+        # history and never block, mirroring the games check (cancelled
+        # games don't block either).
+        blocked_memberships = []
         for reg in fresh_candidates:
             season_id = self._season_of_league_season(reg.league_season_id)
             season = locked_seasons.get(season_id) if season_id else None
@@ -1998,14 +2257,29 @@ class SetupService:
                 blocked.append({"registration_id": reg.id,
                                 "season_id": season_id,
                                 "affected_game_ids": stranded})
-            else:
-                to_move.append((reg, season_id))
+                continue
+            live_memberships = self._open_memberships_for_league_season_team(
+                reg.league_season_id, team_id)
+            if live_memberships:
+                blocked_memberships.append({
+                    "registration_id": reg.id, "season_id": season_id,
+                    "affected_membership_ids":
+                        [m.id for m in live_memberships]})
+                continue
+            to_move.append((reg, season_id))
         if blocked:
             raise ValidationError(
                 "Cannot transfer this team while it has active registrations "
                 "with scheduled games; resolve those games first.",
                 {"reason": "team_transfer_strands_games", "team_id": team_id,
                  "blocked": blocked})
+        if blocked_memberships:
+            raise ValidationError(
+                "Cannot transfer this team while it has live roster "
+                "memberships on its current League; release/transfer them "
+                "first.",
+                {"reason": "team_transfer_strands_memberships",
+                 "team_id": team_id, "blocked": blocked_memberships})
 
         # #331 review round 18: resolve each candidate's target LeagueSeason
         # and check for a row ALREADY sitting there before any write --
@@ -2124,6 +2398,23 @@ class SetupService:
                 "games; resolve those games first.",
                 {"reason": "team_has_scheduled_games",
                  "affected_game_ids": stranded, "count": len(stranded)})
+        # #205 review round 1 finding 2 — a LIVE (non-terminal) membership on
+        # this exact (LeagueSeason, Team) says a player currently participates
+        # here; unregistering would strand it against a Team the operator just
+        # said is no longer participating (create_season_roster_membership
+        # itself refuses a NEW membership once the registration is inactive —
+        # this closes the same gap for an EXISTING one). Terminal (released/
+        # transferred) rows are closed history and never block, mirroring
+        # cancelled games above.
+        live_memberships = self._open_memberships_for_league_season_team(
+            reg.league_season_id, reg.team_id)
+        if live_memberships:
+            raise ValidationError(
+                "Cannot remove this team from the season while it has live "
+                "roster memberships; release/transfer them first.",
+                {"reason": "team_has_live_memberships",
+                 "affected_membership_ids": [m.id for m in live_memberships],
+                 "count": len(live_memberships)})
         reg.active = False
         self.store.save_season_team_registration(reg)
         self._audit("season_team_unregistered", "season_team_registration",
@@ -2203,9 +2494,20 @@ class SetupService:
         games = [g for g in self.store.all_games()
                 if g.season_id == season_id
                 and reg.team_id in (g.home_team_id, g.away_team_id)]
+        # #205 review round 1 finding 2 — a membership names this exact
+        # (LeagueSeason, Team) pair by REQUIRED (non-nullable) foreign key,
+        # so a permanent delete here is exactly the "required FK" shape
+        # games/regs already block on above: ANY membership blocks,
+        # regardless of status (even released/transferred history still
+        # names this row), mirroring delete_team/delete_league/delete_season
+        # blocking on ANY registration regardless of active status.
+        memberships = self.store.memberships_for_league_season_team(
+            reg.league_season_id, reg.team_id)
         self._block_if_dependents(
             "season_team_registration", registration_id, "registration", [
-                self._dep_group("game", games, self._matchup)])
+                self._dep_group("game", games, self._matchup),
+                self._dep_group("roster membership", memberships,
+                                self._membership_label)])
         detail = {"season_id": season_id, "team_id": reg.team_id,
                   "league_id": league_id, "division_id": reg.division_id,
                   "reason": "explicit_inactive_cleanup"}
@@ -2371,6 +2673,616 @@ class SetupService:
                     access_id, actor_id, detail)
         return {"id": access_id, **detail,
                 "season_name": season.name, "venue_name": venue.name}
+
+    # -- season roster memberships (#205 Slice A) ---------------------------
+    #
+    # An athlete's participation stint for one Team in one Season, on the
+    # permanent Team + LeagueSeason spine. This slice ships the bounded
+    # lifecycle only — create, status change, season-scoped attribute edit —
+    # each appending a SeasonRosterMembershipEvent (the per-membership
+    # immutable history) plus the global SetupAuditLog entry. The
+    # transfer/release/deadline-policy workflows and the consumer cutover
+    # (roster/substitute eligibility resolving through memberships) are
+    # follow-up #205 slices and deliberately absent here.
+
+    def _membership_event(self, membership_id: str, action: str,
+                          actor_id: Optional[str], reason: Optional[str],
+                          detail: Optional[dict] = None
+                          ) -> SeasonRosterMembershipEvent:
+        """Append one immutable history event for a membership. Called by
+        every membership mutation in this service — never skipped, so the
+        per-membership history and the audit trail can only move together.
+
+        ``seq`` (#205 review round 1 finding 4) is minted from the SAME
+        counter step as ``id`` (one ``next_seq("srme")`` call, formatted into
+        both) rather than a second ``next_id`` draw, so the numeric id suffix
+        and the ordering key never drift apart. It is what
+        ``events_for_membership`` orders by — never ``id`` (TEXT, sorts
+        lexically) or ``at`` alone (an injected/shared clock can tie)."""
+        n = self.store.next_seq("srme")
+        return self.store.add_season_roster_membership_event(
+            SeasonRosterMembershipEvent(
+                id=f"srme_{n}",
+                membership_id=membership_id,
+                action=action,
+                at=self.clock(),
+                actor_id=actor_id,
+                reason=reason,
+                detail=detail or {},
+                seq=n,
+            ))
+
+    def _validate_membership_status(self, status) -> MembershipStatus:
+        """Type-safe status gate: a real MembershipStatus or its exact string
+        value; anything else is a field-level validation error, never a
+        TypeError/500."""
+        if isinstance(status, MembershipStatus):
+            return status
+        try:
+            return MembershipStatus(status)
+        except (ValueError, TypeError):
+            raise ValidationError(
+                "status must be one of "
+                + ", ".join(s.value for s in MembershipStatus) + ".",
+                {"reason": "invalid_membership_status", "field": "status"})
+
+    def _open_memberships_for_league_season_team(
+            self, league_season_id: str, team_id: str
+            ) -> list:
+        """Every LIVE (non-terminal) membership at this exact (LeagueSeason,
+        Team) pair (#205 review round 1 finding 2) — the set a parent
+        mutation that stops this Team's participation there (unregister,
+        League transfer) must not silently strand. Terminal (released/
+        transferred) rows are closed history and are never returned."""
+        return [m for m in self.store.memberships_for_league_season_team(
+                    league_season_id, team_id)
+                if not m.status.is_terminal]
+
+    def _assert_membership_program_spine(self, team, ls, *,
+                                         membership_id=None) -> None:
+        """The membership spine's PROGRAM leg: the Team's own ``program_id``,
+        the LeagueSeason's League's ``program_id`` and its Season's
+        ``program_id`` must all be present and identical (#205 review round 4,
+        owner ruling).
+
+        This is the exact Python twin of the two PROGRAM checks migration
+        059's preflight already applies to every backfill candidate —
+        ``find_active_players_with_team_program_mismatch`` (``t.program_id``
+        vs ``lg.program_id``) and ``find_active_players_with_program_
+        mismatch`` (``lg.program_id`` vs ``s.program_id``) — compared with
+        the same ``_missing_or_unequal`` rule, so MISSING and UNEQUAL are
+        one violation and two missing keys are never agreement.
+
+        WHY IT HAD TO BE ADDED. ``_assert_membership_spine_valid`` and
+        ``create_season_roster_membership`` had NO Program clause at all —
+        not a falsy-skip, an absence. All six shapes ({Team, League,
+        Season}.program_id x {missing, unequal}) were reproduced on this
+        branch's head 488d1c8 across Memory, SQLite and PostgreSQL: 059's
+        preflight REFUSED every one while the service ACCEPTED create AND
+        all twelve parked revivals, writing a row, an event and an audit
+        entry each time. The migration therefore refused to materialize
+        exactly the rows the live system was still minting.
+
+        WHY IT IS UNCONDITIONAL, despite ``register_team_for_season``'s
+        DELIBERATELY legacy-permissive rule 4 (``if team.program_id and
+        team.program_id != season.program_id``, :1475). That guard tolerates
+        a PROGRAM-LESS Team so pre-#283 legacy data can still be registered.
+        The question this guard had to answer first was whether a SUPPORTED
+        flow can PRODUCE such a Team and then need a membership on it. It
+        cannot — established by execution against every public entry point:
+
+          * ``create_team`` derives the Program from the resolved League and
+            refuses a supplied Program that disagrees with it
+            (``team_program_mismatch``), and refuses a league-less Team
+            outright (``team_league_required``), so it never mints one;
+          * every public League-creating path (``create_league``, the
+            auto-provisioned default League) copies ``season.program_id``,
+            and ``create_season`` requires a real Program — so League and
+            Season always carry one;
+          * ``register_team_for_season``'s legacy branch only PASSES THROUGH
+            a program-less Team, and its non-null disagreement check is
+            exact; the canonical ``league_id`` path refuses one outright;
+          * ``transfer_team_to_league`` heals a program-less Team ONLY when
+            the target League actually differs -- ``team.program_id =
+            team.program_id or league.program_id`` sits below an
+            ``if old == new_league_id: return team`` no-op, so calling it
+            with the Team's current League repairs nothing. It refuses a
+            non-null disagreement either way;
+          * ``roll_forward_registrations`` and its v2 both refuse a
+            program-less Team and refuse a cross-Program rollover;
+          * ``commit_hierarchy_import`` refuses a cross-Program team/league
+            pair (``team_league_program_mismatch``), and BOTH imports heal a
+            pre-existing program-less Team on re-import.
+
+        So the legacy-permissive registration guard is a door for legacy
+        DATA, not a supported producer, and enforcing here refuses no spine
+        any supported flow can build. Registration semantics are left
+        exactly as they were — a legacy program-less Team still registers;
+        it just cannot hold a MEMBERSHIP until its Program is repaired,
+        which is precisely the state 059's preflight already demands before
+        it will backfill one, and which ``transfer_team_to_league`` or
+        either import already repairs."""
+        league = (self.store.get_league(ls.league_id)
+                  if ls.league_id else None)
+        season = (self.store.get_season(ls.season_id)
+                  if ls.season_id else None)
+        league_program = league.program_id if league is not None else None
+        season_program = season.program_id if season is not None else None
+        if (_missing_or_unequal(team.program_id, league_program)
+                or _missing_or_unequal(league_program, season_program)):
+            details = {"reason": "membership_program_mismatch",
+                       "team_id": team.id,
+                       "league_season_id": ls.id,
+                       "team_program_id": team.program_id,
+                       "league_id": ls.league_id,
+                       "league_program_id": league_program,
+                       "season_id": ls.season_id,
+                       "season_program_id": season_program}
+            if membership_id is not None:
+                details["membership_id"] = membership_id
+            raise ValidationError(
+                "A membership must sit on one Program: this Team, its "
+                "League and the Season disagree about which Program they "
+                "belong to (or one of them names none).",
+                details)
+
+    def _assert_membership_spine_valid(
+            self, membership: SeasonRosterMembership) -> None:
+        """Reactivation must recheck the SAME spine ``create_season_roster_
+        membership`` required at birth (#205 review round 1 finding 2):
+        Player, Team and LeagueSeason still exist, the Team still belongs to
+        the LeagueSeason's League, the Team/League/Season still agree about
+        their Program (#205 review round 4 owner ruling — see
+        ``_assert_membership_program_spine``), and the Team still holds an
+        ACTIVE registration there.
+
+        Without this, a membership PARKED (inactive/injured) before its
+        Team's registration was unregistered, or before the Team was
+        transferred to a different League, could be waved back to
+        ``active``/``applicant``/``affiliate`` even though the spine that
+        justified it no longer holds — reactivating a stint the parent side
+        has already ended. finding 2's OTHER fixes (unregister/transfer now
+        block while a LIVE membership exists) prevent this for anything
+        mutated going forward; this is the matching read-time guard for
+        rows that predate those fixes, or whose parent state changed by any
+        other route this store allows (e.g. a restored backup)."""
+        team = self.store.get_team(membership.team_id)
+        if team is None:
+            raise ValidationError(
+                "This membership's Team no longer exists.",
+                {"reason": "membership_team_missing",
+                 "membership_id": membership.id,
+                 "team_id": membership.team_id})
+        ls = self.store.get_league_season(membership.league_season_id)
+        if ls is None:
+            raise ValidationError(
+                "This membership's League season no longer exists.",
+                {"reason": "membership_league_season_missing",
+                 "membership_id": membership.id,
+                 "league_season_id": membership.league_season_id})
+        # #205 review round 3 blocker 3 — a MISSING ``team.league_id`` is a
+        # spine violation, not an exemption. See ``_missing_or_unequal``.
+        if _missing_or_unequal(team.league_id, ls.league_id):
+            raise ValidationError(
+                "This membership's Team no longer sits in this League "
+                "season's League (its League is missing, or has changed); "
+                "it can no longer be reactivated as-is.",
+                {"reason": "membership_league_mismatch",
+                 "membership_id": membership.id, "team_id": team.id,
+                 "team_league_id": team.league_id,
+                 "league_season_league_id": ls.league_id})
+        # #205 review round 4 (owner ruling) — the PROGRAM leg of the same
+        # spine, the clause this helper never had. See
+        # ``_assert_membership_program_spine``.
+        self._assert_membership_program_spine(
+            team, ls, membership_id=membership.id)
+        registration = self.store.registration_for_team_in_league_season(
+            membership.league_season_id, membership.team_id)
+        if registration is None or not registration.active:
+            raise ValidationError(
+                "This membership's Team is no longer actively registered "
+                "in this season; it can no longer be reactivated as-is.",
+                {"reason": "team_not_registered",
+                 "membership_id": membership.id, "team_id": team.id,
+                 "league_season_id": membership.league_season_id})
+        if self.store.get_player(membership.player_id) is None:
+            raise ValidationError(
+                "This membership's Player no longer exists.",
+                {"reason": "membership_player_missing",
+                 "membership_id": membership.id,
+                 "player_id": membership.player_id})
+
+    def _assert_membership_jersey_available(
+            self, league_season_id: str, team_id: str, jersey_number,
+            *, exclude_membership_id: Optional[str] = None) -> None:
+        """Reject a jersey held by another ACTIVE membership of the same
+        (LeagueSeason, Team) — #269's integrity at its season-Team scope.
+
+        Mirrors :meth:`_assert_jersey_available` exactly: only an active
+        membership reserves a number, only concrete numbers are constrained,
+        and the raise is the SAME stable ``IntegrityConflictError`` migration
+        059's ``ux_srm_active_team_jersey`` partial unique index produces on
+        a lost cross-process race. Callers run this BEFORE mutating."""
+        if jersey_number is None:
+            return
+        for other in self.store.memberships_for_league_season_team(
+                league_season_id, team_id):
+            if (other.status is MembershipStatus.ACTIVE
+                    and other.jersey_number == jersey_number
+                    and other.id != exclude_membership_id):
+                raise IntegrityConflictError(
+                    f"Jersey number {jersey_number} is already worn by an "
+                    f"active membership on this team this season.",
+                    {"reason": "duplicate_membership_jersey_number",
+                     "league_season_id": league_season_id,
+                     "team_id": team_id, "jersey_number": jersey_number,
+                     "conflicting_membership_id": other.id})
+
+    def _assert_no_active_membership_conflict(
+            self, player_id: str, season_id: str,
+            *, exclude_membership_id: Optional[str] = None) -> None:
+        """One AUTHORITATIVE active membership per (player, Season) — the
+        epic's core uniqueness rule. Affiliate/call-up rows are outside it by
+        status. The database index (059) decides cross-process races; this
+        pre-check turns the ordinary case into a named, actionable error."""
+        conflicts = [m.id for m in
+                     self.store.active_memberships_for_player_in_season(
+                         player_id, season_id)
+                     if m.id != exclude_membership_id]
+        if conflicts:
+            raise ValidationError(
+                "Player already has an active membership this season; "
+                "release/transfer it (or use affiliate status) first.",
+                {"reason": "membership_active_conflict",
+                 "player_id": player_id, "season_id": season_id,
+                 "affected_membership_ids": conflicts})
+
+    @_transactional
+    def create_season_roster_membership(
+            self, player_id: str, league_season_id: str, team_id: str,
+            status=MembershipStatus.ACTIVE, position=None,
+            jersey_number=_UNSET, shoots=_UNSET,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> SeasonRosterMembership:
+        """Open a membership stint for a player on a Team's LeagueSeason
+        (#205 Slice A).
+
+        Spine rules, mirroring register_team_for_season: the Team is
+        row-locked FIRST (canonical Team → Season → Player lock order, so a
+        concurrent League transfer can't strand the membership on a foreign
+        LeagueSeason), the Team must belong to the LeagueSeason's League
+        (rule 7 analog), the Team/League/Season must agree about their
+        Program (#205 review round 4 owner ruling — see
+        ``_assert_membership_program_spine``), the Team must hold an ACTIVE
+        SeasonTeamRegistration there, and the Season must not be archived. The player is NOT required to have
+        ``player.team_id == team_id`` — that permanent coupling is exactly
+        what memberships replace; legacy consumers keep reading the untouched
+        Player fields until the cutover slice.
+
+        ``position``/``jersey_number``/``shoots`` default to the player's
+        current permanent values (the same copy the 059 backfill performs);
+        pass explicit values — including ``None`` for jersey/shoots — to
+        override. A terminal status can't be born (``released``/
+        ``transferred`` rows exist only as ended stints), and an ``active``
+        create enforces the one-active-per-(player, Season) rule.
+
+        The Player row is locked (#205 review round 1 finding 1) BEFORE the
+        open-stint/active-conflict re-reads below, not just the Team: two
+        concurrent creates for the SAME player on DIFFERENT Teams of the SAME
+        LeagueSeason take DIFFERENT Team locks, so without a lock keyed on
+        the one thing they share (the player) both could observe "no open
+        row" and both insert. The Player lock is that common lock — an
+        under-lock re-read, mirroring the Team lock's own #201 discipline —
+        and migration 059's ``ux_srm_open_player_league_season`` partial
+        unique index is the engine-level backstop for any write that still
+        reaches the table without it (translated to this SAME
+        ``membership_open_conflict`` reason by ``db_errors.py``).
+        """
+        for field_name, value in (("player_id", player_id),
+                                  ("league_season_id", league_season_id),
+                                  ("team_id", team_id)):
+            if not value or not isinstance(value, str):
+                raise ValidationError(
+                    f"{field_name} is required.",
+                    {"reason": "field_required", "field": field_name})
+        team = self.store.get_team_for_update(team_id)
+        if team is None:
+            raise NotFoundError(f"Team {team_id} not found.")
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
+            raise NotFoundError(f"League season {league_season_id} not found.")
+        season = self._require_active_season(ls.season_id)  # #159 guard
+        # #205 review round 1 finding 1 — row-lock the Player, the ONE thing
+        # two concurrent creates on DIFFERENT Teams of the same LeagueSeason
+        # share (their Team locks differ). Held to commit, so the open-stint
+        # and active-conflict re-reads below are a genuine under-lock check,
+        # not a stale snapshot a concurrent create raced past.
+        player = self.store.get_player_for_update(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+        # #205 review round 3 blocker 3 — a MISSING ``team.league_id`` is a
+        # spine violation, not an exemption. See ``_missing_or_unequal``.
+        if _missing_or_unequal(team.league_id, ls.league_id):
+            raise ValidationError(
+                "A membership must sit on the Team's own League's season; "
+                "the Team's League is missing, or is a different one.",
+                {"reason": "membership_league_mismatch", "team_id": team_id,
+                 "team_league_id": team.league_id,
+                 "league_season_league_id": ls.league_id})
+        # #205 review round 4 (owner ruling) — the PROGRAM leg of the spine,
+        # which this method never checked at all while migration 059's
+        # preflight refused every incoherent shape. See
+        # ``_assert_membership_program_spine`` for the six reproduced shapes
+        # and why enforcing here does not collide with
+        # ``register_team_for_season``'s legacy-permissive rule 4.
+        self._assert_membership_program_spine(team, ls)
+        registration = self.store.registration_for_team_in_league_season(
+            league_season_id, team_id)
+        if registration is None or not registration.active:
+            raise ValidationError(
+                "Team is not actively registered in this season.",
+                {"reason": "team_not_registered", "team_id": team_id,
+                 "league_season_id": league_season_id})
+        status = self._validate_membership_status(status)
+        if status.is_terminal:
+            raise ValidationError(
+                "A membership cannot be created in a terminal status.",
+                {"reason": "membership_status_terminal_create",
+                 "status": status.value})
+        canonical_position = self._validate_position(
+            position if position is not None else player.position)
+        jersey = (player.jersey_number if jersey_number is _UNSET
+                  else jersey_number)
+        self._validate_jersey_number(jersey)
+        canonical_shoots = self._validate_shoots(
+            player.shoots if shoots is _UNSET else shoots)
+        # Uniqueness pre-checks (the 059 partial unique indexes decide any
+        # cross-process race the same way, via IntegrityConflictError).
+        open_rows = self.store.open_memberships_for_player_in_league_season(
+            player_id, league_season_id)
+        if open_rows:
+            raise ValidationError(
+                "Player already has an open membership on this league "
+                "season; update or end it instead of creating another.",
+                {"reason": "membership_open_conflict",
+                 "affected_membership_ids": [m.id for m in open_rows]})
+        if status is MembershipStatus.ACTIVE:
+            self._assert_no_active_membership_conflict(player_id, season.id)
+            self._assert_membership_jersey_available(
+                league_season_id, team_id, jersey)
+        membership = SeasonRosterMembership(
+            id=self.store.next_id("srm"),
+            player_id=player_id,
+            league_season_id=league_season_id,
+            season_id=season.id,
+            team_id=team_id,
+            status=status,
+            position=canonical_position,
+            jersey_number=jersey,
+            shoots=canonical_shoots,
+            effective_from=self.clock(),
+            effective_to=None,
+        )
+        self.store.add_season_roster_membership(membership)
+        self._membership_event(
+            membership.id, "created", actor_id, reason,
+            {"player_id": player_id, "league_season_id": league_season_id,
+             "season_id": season.id, "team_id": team_id,
+             "status": status.value, "position": canonical_position.value,
+             "jersey_number": jersey, "shoots": canonical_shoots})
+        self._audit("season_roster_membership_created",
+                    "season_roster_membership", membership.id, actor_id,
+                    {"player_id": player_id, "team_id": team_id,
+                     "league_season_id": league_season_id,
+                     "season_id": season.id, "status": status.value})
+        return membership
+
+    @_transactional
+    def set_season_roster_membership_status(
+            self, membership_id: str, status,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> SeasonRosterMembership:
+        """Move a membership stint through its lifecycle (#205 Slice A).
+
+        A terminal row (released/transferred) is immutable history: it can
+        never transition again — the future #205 correction workflow, with
+        privileged authorization + reason + audit, is the only thing that
+        will ever revisit one, and a NEW stint is a new row. Entering
+        ``active`` re-asserts both uniqueness rules (authoritative-per-
+        (player, Season) and the season-Team jersey). Entering a terminal
+        status stamps ``effective_to``. A no-op transition is rejected, not
+        silently absorbed, so the event history never lies about a change
+        that didn't happen.
+
+        REVIVING a PARKED row (``inactive``/``injured``) into ``applicant``,
+        ``affiliate`` or ``active`` revalidates the FULL Player/Team/
+        LeagueSeason/Program/active-registration spine first (#205 review
+        round 3 blocker 2, extended to the Program leg by round 4's owner
+        ruling) — the same spine ``create_season_roster_membership``
+        demands for those three statuses, and the same set
+        ``_assert_membership_spine_valid`` names in its own contract. The
+        UNIQUENESS rules stay ``active``-only: reviving to applicant or
+        affiliate re-proves the spine without acquiring the one-open-stint
+        or season-Team jersey constraints, exactly as before.
+
+        Entering a TERMINAL status is UNCONDITIONALLY REFUSED — a hard
+        ``NotAuthorizedError``, never reachable by any caller, actor_id or
+        reason string (#205 review round 2, owner product ruling overriding
+        round 1 finding 5's shipped "actor_id + reason" floor). That floor
+        was reachable by any caller supplying an arbitrary non-blank string
+        for each — an unvalidated string is not authorization, so it never
+        actually stopped anyone from releasing or transferring a
+        membership; it only stopped the SILENT/anonymous/unreasoned case.
+        This PR (#212 Slice A) is scoped to schema/migration/compatibility
+        proof only. The authorized transfer/release workflow — session-
+        resolved principals, scope checks, a deadline/override policy,
+        Game-state safeguards, atomic audit, tri-store/HTTP coverage — ships
+        in a LATER #205 slice with its own review; until then, NOTHING on
+        this surface may reach a terminal status. ``released``/
+        ``transferred`` remain valid ENUM values (the schema and event model
+        stay fully capable of representing them, including for a future
+        backfill/migration path) — only SETTING one through this method is
+        refused, unconditionally. A membership already born released/
+        transferred (e.g. planted directly at the store layer, never through
+        this method) is still immutable history exactly as before — that
+        rule, above, is untouched."""
+        membership = self.store.get_season_roster_membership_for_update(
+            membership_id)
+        if membership is None:
+            raise NotFoundError(f"Membership {membership_id} not found.")
+        self._require_active_season(membership.season_id)  # #159 guard
+        status = self._validate_membership_status(status)
+        if membership.status.is_terminal:
+            raise ValidationError(
+                "This membership has ended; its row is immutable history. "
+                "Create a new membership for a new stint.",
+                {"reason": "membership_terminal",
+                 "membership_id": membership.id,
+                 "status": membership.status.value})
+        if status is membership.status:
+            raise ValidationError(
+                f"Membership is already {status.value}.",
+                {"reason": "membership_status_unchanged",
+                 "status": status.value})
+        # #205 review round 3 blocker 2 — REVIVING a parked row revalidates
+        # the spine for EVERY target that requires one, not only ``active``.
+        # This guard used to be spelled ``if status is ACTIVE``, even though
+        # ``_assert_membership_spine_valid``'s own contract has always named
+        # ``active``/``applicant``/``affiliate``: the helper was right and
+        # its single call site was wrong. A membership parked to inactive/
+        # injured, whose SeasonTeamRegistration was then deactivated (or
+        # whose Team/LeagueSeason/Player vanished, or whose Team moved
+        # League), could be moved inactive->applicant or inactive->affiliate
+        # and the new status was written on that dead spine — reproduced on
+        # Memory, SQLite and PostgreSQL. It matters because ``create`` for
+        # those same statuses REQUIRES an active registration, and the
+        # parent-mutation guards treat every non-terminal membership as
+        # live, so a restored backup or direct write could be re-exposed
+        # through a status change.
+        #
+        # Scoped deliberately: the SOURCE must be parked and the TARGET must
+        # be one create validates a spine for. The uniqueness rules below
+        # stay ACTIVE-only — reviving to applicant/affiliate re-proves the
+        # spine, and does NOT start applying the one-open-stint or jersey
+        # rules to non-active statuses. Terminal targets never reach here:
+        # ``is_terminal`` is disjoint from _REVIVING_MEMBERSHIP_STATUSES, so
+        # the unconditional refusal below still fires first and unchanged.
+        if status is MembershipStatus.ACTIVE or (
+                membership.status in _PARKED_MEMBERSHIP_STATUSES
+                and status in _REVIVING_MEMBERSHIP_STATUSES):
+            # #205 review round 1 finding 2 — the spine check runs BEFORE
+            # the uniqueness re-checks: a reactivation onto a spine that no
+            # longer holds is invalid regardless of whether another active
+            # membership or jersey happens to conflict.
+            self._assert_membership_spine_valid(membership)
+        if status is MembershipStatus.ACTIVE:
+            self._assert_no_active_membership_conflict(
+                membership.player_id, membership.season_id,
+                exclude_membership_id=membership.id)
+            self._assert_membership_jersey_available(
+                membership.league_season_id, membership.team_id,
+                membership.jersey_number,
+                exclude_membership_id=membership.id)
+        elif status.is_terminal:
+            # #205 review round 2 — owner product ruling, overriding round
+            # 1 finding 5's "actor_id + reason" floor: that floor was a
+            # VALIDATED INPUT check, not authorization — any caller could
+            # satisfy it by supplying an arbitrary non-blank string for
+            # each, so it never actually stopped an unauthorized release or
+            # transfer, only a silent/anonymous/unreasoned one. This slice
+            # (#212 Slice A) is scoped to schema/migration/compatibility
+            # proof only; the authorized workflow (session-resolved
+            # principals, scope checks, deadline/override policy, Game-
+            # state safeguards, atomic audit, tri-store/HTTP coverage)
+            # ships in a LATER #205 slice. Until then this refuses
+            # UNCONDITIONALLY — checked before any write/event/audit, and
+            # never satisfiable by any actor_id or reason value, unlike the
+            # floor it replaces.
+            raise NotAuthorizedError(
+                "Releasing or transferring a membership is not available "
+                "through this method yet; the authorized transition "
+                "workflow ships in a later slice.",
+                {"reason": "terminal_transition_not_authorized",
+                 "membership_id": membership.id, "status": status.value})
+        previous = membership.status
+        membership.status = status
+        if status.is_terminal:
+            # Currently unreachable through THIS method — the unconditional
+            # refusal above always raises first for any terminal ``status``
+            # — deliberately left in place rather than deleted: the later
+            # #205 slice that ships the authorized transition workflow
+            # replaces that refusal with real authorization checks and
+            # reuses this exact stamping, rather than having to re-add it.
+            membership.effective_to = self.clock()
+        self.store.save_season_roster_membership(membership)
+        self._membership_event(
+            membership.id, "status_changed", actor_id, reason,
+            {"from": previous.value, "to": status.value})
+        self._audit("season_roster_membership_status_changed",
+                    "season_roster_membership", membership.id, actor_id,
+                    {"from": previous.value, "to": status.value})
+        return membership
+
+    @_transactional
+    def update_season_roster_membership(
+            self, membership_id: str, *, position=_UNSET,
+            jersey_number=_UNSET, shoots=_UNSET,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> SeasonRosterMembership:
+        """Correct a membership's SEASON-SCOPED attributes in place (#205
+        Slice A) — id, spine, status and history unchanged.
+
+        Partial and audited exactly like ``update_player``: a field left
+        ``_UNSET`` is untouched; explicit ``None`` clears a nullable one
+        (jersey/shoots; position is always concrete). Values reuse the shared
+        validation (jersey range, membership-scoped active uniqueness,
+        position/shoots gates). A genuine no-op writes nothing and appends
+        no event, so the history never lies. Terminal rows are immutable."""
+        membership = self.store.get_season_roster_membership_for_update(
+            membership_id)
+        if membership is None:
+            raise NotFoundError(f"Membership {membership_id} not found.")
+        self._require_active_season(membership.season_id)  # #159 guard
+        if membership.status.is_terminal:
+            raise ValidationError(
+                "This membership has ended; its row is immutable history.",
+                {"reason": "membership_terminal",
+                 "membership_id": membership.id,
+                 "status": membership.status.value})
+        changed = {}
+        if position is not _UNSET:
+            new_position = self._validate_position(position)
+            if new_position is not membership.position:
+                changed["position"] = {
+                    "from": membership.position.value
+                    if membership.position else None,
+                    "to": new_position.value}
+                membership.position = new_position
+        if jersey_number is not _UNSET:
+            self._validate_jersey_number(jersey_number)
+            if jersey_number != membership.jersey_number:
+                if membership.status is MembershipStatus.ACTIVE:
+                    self._assert_membership_jersey_available(
+                        membership.league_season_id, membership.team_id,
+                        jersey_number, exclude_membership_id=membership.id)
+                changed["jersey_number"] = {
+                    "from": membership.jersey_number, "to": jersey_number}
+                membership.jersey_number = jersey_number
+        if shoots is not _UNSET:
+            new_shoots = self._validate_shoots(shoots)
+            if new_shoots != membership.shoots:
+                changed["shoots"] = {
+                    "from": membership.shoots, "to": new_shoots}
+                membership.shoots = new_shoots
+        if not changed:
+            return membership
+        self.store.save_season_roster_membership(membership)
+        self._membership_event(
+            membership.id, "attributes_changed", actor_id, reason, changed)
+        self._audit("season_roster_membership_updated",
+                    "season_roster_membership", membership.id, actor_id,
+                    {"changed_fields": sorted(changed)})
+        return membership
 
     @_transactional
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
@@ -2881,6 +3793,38 @@ class SetupService:
                      "actual_division_id": existing.division_id})
             wanted[tid] = (lid, div_id)
 
+        return self._apply_registration_selections(
+            to_season_id=to_season_id, from_season_id=from_season_id,
+            wanted=wanted, actor_id=actor_id)
+
+    def _apply_registration_selections(self, *, to_season_id: str,
+                                       from_season_id: str, wanted: dict,
+                                       actor_id: Optional[str]) -> dict:
+        """Shared write-application core for "apply these Team/League/Division
+        selections to this target Season" (#159 copy-forward), extracted
+        verbatim from ``roll_forward_registrations_v2``'s own apply phase so
+        there is exactly ONE implementation both it and the new-Season
+        copy-forward commit call — never two that could silently drift.
+
+        Takes an ALREADY-VALIDATED ``wanted: {team_id: (league_id,
+        division_id)}`` mapping (each caller runs its own pre-write gate first
+        — see ``roll_forward_registrations_v2`` and
+        ``_resolve_copy_forward_plan`` — because what counts as a valid
+        selection differs between "the target Season already exists" and "the
+        target Season does not exist until this very commit creates it"); this
+        helper only performs the upsert/reactivate + per-row and summary audit
+        that is identical either way.
+
+        MUST run inside the caller's transaction, with ``to_season_id`` (if it
+        already existed before this call) and every League named in
+        ``wanted`` already row-locked by the caller in the canonical
+        Team -> League -> Season order (#159) — this helper acquires no lock
+        of its own beyond ``_link_league_season``'s own re-entrant League
+        lock when it creates a new binding. A freshly-minted ``to_season_id``
+        (the copy-forward commit's own case) needs no lock: nothing else can
+        reference a Season id before this transaction that created it
+        commits.
+        """
         rolled, skipped, created = 0, 0, []
         for tid, (lid, div_id) in wanted.items():
             # #283: the registration is stored against the League's LeagueSeason
@@ -2938,6 +3882,1018 @@ class SetupService:
                      "rolled_forward": rolled, "skipped": skipped})
         return {"rolled_forward": rolled, "skipped": skipped,
                 "registrations": created}
+
+    # -- new-Season copy-forward preview/commit (#159) ----------------------
+    # "A new Season can be previewed/copied forward without mutating the
+    # prior Season." Composes create_season (via _resolve_season_creation)
+    # with roll_forward_registrations_v2's own selection machinery (via
+    # _apply_registration_selections), modeled directly on
+    # preview_ice_availability/commit_ice_availability's fingerprint pattern
+    # (#158): preview is side-effect-free (plus an optional audit row) and
+    # returns a ``copy_forward_fingerprint`` binding the ENTIRE resolved plan;
+    # commit refuses before any write unless that fingerprint (a) is
+    # supplied, (b) matches a FRESH re-resolution of the plan against current
+    # state, and (c) matches a successful preview audit by the SAME actor —
+    # then creates the Season and applies the selections in ONE transaction.
+    #
+    # DIVISION CONTRACT (the trickiest part of this slice, decided and
+    # documented here): a selection's optional ``division_id`` cannot name a
+    # row in the TARGET Season the way roll_forward_registrations_v2's own
+    # ``division_id`` does, because the target Season (and therefore any
+    # target LeagueSeason/Division) does not exist until commit creates it,
+    # and this slice deliberately builds no machinery to fabricate a matching
+    # target Division. So ``division_id`` here instead names a Division the
+    # team occupies TODAY, under the SOURCE Season's LeagueSeason for the
+    # same League — proving the selection is a coherent "carry this team's
+    # current division assignment forward" request rather than a fabricated
+    # id — and a division_id that does not resolve there refuses the ENTIRE
+    # batch (``division_needs_target_creation``) rather than silently
+    # guessing. Even a VALID source-side division_id is never written onto
+    # the new registration (no target Division can exist yet): the created
+    # registration always carries ``division_id=None``, and the preview
+    # response marks each such selection ``division_pending: true`` so the
+    # operator sees, before committing, exactly which teams will land without
+    # a Division and need one assigned afterward (create the Division under
+    # the new Season, then reassign — both already-existing tools, out of
+    # scope to extend further here).
+    # -- copy-forward commit ledger: immutable response snapshot (#159
+    # review round 3, owner P1, structural change 1) ------------------------
+    # Explicit, non-generic (de)serializers for exactly the two dataclasses
+    # a commit's response carries — NOT a reflective/generic dataclass walk
+    # — so a datetime/enum field is never silently handed to ``json.dumps``
+    # unconverted, and reconstruction always produces a real ``Season``/
+    # ``SeasonTeamRegistration`` instance (not a plain dict) so the facade's
+    # existing ``_serialize``/``_registration_dict`` keep working completely
+    # unchanged on a replay — they cannot tell a reconstructed row from a
+    # freshly queried one. Deliberately local to this module rather than
+    # importing api/service.py's own ``_jsonify``: services/ must not depend
+    # on api/, the reverse of this codebase's layering (see CLAUDE.md).
+    @staticmethod
+    def _copy_forward_season_snapshot(season: Season) -> dict:
+        return {
+            "id": season.id, "program_id": season.program_id,
+            "name": season.name,
+            "start_date": (season.start_date.isoformat()
+                           if season.start_date else None),
+            "end_date": (season.end_date.isoformat()
+                        if season.end_date else None),
+            "external_ref": season.external_ref,
+            "status": season.status.value if season.status else None,
+            "archived_at": (season.archived_at.isoformat()
+                            if season.archived_at else None),
+        }
+
+    @staticmethod
+    def _copy_forward_season_from_snapshot(data: dict) -> Season:
+        return Season(
+            id=data["id"], program_id=data.get("program_id"),
+            name=data.get("name"),
+            start_date=(datetime.fromisoformat(data["start_date"])
+                       if data.get("start_date") else None),
+            end_date=(datetime.fromisoformat(data["end_date"])
+                     if data.get("end_date") else None),
+            external_ref=data.get("external_ref"),
+            status=(SeasonStatus(data["status"]) if data.get("status")
+                   else SeasonStatus.ACTIVE),
+            archived_at=(datetime.fromisoformat(data["archived_at"])
+                        if data.get("archived_at") else None))
+
+    def _copy_forward_registration_snapshot(
+            self, reg: SeasonTeamRegistration) -> dict:
+        """... plus the registration's PUBLIC identity -- ``season_id``/
+        ``league_id`` -- resolved via its LeagueSeason ONCE, right now,
+        the SAME way ``ApiService._registration_dict`` resolves them (#159
+        review round 4, owner P1 finding 2). Before this round only the
+        domain fields were frozen; ``_registration_dict`` re-resolved
+        ``season_id``/``league_id`` from the LIVE LeagueSeason on EVERY
+        call, replay included, so deleting the target registration's
+        LeagueSeason binding after commit made a replay of an
+        already-successful fingerprint come back with
+        ``season_id: null, league_id: null`` instead of the values the
+        original commit actually returned -- response_snapshot was not
+        the immutable API response it claimed to be. Freezing them here,
+        alongside every other field this snapshot already freezes, closes
+        that: a replay never needs to touch ``league_seasons`` again. See
+        ``_copy_forward_result_from_ledger_row``, which builds
+        ``registration_identities`` from these two fields instead of
+        deferring to a live lookup, and
+        ``ApiService.commit_new_season_copy_forward``, which prefers that
+        map over ``_registration_dict``'s own resolution."""
+        ls = (self.store.get_league_season(reg.league_season_id)
+              if reg.league_season_id else None)
+        return {"id": reg.id, "league_season_id": reg.league_season_id,
+                "team_id": reg.team_id, "division_id": reg.division_id,
+                "active": reg.active,
+                "season_id": ls.season_id if ls else None,
+                "league_id": ls.league_id if ls else None}
+
+    @staticmethod
+    def _copy_forward_registration_from_snapshot(
+            data: dict) -> SeasonTeamRegistration:
+        return SeasonTeamRegistration(
+            id=data["id"], league_season_id=data.get("league_season_id"),
+            team_id=data.get("team_id"), division_id=data.get("division_id"),
+            active=bool(data.get("active")))
+
+    def _copy_forward_response_snapshot(self, *, season, registrations,
+                                        totals) -> dict:
+        """The full immutable snapshot stored on the ledger row at commit
+        time — season + registrations + totals, every value already
+        JSON-safe. See migration 054 and ``SeasonCopyForwardCommit.
+        response_snapshot``."""
+        return {
+            "season": self._copy_forward_season_snapshot(season),
+            "registrations": [self._copy_forward_registration_snapshot(r)
+                              for r in registrations],
+            "totals": dict(totals),
+        }
+
+    @staticmethod
+    def _copy_forward_registration_identities(snapshot: dict) -> dict:
+        """``{registration_id: {"season_id":, "league_id":}}`` for every
+        registration a ``_copy_forward_response_snapshot`` snapshot
+        carries (#159 review round 4, owner P1 finding 2) -- the ONE place
+        that reads the ``season_id``/``league_id`` a registration snapshot
+        froze, so a fresh commit's own response and every future replay of
+        it are built from the exact same values, by construction. See
+        ``ApiService.commit_new_season_copy_forward``, the sole reader."""
+        return {r["id"]: {"season_id": r.get("season_id"),
+                          "league_id": r.get("league_id")}
+                for r in snapshot.get("registrations", []) if r.get("id")}
+
+    @staticmethod
+    def _copy_forward_request_identity(*, actor_id, program_id, name,
+                                       start_date, end_date,
+                                       source_season_id, selections) -> dict:
+        """The RAW caller-supplied identity of a copy-forward commit
+        request (#159 review round 4, owner P1 finding 1) -- the acting
+        actor plus every field ``_resolve_copy_forward_plan`` takes as
+        input, captured EXACTLY as submitted: no store lookup, no
+        normalization.
+
+        Deliberately NOT ``_resolve_copy_forward_plan``'s own ``reviewed``
+        dict (the structure ``fingerprint`` hashes), which is enriched
+        with Program/Team/League/Division NAMES looked up from the store.
+        Re-deriving that enrichment on every early-replay check would mean
+        re-running store-dependent resolution before the ledger is even
+        consulted -- reintroducing, for the REQUEST side of a replay
+        decision, the exact staleness hazard #159 review round 3 closed
+        for the RESPONSE side: a later, unrelated rename elsewhere must
+        never change whether an already-successful replay is honored, any
+        more than it may change what that replay returns. Comparing this
+        raw, input-only identity is what lets a replay decision stay a
+        pure function of "what did THIS caller just submit", with zero
+        store access -- see ``_copy_forward_request_identity_matches``.
+
+        Returns a plain dict wrapping whatever the caller passed for
+        ``selections`` -- possibly a mutable list of mutable dicts the
+        caller still owns and can go on mutating after this call returns.
+        This function's OWN result is therefore still mutable and must
+        NEVER be persisted as-is; see ``_copy_forward_canonical_json``, and
+        the SOLE two call sites of this method
+        (``_copy_forward_request_identity_matches``, and the ledger INSERT
+        in ``commit_new_season_copy_forward``), both of which canonicalize
+        this dict into an immutable string before it is compared or stored
+        (#159 review round 5, owner P1 finding 1).
+        """
+        return {
+            "actor_id": actor_id, "program_id": program_id, "name": name,
+            "start_date": start_date, "end_date": end_date,
+            "source_season_id": source_season_id, "selections": selections,
+        }
+
+    @staticmethod
+    def _copy_forward_canonical_json(value) -> str:
+        """The SAME canonicalization ``_resolve_copy_forward_plan`` already
+        uses to turn its resolved ``reviewed`` plan into ``fingerprint`` —
+        reused here (#159 review round 4) so two request-identity payloads
+        compare equal whenever they are STRUCTURALLY equal, regardless of
+        dict key order or a list-vs-tuple difference introduced by a JSON
+        round trip through SQL storage."""
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          default=str)
+
+    def _copy_forward_request_identity_matches(self, row, *, actor_id,
+                                                program_id, name, start_date,
+                                                end_date, source_season_id,
+                                                selections) -> bool:
+        """True iff the CURRENT actor and submitted request, canonicalized
+        the same way, are byte-identical to the immutable
+        ``request_identity`` the ledger row ``row`` stored at the commit
+        that actually produced it (#159 review round 4, owner P1 finding
+        1). A pure comparison of caller-supplied values against an
+        immutable stored record -- no store access, so it can never be
+        affected by (and can never itself trigger) any later, unrelated
+        mutation. See ``_copy_forward_request_identity`` for exactly what
+        is compared and why it is the RAW request rather than the
+        resolved plan.
+
+        ``row.request_identity`` is ITSELF already the canonical JSON
+        string ``_copy_forward_canonical_json`` produces (#159 review
+        round 5, owner P1 finding 1 -- see that method's own docstring and
+        the ledger INSERT in ``commit_new_season_copy_forward``, the only
+        writer of this column): a plain Python string, immutable by
+        construction, frozen at commit time from whatever the ORIGINAL
+        caller's ``selections`` looked like at that exact moment. Building
+        ``current`` fresh here and comparing it directly against that
+        already-canonical string -- rather than re-canonicalizing
+        ``row.request_identity`` too, the way this comparison worked before
+        this round -- means there is no live dict/list graph on EITHER side
+        of this comparison for a later mutation of the caller's own
+        ``selections`` object to reach: the stored side was already
+        collapsed to an immutable string the instant it was written, no
+        matter what InMemoryStore does or does not copy on write/read.
+
+        Called before EVERY return of an already-committed ledger row's
+        response -- both the early pre-lock check and the post-lock
+        race-check backstop route through this via the shared
+        ``_copy_forward_owned_ledger_result`` helper (#159 review round 5,
+        owner P1 finding 2) -- so a mismatch here is never itself fatal;
+        each CALLER decides what a mismatch means for its own control flow
+        (fall through vs. raise a stable refusal). See
+        ``_copy_forward_owned_ledger_result``.
+        """
+        current = self._copy_forward_canonical_json(
+            self._copy_forward_request_identity(
+                actor_id=actor_id, program_id=program_id, name=name,
+                start_date=start_date, end_date=end_date,
+                source_season_id=source_season_id, selections=selections))
+        return current == (row.request_identity or "")
+
+    def _copy_forward_owned_ledger_result(self, row, *, actor_id,
+                                          program_id, name, start_date,
+                                          end_date, source_season_id,
+                                          selections):
+        """The ONE gate every site in ``commit_new_season_copy_forward``
+        that can return an already-committed ledger row's response must
+        call (#159 review round 5, owner P1 finding 2) -- so the SAME
+        actor/request-identity comparison governs every such site, and a
+        THIRD site added later cannot reintroduce this bug by omission
+        simply by forgetting to call ``_copy_forward_request_identity_
+        matches`` itself.
+
+        Returns the row's response (via ``_copy_forward_result_from_
+        ledger_row``) if ``row`` is not None AND its stored identity
+        matches the CURRENT actor/request; returns ``None`` otherwise --
+        for BOTH ``row is None`` (nothing to return) and an identity
+        mismatch (something exists, but it is not THIS caller's to
+        collect). Callers cannot tell those two ``None`` cases apart from
+        the return value alone, which is intentional: whichever refusal a
+        caller raises when this returns ``None`` must not depend on WHY it
+        was ``None``, or a mismatch would be distinguishable from an
+        ordinary "nothing here yet" — the same non-disclosure property
+        ``_copy_forward_request_identity_matches`` already documents.
+
+        Before this round, the two return sites in
+        ``commit_new_season_copy_forward`` (the early pre-lock check, and
+        the post-lock race-check backstop) each decided independently
+        whether to return a ledger row's response. The early check called
+        ``_copy_forward_request_identity_matches`` directly; the post-lock
+        backstop called NOTHING -- ``if already_committed is not None:
+        return ...`` was unconditional, so it returned ANY row with a
+        matching fingerprint regardless of who committed it. Concretely:
+        actor A previews+commits a plan; actor B independently previews
+        the IDENTICAL plan (the fingerprint hashes the resolved plan only,
+        never the actor, so two different actors submitting the same plan
+        get the same fingerprint) and holds their OWN valid preview audit
+        for it. Actor B's commit correctly fails the EARLY check (identity
+        mismatch), falls through, and independently re-passes both the
+        fingerprint-match and preview-audit gates below (their own
+        preview really was valid) -- landing on the post-lock backstop,
+        which handed back actor A's Season with no further check at all.
+        See ``test_second_actor_who_also_previewed_the_identical_plan_is_
+        refused_not_given_the_winners_season`` (this file) for the
+        regression coverage, sequential AND concurrent, both arrival
+        orders.
+        """
+        if row is None:
+            return None
+        if not self._copy_forward_request_identity_matches(
+                row, actor_id=actor_id, program_id=program_id, name=name,
+                start_date=start_date, end_date=end_date,
+                source_season_id=source_season_id, selections=selections):
+            return None
+        return self._copy_forward_result_from_ledger_row(row)
+
+    def _has_matching_copy_forward_preview_audit(self, actor_id, fingerprint):
+        """True if ``actor_id`` recorded a successful
+        ``new_season_copy_forward_previewed`` audit for exactly
+        ``fingerprint`` — the commit preview gate, mirroring
+        ``_has_matching_preview_audit`` (#158) exactly."""
+        if actor_id is None or fingerprint is None:
+            return False
+        for entry in self.store.all_setup_audit():
+            if (entry.action == "new_season_copy_forward_previewed"
+                    and entry.actor_id == actor_id
+                    and entry.detail.get("copy_forward_fingerprint")
+                    == fingerprint):
+                return True
+        return False
+
+    def _resolve_copy_forward_plan(self, *, program_id, name, start_date,
+                                   end_date, source_season_id, selections):
+        """Deterministic, side-effect-free planning shared by preview and
+        commit (#159 — mirrors ``_plan_ice_availability``'s #158 role
+        exactly): resolve the would-be Season's fields via
+        ``_resolve_season_creation`` (Program exists, timezone-anchored
+        dates, end >= start — the SAME checks ``create_season`` itself runs),
+        validate the source Season and every selection the same way
+        ``roll_forward_registrations_v2`` validates its own (team exists,
+        belongs to the program, has a permanent league_id matching the
+        selection, a named division belongs to the SOURCE LeagueSeason — see
+        the division contract above), and hash the resolved, operator-visible
+        plan into a fingerprint. Commit calls this AGAIN under its own Team/
+        League locks, so the bound snapshot is the one its write acts on —
+        any drift (a source registration deactivated, a team moved to
+        another league, a division renamed) changes the fingerprint and
+        forces a fresh preview, exactly like the ice-availability pattern.
+        """
+        program, clean_name, start, end = self._resolve_season_creation(
+            program_id, name, start_date, end_date)
+        if not isinstance(source_season_id, str) or _blank(source_season_id):
+            raise ValidationError(
+                "source_season_id must be a non-empty string.")
+        src = self.store.get_season(source_season_id)
+        if src is None:
+            raise NotFoundError(f"Season {source_season_id} not found.")
+        # Cross-Program refusal (#159): mirrors roll_forward_registrations_v2's
+        # own src.program_id != dst.program_id check, except the "destination"
+        # here is the REQUESTED program_id for the new Season (it has no
+        # Season of its own yet to compare against).
+        if (src.program_id or None) != (program_id or None):
+            raise ValidationError(
+                "The source season belongs to a different program than the "
+                "new season.",
+                {"reason": "cross_program_source_season",
+                 "program_id": program_id,
+                 "source_season_id": source_season_id})
+        if not isinstance(selections, list) or not selections:
+            raise ValidationError(
+                "Copy-forward requires a non-empty selections list; each "
+                "selection needs a target league_id.")
+        source_active = {
+            r.team_id for r in self.store.registrations_for_season(
+                source_season_id) if r.active}
+        # Same round-19 defense roll_forward_registrations_v2 uses: two
+        # selections for the same team_id in one batch is unresolvable
+        # ambiguity, caught before any selection is otherwise processed.
+        team_id_counts = {}
+        for sel in selections:
+            if isinstance(sel, dict) and isinstance(sel.get("team_id"), str):
+                team_id_counts[sel["team_id"]] = (
+                    team_id_counts.get(sel["team_id"], 0) + 1)
+        rows = []
+        for sel in selections:
+            if not isinstance(sel, dict):
+                raise ValidationError(
+                    "Each selection must be an object with a team_id and "
+                    "league_id.")
+            tid = sel.get("team_id")
+            if not isinstance(tid, str) or _blank(tid):
+                raise ValidationError(
+                    "Each selection needs a non-empty team_id.")
+            if tid not in source_active:
+                raise ValidationError(
+                    f"Team {tid} is not registered in the source season.")
+            if team_id_counts.get(tid, 0) > 1:
+                raise ValidationError(
+                    f"Team {tid} has more than one selection in this "
+                    "copy-forward batch; submit only one selection per team.",
+                    {"reason": "rollover_duplicate_team_selection",
+                     "team_id": tid})
+            # Optional explicit source registration identity (#331 round 19
+            # parity): when supplied, must resolve to an ACTIVE row for
+            # EXACTLY this team in the source season.
+            reg_id = sel.get("registration_id")
+            if reg_id is not None:
+                if not isinstance(reg_id, str) or _blank(reg_id):
+                    raise ValidationError(
+                        "A selection's registration_id must be a "
+                        "non-empty string when present.")
+                src_reg = self.store.get_season_team_registration(reg_id)
+                if (src_reg is None or src_reg.team_id != tid
+                        or not src_reg.active
+                        or self._season_of_league_season(
+                            src_reg.league_season_id) != source_season_id):
+                    raise ValidationError(
+                        f"Registration {reg_id} is not an active "
+                        f"source-season registration for team {tid}.",
+                        {"reason": "rollover_registration_mismatch",
+                         "team_id": tid, "registration_id": reg_id})
+            lid = sel.get("league_id")
+            if not isinstance(lid, str) or _blank(lid):
+                raise ValidationError(
+                    f"Selection for team {tid} needs a target league_id.")
+            league = self.store.get_league(lid)
+            if league is None:
+                raise NotFoundError(f"League {lid} not found.")
+            if (league.program_id or None) != (program_id or None):
+                raise ValidationError(
+                    f"League {lid} belongs to a different program than the "
+                    "new season.",
+                    {"reason": "league_program_mismatch", "league_id": lid})
+            team = self.store.get_team(tid)
+            if team is None:
+                raise ValidationError(
+                    f"Team {tid} in the source season no longer exists; it "
+                    "cannot be copied forward.")
+            if (team.program_id or None) != (program_id or None):
+                raise ValidationError(
+                    f"Team {tid} belongs to a different program than this "
+                    "copy-forward; it cannot be carried into the new "
+                    "season.")
+            # #283 Slice E parity: a Team may only be carried into its OWN
+            # permanent League (rule 7) — never a sole/latest/default guess.
+            if (team.league_id or None) != lid:
+                raise ValidationError(
+                    f"Team {tid} can only roll into its permanent league "
+                    f"{team.league_id or 'none'}, not {lid}.",
+                    {"reason": "rollover_league_not_team_league",
+                     "team_id": tid, "team_league_id": team.league_id,
+                     "selected_league_id": lid})
+            div_id = sel.get("division_id")
+            source_division_id = None
+            source_division_name = None
+            if div_id is not None:
+                if not isinstance(div_id, str):
+                    raise ValidationError(
+                        "A selection's division_id must be a string or "
+                        "null.")
+                division = self.store.get_division(div_id)
+                div_ls = (self.store.get_league_season(
+                    division.league_season_id)
+                    if division is not None else None)
+                # The DIVISION CONTRACT above: resolved against the SOURCE
+                # season's LeagueSeason for this selection's league, never a
+                # target one (it does not exist yet).
+                if (division is None or div_ls is None
+                        or div_ls.season_id != source_season_id
+                        or div_ls.league_id != lid):
+                    raise ValidationError(
+                        f"Division {div_id} does not exist under the source "
+                        f"season's league {lid}; the new season will need "
+                        "this Division created before this team's division "
+                        "can be carried forward. Remove this selection's "
+                        "division_id, or create the matching Division in "
+                        "the source season first.",
+                        {"reason": "division_needs_target_creation",
+                         "team_id": tid, "division_id": div_id,
+                         "league_id": lid})
+                source_division_id = division.id
+                source_division_name = division.name
+            rows.append({
+                "team_id": tid, "team_name": team.name,
+                "league_id": lid, "league_name": league.name,
+                "registration_id": reg_id,
+                "source_division_id": source_division_id,
+                "source_division_name": source_division_name,
+            })
+        reviewed = {
+            "program_id": program_id, "program_name": program.name,
+            "name": clean_name,
+            "start_date": start.isoformat() if start else None,
+            "end_date": end.isoformat() if end else None,
+            "source_season_id": source_season_id,
+            "source_season_name": src.name,
+            "selections": [
+                {**row, "division_pending": row["source_division_id"]
+                 is not None}
+                for row in rows],
+            "totals": {
+                "teams": len(rows),
+                "leagues": len({row["league_id"] for row in rows}),
+                "divisions_pending": sum(
+                    1 for row in rows
+                    if row["source_division_id"] is not None),
+            },
+        }
+        fingerprint = hashlib.sha256(json.dumps(
+            reviewed, sort_keys=True, separators=(",", ":"), default=str
+        ).encode()).hexdigest()[:16]
+        return {"program": program, "name": clean_name, "start": start,
+                "end": end, "src": src, "rows": rows, "reviewed": reviewed,
+                "fingerprint": fingerprint}
+
+    def preview_new_season_copy_forward(self, *, program_id=None, name=None,
+                                        start_date=None, end_date=None,
+                                        source_season_id=None,
+                                        selections=None, actor_id=None
+                                        ) -> dict:
+        """Preview a new-Season copy-forward (#159): the fully-resolved plan
+        for creating ``name`` under ``program_id`` and carrying
+        ``selections`` forward from ``source_season_id`` — side-effect-free
+        except for a server-attributed ``new_season_copy_forward_previewed``
+        audit row on a SUCCESSFUL preview by an authenticated caller (an
+        invalid plan raises before the audit; ``actor_id`` None records
+        nothing), mirroring ``preview_ice_availability`` (#158) exactly."""
+        plan = self._resolve_copy_forward_plan(
+            program_id=program_id, name=name, start_date=start_date,
+            end_date=end_date, source_season_id=source_season_id,
+            selections=selections)
+        resp = {**plan["reviewed"],
+                "copy_forward_fingerprint": plan["fingerprint"]}
+        if actor_id is not None:
+            with self.store.transaction():
+                self._audit(
+                    "new_season_copy_forward_previewed", "program",
+                    program_id, actor_id, {
+                        "copy_forward_fingerprint": plan["fingerprint"],
+                        "program_id": program_id,
+                        "source_season_id": source_season_id,
+                        "team_ids": [row["team_id"] for row in plan["rows"]],
+                        "totals": resp["totals"],
+                    })
+        return resp
+
+    @_transactional
+    def commit_new_season_copy_forward(self, *, program_id=None, name=None,
+                                       start_date=None, end_date=None,
+                                       source_season_id=None,
+                                       selections=None,
+                                       copy_forward_fingerprint=None,
+                                       actor_id=None) -> dict:
+        """Commit a previewed new-Season copy-forward (#159): atomically
+        create the Season and carry the previewed Team/League selections
+        forward (never Division — see the contract above), requiring
+        ``copy_forward_fingerprint`` to (a) be supplied, (b) match a FRESH
+        re-resolution of the plan against current state, and (c) match a
+        successful preview audit for this SAME actor — all three checked
+        BEFORE any write, mirroring ``commit_ice_availability`` (#158)
+        exactly. A refused commit mutates nothing: no Season row, no
+        registrations, no audit beyond the refusal itself.
+
+        IDEMPOTENT on the fingerprint (#159 review round 2 — supersedes the
+        original "not single-use" design, which the owner ruled a real
+        double-submit/retry blocker, not an acceptable tradeoff): a second
+        commit that reuses the SAME still-valid fingerprint — a client
+        retry, a double-click, or two genuinely concurrent requests racing
+        — does NOT mint a second, distinct Season. A durable ledger
+        (``season_copy_forward_commits``, migration 053's UNIQUE index on
+        ``copy_forward_fingerprint``) records which Season each fingerprint
+        actually produced and — since #159 review round 3 — the FULLY-
+        RESOLVED response itself (``response_snapshot``, migration 054); a
+        replay returns that immutable snapshot instead of creating a
+        second Season — the standard REST idempotency-key replay, exactly
+        as if this caller's own request had simply been re-delivered.
+
+        REPLAY ORDER, AND WHY IT CHANGED (#159 review round 3, owner P1):
+        the ledger is now consulted FIRST — keyed by the caller-supplied
+        ``copy_forward_fingerprint`` directly, before any Team/League lock
+        and before ``_resolve_copy_forward_plan`` re-validates anything —
+        and, on a hit, ``_copy_forward_result_from_ledger_row`` deserializes
+        ``response_snapshot`` and returns it WITHOUT touching the
+        ``seasons`` or ``season_team_registrations`` tables at all. Before
+        this round, the plan was re-resolved (and the ledger only checked
+        AFTER) — which re-validated the SOURCE Season's current
+        registrations, so once the selected Team was unregistered from the
+        source Season, a byte-identical replay of an already-successful
+        fingerprint raised ``Team ... is not registered in the source
+        season`` instead of returning the original result. Worse, the OLD
+        replay path rebuilt its response by re-fetching
+        ``registration_ids`` from the CURRENT store — so once the target
+        registration (or the target Season itself) was deleted through an
+        otherwise fully supported operation, a replay silently returned
+        ``registrations: []`` beside a ledger that still said
+        ``rolled_forward: 1``, or (worse) ``season: null``. All three are
+        closed the same way: the ledger hit is authoritative and
+        self-contained, so nothing that happens to the source Season, the
+        target registrations, or (per ``delete_season``'s own itemized
+        ``copy_forward_commit`` dependency, added the same round) the
+        target Season can ever change what a replay of a given fingerprint
+        returns. The full plan re-resolution below still runs — but ONLY
+        when there is no ledger hit, i.e. either a genuinely new
+        fingerprint or the race-loser path the next paragraph describes.
+
+        THE LEDGER HIT IS AUTHORITATIVE FOR ITS OWN REQUEST ONLY (#159
+        review round 4, owner P1 finding 1) — round 3's "authoritative and
+        self-contained" above described the RESPONSE side; it said nothing
+        about who may collect it. Before this round the early check
+        trusted ANY caller-supplied ``copy_forward_fingerprint`` that
+        matched a row, full stop — a fingerprint is only a hash of the
+        ORIGINAL committer's resolved plan, and this check ran before
+        ``_resolve_copy_forward_plan``/``_has_matching_copy_forward_
+        preview_audit`` ever looked at the CURRENT actor or CURRENT body
+        at all. A second actor who learned (or guessed) an already-
+        committed fingerprint — their own earlier preview response, a
+        browser history entry, a server log — could submit an entirely
+        different Program/source Season/selections/name alongside it and
+        receive the ORIGINAL committer's full response verbatim; their own
+        submitted request was never validated. Every ledger row now ALSO
+        carries ``request_identity`` (migration 055): the RAW actor +
+        body this commit was actually validated against, frozen in the
+        SAME transaction as ``response_snapshot``. Before any early-replay
+        return, the CURRENT actor and submitted request — canonicalized
+        the same way, no store lookup — must match that stored identity
+        exactly (``_copy_forward_request_identity_matches``); on a
+        mismatch this method does NOT raise a bespoke error — it falls
+        through to the UNCHANGED Team/League-lock + plan-resolution path
+        below, which naturally refuses a foreign/stale fingerprint with
+        the ordinary ``preview_mismatch``/``preview_required`` shape any
+        other stale fingerprint gets, so a mismatch is never
+        distinguishable from an everyday refusal and discloses nothing
+        about the original row. See ``test_replay_by_another_actor_who_
+        never_previewed_is_refused``, ``test_replay_with_changed_name_
+        after_commit_is_refused``, and ``test_replay_with_different_
+        program_and_source_season_is_refused`` (tests/test_new_season_
+        copy_forward.py, all three classes) for the required regression
+        matrix, and that file's ``NewSeasonCopyForwardHttpTest`` for the
+        HTTP-only case (d): the original actor's account deactivated
+        (loses ALL scope — the closest realizable form of "loses
+        original-Program scope" for a role that is already global; see
+        ``context_scope._GLOBAL_ROLES``) between the original commit and
+        the replay attempt, which the pre-existing session layer already
+        refuses independent of anything here — regression-tested so this
+        round's change can never accidentally weaken it.
+
+        RESPONSE_SNAPSHOT IS NOW THE COMPLETE PUBLIC DTO (#159 review
+        round 4, owner P1 finding 2): each registration entry in
+        ``response_snapshot`` also freezes its public ``season_id``/
+        ``league_id`` — resolved via its LeagueSeason ONCE, right here,
+        the same way ``ApiService._registration_dict`` resolves them —
+        instead of leaving the facade to re-resolve them from the LIVE
+        LeagueSeason on every read. Before this round that live
+        re-resolution ran on a replay exactly as it does on an ordinary
+        read, so once the target registration's LeagueSeason binding was
+        deleted (a fully supported operation this same round 3 already
+        made survivable for every OTHER field), a replay's season_id/
+        league_id silently came back null instead of the values the
+        original commit actually returned — ``response_snapshot`` claimed
+        to be the immutable API response but was not. See
+        ``_copy_forward_registration_identities`` and ``ApiService.
+        commit_new_season_copy_forward``, and this file's
+        ``test_replay_full_dto_equality_after_registration_and_league_
+        season_deleted`` (all three service/SQL test classes, plus the
+        HTTP twin) for the full-equality regression coverage.
+
+        WHY A PRE-CHECK, NOT A CATCH-ON-CONFLICT (the design this replaced
+        in self-review): this method runs under ``setup_guarded_create``
+        (server.py's ``/api/v2/setup/seasons/copy-forward/commit`` route)
+        INSIDE that caller's OWN already-open transaction — ``@_transactional``
+        above then only JOINS it (``SqlStore.transaction()`` is reentrant),
+        it does not become a second, independently-rollback-able unit. A
+        losing attempt that instead caught the ledger INSERT's unique-
+        violation and swallowed it into a normal return would let THAT
+        outer transaction commit normally afterward — persisting the
+        loser's own un-rolled-back Season, exactly the duplicate this fix
+        exists to prevent (caught live: two sequential HTTP commits each
+        returned the SAME season id in their JSON, yet a THIRD Season row
+        with no client-visible id was left behind in the store). The
+        pre-check sidesteps the whole hazard: it is a plain read with no
+        side effect, so it is correct whether this transaction is the
+        outermost one (a direct/test caller) or nested inside an ancestor's
+        (the HTTP route) — nothing here ever needs to unwind a transaction
+        it does not own. The residual INSERT-vs-INSERT race below (the
+        narrow window between this pre-check and the write) still exists
+        for defense in depth, but is vanishingly rare in practice: the SAME
+        fingerprint implies the SAME selections (it hashes them), so two
+        commits racing on one fingerprint already fully serialize on the
+        Team/League locks taken below, before either ever reaches the
+        pre-check — by the time a loser gets past those locks, the winner
+        has already committed, and the pre-check finds it. When that
+        residual race IS lost, this raises a retryable
+        ConcurrencyConflictError rather than catching it: propagating
+        unwinds to whichever transaction is genuinely outermost for this
+        call, and for the HTTP route, ``setup_guarded_create``'s own
+        ``except ConcurrencyConflictError`` retry (already used for the
+        SAME class of row-moved-under-us race elsewhere in that method)
+        re-runs this method from scratch, landing cleanly on the pre-check.
+        See ``test_second_commit_reusing_the_same_fingerprint_is_idempotent``
+        (tests/test_new_season_copy_forward.py) for the sequential guarantee,
+        ``test_concurrent_commits_with_the_same_fingerprint_create_exactly_
+        one_season`` for the genuine two-connection race, and
+        ``test_sequential_commit_replay_over_http_is_idempotent`` /
+        ``test_concurrent_commit_replay_over_http_is_idempotent`` for both
+        proved again through the REAL nested ``setup_guarded_create``
+        transaction this docstring describes. See (same file)
+        ``test_replay_survives_source_team_unregistered_after_commit``,
+        ``test_replay_survives_target_registration_deleted_after_commit``,
+        and ``test_target_season_delete_is_blocked_then_replay_stays_
+        stable`` / ``test_target_season_delete_blocked_by_copy_forward_
+        commit_never_raw_fk`` for the three #159 review round 3 scenarios
+        this reordering and the itemized ``delete_season`` dependency
+        close, and ``test_delete_vs_replay_race_delete_stays_blocked_
+        replay_stays_stable`` for the required real two-connection
+        delete-vs-replay race.
+        """
+        # #159 review round 3 (owner P1, structural change 1): authenticate
+        # + authorize already happened at the HTTP boundary (server.py) —
+        # this is the service entrypoint — so the FIRST thing this method
+        # does is validate the fingerprint is well-formed and, if so, check
+        # the idempotency ledger BEFORE anything else: before either
+        # Team/League lock below and before _resolve_copy_forward_plan
+        # re-validates ANY mutable state (the source Season's current
+        # registrations, the selections, the Program). ``None`` is refused
+        # immediately, exactly as before this round. Anything else that is
+        # not a non-blank string can never correctly be a store lookup key
+        # (a non-string bound straight to a SQL parameter would crash the
+        # driver instead of raising a structured error — see
+        # SqlStore._query's ``?`` binding), so it is deliberately left
+        # untouched for the UNCHANGED plan/fingerprint-mismatch path below
+        # to refuse in the usual, structured ``preview_mismatch`` shape —
+        # exactly what a malformed fingerprint already got before this
+        # round, since the OLD code never used the raw caller-supplied
+        # value as a lookup key either (only ``plan["fingerprint"]``, a
+        # value this method always computes itself).
+        if copy_forward_fingerprint is None:
+            raise ValidationError(
+                "Preview this copy-forward before committing it.",
+                details={"reason": "preview_required"})
+        if (isinstance(copy_forward_fingerprint, str)
+                and not _blank(copy_forward_fingerprint)):
+            early_replay = (
+                self.store.get_season_copy_forward_commit_by_fingerprint(
+                    copy_forward_fingerprint))
+            # #159 review round 4 (owner P1 finding 1): a fingerprint match
+            # ALONE is not enough to trust this row's response to THIS
+            # caller — it is only a hash of the ORIGINAL committer's
+            # resolved plan, and this early check runs BEFORE
+            # _resolve_copy_forward_plan / _has_matching_copy_forward_
+            # preview_audit ever look at the CURRENT actor or CURRENT
+            # body at all. Without this gate, any caller who learned
+            # (or guessed) an already-committed fingerprint — e.g. their
+            # own earlier preview response, a browser history entry, a
+            # server log — could submit an entirely different Program,
+            # source Season, selections, or name alongside it and receive
+            # the ORIGINAL committer's full response verbatim, never
+            # having validated their own submitted request at all.
+            # _copy_forward_owned_ledger_result (#159 review round 5,
+            # owner P1 finding 2) is the ONE gate both this site and the
+            # post-lock race-check backstop below now share — see its own
+            # docstring. A mismatch here does NOT raise — it falls through
+            # to the unchanged Team/League-lock + _resolve_copy_forward_
+            # plan path below, which naturally refuses a foreign/stale
+            # fingerprint with the SAME preview_mismatch/preview_required
+            # shape any other stale fingerprint gets (this caller's OWN
+            # freshly resolved plan will not hash to a fingerprint that
+            # was computed over someone else's request) — so a mismatch
+            # is never distinguishable from an ordinary stale-fingerprint
+            # refusal, and discloses nothing about the original row.
+            early_result = self._copy_forward_owned_ledger_result(
+                early_replay, actor_id=actor_id, program_id=program_id,
+                name=name, start_date=start_date, end_date=end_date,
+                source_season_id=source_season_id, selections=selections)
+            if early_result is not None:
+                return early_result
+        # Lock every distinct Team/League named in selections FIRST, sorted —
+        # roll_forward_registrations_v2's own canonical lock order (#159), so
+        # a batch can never deadlock Team-vs-Team or League-vs-League, and
+        # the plan rebuilt below can't be shifted by a concurrent transfer or
+        # delete landing between this lock and the write. No lock is taken
+        # for the Season being minted — nothing can reference its id before
+        # this transaction, which creates it, commits. Note: since the SAME
+        # fingerprint implies the SAME selections (it hashes them), two
+        # commits racing on one fingerprint already serialize here — the
+        # ledger pre-check/insert below is the backstop that still holds
+        # even if that ever stops being true (e.g. a future caller re-using
+        # a fingerprint against a hand-built, differently-ordered
+        # selections list).
+        if isinstance(selections, list):
+            for _tid in sorted({sel.get("team_id") for sel in selections
+                                if isinstance(sel, dict)
+                                and isinstance(sel.get("team_id"), str)
+                                and not _blank(sel.get("team_id"))}):
+                self.store.get_team_for_update(_tid)
+            for _lid in sorted({sel.get("league_id") for sel in selections
+                                if isinstance(sel, dict)
+                                and isinstance(sel.get("league_id"), str)
+                                and not _blank(sel.get("league_id"))}):
+                self._lock_league_for_binding(_lid)
+        # Build the ENTIRE plan UNDER the locks (#158-review pattern): Program
+        # existence, date parsing, the source Season and every selection are
+        # (re)resolved here, so nothing the fingerprint check compares against
+        # can be stale relative to committed state.
+        plan = self._resolve_copy_forward_plan(
+            program_id=program_id, name=name, start_date=start_date,
+            end_date=end_date, source_season_id=source_season_id,
+            selections=selections)
+        # Preview binding (#158-review pattern): a commit MUST be preceded by
+        # a preview of the SAME resolved plan BY THE SAME actor — the
+        # fingerprint alone is not a capability, so both checks below must
+        # hold, and they run BEFORE any write. (The "is None" refusal now
+        # lives at the very top of this method, before the early ledger
+        # check — copy_forward_fingerprint can never be None by this point.)
+        if copy_forward_fingerprint != plan["fingerprint"]:
+            raise ScheduleConflictError(
+                "This copy-forward plan changed since it was previewed. "
+                "Preview again before committing.",
+                details={"reason": "preview_mismatch",
+                         "expected": plan["fingerprint"]})
+        if not self._has_matching_copy_forward_preview_audit(
+                actor_id, plan["fingerprint"]):
+            raise ValidationError(
+                "No matching preview by this operator for this "
+                "copy-forward plan. Preview it before committing.",
+                details={"reason": "preview_required"})
+        # SECOND idempotent-replay check (#159 review round 2 originally;
+        # round 3 narrows what it is FOR). The EARLY check at the top of
+        # this method already handles every ordinary replay of an
+        # already-committed fingerprint without reaching here at all. This
+        # one exists purely for the residual genuine-race window: a
+        # fingerprint that was BRAND NEW when this call started (the early
+        # check found nothing) but has since been committed by a concurrent
+        # racer that reached the ledger INSERT below first, while THIS call
+        # was still blocked acquiring the Team/League locks above. A plain
+        # read, no exception, no write attempted — so it is correct and
+        # side-effect-free whether this transaction is this call's own
+        # outermost one or nested inside an ancestor's.
+        already_committed = (
+            self.store.get_season_copy_forward_commit_by_fingerprint(
+                plan["fingerprint"]))
+        # #159 review round 5 (owner P1 finding 2): this return used to be
+        # unconditional -- ANY row with a matching fingerprint was handed
+        # back, regardless of who committed it. The fingerprint hashes the
+        # RESOLVED PLAN only, never the actor, so two different actors who
+        # each independently, legitimately preview the IDENTICAL plan get
+        # the SAME fingerprint and can each individually pass the
+        # fingerprint-match + preview-audit gates just above using their
+        # OWN valid preview. Before this round, whichever of them lost the
+        # race to commit first landed here and silently received the
+        # WINNER's Season -- see _copy_forward_owned_ledger_result's own
+        # docstring for the full walkthrough and
+        # test_second_actor_who_also_previewed_the_identical_plan_is_
+        # refused_not_given_the_winners_season for the regression coverage.
+        # Routing through the SAME shared helper the early check above uses
+        # means this can never again silently skip the identity check the
+        # way the old unconditional return did.
+        race_result = self._copy_forward_owned_ledger_result(
+            already_committed, actor_id=actor_id, program_id=program_id,
+            name=name, start_date=start_date, end_date=end_date,
+            source_season_id=source_season_id, selections=selections)
+        if race_result is not None:
+            return race_result
+        if already_committed is not None:
+            # A ledger row for this EXACT fingerprint already exists, but
+            # its frozen request_identity does not belong to this actor/
+            # request -- this is NOT the residual same-request race the
+            # INSERT-conflict backstop a few lines below exists for (that
+            # backstop's own reasoning -- "the SAME fingerprint implies the
+            # SAME selections" -- only holds for the SAME actor/request;
+            # the fingerprint never encodes WHO is asking). Falling through
+            # to attempt the insert would just lose migration 053's UNIQUE
+            # index and surface a misleading "retry" — retrying changes
+            # nothing, since this fingerprint is now PERMANENTLY spoken for
+            # by someone else's commit. Refused instead with the EXACT SAME
+            # message/reason an ordinary missing-preview-audit refusal
+            # produces a few lines above, so this is never distinguishable
+            # from a caller who simply never previewed, and discloses
+            # nothing about a foreign, already-committed fingerprint
+            # existing at all.
+            raise ValidationError(
+                "No matching preview by this operator for this "
+                "copy-forward plan. Preview it before committing.",
+                details={"reason": "preview_required"})
+        # create_season's own validation already ran above (inside
+        # _resolve_copy_forward_plan's _resolve_season_creation call), so
+        # build and insert the Season directly rather than re-validating.
+        season = Season(id=self.store.next_id("season"),
+                        program_id=program_id, name=plan["name"],
+                        start_date=plan["start"], end_date=plan["end"])
+        self.store.add_season(season)
+        self._audit("season_created", "season", season.id, actor_id,
+                    {"league_id": program_id})
+        wanted = {row["team_id"]: (row["league_id"], None)
+                 for row in plan["rows"]}
+        applied = self._apply_registration_selections(
+            to_season_id=season.id, from_season_id=source_season_id,
+            wanted=wanted, actor_id=actor_id)
+        self._audit(
+            "new_season_copy_forward_committed", "season", season.id,
+            actor_id, {
+                "program_id": program_id,
+                "source_season_id": source_season_id,
+                "copy_forward_fingerprint": plan["fingerprint"],
+                "rolled_forward": applied["rolled_forward"],
+                "skipped": applied["skipped"]})
+        result = {"season": season, "registrations": applied["registrations"],
+                  "totals": {"rolled_forward": applied["rolled_forward"],
+                            "skipped": applied["skipped"]}}
+        # Built ONCE, here, and reused for BOTH the ledger row's
+        # ``response_snapshot`` below AND this fresh commit's own
+        # ``registration_identities`` (#159 review round 4, owner P1
+        # finding 2) — so a fresh commit's response and every future
+        # replay of it read season_id/league_id from the exact same
+        # computation, by construction, rather than two separate
+        # resolutions that could in principle drift.
+        snapshot = self._copy_forward_response_snapshot(
+            season=result["season"], registrations=result["registrations"],
+            totals=result["totals"])
+        result["registration_identities"] = (
+            self._copy_forward_registration_identities(snapshot))
+        # Atomically consume the fingerprint (#159 review round 2): the
+        # LAST statement of this transaction, so migration 053's UNIQUE
+        # index is the final word on whether THIS attempt or a racing one
+        # gets to keep the Season just created above. This is the RESIDUAL
+        # race the pre-check above does not close (the narrow window
+        # between that read and this write) — vanishingly rare per this
+        # method's own docstring, but still enforced rather than assumed.
+        # A race-losing INSERT is translated to IntegrityConflictError and
+        # re-raised here as a RETRYABLE ConcurrencyConflictError — NEVER
+        # caught in this method — so it always unwinds to whichever
+        # transaction is genuinely outermost for this call: this method's
+        # own, for a direct caller (which surfaces the retryable conflict,
+        # matching this codebase's house style for an exhausted race, e.g.
+        # commit_ice_availability's own final `raise` after its retry
+        # budget), or setup_guarded_create's wrapping transaction for the
+        # HTTP route, whose existing `except ConcurrencyConflictError`
+        # retry (already used for the same class of row-moved-under-us
+        # race elsewhere in that method) re-runs this method from scratch
+        # and lands cleanly on the pre-check above.
+        #
+        # ``response_snapshot`` (#159 review round 3, structural change 1)
+        # is built from ``result`` — the season/registrations THIS
+        # transaction just created — right here, still inside the same
+        # transaction, so it is a byte-accurate record of what this commit
+        # actually produced. Every future replay of this fingerprint
+        # deserializes this blob and returns it verbatim; it is never
+        # rebuilt by re-querying ``seasons``/``season_team_registrations``
+        # again, so nothing that later mutates either table (unregistering
+        # the source Team, deleting the target registration — deleting the
+        # target Season itself is refused outright, see delete_season's own
+        # itemized ``copy_forward_commit`` dependency) can change it.
+        try:
+            self.store.add_season_copy_forward_commit(
+                SeasonCopyForwardCommit(
+                    id=self.store.next_id("cfcommit"),
+                    copy_forward_fingerprint=plan["fingerprint"],
+                    season_id=season.id, actor_id=actor_id,
+                    registration_ids=[r.id
+                                     for r in applied["registrations"]],
+                    rolled_forward=applied["rolled_forward"],
+                    skipped=applied["skipped"], committed_at=self.clock(),
+                    response_snapshot=snapshot,
+                    # #159 review round 4 (owner P1 finding 1): the RAW
+                    # request THIS transaction actually validated (via the
+                    # plan re-resolution and preview-audit checks above),
+                    # frozen alongside the response it produced — the
+                    # identity a FUTURE replay of this exact fingerprint
+                    # must match before ever reusing this row. See
+                    # _copy_forward_request_identity_matches.
+                    #
+                    # Canonicalized to an immutable STRING here, at the
+                    # ledger-write boundary itself (#159 review round 5,
+                    # owner P1 finding 1) -- NOT the raw dict
+                    # _copy_forward_request_identity returns, which still
+                    # wraps whatever mutable ``selections`` object the
+                    # CALLER passed in and may keep mutating after this
+                    # call returns. This is the ONE place that matters:
+                    # once this string is built, nothing that happens to
+                    # the caller's own selections list afterward can ever
+                    # reach it again, regardless of how any store chooses
+                    # to hold the row (by reference or by copy).
+                    request_identity=self._copy_forward_canonical_json(
+                        self._copy_forward_request_identity(
+                            actor_id=actor_id, program_id=program_id,
+                            name=name, start_date=start_date,
+                            end_date=end_date,
+                            source_season_id=source_season_id,
+                            selections=selections))))
+        except IntegrityConflictError as exc:
+            if exc.details.get("reason") != "copy_forward_already_committed":
+                raise
+            raise ConcurrencyConflictError(
+                "This copy-forward was just committed by another request; "
+                "please retry.",
+                details={"reason": "copy_forward_fingerprint_conflict",
+                         "retryable": True}) from exc
+        return result
+
+    def _copy_forward_result_from_ledger_row(self, row) -> dict:
+        """Rebuild the exact success shape ``commit_new_season_copy_
+        forward`` returns from an ALREADY-committed ledger row, by
+        deserializing its immutable ``response_snapshot`` (#159 review
+        round 3, structural change 1) — NEVER by touching the ``seasons``
+        or ``season_team_registrations`` tables. The OLD implementation
+        (#159 review round 2) re-fetched ``row.season_id`` and each id in
+        ``row.registration_ids`` from those live tables, which is exactly
+        what let a later, unrelated mutation of either — unregistering the
+        source Team (which the plan re-resolution this replay path used to
+        run BEFORE reaching here would then reject), deleting the target
+        registration, or deleting the target Season — silently change or
+        break what a replay of an already-successful commit returned. This
+        version returns precisely, byte-for-byte, what THAT original
+        commit produced, regardless of anything that has happened to
+        either table since — reconstructing real ``Season``/
+        ``SeasonTeamRegistration`` instances (not plain dicts) so the
+        facade's existing ``_serialize``/``_registration_dict`` calls on
+        the result work completely unchanged, exactly as they do for a
+        freshly-created commit.
+
+        ``registration_identities`` (#159 review round 4, owner P1
+        finding 2) carries each registration's FROZEN ``season_id``/
+        ``league_id`` — see ``_copy_forward_registration_identities`` —
+        so ``ApiService.commit_new_season_copy_forward`` never needs to
+        re-resolve them from the live LeagueSeason for a replay either."""
+        snap = row.response_snapshot or {}
+        return {
+            "season": self._copy_forward_season_from_snapshot(snap["season"]),
+            "registrations": [
+                self._copy_forward_registration_from_snapshot(r)
+                for r in snap.get("registrations", [])],
+            "totals": snap.get("totals") or {
+                "rolled_forward": row.rolled_forward, "skipped": row.skipped},
+            "registration_identities": (
+                self._copy_forward_registration_identities(snap)),
+        }
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     # Each records the old→new parent id in the audit detail so a move is
@@ -3079,6 +5035,19 @@ class SetupService:
     @_transactional
     def assign_player_team(self, player_id: str, team_id: str,
                            actor_id: Optional[str] = None) -> Player:
+        # PR #423 (design §8.6): the epoch fence's GLOBAL exclusive hold,
+        # first (row 15 of the design's writer table) — a Player/Team
+        # reassignment can change what a Player's or Guardian's own scoped
+        # reads resolve to (context_scope walks Player.team_id), and the
+        # affected user is found only by a lookup this method doesn't even
+        # need to perform itself, so it takes the GLOBAL key rather than a
+        # per-user one (§4.2's classification rule). `@_transactional`
+        # already opened this method's transaction; when called from
+        # `_guarded_attempt` (the v2 reassignment dispatch) this simply joins
+        # that already-open, already-SERIALIZABLE transaction (reentrant, see
+        # `SqlStore.transaction`), so "same transaction as the write" holds
+        # either way.
+        self.store.epoch_fence_acquire_exclusive(EPOCH_FENCE_GLOBAL_KEY)
         # #159 r15 — row-lock the Player (not an unlocked read): update_player /
         # set_player_active / delete_player all lock this row, so without the
         # lock a concurrent profile edit or deactivation would be clobbered (or a
@@ -3096,6 +5065,19 @@ class SetupService:
         if player.is_active:
             self._assert_jersey_available(team_id, player.jersey_number,
                                           exclude_player_id=player.id)
+        # #273 review round 2 finding 2: the same same-team duplicate check
+        # create/update already run, now BEFORE the destination-team move —
+        # this method used to check ONLY jersey availability, so a player
+        # carrying a registration number could be moved onto a team that
+        # already had another player with that same number, landing two
+        # rows with one governing-body id on one team. Unlike the jersey
+        # check this is NOT conditioned on ``player.is_active``: the
+        # existing same-team check includes inactive players (deactivating a
+        # row must not free the identity for an accidental duplicate), so a
+        # move must honor the same rule regardless of the mover's active
+        # state.
+        self._assert_registration_number_available(
+            team_id, player.registration_number, exclude_player_id=player.id)
         player.team_id = team_id
         self.store.save_player(player)
         self._audit("player_team_assigned", "player", player.id, actor_id,
@@ -4861,14 +6843,12 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch under the Season lock (the pre-lock read was a
-        # locator). A concurrent move_game relocates the game (new slot/time,
-        # unpublished) under the same Season lock; publishing the stale object
-        # would clobber those fields back. Act on the fresh row.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches under the Season lock it takes (the
+        # pre-lock read was a locator). A concurrent move_game relocates the
+        # game (new slot/time, unpublished) under the same Season lock;
+        # publishing the stale object would clobber those fields back. Act on
+        # the fresh row the guard returns (#427 centralized this).
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         # A game may only be made public while both teams are still valid
         # participants of its competition scope (#180 / #283 Slice E: exact
         # LeagueSeason for a regular game, active Season participation for an
@@ -5097,12 +7077,10 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch under the Season lock; a concurrent move_game may
-        # have unpublished/relocated the game after the locator read.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches under the Season lock it takes; a
+        # concurrent move_game may have unpublished/relocated the game after
+        # the locator read.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot request a reschedule for a cancelled game.")
         if not game.published:
@@ -5570,18 +7548,64 @@ class SetupService:
             changed = list(changed) + ["league_id"]
         return existing, False, changed
 
-    def upsert_imported_player(self, code: str, name: str, team_id: str,
+    def upsert_imported_player(self, code: str, name: Optional[str],
+                               team_id: str,
                                position: Position, jersey_number: Optional[int],
                                email: Optional[str], existing=None,
                                actor_id: Optional[str] = None,
                                import_batch_id: Optional[str] = None,
-                               staged_original_jersey=_UNSET):
+                               staged_original_jersey=_UNSET,
+                               staged_original_registration=_UNSET,
+                               first_name: Optional[str] = None,
+                               last_name: Optional[str] = None,
+                               preferred_name: Optional[str] = None,
+                               birthdate: Optional[str] = None,
+                               registration_number: Optional[str] = None,
+                               shoots: Optional[str] = None,
+                               skill_rating=None):
         """Upsert a Player by its stable player_code (#260), syncing an
         optional email the same way ``add_player`` does: an existing
         ``player:<id>`` ContactDestination's value is updated in place,
         never duplicated. Omitting the email on a repeat row leaves a
         previously-set contact untouched — clearing/retiring a contact is
         #232's own explicit, audited action, never an import side effect.
+
+        #273 identity: the caller may supply structured
+        ``first_name``+``last_name`` (the flattened ``name`` is then derived
+        through the same shared contract as create/edit) plus the optional
+        ``preferred_name`` / ``birthdate`` / ``registration_number`` /
+        ``shoots`` / ``skill_rating`` cells. Every optional cell follows the
+        email rule above: ``None`` (absent/blank) means "leave as-is on
+        update, unset on create" — an import never clears identity data. A
+        same-team duplicate registration number is refused before any write;
+        a same-name-on-one-Team create appends the ``player_duplicate_warning``
+        audit (warn only, never a block or merge). ``staged_original_
+        registration`` (#273 review round 3 finding 1) is the pre-staging
+        registration_number a caller's own
+        :meth:`release_batch_player_registrations` pre-pass already reported
+        for this player, if it released one — see that method and
+        ``staged_original_jersey`` immediately below for why a caller running
+        that pre-pass must pass its result back here rather than let this
+        method read ``existing.registration_number`` directly.
+
+        ``jersey_number`` (#269, predates the ``identity_values`` pattern
+        above) now follows the SAME "leave as-is" contract, computed the
+        SAME way as ``registration_number``'s ``effective_registration``
+        just below (#424 round-4 review): a blank cell (``jersey_number is
+        None``) RETAINS the pre-staging original — ``staged_original_jersey``
+        when a :meth:`release_batch_player_jerseys` pre-pass supplied one,
+        else ``existing.jersey_number`` — rather than landing ``None`` and
+        silently clearing a real number. Before this fix, ``jersey_number``
+        was placed into ``values`` unconditionally as the raw (possibly
+        ``None``) argument and checked for availability the same raw way, so
+        a blank cell on a Team move both evaded the destination team's
+        uniqueness check (a ``None`` availability check is a deliberate
+        no-op — an absent jersey never collides) AND then overwrote the
+        retained value with ``None`` at write time, once
+        ``staged_original_jersey`` had already restored ``obj.jersey_number``
+        for diffing. A brand-new player (``existing is None``) has nothing to
+        retain, so its effective value is simply the supplied one, exactly as
+        before.
         """
         self._validate_jersey_number(jersey_number)
         # Validate/canonicalize the email BEFORE any player write (#268 review):
@@ -5591,7 +7615,25 @@ class SetupService:
         # transaction. None/blank canonicalizes to None -> a no-op below (the
         # import rule: an absent cell is "leave as-is", never a retirement).
         canonical_email = self._validate_email(email)
-        canonical_name = self._validate_player_name(name)
+        canonical_name, canonical_first, canonical_last = (
+            self._resolve_new_player_names(name, first_name, last_name))
+        identity_values = {}
+        if canonical_first is not None:
+            identity_values["first_name"] = canonical_first
+            identity_values["last_name"] = canonical_last
+        if preferred_name is not None:
+            identity_values["preferred_name"] = (
+                self._validate_preferred_name(preferred_name))
+        if birthdate is not None:
+            identity_values["birthdate"] = self._validate_birthdate(birthdate)
+        if registration_number is not None:
+            identity_values["registration_number"] = (
+                self._validate_registration_number(registration_number))
+        if shoots is not None:
+            identity_values["shoots"] = self._validate_shoots(shoots)
+        if skill_rating is not None:
+            identity_values["skill_rating"] = (
+                self._validate_skill_rating(skill_rating))
         if existing is not None:
             # #331 review round 15 finding 2 — re-fetch the Player under its
             # ROW LOCK before reading any of its fields, mirroring
@@ -5610,6 +7652,21 @@ class SetupService:
             # match zero rows while still reporting success (SQLite), or
             # lose a concurrent update (PostgreSQL).
             existing = self.store.get_player_for_update(existing.id)
+        # #424 round-4 review: the RETAINED fallback must be the TRUE
+        # pre-staging value — ``staged_original_jersey`` when the caller ran
+        # a swap-safe :meth:`release_batch_player_jerseys` pre-pass (mirrors
+        # #292), never ``existing.jersey_number`` read directly, which may
+        # already carry the transient released NULL. The EFFECTIVE value —
+        # the row's own supplied number, or that true original when the cell
+        # is blank — is what both the availability check and the actual
+        # write use from here on, exactly like ``effective_registration``
+        # below; ``jersey_number`` itself (the raw, possibly-``None``
+        # argument) is never used again past this point.
+        original_jersey = (
+            staged_original_jersey if staged_original_jersey is not _UNSET
+            else (existing.jersey_number if existing is not None else None))
+        effective_jersey_number = (
+            jersey_number if jersey_number is not None else original_jersey)
         # Enforce active-team jersey uniqueness on the IMPORTED target state
         # before any write (#269), so a conflicting row aborts the whole
         # one-transaction batch with zero committed players. An import never
@@ -5619,10 +7676,53 @@ class SetupService:
         target_active = True if existing is None else existing.is_active
         if target_active:
             self._assert_jersey_available(
-                team_id, jersey_number,
+                team_id, effective_jersey_number,
                 exclude_player_id=None if existing is None else existing.id)
         values = {"name": canonical_name, "team_id": team_id,
-                  "position": position, "jersey_number": jersey_number}
+                  "position": position,
+                  "jersey_number": effective_jersey_number,
+                  **identity_values}
+        # Same-team duplicate governing-body id (#273): refuse BEFORE any
+        # write, excluding the row's own player when this is an update.
+        #
+        # #273 review round 2 finding 2: check the EFFECTIVE registration
+        # number the row will carry after this write, not just a
+        # newly-supplied one. The previous version only checked when
+        # ``new_registration is not None`` and it differed from the
+        # existing row's stored value, so a blank cell (``registration_number``
+        # stays unset in ``identity_values`` here -- "leave as-is" on update,
+        # per this method's own contract) or an explicitly re-supplied
+        # UNCHANGED value skipped the check entirely, even though ``team_id``
+        # may be moving the player onto a team that already holds that same
+        # number. Now it always runs against the value the row will actually
+        # carry -- ``new_registration`` when the sheet supplied one, else the
+        # existing row's own retained value -- exactly like the unconditional
+        # jersey check just above. ``exclude_player_id`` keeps a same-team
+        # no-op (or a same-team re-import) from colliding with itself.
+        #
+        # #273 review round 3 finding 1: the RETAINED fallback must be the
+        # TRUE pre-staging value, not ``existing.registration_number`` read
+        # directly -- when the caller ran a swap/cycle-safe
+        # ``release_batch_player_registrations`` pre-pass (mirroring #292's
+        # jersey release) before calling this method, ``existing`` may
+        # already carry the transient released NULL, which would make a
+        # blank-cell row that is actually retaining a real number look like
+        # it holds nothing at all and skip this check entirely.
+        # ``staged_original_registration`` is that pre-pass's own reported
+        # original, exactly like ``staged_original_jersey`` above.
+        original_registration = (
+            staged_original_registration
+            if staged_original_registration is not _UNSET
+            else (existing.registration_number if existing is not None
+                 else None))
+        new_registration = identity_values.get("registration_number")
+        effective_registration = (
+            new_registration if new_registration is not None
+            else original_registration)
+        if effective_registration is not None:
+            self._assert_registration_number_available(
+                team_id, effective_registration,
+                exclude_player_id=None if existing is None else existing.id)
         if existing is None:
             # #331 review round 14 finding 3: same mechanism as
             # upsert_imported_team above -- reserve first, recheck under
@@ -5637,6 +7737,9 @@ class SetupService:
             self._audit("player_created", "player", obj.id, actor_id,
                        {"import_batch_id": import_batch_id, "external_ref": code,
                         "team_id": team_id})
+            # Same-name-on-one-Team WARNING (#273 AC[4]) — audit only.
+            self._warn_same_name_duplicates(
+                obj, actor_id, import_batch_id=import_batch_id)
             created, changed = True, []
         else:
             obj = existing
@@ -5645,8 +7748,34 @@ class SetupService:
             # set reflects the operator's true before→after — a Team-only move
             # that keeps the same number must NOT report a jersey change, and a
             # blank/keep-current cell must land the original, not the NULL.
+            # ``values["jersey_number"]`` is always the EFFECTIVE value
+            # computed above (#424 round-4 review) — the row's own supplied
+            # number, or this SAME restored original when the cell was blank
+            # — so a genuine blank-cell retain now diffs original-vs-original
+            # (no reported change) and a genuine supplied change still diffs
+            # original-vs-new (reported and applied) exactly as before.
             if staged_original_jersey is not _UNSET:
                 obj.jersey_number = staged_original_jersey
+            # Same restore-before-diff for registration_number (#273 review
+            # round 3 finding 1) — but registration_number reaches ``values``
+            # by a DIFFERENT route than jersey_number's effective-value
+            # computation above: it is placed into ``values`` ONLY when the
+            # sheet supplies a new one (the same "absent key = leave as-is"
+            # contract every other optional identity cell in
+            # ``identity_values`` follows), so the restore alone is enough
+            # here: a blank cell's ``values`` carries no "registration_number"
+            # key at all, ``_apply_changes`` never touches the just-restored
+            # original, and no false "changed" report follows; an explicitly
+            # re-supplied value is still in ``values`` and still overwrites +
+            # reports exactly as before. Both routes land on the same
+            # "blank retains, ``_apply_changes`` never sees a spurious diff"
+            # outcome; only the mechanism (unconditional effective value vs.
+            # conditional key placement) differs, because jersey_number is a
+            # required top-level field on every ``Player`` and
+            # registration_number is one of the purely-optional identity
+            # cells.
+            if staged_original_registration is not _UNSET:
+                obj.registration_number = staged_original_registration
             changed = self._apply_changes(obj, values)
             if changed:
                 self.store.save_player(obj)
@@ -5866,19 +7995,90 @@ class SetupService:
             self.store.save_player(existing)
         return released
 
+    def release_batch_player_registrations(self, assignments) -> dict:
+        """Stage a batch import's registration_number moves so a valid
+        same-team swap or longer cycle can commit (#273 review round 3
+        finding 1) — the SAME mechanism as :meth:`release_batch_player_jerseys`
+        (#292) above, applied to ``registration_number`` instead of
+        ``jersey_number``, with the one difference the invariant itself
+        already draws: a registration number is reserved by an INACTIVE
+        player too (migration 058, ``_assert_registration_number_available``),
+        so this release is NOT conditioned on ``is_active`` the way the
+        jersey release is.
+
+        A sequential per-row apply cannot commit an otherwise-valid same-team
+        registration swap (A ``REG-A``→``REG-B``, B ``REG-B``→``REG-A``) or a
+        longer cycle: the first write collides with the number a later row in
+        the SAME batch still holds. Run FIRST, inside the batch's single
+        transaction: for every EXISTING player (active or inactive) whose
+        final ``(team, registration_number)`` differs from its current one,
+        release the number it holds now (set ``registration_number = NULL`` —
+        always unconstrained; migration 058's partial unique index excludes
+        NULL), so the subsequent per-row assignment lands the validated final
+        state with no transient uniqueness failure. Only
+        ``registration_number`` is touched — the id, the team, the jersey,
+        and every other field are preserved — and no audit is written here:
+        the per-row upsert emits the real ``player_created`` /
+        ``player_updated`` entry with the final value. A genuine final-state
+        collision is still caught by the per-row
+        ``_assert_registration_number_available`` (and the DB index), so the
+        whole batch rolls back with zero writes — the SAME final-state
+        question :func:`hockey_scheduler.domain.identity.
+        plan_effective_registration_state` already answered for the preview
+        that gated this commit.
+
+        ``assignments`` is an iterable of ``(existing_player, final_team_id,
+        final_registration_number)``; new players (``existing_player is
+        None``), numberless players, and players staying in the same slot are
+        skipped. Returns ``{player_id: pre-release registration_number}`` for
+        exactly the players it released, so the apply step can restore each
+        real original — a blank/keep-current cell must land the ORIGINAL
+        value, not the transient NULL, and the single final audit must
+        describe the operator's real before→after, not the staging.
+        """
+        released = {}
+        for existing, final_team_id, final_registration in assignments:
+            if existing is None:
+                continue
+            if existing.registration_number is None:
+                continue  # holds no number → nothing to release
+            if (existing.team_id, existing.registration_number) == (
+                    final_team_id, final_registration):
+                continue  # staying put → keep it so real collisions still catch
+            released[existing.id] = existing.registration_number
+            existing.registration_number = None
+            self.store.save_player(existing)
+        return released
+
     # -- convenience: add a player to a team ------------------------------
     @_transactional
-    def add_player(self, team_id: str, name: str, position: Position,
+    def add_player(self, team_id: str, name: Optional[str], position: Position,
                    jersey_number: Optional[int] = None,
                    email: Optional[str] = None,
                    shoots: Optional[str] = None,
                    is_active: bool = True,
-                   actor_id: Optional[str] = None) -> Player:
+                   actor_id: Optional[str] = None,
+                   first_name: Optional[str] = None,
+                   last_name: Optional[str] = None,
+                   preferred_name: Optional[str] = None,
+                   birthdate: Optional[str] = None,
+                   registration_number: Optional[str] = None,
+                   skill_rating: Optional[int] = None) -> Player:
         """Manually create one Player (#114) — the same model/store the CSV
         import path writes, so a league admin isn't forced through Import for
         a single new arrival. Validation mirrors import_validator's row
         checks (jersey_number > 0, an ``@`` with a ``.`` after it in email)
-        so a manual create can't slip in data the bulk path would reject."""
+        so a manual create can't slip in data the bulk path would reject.
+
+        #273 identity: a caller supplies EITHER the legacy flattened ``name``
+        OR structured ``first_name``+``last_name`` (display name derived,
+        never free-typed) — one shared contract with edit and both imports
+        (:meth:`_resolve_new_player_names`). ``birthdate`` (private),
+        ``registration_number`` (private, same-team duplicates hard-refused),
+        ``preferred_name`` and the 1-7 ``skill_rating`` are optional. An
+        exact same-name teammate lacking disambiguating data appends a
+        ``player_duplicate_warning`` audit — a visible warning, never a
+        block and never a merge."""
         # Name the missing required field (#271) BEFORE the team lookup, so a
         # None/empty team_id is a clear `field_required` validation error rather
         # than the misleading `NotFoundError("Team None not found.")` — correct
@@ -5907,20 +8107,62 @@ class SetupService:
         canonical_email = self._validate_email(email)
         canonical_shoots = self._validate_shoots(shoots)
         canonical_position = self._validate_position(position)
-        canonical_name = self._validate_player_name(name)
+        display_name, canonical_first, canonical_last = (
+            self._resolve_new_player_names(name, first_name, last_name))
+        canonical_preferred = self._validate_preferred_name(preferred_name)
+        canonical_birthdate = self._validate_birthdate(birthdate)
+        canonical_registration = self._validate_registration_number(
+            registration_number)
+        canonical_skill = self._validate_skill_rating(skill_rating)
+        self._assert_registration_number_available(
+            team_id, canonical_registration)
         player = Player(id=self.store.next_id("player"), team_id=team_id,
-                        name=canonical_name,
+                        name=display_name,
                         position=canonical_position,
                         jersey_number=jersey_number,
                         shoots=canonical_shoots,
-                        is_active=is_active)
+                        is_active=is_active,
+                        first_name=canonical_first,
+                        last_name=canonical_last,
+                        preferred_name=canonical_preferred,
+                        birthdate=canonical_birthdate,
+                        registration_number=canonical_registration,
+                        skill_rating=canonical_skill)
         self.store.add_player(player)
         self._audit("player_added", "player", player.id, actor_id,
                     {"team_id": team_id})
+        self._warn_same_name_duplicates(player, actor_id)
         if canonical_email is not None:
             # Nonblank only: create/reactivate via the shared set/retire path.
             self._set_email_contact(f"player:{player.id}", canonical_email)
+        # #205 cutover parity dual-write — see
+        # _mirror_memberships_for_new_player above register_team_for_season.
+        self._mirror_memberships_for_new_player(player, actor_id)
         return player
+
+    def _resolve_new_player_names(self, name, first_name, last_name):
+        """The ONE name-form contract for Player create and both imports
+        (#273 AC[3]) → ``(display_name, first, last)``.
+
+        Structured form: ``first_name``+``last_name`` (both required together
+        — ``structured_name_incomplete`` names the missing one), display name
+        DERIVED, and a nonblank flattened ``name`` alongside them is refused
+        (``conflicting_name_forms``) rather than silently ignored — two
+        disagreeing name forms in one request is operator error, not data.
+        Legacy form: flattened ``name`` alone, validated exactly as before
+        (#268). Structured parts are None in that case — never guessed by
+        splitting the display name.
+        """
+        if first_name is not None or last_name is not None:
+            if name is not None and (not isinstance(name, str) or name.strip()):
+                raise ValidationError(
+                    "Supply either name or first_name+last_name, not both.",
+                    {"reason": "conflicting_name_forms", "field": "name"})
+            canonical_first = self._validate_name_part(first_name, "first_name")
+            canonical_last = self._validate_name_part(last_name, "last_name")
+            return (derive_display_name(canonical_first, canonical_last),
+                    canonical_first, canonical_last)
+        return self._validate_player_name(name), None, None
 
     @staticmethod
     def _validate_email(email) -> Optional[str]:
@@ -6015,9 +8257,147 @@ class SetupService:
                 {"reason": "invalid_name", "field": "name"})
         return name.strip()
 
+    @staticmethod
+    def _validate_name_part(value, field: str) -> str:
+        """Canonicalize a REQUIRED structured name part (#273).
+
+        Shared by create, edit, and both import paths — one contract
+        (AC[3]). Trims and collapses internal whitespace; rejects
+        non-strings, blanks, and over-length values with a field-level
+        error naming the exact part.
+        """
+        canonical, reason = normalize_name_part(value)
+        if reason is not None:
+            raise ValidationError(
+                f"{field} must be a non-empty string of at most "
+                f"{MAX_NAME_PART_LENGTH} characters.",
+                {"reason": f"invalid_{field}", "field": field})
+        return canonical
+
+    @staticmethod
+    def _validate_preferred_name(value) -> Optional[str]:
+        """Optional preferred name (#273): blank/None → unset, else the same
+        shape rules as the required parts."""
+        canonical, reason = normalize_preferred_name(value)
+        if reason is not None:
+            raise ValidationError(
+                f"preferred_name must be a string of at most "
+                f"{MAX_NAME_PART_LENGTH} characters, or left blank.",
+                {"reason": "invalid_preferred_name", "field": "preferred_name"})
+        return canonical
+
+    def _validate_birthdate(self, value) -> Optional[str]:
+        """Optional PRIVATE birthdate (#273) → canonical ``YYYY-MM-DD``.
+
+        Must be a real calendar date, not in the future — "today" comes from
+        the service's injected clock, never a domain-side ``now()``. The
+        single gate for create, edit, and both import commits.
+        """
+        canonical, reason = normalize_birthdate(
+            value, today=self.clock().date())
+        if reason is not None:
+            raise ValidationError(
+                f"birthdate must be a real past calendar date in YYYY-MM-DD "
+                f"form ({reason}).",
+                {"reason": "invalid_birthdate", "field": "birthdate"})
+        return canonical
+
+    @staticmethod
+    def _validate_registration_number(value) -> Optional[str]:
+        """Optional governing-body registration number (#273): trimmed,
+        case preserved, no internal whitespace, bounded length."""
+        canonical, reason = normalize_registration_number(value)
+        if reason is not None:
+            raise ValidationError(
+                f"registration_number must be a short identifier without "
+                f"whitespace ({reason}).",
+                {"reason": "invalid_registration_number",
+                 "field": "registration_number"})
+        return canonical
+
+    @staticmethod
+    def _validate_skill_rating(value) -> Optional[int]:
+        """Optional 1-7 skill rating (#287 owner ruling → #273); None/blank =
+        unrated, a fully supported state."""
+        canonical, reason = normalize_skill_rating(value)
+        if reason is not None:
+            raise ValidationError(
+                f"skill_rating must be an integer between {MIN_SKILL_RATING} "
+                f"and {MAX_SKILL_RATING}, or left blank.",
+                {"reason": "invalid_skill_rating", "field": "skill_rating"})
+        return canonical
+
+    def _assert_registration_number_available(
+            self, team_id: str, registration_number: Optional[str],
+            exclude_player_id: Optional[str] = None) -> None:
+        """Refuse a SAME-TEAM duplicate governing-body id (#273).
+
+        Two rows on one Team carrying one registration number is
+        definitionally the same athlete twice — a hard field-level error, not
+        a warning (and not a merge: the caller's row is simply refused).
+        CROSS-team duplicates stay allowed: under the legacy permanent
+        Player→Team model one human on two teams is two legitimate rows
+        (#205 restructures that); ``player_duplicate_report`` surfaces them
+        as warnings instead. Includes inactive players — deactivating a row
+        must not free the identity for an accidental duplicate.
+        """
+        if registration_number is None:
+            return
+        for other in self.store.players_for_team(team_id):
+            if other.id == exclude_player_id:
+                continue
+            if other.registration_number == registration_number:
+                raise ValidationError(
+                    "registration_number is already used by another player "
+                    "on this team.",
+                    {"reason": "duplicate_registration_number",
+                     "field": "registration_number"})
+
+    def _warn_same_name_duplicates(self, player, actor_id,
+                                   import_batch_id=None) -> None:
+        """Append a ``player_duplicate_warning`` audit when a just-written
+        player is an exact same-name record on one Team lacking
+        disambiguating data (#273 AC[4]).
+
+        A pair counts as DISAMBIGUATED only when both rows carry a birthdate
+        or registration number that proves them different people; anything
+        less is warned. A WARNING only — never a block, and never any merge
+        (records are never matched by name alone, per #273 and the epic #205
+        ruling). The audit detail carries ids only: no name text, no
+        birthdate, no registration number.
+        """
+        key = normalized_name_key(player.name)
+        if key is None:
+            return
+        matches = []
+        for other in self.store.players_for_team(player.team_id):
+            if other.id == player.id:
+                continue
+            if normalized_name_key(other.name) != key:
+                continue
+            proven_different = (
+                (player.birthdate is not None and other.birthdate is not None
+                 and player.birthdate != other.birthdate)
+                or (player.registration_number is not None
+                    and other.registration_number is not None
+                    and player.registration_number
+                    != other.registration_number))
+            if not proven_different:
+                matches.append(other.id)
+        if matches:
+            detail = {"team_id": player.team_id,
+                      "matching_player_ids": sorted(matches)}
+            if import_batch_id is not None:
+                detail["import_batch_id"] = import_batch_id
+            self._audit("player_duplicate_warning", "player", player.id,
+                        actor_id, detail)
+
     @_transactional
     def update_player(self, player_id: str, *, name=_UNSET, position=_UNSET,
                       jersey_number=_UNSET, shoots=_UNSET, email=_UNSET,
+                      first_name=_UNSET, last_name=_UNSET,
+                      preferred_name=_UNSET, birthdate=_UNSET,
+                      registration_number=_UNSET, skill_rating=_UNSET,
                       actor_id: Optional[str] = None) -> Player:
         """Correct a Player's profile in place (#268) — id and history unchanged.
 
@@ -6034,18 +8414,90 @@ class SetupService:
         transaction — leaves ZERO partial state. A genuine no-op writes nothing
         and appends no ``player_updated`` audit (so the trail never lies). The
         audit's ``changed_fields`` names WHICH fields changed, never the email
-        address or any other value.
+        address or any other value (nor, #273, the birthdate or registration
+        number — private values never enter the audit trail).
+
+        #273 identity edits share the create/import contract: while a player
+        carries structured names the flattened ``name`` is DERIVED — editing
+        it directly is refused (``name_is_derived``); edit the parts instead
+        and the display name follows. The parts live and die together:
+        ending up with exactly one of first/last set is
+        ``structured_name_incomplete``; clearing BOTH (explicit None) returns
+        the player to legacy flattened-name state (the display name stays —
+        it is required — and may be edited in that same call). A changed
+        registration number re-checks same-team uniqueness excluding self.
         """
         player = self.store.get_player_for_update(player_id)
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
 
         changed = []
+        # -- structured names first (#273): the flattened name's editability
+        # depends on the structured state AFTER these edits are applied.
+        if first_name is not _UNSET or last_name is not _UNSET:
+            new_first = (player.first_name if first_name is _UNSET
+                         else None if first_name is None
+                         else self._validate_name_part(first_name,
+                                                       "first_name"))
+            new_last = (player.last_name if last_name is _UNSET
+                        else None if last_name is None
+                        else self._validate_name_part(last_name, "last_name"))
+            # Validate the whole name-form outcome BEFORE any assignment.
+            if (new_first is None) != (new_last is None):
+                raise ValidationError(
+                    "first_name and last_name are set and cleared together.",
+                    {"reason": "structured_name_incomplete",
+                     "field": ("first_name" if new_first is None
+                               else "last_name")})
+            if new_first is not None and name is not _UNSET:
+                raise ValidationError(
+                    "Supply either name or first_name+last_name, not both.",
+                    {"reason": "conflicting_name_forms", "field": "name"})
+            if new_first != player.first_name:
+                player.first_name = new_first
+                changed.append("first_name")
+            if new_last != player.last_name:
+                player.last_name = new_last
+                changed.append("last_name")
+            if new_first is not None:
+                derived = derive_display_name(new_first, new_last)
+                if derived != player.name:
+                    player.name = derived
+                    changed.append("name")
         if name is not _UNSET:
+            if player.first_name is not None or player.last_name is not None:
+                raise ValidationError(
+                    "name is derived from first_name+last_name on this "
+                    "player; edit those instead.",
+                    {"reason": "name_is_derived", "field": "name"})
             new_name = self._validate_player_name(name)
             if new_name != player.name:
                 player.name = new_name
                 changed.append("name")
+        if preferred_name is not _UNSET:
+            new_preferred = self._validate_preferred_name(preferred_name)
+            if new_preferred != player.preferred_name:
+                player.preferred_name = new_preferred
+                changed.append("preferred_name")
+        if birthdate is not _UNSET:
+            new_birthdate = self._validate_birthdate(birthdate)
+            if new_birthdate != player.birthdate:
+                player.birthdate = new_birthdate
+                changed.append("birthdate")
+        if registration_number is not _UNSET:
+            new_registration = self._validate_registration_number(
+                registration_number)
+            if new_registration != player.registration_number:
+                self._assert_registration_number_available(
+                    player.team_id, new_registration,
+                    exclude_player_id=player.id)
+                player.registration_number = new_registration
+                changed.append("registration_number")
+        if skill_rating is not _UNSET:
+            new_skill = self._validate_skill_rating(skill_rating)
+            if new_skill != player.skill_rating:
+                player.skill_rating = new_skill
+                changed.append("skill_rating")
         if position is not _UNSET:
             new_position = self._validate_position(position)
             if new_position != player.position:
@@ -6079,6 +8531,242 @@ class SetupService:
             self._audit("player_updated", "player", player.id, actor_id,
                         {"changed_fields": fields})
         return player
+
+    # -- age eligibility rules + duplicate detection (#273) ---------------
+
+    @_transactional
+    def set_age_eligibility_rule(self, league_season_id: str,
+                                 cutoff_month, cutoff_day, tiers,
+                                 enforcement=None,
+                                 actor_id: Optional[str] = None
+                                 ) -> AgeEligibilityRule:
+        """Append the next VERSION of a LeagueSeason's age-eligibility rule.
+
+        Rules are immutable rows; "changing the rule" writes version N+1 and
+        leaves history intact, so any past eligibility answer can name and
+        reproduce the exact version it used (the owner's versioned-policy
+        pattern from epic #205). Cutoff month/day (Feb 29 refused — the
+        cutoff must exist every year), tiers, and the warn-first
+        ``enforcement`` mode are canonicalized by the pure domain module
+        before any write. Audited without PII: the detail carries scope,
+        version, cutoff, tier codes, and mode.
+
+        #273 review round 2 finding 3: the OWNING Season is locked (row-locked
+        via ``_require_active_season``, mirroring ``create_league_season`` /
+        ``delete_league_season``'s identical Season-first lock order) BEFORE
+        any further work, and the LeagueSeason binding is RE-READ under that
+        lock. A prior revision read the LeagueSeason with a plain unlocked
+        get, never called ``_require_active_season`` at all, and computed
+        ``max(version) + 1`` with no lock held — so a rule could be appended
+        to an ARCHIVED Season's history (frozen history silently mutated),
+        and two concurrent callers appending a rule for the SAME
+        league_season_id could both read the same ``existing`` list and both
+        compute the same next version (the unique ``(league_season_id,
+        version)`` index would then reject the loser outright, rather than
+        the two committing consecutive versions the way two concurrent
+        ``create_league_season``/``archive_season`` callers already do
+        elsewhere in this file). Locking the Season row first closes both
+        holes at once: it fails closed on an archived Season exactly like
+        every other Season-owned write, AND it serializes every writer
+        appending a rule for a LeagueSeason under that same Season — a second
+        writer blocks on the row lock until the first commits, then re-reads
+        ``existing`` (below) and sees the just-committed row, so both writers
+        succeed with genuinely consecutive versions instead of racing for the
+        same one. The RE-READ of the LeagueSeason itself (like
+        ``delete_league_season``'s own re-fetch) catches a concurrent
+        ``delete_league_season`` of this SAME binding, which takes the
+        identical Season-row lock first: the loser of that race fails closed
+        with ``not_found`` and zero mutation rather than resurrecting a
+        rule against a binding that no longer exists.
+        """
+        if not league_season_id:
+            raise ValidationError(
+                "league_season_id is required.",
+                {"reason": "field_required", "field": "league_season_id"})
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
+            raise NotFoundError(
+                f"LeagueSeason {league_season_id} not found.")
+        if ls.season_id:
+            self._require_active_season(ls.season_id)  # #159 read-only guard
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
+            raise NotFoundError(
+                f"LeagueSeason {league_season_id} not found.")
+        canonical_cutoff, reason = normalize_cutoff(cutoff_month, cutoff_day)
+        if reason is not None:
+            raise ValidationError(
+                f"cutoff must be a month/day that exists every year "
+                f"({reason}).",
+                {"reason": "invalid_cutoff",
+                 "field": ("cutoff_month" if reason
+                           in ("month_out_of_range", "not_an_integer")
+                           else "cutoff_day")})
+        canonical_tiers, reason = normalize_age_tiers(tiers)
+        if reason is not None:
+            raise ValidationError(
+                f"tiers must be a non-empty list of unique "
+                f"{{code, max_age}} entries ({reason}).",
+                {"reason": "invalid_tiers", "field": "tiers"})
+        canonical_enforcement, reason = normalize_enforcement(enforcement)
+        if reason is not None:
+            raise ValidationError(
+                "enforcement must be 'warn' or 'block'.",
+                {"reason": "invalid_enforcement", "field": "enforcement"})
+        # Still holding the Season row lock acquired above: a second
+        # concurrent writer blocks on that SAME lock until this transaction
+        # commits or rolls back, so the version it computes here can never
+        # race another writer's — see the docstring.
+        existing = self.store.age_eligibility_rules_for_league_season(
+            league_season_id)
+        version = existing[-1].version + 1 if existing else 1
+        rule = AgeEligibilityRule(
+            id=self.store.next_id("agerule"),
+            league_season_id=league_season_id,
+            version=version,
+            cutoff_month=canonical_cutoff[0],
+            cutoff_day=canonical_cutoff[1],
+            tiers=canonical_tiers,
+            enforcement=canonical_enforcement,
+            created_at=self.clock(),
+            actor_id=actor_id)
+        self.store.add_age_eligibility_rule(rule)
+        self._audit(
+            "age_eligibility_rule_set", "age_eligibility_rule", rule.id,
+            actor_id,
+            {"league_season_id": league_season_id, "version": version,
+             "cutoff": f"{rule.cutoff_month:02d}-{rule.cutoff_day:02d}",
+             "tier_codes": [t["code"] for t in canonical_tiers],
+             "enforcement": canonical_enforcement})
+        return rule
+
+    def current_age_eligibility_rule(
+            self, league_season_id: str) -> Optional[AgeEligibilityRule]:
+        """The highest-version rule for a LeagueSeason, or None."""
+        rules = self.store.age_eligibility_rules_for_league_season(
+            league_season_id)
+        return rules[-1] if rules else None
+
+    def evaluate_player_age_eligibility(self, player_id: str,
+                                        division_id: str) -> dict:
+        """Answer #273's acceptance question for one athlete and Division.
+
+        Resolves the Division → LeagueSeason → current rule + Season start,
+        reads the athlete's birthdate, and delegates the actual decision to
+        the pure domain evaluator. The result names the exact rule id +
+        version it used and NEVER contains the birthdate itself — only
+        derived values (status/reason/age-at-cutoff), so it is safe as the
+        Coach-facing eligibility summary the bounded-#124 ruling requires
+        (raw protected values stay operator-only). Honest indeterminates
+        (``no_rule`` / ``no_birthdate`` / ``unknown_tier`` /
+        ``no_season_start``) are answers, never guesses. Nothing here blocks
+        anything: wiring ``enforcement == "block"`` into registration/roster
+        mutations is explicitly later policy work.
+        """
+        player = self.store.get_player(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+        division = self.store.get_division(division_id)
+        if division is None:
+            raise NotFoundError(f"Division {division_id} not found.")
+        league_season = self.store.get_league_season(
+            division.league_season_id)
+        rule = self.current_age_eligibility_rule(division.league_season_id)
+        out = {"player_id": player_id, "division_id": division_id,
+               "league_season_id": division.league_season_id,
+               "rule_id": None, "rule_version": None, "enforcement": None}
+        if rule is None:
+            out.update({"status": "indeterminate", "reason": "no_rule",
+                        "tier_code": None, "max_age": None,
+                        "age_at_cutoff": None, "cutoff_date": None})
+            return out
+        season = (self.store.get_season(league_season.season_id)
+                  if league_season is not None else None)
+        result = evaluate_age_eligibility(
+            birthdate=player.birthdate,
+            tier_declared=division.age_group,
+            cutoff_month=rule.cutoff_month,
+            cutoff_day=rule.cutoff_day,
+            season_start=season.start_date if season is not None else None,
+            tiers=rule.tiers)
+        out.update({"rule_id": rule.id, "rule_version": rule.version,
+                    "enforcement": rule.enforcement, **result})
+        return out
+
+    def player_duplicate_report(self,
+                                team_id: Optional[str] = None) -> List[dict]:
+        """Duplicate-candidate WARNINGS across players (#273 AC[4]).
+
+        Detection keys on the STABLE identifiers plus birthdate context —
+        never on name alone, and this report never merges, writes, or even
+        suggests a merge; it only points an operator at rows to inspect.
+
+        Three warning shapes, each with sorted ``player_ids``:
+
+        * ``same_name_same_team_undisambiguated`` — exact same-name records
+          on one Team where no pair is PROVEN different people by differing
+          birthdates or registration numbers (the issue's minimum warning).
+        * ``shared_registration_number`` — one governing-body id on multiple
+          rows (cross-team; same-team is hard-refused at write time). The
+          identifier value itself is included: this report is operator
+          tooling and is listed for the MANAGE_SETUP-gated surface in the
+          web follow-up, mirroring ``include_email``.
+        * ``same_name_same_birthdate`` — same name AND same birthdate on
+          different Teams: very likely one athlete row-duplicated under the
+          legacy permanent Player→Team model. The shared birthdate is NOT
+          echoed into the report.
+        """
+        players = (self.store.players_for_team(team_id) if team_id
+                   else self.store.all_players())
+        warnings = []
+        by_team_name = {}
+        for p in players:
+            key = normalized_name_key(p.name)
+            if key is not None:
+                by_team_name.setdefault((p.team_id, key), []).append(p)
+        for (group_team_id, _key), group in sorted(by_team_name.items()):
+            if len(group) < 2:
+                continue
+            proven = all(
+                (a.birthdate is not None and b.birthdate is not None
+                 and a.birthdate != b.birthdate)
+                or (a.registration_number is not None
+                    and b.registration_number is not None
+                    and a.registration_number != b.registration_number)
+                for i, a in enumerate(group) for b in group[i + 1:])
+            if not proven:
+                warnings.append({
+                    "type": "same_name_same_team_undisambiguated",
+                    "team_id": group_team_id,
+                    "name": group[0].name,
+                    "player_ids": sorted(p.id for p in group)})
+        by_registration = {}
+        for p in players:
+            if p.registration_number is not None:
+                by_registration.setdefault(
+                    p.registration_number, []).append(p)
+        for registration, group in sorted(by_registration.items()):
+            if len(group) >= 2:
+                warnings.append({
+                    "type": "shared_registration_number",
+                    "registration_number": registration,
+                    "team_ids": sorted({p.team_id for p in group}),
+                    "player_ids": sorted(p.id for p in group)})
+        by_name_birthdate = {}
+        for p in players:
+            key = normalized_name_key(p.name)
+            if key is not None and p.birthdate is not None:
+                by_name_birthdate.setdefault(
+                    (key, p.birthdate), []).append(p)
+        for (_key, _bd), group in sorted(by_name_birthdate.items()):
+            teams = {p.team_id for p in group}
+            if len(group) >= 2 and len(teams) >= 2:
+                warnings.append({
+                    "type": "same_name_same_birthdate",
+                    "name": group[0].name,
+                    "team_ids": sorted(teams),
+                    "player_ids": sorted(p.id for p in group)})
+        return warnings
 
     def _set_email_contact(self, recipient_ref: str, email) -> bool:
         """The one set/retire path for a recipient's EMAIL ``ContactDestination``.
@@ -6396,7 +9084,11 @@ class SetupService:
         # the single write transaction below, so the lock is held through every
         # import mutation (#159).
 
-        result = validate_import(sheets, store=self.store)
+        # today (#273): lets the dry-run report a future birthdate BEFORE
+        # any write, from this service's injected clock (never a validator-
+        # side now()).
+        result = validate_import(sheets, store=self.store,
+                                 today=self.clock().date())
         if not result["ok"]:
             return {"committed": False, "summary": result["summary"],
                     "errors": result["errors"], "warnings": result["warnings"]}
@@ -7043,11 +9735,38 @@ class SetupService:
                     released = self.release_batch_player_jerseys(
                         _final_slot(row) for row in player_rows)
 
+                    # Swap-safe apply, registration_number (#273 review round
+                    # 3 finding 1, mirrors the jersey release just above):
+                    # release every existing player's registration_number
+                    # whose final (team, registration) differs from its
+                    # current one BEFORE any per-row write, so a valid
+                    # same-team (or cross-team) swap or longer cycle commits
+                    # without a transient uniqueness failure. A blank
+                    # registration_number cell RETAINS the current value
+                    # (final == current → not released).
+                    def _final_registration(row):
+                        existing = by_code.get(_clean(row.get("player_code")))
+                        team_id = team_code_to_id.get(_clean(row.get("team_code")))
+                        raw = row.get("registration_number")
+                        registration = (_clean(raw) if not _blank(raw)
+                                        else (existing.registration_number
+                                              if existing else None))
+                        return existing, team_id, registration
+                    released_registrations = self.release_batch_player_registrations(
+                        _final_registration(row) for row in player_rows)
+
                     for row in player_rows:
                         player_code = _clean(row.get("player_code"))
-                        full_name = self._validate_player_name(
-                            (f"{_clean(row.get('first_name'))} "
-                             f"{_clean(row.get('last_name'))}").strip())
+                        # #273: the sheet's structured names are PERSISTED now
+                        # (they were previously flattened away at write time),
+                        # through the same shared name contract create/edit
+                        # use; the display name is derived, never free-typed.
+                        canonical_first = self._validate_name_part(
+                            _clean(row.get("first_name")), "first_name")
+                        canonical_last = self._validate_name_part(
+                            _clean(row.get("last_name")), "last_name")
+                        full_name = derive_display_name(canonical_first,
+                                                        canonical_last)
                         # validate_import already guarantees this team_code matches a
                         # row in THIS SAME upload's teams sheet; .get() is just a
                         # defensive belt-and-suspenders check against a bug elsewhere.
@@ -7065,6 +9784,31 @@ class SetupService:
                                    if not _blank(position_raw) else None)
                         email_raw = row.get("email")
                         email = _clean(email_raw) if not _blank(email_raw) else None
+                        # Optional identity cells (#273) + the shoots import
+                        # wiring gap (#268 covered create/edit only). A blank
+                        # or absent cell means "leave as-is" on update and
+                        # unset on create — never a clearing write (the email
+                        # rule).
+                        preferred_cell = (
+                            self._validate_preferred_name(
+                                _clean(row.get("preferred_name")))
+                            if not _blank(row.get("preferred_name")) else None)
+                        shoots_cell = (
+                            self._validate_shoots(_clean(row.get("shoots")))
+                            if not _blank(row.get("shoots")) else None)
+                        birthdate_cell = (
+                            self._validate_birthdate(
+                                _clean(row.get("birthdate")))
+                            if not _blank(row.get("birthdate")) else None)
+                        registration_cell = (
+                            self._validate_registration_number(
+                                _clean(row.get("registration_number")))
+                            if not _blank(row.get("registration_number"))
+                            else None)
+                        skill_cell = (
+                            self._validate_skill_rating(
+                                _clean(row.get("skill_rating")))
+                            if not _blank(row.get("skill_rating")) else None)
 
                         player = next((p for p in self.store.all_players()
                                       if p.external_ref == player_code), None)
@@ -7094,10 +9838,70 @@ class SetupService:
                                 self._assert_jersey_available(
                                     team_id, target_jersey, exclude_player_id=player.id)
                             player.name = full_name
+                            player.first_name = canonical_first
+                            player.last_name = canonical_last
                             player.team_id = team_id
                             player.jersey_number = target_jersey
                             if position is not None:
                                 player.position = position
+                            if preferred_cell is not None:
+                                player.preferred_name = preferred_cell
+                            if shoots_cell is not None:
+                                player.shoots = shoots_cell
+                            if birthdate_cell is not None:
+                                player.birthdate = birthdate_cell
+                            # #273 review round 2 finding 2: check the
+                            # EFFECTIVE registration number the row will
+                            # carry after this write, not just a
+                            # newly-supplied cell. The previous version
+                            # only checked ``registration_cell is not
+                            # None and registration_cell !=
+                            # player.registration_number``, so a BLANK
+                            # cell (registration_cell is None -- "leave
+                            # as-is", the same rule every other optional
+                            # cell in this loop follows) or an explicitly
+                            # re-supplied UNCHANGED value skipped the
+                            # check entirely, even though ``team_id`` a
+                            # few lines up may already have moved this
+                            # player onto a team that holds that same
+                            # number on another row. Always check the
+                            # value the row will actually end up
+                            # carrying, exactly like the unconditional
+                            # jersey check above; exclude_player_id keeps
+                            # a same-team re-import from colliding with
+                            # itself.
+                            #
+                            # #273 review round 3 finding 1: the RETAINED
+                            # fallback must be the TRUE pre-staging value —
+                            # resolved from ``released_registrations``
+                            # (captured before the swap-safe release above),
+                            # never ``player.registration_number`` read
+                            # directly, which may already hold the transient
+                            # released NULL — exactly the same original vs.
+                            # transient distinction ``original_jersey`` draws
+                            # for jersey_number just above. The final value is
+                            # then assigned UNCONDITIONALLY (mirroring
+                            # ``player.jersey_number = target_jersey`` above),
+                            # not only ``if registration_cell is not None``:
+                            # a blank cell's effective value already equals
+                            # the just-restored original when nothing else in
+                            # this batch moved it, and equals the row's own
+                            # supplied value when it did — either way this is
+                            # always the row's true final state, so it is
+                            # always safe (and, once release is in play,
+                            # required) to land it.
+                            original_registration = released_registrations.get(
+                                player.id, player.registration_number)
+                            effective_registration = (
+                                registration_cell if registration_cell is not None
+                                else original_registration)
+                            if effective_registration is not None:
+                                self._assert_registration_number_available(
+                                    team_id, effective_registration,
+                                    exclude_player_id=player.id)
+                            player.registration_number = effective_registration
+                            if skill_cell is not None:
+                                player.skill_rating = skill_cell
                             self.store.save_player(player)
                             self._audit("player_updated", "player", player.id, actor_id,
                                         {"team_id": team_id, "import_batch_id": batch_id})
@@ -7106,6 +9910,10 @@ class SetupService:
                             # A brand-new imported player is active, so its number must
                             # be free among the team's active players (#269).
                             self._assert_jersey_available(team_id, jersey_number)
+                            # Same-team duplicate governing-body id (#273): hard
+                            # error BEFORE the write, aborting the whole batch.
+                            self._assert_registration_number_available(
+                                team_id, registration_cell)
                             # The domain model requires a Position with no default,
                             # but #92 doesn't require the CSV to supply one — default
                             # a brand-new player to FORWARD as an explicit judgment
@@ -7114,10 +9922,21 @@ class SetupService:
                                             name=full_name,
                                             position=position or Position.FORWARD,
                                             jersey_number=jersey_number,
-                                            external_ref=player_code)
+                                            external_ref=player_code,
+                                            first_name=canonical_first,
+                                            last_name=canonical_last,
+                                            preferred_name=preferred_cell,
+                                            shoots=shoots_cell,
+                                            birthdate=birthdate_cell,
+                                            registration_number=registration_cell,
+                                            skill_rating=skill_cell)
                             self.store.add_player(player)
                             self._audit("player_added", "player", player.id, actor_id,
                                         {"team_id": team_id, "import_batch_id": batch_id})
+                            # Same-name-on-one-Team WARNING (#273 AC[4]) —
+                            # an audit entry, never a block, never a merge.
+                            self._warn_same_name_duplicates(
+                                player, actor_id, import_batch_id=batch_id)
                             counts["players_created"] += 1
 
                         # A blank cell parsed to None above → no-op (leave any existing
@@ -7850,17 +10669,21 @@ class SetupService:
         If the official has declared an overlapping UNAVAILABLE window (#88),
         the assignment is blocked unless ``override_unavailable`` is set — an
         explicit operator override, which is audited.
-        """
+
+        PR #423 (design §8.5): acquires the epoch fence's GLOBAL exclusive
+        hold first (row 13 of the design's writer table) — an assignment can
+        change what the assigned Official's own scoped reads resolve to, and
+        the affected user is found only by a lookup, so this uses the GLOBAL
+        key (§4.2's classification rule)."""
+        self.store.epoch_fence_acquire_exclusive(EPOCH_FENCE_GLOBAL_KEY)
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch the game under the Season lock so the cancelled /
-        # time-overlap checks below run on its current state, not a locator
-        # snapshot a concurrent move_game may have changed.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches the game under the Season lock it
+        # takes, so the cancelled / time-overlap checks below run on its
+        # current state, not a locator snapshot a concurrent move_game may
+        # have changed.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot assign officials to a cancelled game.")
         # #159 r15 — row-lock the Official: delete_official locks the Official row
@@ -7968,7 +10791,13 @@ class SetupService:
     @_transactional
     def unassign_official(self, assignment_id: str,
                           actor_id: Optional[str] = None) -> OfficialAssignment:
-        """Remove an official assignment from a game entirely."""
+        """Remove an official assignment from a game entirely.
+
+        PR #423 (design §8.5): acquires the epoch fence's GLOBAL exclusive
+        hold first (row 14 of the design's writer table) — an unassignment is
+        an authorization WITHDRAWAL for the affected Official's own scoped
+        reads, found only by a lookup, so this uses the GLOBAL key."""
+        self.store.epoch_fence_acquire_exclusive(EPOCH_FENCE_GLOBAL_KEY)
         a = self.store.get_official_assignment(assignment_id)
         if a is None:
             raise NotFoundError(f"Assignment {assignment_id} not found.")
@@ -7999,12 +10828,10 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #201 — re-fetch under the Season lock; a concurrent cancel_game commits
-        # under the same lock, so the cancelled gate must see the fresh Game.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #201 — the guard re-fetches under the Season lock it takes; a
+        # concurrent cancel_game commits under the same lock, so the cancelled
+        # gate must see the fresh Game.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot record a result for a cancelled game.")
         hs, as_ = self._require_score(home_score), self._require_score(away_score)
@@ -8034,12 +10861,10 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #201 — re-fetch under the Season lock; a concurrent cancel_game commits
-        # under the same lock, so the cancelled gate must see the fresh Game.
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #201 — the guard re-fetches under the Season lock it takes; a
+        # concurrent cancel_game commits under the same lock, so the cancelled
+        # gate must see the fresh Game.
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if game.cancelled:
             raise ValidationError("Cannot approve a result for a cancelled game.")
         result = self.store.result_for_game(game_id)
@@ -8244,6 +11069,15 @@ class SetupService:
         team = self.store.get_team(team_id) if team_id else None
         return team.name if team else (team_id or "—")
 
+    def _membership_label(self, m) -> str:
+        """Display label for a SeasonRosterMembership dependency-block row
+        (#205 review round 1 finding 2): the player's name plus its current
+        status, so a blocked parent mutation names WHO is stranding it, not
+        just an opaque membership id."""
+        player = self.store.get_player(m.player_id) if m.player_id else None
+        name = player.name if player else (m.player_id or "—")
+        return f"{name} ({m.status.value})"
+
     def _season_name(self, season_id) -> str:
         season = self.store.get_season(season_id) if season_id else None
         return season.name if season else (season_id or "—")
@@ -8320,6 +11154,11 @@ class SetupService:
         # explicit dependents (there is no FK to catch this at the DB layer).
         teams = [t for t in self.store.all_teams()
                  if t.league_id == league_id]
+        # #205 review round 1 finding 2 — same "required FK" shape as
+        # registrations/games above: ANY membership on any of this League's
+        # LeagueSeasons blocks, regardless of status.
+        memberships = [m for m in self.store.all_season_roster_memberships()
+                      if m.league_season_id in ls_ids]
         # #159 — a LeagueSeason binding is itself a dependent, NOT something this
         # delete may silently cascade away: the destructive-delete contract is
         # dependency-gated, itemized blockers with no implicit cascades. An
@@ -8335,7 +11174,9 @@ class SetupService:
                             lambda s: s.name),
             self._dep_group("team", teams, lambda t: t.name),
             self._dep_group("season binding", ls_rows,
-                            lambda ls: self._season_name(ls.season_id))])
+                            lambda ls: self._season_name(ls.season_id)),
+            self._dep_group("roster membership", memberships,
+                            self._membership_label)])
         self.store.delete_league(league_id)
         self._audit("level_deleted", "level", league_id, actor_id,
                     {"name": league.name, "program_id": league.program_id})
@@ -8401,6 +11242,32 @@ class SetupService:
         venue_access = self.store.season_venue_access_for_season(season_id)
         scenarios = [s for s in self.store.all_schedule_scenarios()
                      if s.season_id == season_id]
+        # Copy-forward commit ledger (#159 review round 3, owner P1,
+        # structural change 2): a Season this route MINTED is named by
+        # exactly the row(s) SeasonCopyForwardCommit.season_id points at
+        # it — the same itemized-dependency pattern as every group above,
+        # not a silent orphan and not a raw/generic FK failure. Checked
+        # (and blocked) here, BEFORE ``self.store.delete_season`` below
+        # ever runs, so migration 053's ``season_copy_forward_commits.
+        # season_id`` foreign key is never actually violated: on SQLite
+        # and PostgreSQL alike that would otherwise surface as the
+        # unhelpful generic ``foreign_key_violation`` conflict this same
+        # review reproduced, rather than a named, itemized reason. There
+        # is deliberately no separate "clear this dependency" tool (unlike
+        # team registrations/venue access/games, an operator never creates
+        # or removes a ledger row directly — it exists purely to make a
+        # committed copy-forward's replay response stable) — a Season a
+        # copy-forward commit produced stays permanently undeletable
+        # through this route, which is the tradeoff that guarantees the
+        # replay contract below can never observe a torn or missing
+        # Season. See _copy_forward_result_from_ledger_row.
+        copy_forward_commits = (
+            self.store.season_copy_forward_commits_for_season(season_id))
+        # #205 review round 1 finding 2 — same "required FK" shape as the
+        # registrations/games above: ANY membership in this Season blocks,
+        # regardless of status (``season_id`` is denormalized but NOT NULL
+        # on every membership row).
+        memberships = self.store.memberships_for_season(season_id)
         self._block_if_dependents("season", season_id, "season", [
             self._dep_group("level", levels, lambda lv: lv.name,
                             display="league"),
@@ -8411,7 +11278,12 @@ class SetupService:
             self._dep_group("schedule scenario", scenarios,
                             lambda s: s.name),
             self._dep_group("venue access", venue_access,
-                            lambda a: self._venue_name(a.venue_id))])
+                            lambda a: self._venue_name(a.venue_id)),
+            self._dep_group("copy_forward_commit", copy_forward_commits,
+                            lambda c: c.copy_forward_fingerprint,
+                            display="copy-forward commit"),
+            self._dep_group("roster membership", memberships,
+                            self._membership_label)])
         self._cascade_scheduling_policy(
             PolicyScopeType.SEASON, season_id, actor_id)
         self.store.delete_season(season_id)
@@ -8533,6 +11405,13 @@ class SetupService:
                  if p.recipient_ref == team_id]
         devices = [d for d in self.store.all_device_tokens()
                    if d.recipient_ref == team_id]
+        # #205 review round 1 finding 2 — a membership's team_id is a
+        # REQUIRED (non-nullable) foreign key onto this exact Team, the same
+        # shape season registrations/games above already block on regardless
+        # of status; ANY membership (even released/transferred history)
+        # blocks.
+        memberships = [m for m in self.store.all_season_roster_memberships()
+                      if m.team_id == team_id]
         self._block_if_dependents("team", team_id, "team", [
             self._dep_group("season registration", regs,
                             lambda r: self._season_name(  # #283: via LeagueSeason
@@ -8544,11 +11423,21 @@ class SetupService:
             self._dep_group("calendar feed", feeds,
                             lambda t: t.label or t.actor_ref),
             self._dep_group("contact destination", contacts,
-                            lambda c: c.label or c.destination),
+                            # Masked, never the raw destination (#426 review
+                            # finding 2): this itemisation is an
+                            # unaudited read path outside the
+                            # policy+audit boundary, and the raw value is
+                            # unnecessary here — the operator only needs
+                            # to know THAT a contact destination blocks
+                            # the delete, with an optional human label if
+                            # one was set.
+                            lambda c: c.label or "(unlabeled contact)"),
             self._dep_group("notification preference", prefs,
                             lambda p: p.channel.value),
             self._dep_group("device token", devices,
-                            lambda d: d.label or d.provider)])
+                            lambda d: d.label or d.provider),
+            self._dep_group("roster membership", memberships,
+                            self._membership_label)])
         self.store.delete_team(team_id)
         self._audit("team_deleted", "team", team_id, actor_id,
                     {"name": team.name, "league_id": team.program_id})
@@ -8604,7 +11493,15 @@ class SetupService:
             self._dep_group("calendar feed", feeds,
                             lambda t: t.label or t.actor_ref),
             self._dep_group("contact destination", contacts,
-                            lambda c: c.label or c.destination),
+                            # Masked, never the raw destination (#426 review
+                            # finding 2): this itemisation is an
+                            # unaudited read path outside the
+                            # policy+audit boundary, and the raw value is
+                            # unnecessary here — the operator only needs
+                            # to know THAT a contact destination blocks
+                            # the delete, with an optional human label if
+                            # one was set.
+                            lambda c: c.label or "(unlabeled contact)"),
             self._dep_group("notification preference", prefs,
                             lambda p: p.channel.value),
             self._dep_group("device token", devices,
@@ -8651,6 +11548,15 @@ class SetupService:
                  if p.active and p.recipient_ref == ref]
         devices = [d for d in self.store.all_device_tokens()
                    if d.active and d.recipient_ref == ref]
+        # #205 review round 1 finding 2 — a membership's player_id is a
+        # REQUIRED (non-nullable) foreign key onto this exact Player; before
+        # this check, Memory left a dangling player_id on any surviving
+        # membership and SQLite/PostgreSQL surfaced only the DB's generic,
+        # untranslated foreign-key-violation error. ANY membership (even
+        # released/transferred history) blocks now, mirroring the roster
+        # entry/availability/substitute checks above, which also block on
+        # historical rows, not just live ones.
+        memberships = self.store.memberships_for_player(player_id)
         self._block_if_dependents("player", player_id, "player", [
             self._dep_group("roster entry", rosters, self._matchup_for_game_ref),
             self._dep_group("availability response", availability,
@@ -8663,11 +11569,21 @@ class SetupService:
             self._dep_group("calendar feed", feeds,
                             lambda t: t.label or t.actor_ref),
             self._dep_group("contact destination", contacts,
-                            lambda c: c.label or c.destination),
+                            # Masked, never the raw destination (#426 review
+                            # finding 2): this itemisation is an
+                            # unaudited read path outside the
+                            # policy+audit boundary, and the raw value is
+                            # unnecessary here — the operator only needs
+                            # to know THAT a contact destination blocks
+                            # the delete, with an optional human label if
+                            # one was set.
+                            lambda c: c.label or "(unlabeled contact)"),
             self._dep_group("notification preference", prefs,
                             lambda p: p.channel.value),
             self._dep_group("device token", devices,
-                            lambda d: d.label or d.provider)])
+                            lambda d: d.label or d.provider),
+            self._dep_group("roster membership", memberships,
+                            self._membership_label)])
         self.store.delete_player(player_id)
         self._audit("player_deleted", "player", player_id, actor_id,
                     {"name": player.name, "team_id": player.team_id})
@@ -8750,14 +11666,11 @@ class SetupService:
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
-        self._guard_game_season(game)  # #159 read-only guard
-        # #159 r15 — re-fetch under the Season lock; a concurrent publish_game/
-        # move_game commits under the same lock, so decide draft-eligibility and
-        # release the slot from the FRESH row (never delete a just-published game
-        # or free the wrong old slot).
-        game = self.store.get_game(game_id)
-        if game is None:
-            raise NotFoundError(f"Game {game_id} not found.")
+        # #159 r15 — the guard re-fetches under the Season lock it takes; a
+        # concurrent publish_game/move_game commits under the same lock, so
+        # decide draft-eligibility and release the slot from the FRESH row
+        # (never delete a just-published game or free the wrong old slot).
+        game = self._guard_game_season(game)  # #159/#427 guard + re-fetch
         if not getattr(game, "is_draft", False) or game.published \
                 or game.cancelled \
                 or self.store.result_for_game(game_id) is not None:

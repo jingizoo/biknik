@@ -76,6 +76,7 @@ from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import clear_membership_rows_directly
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import Role
@@ -1747,10 +1748,17 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
                          "name": f"TA-{tag} Spare Team {self._seq()}"})["id"]
 
     def _mint_player(self, tag):
-        return self._ok(self._o(tag), "/api/v2/setup/player",
-                        {"team_id": self.worlds[tag]["team"],
-                         "name": f"TA-{tag} Spare Player {self._seq()}",
-                         "position": "forward"})["id"]
+        pid = self._ok(self._o(tag), "/api/v2/setup/player",
+                       {"team_id": self.worlds[tag]["team"],
+                        "name": f"TA-{tag} Spare Player {self._seq()}",
+                        "position": "forward"})["id"]
+        # The #205 cutover's dual-write auto-opened a parity stint, and the
+        # landed #205 rule blocks the delete-player route while ANY
+        # membership row exists. This matrix probes AUTHORIZATION, not the
+        # dependency rule, so mint the no-membership shape out-of-band —
+        # the delete row's positive case stays a real, deletable positive.
+        clear_membership_rows_directly(self.srv.STATE.api.store, pid)
+        return pid
 
     def _mint_game(self, tag):
         return self._inject_draft_game(tag, self.worlds[tag]["team"],

@@ -31,8 +31,8 @@ from ..bootstrap import (
     installation_claim_status,
 )
 from ..domain import (
-    AvailabilityStatus, DomainError, ROLE_LABELS, Permission, Role, can,
-    permissions_for,
+    AvailabilityStatus, ConcurrencyConflictError, DomainError, ROLE_LABELS,
+    Permission, Role, SensitiveFieldCategory, can, permissions_for,
 )
 from ..full_demo import build_full_demo_store
 from ..services import (
@@ -40,7 +40,11 @@ from ..services import (
     email_transport_from_env,
     push_transport_from_env,
 )
-from ..services.context_gate import ContextSwitchGate
+from ..services.context_epoch import (
+    CONTEXT_EPOCH_HEADER, EPOCH_MISMATCH, epoch_secret, epoch_verdict)
+from ..services.context_gate import (
+    CONTEXT_GATE, LIFECYCLE_GATE, LIFECYCLE_GATE_KEY as _LIFECYCLE_GATE_KEY)
+from ..services.epoch_fence import EPOCH_FENCE_GLOBAL_KEY, user_fence_key
 from ..store import SqlStore, create_store
 from .auth import (
     DEFAULT_TTL_SECONDS,
@@ -53,8 +57,11 @@ from .auth import (
 from .authz import authorize, required_permission
 from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
+from ..services import lineup_visibility
 from .rate_limit import LoginThrottle, RateLimiter
-from .scope import can_read_private_game_data, own_team_id, scope_violation
+from .route_registry import REGISTRY
+from .scope import (
+    can_read_private_game_data, resolve_private_game_read, scope_violation)
 from .validation import BodyError, check_body, parse_json_object
 
 # Acting role resolution (#50): a server-issued session cookie is authoritative.
@@ -210,170 +217,45 @@ _REASSIGN_PARENTS = {
 }
 
 
-# Method-405 routing table (#271). Two ordered lists of compiled path patterns
-# transcribed from the ``do_GET``/``do_POST`` dispatch below (an explicitly
-# scoped near-term list, a bounded child of #202). ``_method_fallback`` uses
-# them to answer an unsupported method with a JSON 405 + a correct ``Allow``
-# header instead of the stdlib's HTML 501. Every method/path claimed here is
-# verified against the real dispatch (see tests/test_write_schemas.py). The
-# game POST pattern enumerates only the ACTUAL write actions, so a read-only
-# subpath (``.../board``) is NOT claimed as POST.
-_GET_ROUTES = [re.compile(p) for p in (
-    r"^/api/demo/overview$",
-    r"^/api/setup/hierarchy$",
-    r"^/api/import/hierarchy-codes$",
-    r"^/api/setup/leagues/[^/]+/teams$",
-    r"^/api/setup/seasons/[^/]+/team-registrations$",
-    r"^/api/onboarding/status$",
-    r"^/api/v2/setup/overview$",
-    r"^/api/v2/setup/seasons/[^/]+/venue-candidates$",  # #369 grant candidates
-    r"^/api/v2/setup/hierarchy$",
-    r"^/api/v2/setup/progress$",
-    r"^/api/v2/setup/programs/[^/]+/teams$",
-    r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
-    r"^/api/v2/setup/seasons/[^/]+/venue-access$",
-    r"^/api/setup/scheduling-policy$",
-    r"^/api/v2/onboarding/status$",
-    r"^/api/bootstrap/status$",
-    r"^/api/status$",
-    r"^/api/health$",
-    r"^/api/readiness$",
-    r"^/api/auth/roles$",
-    r"^/api/auth/accounts$",
-    r"^/api/accounts$",
-    r"^/api/accounts/[^/]+/sessions$",
-    r"^/api/guardians/links$",
-    r"^/api/officials$",
-    r"^/api/players$",
-    r"^/api/reschedule/pending$",
-    r"^/api/officials/[^/]+/availability$",
-    r"^/api/notifications$",
-    r"^/api/notifications/deliveries$",
-    r"^/api/notifications/contacts$",
-    r"^/api/notifications/preferences$",
-    r"^/api/calendar-feeds$",
-    r"^/api/notifications/device-tokens$",
-    r"^/api/me/assignments$",
-    r"^/api/me/player-home$",
-    r"^/api/me/substitute-opportunities/[^/]+$",
-    r"^/api/me/guardian/home$",
-    r"^/api/me/guardian/[^/]+/substitute-opportunities/[^/]+$",
-    r"^/api/standings/[^/]+$",
-    r"^/api/standings/league-season/[^/]+/[^/]+$",
-    r"^/api/public/schedule$",
-    r"^/api/public/standings/[^/]+$",
-    r"^/api/public/standings/league-season/[^/]+/[^/]+$",
-    r"^/api/public/games/[^/]+$",
-    r"^/api/scheduler/drafts$",
-    r"^/api/scheduler/scenarios$",
-    r"^/api/scheduler/scenarios/[^/]+$",
-    r"^/api/auth/me$",
-    r"^/api/context$",
-    r"^/api/context/options$",
-    r"^/api/games/[^/]+(?:/(?:board|lineups|roster-status|roster|substitutes"
-    r"|substitute-candidates|substitute-addable|reschedule|officials"
-    r"|availability-summary))?$",
-)]
-_POST_ROUTES = [re.compile(p) for p in (
-    r"^/api/bootstrap/claim$",
-    r"^/api/auth/login$",
-    r"^/api/auth/logout$",
-    r"^/api/public/calendar-feeds$",
-    r"^/api/notifications/preferences$",
-    r"^/api/officials/[^/]+/availability$",
-    r"^/api/officials/availability/[^/]+/delete$",
-    r"^/api/games/[^/]+/reschedule/[^/]+/respond$",
-    r"^/api/calendar-feeds$",
-    r"^/api/calendar-feeds/[^/]+/revoke$",
-    r"^/api/me/substitute-opportunities/[^/]+/"
-    r"(?:enroll|withdraw|accept-offer|decline-offer)$",
-    r"^/api/me/guardian/[^/]+/games/[^/]+/availability$",
-    r"^/api/me/guardian/[^/]+/substitute-opportunities/[^/]+/"
-    r"(?:accept-offer|decline-offer)$",
-    r"^/api/reset$",
-    r"^/api/demo/(?:reset|load|clear)$",
-    r"^/api/admin/factory-reset/(?:preview|execute)$",
-    r"^/api/demo/add-ice-slot$",
-    r"^/api/context$",
-    # v1 setup writes (#271): EXACT routes transcribed from _handle_setup /
-    # _handle_reassign — a broad `.+` over-claims POST on nonexistent paths
-    # whose real POST is a 404, so the fallback would wrongly answer 405.
-    r"^/api/setup/(?:league|season|level|division|club|team|organization"
-    r"|venue|rink|ice-slot|game|official|player)$",  # entity creates
-    r"^/api/setup/(?:organization|league|season|level|division|club|team"
-    r"|venue|rink|ice-slot|game|player|official)/[^/]+/delete$",  # deletes
-    r"^/api/setup/league/[^/]+/assign-organization$",
-    r"^/api/setup/venue/[^/]+/assign-organization$",
-    r"^/api/setup/rink/[^/]+/assign-venue$",
-    r"^/api/setup/division/[^/]+/assign-level$",
-    r"^/api/setup/team/[^/]+/assign-club$",
-    r"^/api/setup/player/[^/]+/assign-team$",
-    r"^/api/setup/seasons/[^/]+/team-registrations$",
-    r"^/api/setup/seasons/[^/]+/roll-forward$",
-    r"^/api/setup/season-team-registration/[^/]+/assign-division$",
-    r"^/api/setup/season-team-registration/[^/]+/remove$",
-    # v2 setup writes (#271): EXACT routes from _handle_setup_v2 /
-    # _handle_reassign_v2 (the v2 entity/target sets differ from v1).
-    r"^/api/v2/setup/(?:program|season|league|division|club|team|organization"
-    r"|venue|rink|ice-slot|game|official|player)$",  # entity creates
-    r"^/api/v2/setup/(?:organization|program|season|league|league-season"
-    r"|division|club|team|venue|rink|ice-slot|game|official|player)"
-    r"/[^/]+/delete$",  # deletes
-    r"^/api/v2/setup/program/[^/]+/assign-organization$",
-    r"^/api/v2/setup/division/[^/]+/assign-league$",
-    r"^/api/v2/setup/team/[^/]+/assign-club$",
-    r"^/api/v2/setup/team/[^/]+/assign-league$",
-    r"^/api/v2/setup/player/[^/]+/assign-team$",
-    r"^/api/v2/setup/player/[^/]+/update$",
-    r"^/api/v2/setup/player/[^/]+/active$",
-    r"^/api/v2/setup/rink/[^/]+/assign-venue$",
-    r"^/api/v2/setup/venue/[^/]+/assign-organization$",
-    r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
-    r"^/api/v2/setup/seasons/[^/]+/venue-access$",
-    r"^/api/v2/setup/seasons/[^/]+/roll-forward$",
-    r"^/api/v2/setup/seasons/[^/]+/archive$",
-    r"^/api/v2/setup/seasons/[^/]+/reopen$",
-    r"^/api/v2/setup/season-team-registration/[^/]+/assign-league$",
-    r"^/api/v2/setup/season-team-registration/[^/]+/assign-division$",
-    r"^/api/v2/setup/season-team-registration/[^/]+/remove$",
-    r"^/api/v2/setup/season-team-registration/[^/]+/delete$",
-    r"^/api/v2/setup/season-venue-access/[^/]+/remove$",
-    r"^/api/v2/setup/season-venue-access/[^/]+/delete$",
-    r"^/api/import/dry-run$",
-    r"^/api/import/commit/(?:teams-players|officials-availability"
-    r"|rinks-ice-slots)$",
-    r"^/api/scheduler/draft$",
-    r"^/api/scheduler/scenarios$",
-    r"^/api/scheduler/scenarios/[^/]+/commit$",
-    r"^/api/scheduler/commit$",
-    r"^/api/scheduler/drafts/(?:publish|discard)$",
-    r"^/api/setup/ice-availability/(?:preview|commit)$",
-    r"^/api/setup/scheduling-policy$",
-    r"^/api/notifications/deliveries/process$",
-    r"^/api/notifications/deliveries/[^/]+/(?:retry|ignore)$",
-    r"^/api/notifications/contacts$",
-    r"^/api/notifications/contacts/[^/]+/active$",
-    r"^/api/notifications/device-tokens$",
-    r"^/api/notifications/device-tokens/[^/]+/active$",
-    r"^/api/notifications/preferences/[^/]+/active$",
-    r"^/api/accounts$",
-    r"^/api/accounts/[^/]+/active$",
-    r"^/api/accounts/[^/]+/scope$",
-    r"^/api/accounts/[^/]+/sessions/[^/]+/revoke$",
-    r"^/api/guardians/links$",
-    r"^/api/guardians/links/[^/]+/verify$",
-    r"^/api/notifications/read-all$",
-    r"^/api/notifications/[^/]+/read$",
-    r"^/api/officials/assignments/[^/]+/(?:accept|decline|unassign)$",
-    # Game write actions only (NOT the read-only subpaths above): a POST to a
-    # read subpath like ``.../board`` is a 404, never a real route.
-    r"^/api/games/[^/]+/(?:availability|availability/remind|build-roster"
-    r"|roster/select|roster/remove|roster/copy-previous|officials/assign"
-    r"|result|result/approve|publish|move|reschedule/request"
-    r"|reschedule/[^/]+/decide|substitutes/enroll|substitutes/withdraw"
-    r"|substitutes/add-candidate|substitutes/[^/]+/(?:offer|accept|decline"
-    r"|add-to-roster)|roster/lock|roster/unlock|cancel)$",
-)]
+# Method-405 routing table (#202 repair, wiring step; #271 origin). Two lists
+# of compiled path patterns, now DERIVED from route_registry.py rather than
+# hand-transcribed -- there is no longer a second, hand-maintained table that
+# can drift from the dispatch it claims to describe (the failure the #202
+# post-merge review found: 12 routes silently misrepresented as one wildcard
+# in the registry, with nothing checking it against this table or vice
+# versa). ``_method_fallback`` uses these to answer an unsupported method
+# with a JSON 405 + a correct ``Allow`` header instead of the stdlib's HTML
+# 501.
+#
+# The registry's structural ``kind`` is the admission boundary. Every concrete
+# route publishes its method contract regardless of path prefix; static shells,
+# broad families, and fallthroughs do not claim endpoint existence:
+#
+#   kind == "route"   excludes kind="static" (the /setup, /mobile, / shells
+#                     and the unconditional static-file tail -- serving a
+#                     static asset was never this table's job; OPTIONS/PUT on
+#                     a static path answers 404 today, not 405+Allow, and
+#                     must keep doing so) and kind="fallthrough" (the
+#                     ``/api/{*0}`` do-nothing tail -- a 404 fallthrough is
+#                     not a route with a policy, #202 repair finding 6) and
+#                     kind="family" (a branch broader than the real routes
+#                     under it -- ``/api/games/{}/{*}`` matches ANY
+#                     sub-action, including nonexistent ones; admitting it
+#                     would over-claim paths this table never admitted
+#                     before. Its concrete siblings -- ``.../result``,
+#                     ``.../publish``, etc -- are each their own
+#                     kind="route" spec and ARE admitted individually, the
+#                     same "ACTUAL write actions only" scope the old
+#                     hand-written game POST pattern documented).
+# tests/test_route_registry.py pins this scope from both directions: every
+# admitted pattern still has a matching RouteSpec, every concrete non-API GET
+# is admitted, and the specific non-concrete set these tables omit (static
+# shells/tail, API fallthrough, and the games family) is exact.
+_GET_ROUTES = [re.compile(spec.pattern) for spec in REGISTRY
+              if spec.method == "GET" and spec.kind == "route"]
+_POST_ROUTES = [re.compile(spec.pattern) for spec in REGISTRY
+               if spec.method == "POST" and spec.kind == "route"
+               and spec.pattern.startswith(r"^/api/")]
 
 
 def _json_default(obj):
@@ -652,19 +534,22 @@ STATE = DemoState()
 #
 # THE ENUMERATION THAT PRODUCES THIS TABLE, stated so it can actually be re-run.
 # The comparison is NOT funnelled through one helper, and an audit that assumes
-# it is will miss three of the four rows below. Enumerate every caller of
+# it is will miss three of the five rows below. Enumerate every caller of
 # `ContextService.resolve_with_league` in `api/service.py` that then compares a
-# caller-named target to the resolved Season — by ANY of the four routes the
-# code actually uses:
+# caller-named target to the resolved Season — by ANY of the three SHAPES the
+# code actually uses (the count is of shapes, not of routes; an earlier revision
+# said "routes" here and meant this):
 #
-#   * INLINE, `season_id != active_season.id`  (service.py:9378, :10688 — this
+#   * INLINE, `season_id != active_season.id`  (service.py:9441, :10751 — this
 #     is how BOTH venue reads do it; neither touches the helpers below)
-#   * `_scenario_in_active_tuple` -> `_setup_target_edge_allows`  (:6536, :1013)
-#   * `_division_matches_active_context`  (:5947, called at :6025)
+#   * `_scenario_in_active_tuple` -> `_setup_target_edge_allows`  (:6599, :991)
+#   * `_league_season_matches_active_context`  (:5947) — reached by BOTH
+#     standings reads: directly (:6187) and through
+#     `_division_matches_active_context` (:5995, called at :6045)
 #
 # An earlier revision of this comment named only the middle one and claimed the
 # table was derived from it. It was not: that recipe reaches exactly one of the
-# four listed routes. Six GET routes reach the comparison at all; four qualify:
+# listed routes. Seven GET routes reach the comparison at all; five qualify:
 #
 #   * /api/v2/setup/seasons/<id>/venue-candidates   LISTED — named Season
 #   * /api/v2/setup/seasons/<id>/venue-access       LISTED — named Season
@@ -677,6 +562,14 @@ STATE = DemoState()
 #       `league_season.season_id != season.id`; a mismatch is the generic
 #       EMPTY standings shape, which is a wrong answer that looks like a real
 #       one rather than a refusal — worse to leave unordered, not better
+#   * /api/standings/league-season/<l>/<s>          LISTED — named LeagueSeason,
+#       via the same comparison one level up; a mismatch is the generic
+#       `not_found` a nonexistent (league, season) pair takes. NOT listed
+#       before #202, and correctly so: the route then passed no role/scope at
+#       all, so it never resolved the tuple and failed clause 1 outright. That
+#       is the criterion tracking a real defect rather than papering over it —
+#       the route was answering ANONYMOUS callers, which is what #202 fixed;
+#       giving it the ceiling is what earns it the ordering constraint.
 #   * /api/scheduler/scenarios and /api/scheduler/drafts   NOT LISTED, and
 #       that is the criterion doing its job: they name no target, so the active
 #       tuple IS their query rather than a ceiling on something the caller
@@ -691,6 +584,7 @@ CONTEXT_SCOPED_READ_ROUTES = (
     re.compile(r"^/api/v2/setup/seasons/[^/]+/venue-access$"),
     re.compile(r"^/api/scheduler/scenarios/[^/]+$"),
     re.compile(r"^/api/standings/[^/]+$"),
+    re.compile(r"^/api/standings/league-season/[^/]+/[^/]+$"),
 )
 
 
@@ -698,11 +592,95 @@ def is_context_scoped_read(path: str) -> bool:
     return any(rx.match(path) for rx in CONTEXT_SCOPED_READ_ROUTES)
 
 
+# Sensitive POST routes that must durably audit a denial at do_POST's
+# GENERIC per-request gate (#426 round-2 review finding 2: "the generic
+# do_POST authorize(role, path) gate still returns 403 without a
+# DataAccessLog denial for contact active-toggle and delivery retry/
+# ignore" — closing the residual gap #426's own first round left
+# documented, now ruled in scope). Each entry is
+# (pattern, SensitiveFieldCategory, purpose) — purpose mirrors the
+# facade method the SAME route reaches when authorized, so an allowed
+# and a denied attempt at the identical action share one vocabulary in
+# the audit trail. Consulted by do_POST's OWN two refusal points below
+# (the resolve_role() 401 and the authorize() 403), never by
+# _operator_only's GET-side gate, which already has its own
+# per-call-site audit_category parameter.
+#
+# The device-token active-toggle entry (#426 round-3 review finding 1)
+# joins the contacts-active-toggle entry above it for the SAME reason: its
+# response echoes a stored raw value (the token) an unauthorized caller
+# never submitted, so a transport-level refusal is exactly as much a
+# sensitive-read denial as the facade's own — reusing the ONE
+# CONTACT_DESTINATION-category gate, not a second one.
+_SENSITIVE_POST_AUDIT_ROUTES = (
+    (re.compile(r"^/api/notifications/contacts/[^/]+/active$"),
+     SensitiveFieldCategory.CONTACT_DESTINATION, "set_contact_destination_active"),
+    (re.compile(r"^/api/notifications/deliveries/[^/]+/retry$"),
+     SensitiveFieldCategory.CONTACT_DESTINATION, "retry_notification_delivery"),
+    (re.compile(r"^/api/notifications/deliveries/[^/]+/ignore$"),
+     SensitiveFieldCategory.CONTACT_DESTINATION, "ignore_notification_delivery"),
+    (re.compile(r"^/api/notifications/device-tokens/[^/]+/active$"),
+     SensitiveFieldCategory.CONTACT_DESTINATION, "set_device_token_active"),
+)
+
+
+def _sensitive_post_audit_target(path: str):
+    """The ``(category, purpose)`` a denial of this POST ``path`` must be
+    durably audited under, or ``(None, None)`` for every other route —
+    see ``_SENSITIVE_POST_AUDIT_ROUTES`` above."""
+    for pattern, category, purpose in _SENSITIVE_POST_AUDIT_ROUTES:
+        if pattern.match(path):
+            return category, purpose
+    return None, None
+
+
 # ONE gate per process, beside STATE and with the same lifetime — it orders
 # REQUESTS, not data, so it deliberately survives STATE.reset()/store swaps.
 # See services/context_gate.py for the ordering argument, the lock level, and
 # the honest per-process scope limit.
-CONTEXT_GATE = ContextSwitchGate()
+#
+# round-N+1: RELOCATED to `services/context_gate.py` (imported at the top of
+# this file, not instantiated here) — `api/service.py` needs these SAME two
+# objects for its own writer-side wraps (finding 1's Memory/SQLite fix, see
+# that module's own "process-wide instances" comment for the full reasoning),
+# and importing them FROM `web/server.py` there would be circular
+# (`web/server.py` already imports `ApiService` from `api/service.py`).
+# `_LIFECYCLE_GATE_KEY` keeps its historical, underscore-prefixed LOCAL name
+# via the top-of-file import's `as` clause — every existing reference in this
+# file (and `tests/test_epoch_fence.py`'s `EpochFenceConstantsStaySyncedTest`,
+# which reads it off this module) is unchanged.
+#
+# A SECOND, INDEPENDENT instance of the SAME primitive orders scoped reads
+# against Season LIFECYCLE mutations (archive/reopen) — and, as of round-N+1,
+# every OTHER global-keyed writer too, since `api/service.py`'s
+# `_guarded_attempt` and five individual facade methods now take
+# `LIFECYCLE_GATE.exclusive(...)` the same way `archive_season`/
+# `reopen_season` always have — instead of per-user context switches (#159
+# review finding 3 — the check->service TOCTOU). See `services/context_gate.py`
+# for the full defect/fix argument and the lock-order invariant (level 0,
+# strictly outermost, never acquired while a store lock is held).
+
+# THE OTHER HALF OF THE SAME PROBLEM (#159 follow-up to #415). The gate orders a
+# read that is ALREADY INSIDE the server against a switch. It cannot help a read
+# the client DISPATCHED before the switch but that reaches `do_GET` AFTER it:
+# such a read takes a higher arrival sequence, correctly waits behind the
+# writer, correctly runs against the NEW tuple, and the unchanged exact-Season
+# ceiling correctly answers the generic 404 — for a question the operator had
+# already withdrawn. `AbortController.abort()` settles the client's promise; it
+# does not un-send the request.
+#
+# The missing fact — WHICH SELECTION THIS READ WAS RENDERED UNDER — therefore
+# travels on the read itself, in `X-Context-Epoch`, and is compared against the
+# epoch derived from the persisted row as it stands now. NOTHING IS RETAINED to
+# make that comparison, so no TTL and no eviction can turn a superseded read
+# back into a 404; see services/context_epoch.py for the owner ruling this
+# replaced a per-read-id cancellation registry to satisfy.
+
+# The sentinel a scoped-read branch gets back from `_read_under_context_gate`
+# instead of a payload when the selection moved underneath it. A distinct
+# object, not None: `None` is a value a service could legitimately return, and
+# mistaking one for the other would silently turn a real answer into a discard.
+DISCARDED_READ = object()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1040,18 +1018,78 @@ class Handler(BaseHTTPRequestHandler):
                        "shortly."}}, 429)
         return True
 
-    def _operator_only(self, guard: str) -> bool:
+    def _sensitive_get(self, facade_method) -> None:
+        """Send the response for a sensitive-read GET route (#426 review
+        finding 1): ``facade_method`` is an ``ApiService`` method
+        (``list_contact_destinations`` / ``get_delivery_overview``).
+
+        The caller has already passed ``_operator_only(guard,
+        audit_category=...)`` (its OWN refusal durably audited there —
+        see that method's docstring) before reaching this point, so this
+        method's job is narrower than it once was: resolve the session
+        ONE more time and pass it straight through as the facade's
+        ``actor_role``/``actor_user_id``, so the facade's OWN policy+audit
+        gate — never a no-principal placeholder — makes the actual
+        disclosure decision and records the real actor. Re-resolving here
+        (rather than threading ``_operator_only``'s own resolution through)
+        costs one extra cheap, side-effect-free cookie parse; it does NOT
+        reopen the bug this fixes, because neither resolution can disagree
+        with itself inside one synchronous request handler, and it keeps
+        this method usable standalone should a future sensitive GET route
+        need it without an ``_operator_only`` pre-gate.
+
+        An invalid/missing session (``err`` from ``_resolve_role()``) still
+        reaches the facade — its ``role=None`` fails closed exactly like
+        any other unrecognised principal — so the refusal is STILL durably
+        audited ("durably audit transport-level refusals", #426 review
+        finding 1), but the HTTP RESPONSE sent back is the ORIGINAL 401
+        from ``_resolve_role()``, not the facade's generic 403: the more
+        accurate status for "no session at all", matching every other
+        route's convention. In practice this is now unreachable from the
+        two live call sites below (``_operator_only`` already turned a
+        missing session into its OWN audited 401 first), but it stays
+        correct rather than assuming that will always be true.
+        """
+        role, scope, user_id, err = self._resolve_role()
+        request_id = STATE.api._mint_request_id()
+        result = facade_method(
+            actor_role=role, actor_user_id=user_id, request_id=request_id)
+        if err is not None:
+            code, payload = err
+            return self._send_json(payload, code)
+        return self._send_api(result)
+
+    def _operator_only(self, guard: str, *, audit_category=None) -> bool:
         """For read-only operator routes: send 401/403 and return True if the
         caller may not operate, else False. Same resolution as the feed —
         invalid cookie → 401, and the ``guard`` path's permission → 403 for
         non-operators.
+
+        ``audit_category`` (#426 review finding 1, optional, default
+        ``None``): when supplied, EVERY refusal this call sends — the 401
+        for a missing/invalid session exactly as much as the 403 for an
+        authenticated-but-insufficient role — is ALSO durably audited as a
+        denied read of that sensitive-field category, attributed to
+        whatever principal THIS SAME resolution produced (``None`` for the
+        401 case, which ``ApiService._privacy_principal`` labels
+        ``NO_PRINCIPAL``, never a disclosure). Closes "A Viewer refusal
+        stopped at ``_operator_only`` and recorded no denial" (#426 review
+        finding 1) without turning every OTHER ``_operator_only`` call
+        site — none of which pass this — into an unrelated audit source:
+        every existing caller keeps today's exact silent 401/403 behavior.
         """
-        role, scope, _uid, err = self._resolve_role()
+        role, scope, uid, err = self._resolve_role()
         if err is not None:
+            if audit_category is not None:
+                STATE.api._audit_transport_denial(
+                    audit_category, "http_operator_gate", uid, None)
             code, payload = err
             self._send_json(payload, code)
             return True
         if not authorize(role, guard):
+            if audit_category is not None:
+                STATE.api._audit_transport_denial(
+                    audit_category, "http_operator_gate", uid, role)
             perm = required_permission(guard)
             self._send_json({"error": {
                 "code": "forbidden",
@@ -1062,6 +1100,33 @@ class Handler(BaseHTTPRequestHandler):
             }}, 403)
             return True
         return False
+
+    def _audit_sensitive_post_denial(self, path: str, role, uid) -> None:
+        """Durably audit a denial at do_POST's GENERIC per-request
+        ``authorize(role, path)`` gate, for the sensitive routes named in
+        ``_SENSITIVE_POST_AUDIT_ROUTES`` (#426 round-2 review finding 2 —
+        the residual gap the FIRST #426 review round documented and left
+        open; the owner has since ruled it in scope). A no-op for every
+        OTHER POST route — every other route's 401/403 keeps today's exact
+        silent behavior, the SAME "existing caller unaffected" contract
+        ``_operator_only``'s own ``audit_category`` parameter already
+        keeps for the GET side.
+
+        ``role`` is ``None`` for the missing/invalid-session (401) case,
+        matching every other transport-boundary denial audit — see
+        ``ApiService._audit_transport_denial``'s own docstring.
+
+        Deliberately a SEPARATE call, not a change to ``authorize(role,
+        path)`` or the ``if not authorize(role, path):``/``if err is not
+        None:`` nodes themselves: those two are do_POST's own generic,
+        blanket-gate shapes, already reviewed and recognized as such by
+        ``web/route_extract.py``'s dispatch analysis (#202) — this
+        function is called from beside them, not folded into their own
+        text, so neither node's recognized shape changes.
+        """
+        category, purpose = _sensitive_post_audit_target(path)
+        if category is not None:
+            STATE.api._audit_transport_denial(category, purpose, uid, role)
 
     # -- setup TARGET-RECORD authorization (#369) --------------------------
     #
@@ -1554,6 +1619,531 @@ class Handler(BaseHTTPRequestHandler):
         with ticket.bind(user_id) as held:
             yield held
 
+    @contextmanager
+    def _lifecycle_read_hold(self):
+        """Hold ``LIFECYCLE_GATE`` SHARED across a scoped read's epoch check
+        AND its dependent service call (#159 review finding 3), ordering it
+        against ``archive_season``/``reopen_season`` — see that gate's own
+        module-level comment for the full defect/fix argument.
+
+        UNLIKE ``_context_read_hold``, no early (PHASE A) arrival is needed.
+        The window this has to protect starts exactly where it is entered
+        (``_read_under_context_gate``, right before the epoch is derived):
+        before that point no epoch decision has been made yet for THIS
+        gate to protect, so an archive/reopen landing any earlier is simply
+        part of the state the not-yet-started check will correctly observe.
+        ``LIFECYCLE_GATE``'s key is a single constant (not a per-request
+        identity to resolve), so there is no "arrived but not yet
+        identified" window analogous to the one ``_context_read_ticket``
+        exists for.
+
+        Released before the caller writes its response, exactly as
+        ``_context_read_hold`` is.
+        """
+        ticket = LIFECYCLE_GATE.arrive()
+        with ticket.bind(_LIFECYCLE_GATE_KEY):
+            yield
+
+    def _read_under_context_gate(self, user_id, role, scope, produce):
+        """Run a scoped read's service call under PHASE B of the gate, unless
+        the selection it was RENDERED UNDER is no longer the EFFECTIVE
+        selection — in which case return ``DISCARDED_READ`` and never call the
+        service at all (#159 follow-up to #415; role/scope-aware effective
+        resolution added by #159 review finding 2).
+
+        THE PLACEMENTS ARE THE WHOLE MECHANISM, and none works without the
+        others:
+
+          * The comparison is made INSIDE ``_context_read_hold``, i.e. AFTER
+            ``bind`` has waited out every SWITCH that registered before this
+            request arrived. So the CURRENT epoch it derives is derived as of
+            after that switch committed — a read that arrives mid-quiesce
+            cannot look early, see the old epoch, match it, and then be
+            judged by the ceiling against the new tuple anyway.
+          * The comparison AND ``produce()`` both run INSIDE
+            ``_lifecycle_read_hold`` too (#159 review finding 3), so an
+            archive/reopen cannot commit BETWEEN "the epoch matched" and "the
+            service ran": ``LIFECYCLE_GATE`` orders this read's entire
+            protected window against every such mutation, so the two can
+            never straddle one — either the mutation is ordered wholly before
+            this read (and the epoch check itself already reflects it, so a
+            stale echo correctly mismatches) or wholly after it (and
+            ``produce()`` runs against exactly the state the epoch was just
+            proven current against). See ``LIFECYCLE_GATE``'s own comment for
+            why this is a GATE rather than a shared database transaction.
+          * The whole thing is BEFORE any data-bearing response is possible,
+            so a discarded read never reaches the exact-Season ceiling and the
+            answer discloses nothing about the named Season in EITHER
+            direction: a discard looks the same whether the Season is a
+            sibling of the selection, is archived, or was never real.
+
+        A read the gate ordered AHEAD of the switch is untouched: it holds the
+        gate, the switch waits for it, the row does not move underneath it, and
+        its echo matches. #415's "already inside the server" guarantee is
+        therefore intact and is asserted as such by
+        ``test_a_read_already_inside_the_server_keeps_the_415_ordering``.
+
+        A caller that echoes NOTHING gets exactly today's behaviour — the
+        verdict is ``EPOCH_ABSENT`` and this reduces to the plain
+        ``_context_read_hold`` the four branches took before (now also
+        ordered against lifecycle mutations, which changes no OBSERVABLE
+        behaviour for an absent header — there is still no epoch to compare).
+
+        The holds are released before the caller writes its response, exactly
+        as ``_context_read_hold`` alone was before.
+
+        PR #423 (design §7): LAYERED alongside the two in-process holds above
+        — not a replacement for them — are the new database-coordinated
+        epoch fence's SHARED holds, one per-user and one global, mirroring
+        exactly which writer classes each in-process gate already orders
+        against (``CONTEXT_GATE``/per-user vs ``LIFECYCLE_GATE``/global) and
+        widening coverage to the writers in the design's §3 table that never
+        had ANY gate before this (Season/Program/League/LeagueSeason
+        deletion, venue-access revoke/delete, Team transfer, Official
+        assign/unassign, Player/Guardian reassignment, account scope
+        rebind/activate, Guardian link create/verify). Both fence holds are
+        acquired BEFORE the epoch is derived (so the derivation cannot
+        straddle a fenced writer's commit) and held across ``produce()``
+        (the same reason a shared/exclusive PRIMITIVE is used at all rather
+        than re-checking the epoch after the fact — see the store's own
+        ``epoch_fence_acquire_shared`` docstring). The owner's explicit
+        instruction is to keep ``CONTEXT_GATE``/``LIFECYCLE_GATE`` and
+        Phase-A's arrival-ticket machinery intact rather than retire them in
+        this round (`do_GET`'s ``CONTEXT_GATE.arrive()`` and everything that
+        depends on it), so this method now holds SIX things at once rather
+        than replacing two with two — belt-and-suspenders, not a swap. Each
+        layer is independently sufficient for its own writer class on its own
+        backend (the two NEW SHARED holds are the only protection that is
+        durable ACROSS independent PostgreSQL processes, which the two OLD
+        in-process holds, being Python objects, structurally cannot be — see
+        ``context_gate.py``'s own HONEST SCOPE LIMIT).
+
+        round-N+1 CORRECTION — the two OLD in-process holds are now what
+        PRIMARILY closes Memory and same-process SQLite, not the version
+        counter (see the ROUND-N+1 paragraph below for why the round-N
+        version-counter-only design was rejected and what replaced it as the
+        PRIMARY mechanism there).
+
+        ROUND-N REVIEW FINDING 2 — the two SHARED holds' return values are
+        no longer discarded. Each ``epoch_fence_acquire_shared`` yields
+        ``True`` only when it genuinely acquired (or the call is a documented
+        no-op that never contends — Memory/SQLite); it yields ``False`` when
+        it FAILED OPEN after PostgreSQL's bounded ``lock_timeout`` expired
+        against a held EXCLUSIVE holder (SQLSTATE 55P03 — see
+        ``_epoch_fence_shared_postgres``). Proceeding past a ``False`` used to
+        mean deriving the epoch and calling ``produce()`` completely
+        unprotected: if the exclusive writer that outlasted the timeout then
+        committed between those two calls, the exact torn read this whole
+        mechanism exists to prevent would be served instead of discarded.
+        FAILING TO ACQUIRE IS NOW TREATED EXACTLY LIKE AN EPOCH MISMATCH —
+        the empty 204, ``produce()`` never called — which changes nothing
+        about the FENCE's own fail-open-toward-not-blocking-writers property
+        (a stuck reader still can never lock out a writer; see
+        ``epoch_fence_acquire_shared``'s own docstring, unchanged): it only
+        changes what THIS READER does when IT could not get the fence, from
+        "serve unprotected" to "safely discard".
+
+        ROUND-N REVIEW FINDING 1 (round-N; SUPERSEDED AS THE PRIMARY MECHANISM
+        BY ROUND-N+1 BELOW, KEPT AS DEFENSE-IN-DEPTH). ``*_version_before``/
+        ``*_version_after`` bracket the epoch derivation AND ``produce()``
+        with the persisted, EVERY-BACKEND version counters every one of the
+        17 fenced writers bumps as part of its own transaction (``SqlStore``/
+        ``InMemoryStore`` ``epoch_fence_acquire_exclusive`` — see either's
+        docstring). NO LOCK is held across ``produce()`` for this check, so it
+        cannot deadlock — but the owner's round-N+1 correction is exact and
+        decisive: on a torn read this check still lets ``produce()`` run to
+        completion (with whatever side effects, audits, cache writes, or
+        exceptions it has) BEFORE discarding the RESPONSE, which is not the
+        required contract (204, ZERO service calls). It remains here as a
+        REGRESSION-DETECTION backstop — if either pair of samples disagrees,
+        something landed inside this window that the PRIMARY mechanism below
+        failed to order against, and the response is still discarded — but it
+        is no longer what this method relies on to keep Memory/SQLite's call
+        count at zero; see the ROUND-N+1 paragraph immediately below for what
+        does.
+
+        ROUND-N+1 CORRECTION (this round) — a genuine PRE-``produce()`` gate
+        on all three backends, closing exactly the gap the owner identified:
+        "the persisted version counter may remain as an additional defense-
+        in-depth/regression-detection layer, not as the PRIMARY mechanism
+        satisfying the zero-call contract."
+
+        * MEMORY (and, incidentally and for free, any SAME-PROCESS SQLite
+          race): the two OLD in-process holds documented above
+          (``_context_read_hold``/``_lifecycle_read_hold``, i.e.
+          ``CONTEXT_GATE``/``LIFECYCLE_GATE``) are PURE ``threading``
+          objects — no store, no connection, nothing that could ever
+          participate in a lock-ordering cycle with ``self._lock`` (see
+          ``services/context_gate.py``'s own LOCK ORDER invariant: this gate
+          is level 0, strictly OUTERMOST, and is never held while a store
+          lock is held). Round-N wired only 3 of the 17 writers (context
+          switch, archive, reopen) into these two gates' EXCLUSIVE side;
+          round-N+1 wires the remaining 14 (``api/service.py``'s
+          ``_guarded_attempt`` — every kind in ``_EPOCH_FENCE_KINDS``, the
+          same set the database-coordinated fence already uses — plus five
+          individual facade methods: ``rebind_user_account_scope``,
+          ``set_user_account_active``, ``assign_official``,
+          ``unassign_official``, ``create_guardian_link``,
+          ``verify_guardian_link``, and the two v1/v2 reassign-dispatch
+          sites in THIS module for the Player/Team combo, which cannot be
+          folded into ``_guarded_attempt``'s generic check without
+          over-fencing every OTHER guarded Player mutation). Once EVERY
+          writer takes the SAME gate this method's readers already hold
+          SHARED across their whole window, a torn read is not merely
+          detected and discarded — it is STRUCTURALLY UNREACHABLE: a writer
+          registering after this read's hold begins cannot commit until the
+          hold (and ``produce()`` inside it) releases, and a writer already
+          holding the gate's EXCLUSIVE side blocks this read's ENTRY, before
+          ``current_epoch()`` is even called, until the writer's commit is
+          fully durable — at which point the freshly-derived epoch correctly
+          mismatches a stale echo and this method returns ``DISCARDED_READ``
+          on the line below, ``produce()`` never reached. See
+          ``tests/test_epoch_fence_http.py`` for the real-HTTP, real-spy
+          proof (parked WRITER, not parked reader — the round-N version of
+          this file's own test parked the READER, which is precisely the
+          shape a genuine pre-``produce()`` gate turns into ordinary,
+          correct, #415-covered "read admitted ahead of the writer"
+          behaviour rather than a torn read).
+        * FILE-BACKED SQLITE additionally gets its OWN mechanism, not merely
+          inherited from the in-process gates above (those are genuinely
+          sufficient for a SAME-PROCESS race — today's only deployed
+          topology, per ``context_gate.py``'s own HONEST SCOPE LIMIT — but
+          are structurally incapable of a cross-process one, and the file
+          itself is what the owner asked this round to use as "the durable,
+          engine-level primitive this needs" so the guarantee does not
+          quietly depend on staying single-process forever): see
+          ``_read_under_context_gate_sqlite`` below.
+        * ``:memory:`` SQLITE (and Postgres) take neither of the two branches
+          above's EXTRA mechanism — Postgres already has a REAL cross-process
+          lock via the SHARED holds two paragraphs up; ``:memory:`` SQLite
+          cannot have a second, independent connection to the SAME data at
+          all (each connection to ``:memory:`` is its own blank database —
+          see ``epoch_fence_acquire_shared``'s own PER-CONNECTION-PRIVATE
+          paragraph), so it relies on the in-process gates exactly like
+          Memory does. Both keep the version-counter check as the SAME
+          defense-in-depth backstop described above.
+
+        KEYED THE SAME WAY THE SHARED HOLDS ARE — one counter for THIS
+        user's own key, one for the global key — not one shared counter
+        across every writer for every user. A single shared counter shipped
+        first and was reverted: it made an UNRELATED user's own writer
+        (their own context switch, nothing to do with THIS read) discard
+        this read too, breaking the cross-user independence
+        ``ContextSwitchGate``/``CONTEXT_GATE`` exist to bound (measured
+        directly against ``test_context_switch_server_exit.py``'s own
+        cross-user cases, which regressed from 200 to 204 the moment a
+        single global counter shipped). See migration 052's own docstring
+        for the fuller account.
+
+        SAMPLED *AFTER* THE TWO IN-PROCESS HOLDS SETTLE, NOT BEFORE THEM —
+        placement matters here too, and getting it wrong reproduced the
+        SAME class of false discard the paragraph above describes, from a
+        different angle: a read legitimately WAITING on ``_context_read_
+        hold`` for a writer that registered ahead of it (the #415/#159 gate's
+        own, correct, intended job — e.g. this user's own switch, already
+        committing when this read arrived) is not a torn read; it is
+        exactly the re-ordering that gate exists to produce, and the read
+        is SUPPOSED to observe the writer's fresh commit once the wait
+        ends. Sampling ``*_version_before`` ahead of that wait would count
+        the wait's own writer as evidence of tearing and wrongly discard a
+        read the gate had already correctly re-ordered — measured directly
+        against ``test_one_operators_switch_is_not_stalled_by_anothers_
+        scoped_read``, whose own Bob-behind-his-own-switch case went from
+        200 to 204 the moment the sample was taken too early. Sampling once
+        the holds — and therefore any wait they were going to do — have
+        already settled means the baseline reflects state as of "now
+        genuinely free to proceed", so only a writer that commits DURING
+        the still-open window (epoch derivation through ``produce()``
+        returning) can move it.
+
+        round-N+1: ``produce`` now takes ONE argument — the ``ApiService``
+        instance to call it against — rather than none. Every call site
+        below still passes a plain closure, just one that accepts (and,
+        outside the SQLite branch, ignores) it: ``lambda api: api.get_x(...)``
+        instead of ``lambda: api.get_x(...)``. This is what lets
+        ``_read_under_context_gate_sqlite`` run ``produce`` against ITS OWN
+        independent ``ApiService`` — bound to a fresh, independent
+        ``SqlStore`` — instead of ``STATE.api``, without every call site
+        needing to know which ``ApiService`` is "the real one" for this
+        request.
+        """
+        user_key = user_fence_key(user_id) if user_id else None
+        with self._context_read_hold(user_id), self._lifecycle_read_hold(), \
+             STATE.api.store.epoch_fence_acquire_shared(
+                 user_key) as user_fence_held, \
+             STATE.api.store.epoch_fence_acquire_shared(
+                 EPOCH_FENCE_GLOBAL_KEY) as global_fence_held:
+            if user_fence_held is False or global_fence_held is False:
+                # Finding 2: could not confirm no exclusive writer is held —
+                # fail CLOSED (discard), never serve unprotected.
+                return DISCARDED_READ
+            # round-N+1: file-backed SQLite's genuine pre-produce() gate —
+            # see _read_under_context_gate_sqlite's own docstring. Reached
+            # from INSIDE the two in-process holds above (so Memory-style
+            # same-process ordering applies here too, belt-and-suspenders),
+            # but does its OWN, INDEPENDENT epoch derivation and produce()
+            # call rather than using STATE.api / the version-counter check
+            # below — see that method for why.
+            if (STATE.api.store.backend == "sqlite"
+                    and not STATE.api.store.is_memory_backed):
+                return self._read_under_context_gate_sqlite(
+                    user_id, role, scope, produce)
+            user_version_before = (
+                STATE.api.store.current_epoch_fence_version(user_key)
+                if user_key else None)
+            global_version_before = (
+                STATE.api.store.current_epoch_fence_version(
+                    EPOCH_FENCE_GLOBAL_KEY))
+            current = STATE.api.context.current_epoch(user_id, role, scope)
+            verdict = epoch_verdict(
+                self.headers.get(CONTEXT_EPOCH_HEADER), current)
+            if verdict == EPOCH_MISMATCH:
+                return DISCARDED_READ
+            result = produce(STATE.api)
+            # Finding 1 (defense-in-depth, round-N+1): no lock held across
+            # the call above — two plain reads of the persisted counters
+            # bracketing it. On MEMORY this is now a pure backstop: the
+            # in-process holds above already make a torn read structurally
+            # unreachable once every writer takes them (round-N+1's actual
+            # fix — see this method's own docstring). Kept rather than
+            # removed because it is a real, independent regression detector
+            # (a FUTURE writer added without the gate wrap would still be
+            # caught here, discarded rather than served) and because
+            # removing a currently-passing safety net is not this round's
+            # job.
+            user_version_after = (
+                STATE.api.store.current_epoch_fence_version(user_key)
+                if user_key else None)
+            global_version_after = (
+                STATE.api.store.current_epoch_fence_version(
+                    EPOCH_FENCE_GLOBAL_KEY))
+            if (user_version_after != user_version_before
+                    or global_version_after != global_version_before):
+                return DISCARDED_READ
+            return result
+
+    def _read_under_context_gate_sqlite(self, user_id, role, scope, produce):
+        """FILE-BACKED SQLITE ONLY: the epoch derivation and ``produce()``
+        run against a FRESH, fully INDEPENDENT ``SqlStore``/``ApiService``
+        pair — never ``STATE.api`` — for the whole of this method (round-N+1,
+        closing the finding-1 gap the owner's follow-up named exactly:
+        "on a torn read, produce() DOES run... The required contract remains
+        204 with zero service calls").
+
+        WHY A SEPARATE STORE INSTANCE, NOT A SEPARATE CONNECTION ON THE SAME
+        ONE. The round-N design (a DEDICATED connection held only for the
+        fence's advisory-lock-shaped SHARED side, with the actual reads —
+        ``current_epoch()``/``produce()`` — still running on ``STATE.api``'s
+        PRIMARY connection) was measured to deadlock: the dedicated
+        connection's SHARED file lock is one axis; ``STATE.api.store.
+        self._lock`` (a plain ``threading.RLock``, required by every read
+        ``current_epoch()``/``produce()`` make) is a SEPARATE axis a WRITER
+        already holds for its whole transaction (see
+        ``epoch_fence_acquire_exclusive``'s own docstring for the
+        measurement). Splitting fence-holding from actual-reading is what
+        creates the cycle: this thread would hold [dedicated SHARED lock],
+        want [``self._lock``, held by a writer]; the writer holds
+        [``self._lock``], wants [EXCLUSIVE, blocked by this thread's
+        dedicated SHARED lock]. NEVER SPLITTING THE TWO is what closes it: if
+        this method's ENTIRE window — epoch derivation through ``produce()``
+        returning — runs against a store that has its OWN separate
+        ``self._lock`` (never ``STATE.api.store``'s), there is no second lock
+        for a writer's ``self._lock`` hold to cross with at all. The ONLY
+        remaining coordination is SQLite's own native file-lock state
+        machine (``transaction()``'s existing ``BEGIN IMMEDIATE``), which is
+        exactly the durable, engine-level primitive a genuine pre-
+        ``produce()`` gate needs, and is unaffected by which Python-level
+        lock either side happens to hold.
+
+        THE HOLD ITSELF is nothing more than ``fresh_store.transaction()`` —
+        no new store primitive was written for this. ``transaction()``'s
+        existing SQLite branch already does precisely what is needed here:
+        ``BEGIN IMMEDIATE`` takes the file's RESERVED lock as the FIRST
+        statement (before this method's caller could have made any read),
+        and RESERVED already blocks a genuine WRITER's own ``BEGIN
+        IMMEDIATE`` from proceeding until this transaction ends — a writer
+        racing this read either fully precedes it (commits, releases,
+        THEN this transaction opens and observes the fresh state) or fully
+        follows it (blocks at its own ``BEGIN IMMEDIATE`` until
+        ``fresh_store.close()`` below releases), never interleaved. A
+        genuinely torn read is therefore not merely detected after the fact
+        here — it cannot occur: either ``current_epoch()`` and ``produce()``
+        both observe pre-write state (consistent, and if the client's echoed
+        epoch is ALSO pre-write, this correctly serves) or both observe
+        post-write state (and a pre-write echoed epoch correctly mismatches,
+        BEFORE ``produce()`` is reached). The bound is the SAME operator-
+        configurable one used everywhere else in this mechanism (SQLite's
+        driver-level ``timeout``, matching ``HS_CONTEXT_GATE_TIMEOUT`` in
+        spirit — a genuinely wedged writer cannot lock a reader out forever).
+        A stricter, dedicated SHARED-only lock (so two concurrent scoped
+        reads would not also serialize against each other, only against
+        writers) was considered and rejected THIS round in favour of reusing
+        ``transaction()`` unmodified: it needs a NEW store primitive
+        (untested surface, on the mechanism this exact review round is
+        scrutinising most closely) to buy back a narrower concurrency
+        property that matters far less on SQLite — explicitly not "the
+        actual deployment target" (see this file's own history) — than
+        correctness does. Documented here rather than silently accepted:
+        two concurrent file-backed-SQLite scoped reads now briefly serialize
+        against each other, in addition to against writers, which they did
+        not before this round.
+
+        A FRESH INSTANCE PER CALL, not a cached long-lived second store,
+        matching the owner's own framing ("for the duration of one scoped-
+        read request"): opening a ``sqlite3`` connection to an
+        ALREADY-MIGRATED file and re-running ``migrate()`` (a no-op scan —
+        every version is already applied) measures at roughly 1.2ms: real,
+        but small, on a route this narrow (5 GET routes) on a backend that
+        is explicitly not the production target. The alternative — a store
+        cached across requests — would need its own invalidation on
+        ``STATE.reset()`` (a demo reset, or simply a different test process)
+        to avoid holding a connection to a file the primary store has since
+        abandoned; a fresh instance needs none, by construction, and closes
+        the class of bug that invalidation logic could otherwise leave open.
+
+        ``ApiService``/``ContextService`` HOLD NO PROCESS-WIDE STATE BEYOND
+        THE STORE they were constructed with — verified, not assumed, before
+        committing to this shape: every constituent service
+        (``RosterService``, ``SetupService``, ``AccountService``,
+        ``GuardianService``, ``ContextService``, ``DeliveryWorker``) takes
+        only ``store`` (+ a plain, stateless clock callable) in its
+        ``__init__``; ``DeliveryWorker``'s email/push transports default to
+        the SAME dry-run transports a bare ``ApiService()`` already gets, and
+        ``DeliveryLoop`` is constructed disabled and starts no thread. The
+        five scoped-read service methods this method's callers actually
+        invoke (``get_venue_grant_candidates``, ``list_season_venue_access``,
+        ``get_schedule_scenario``, ``get_standings``,
+        ``get_league_season_standings``) were individually confirmed to read
+        only through ``self.store``/``self.context``/``self.setup`` — no
+        delivery, no audit write, no module-level global.
+        """
+        fresh_store = SqlStore(STATE.api.store._url)
+        try:
+            # `SqlStore.__init__` already binds THIS (and every other)
+            # connection's busy-wait to the SAME `HS_CONTEXT_GATE_TIMEOUT`
+            # knob every other layer of this mechanism uses (`PRAGMA
+            # busy_timeout`, set once at connection-open time — see that
+            # method's own comment for why a wedged scoped read's held file
+            # lock would otherwise let a racing WRITER's bounded retry loop
+            # compound the driver's own unrelated 5s default up to 10x,
+            # measured directly against
+            # ``test_a_waiter_cannot_block_forever_on_a_read_that_never_
+            # returns``).
+            #
+            # isolation="SERIALIZABLE", not the bare default: `current_epoch()`
+            # (`ContextService._snapshot`) always opens ITS OWN nested
+            # `transaction(isolation="SERIALIZABLE")`, and a nested join
+            # cannot RAISE the isolation of an already-open outer transaction
+            # (`SqlStore.transaction`'s own rule, #369) — asking for less than
+            # SERIALIZABLE here would make that inner call raise
+            # ``RuntimeError`` on every single scoped read. Asking for it here
+            # is free on SQLite: this branch's own docstring already explains
+            # why `BEGIN IMMEDIATE` + `self._lock` is unconditionally at least
+            # as strong. This call deliberately leaves `read_only` at its
+            # default `False` for the SAME reason: `current_epoch()`'s own
+            # nested `_snapshot` call now asks for `read_only=True`
+            # (round-N+2), but a nested join only ever ADMITS or JOINS the
+            # already-open transaction's strength (never downgrades it) — see
+            # `SqlStore.transaction`'s nested-join check — so that inner
+            # `read_only=True` is satisfied by, and changes nothing about,
+            # this outer write-strength (`BEGIN IMMEDIATE`) transaction.
+            try:
+                with fresh_store.transaction(isolation="SERIALIZABLE"):
+                    fresh_api = ApiService(fresh_store)
+                    current = fresh_api.context.current_epoch(
+                        user_id, role, scope)
+                    verdict = epoch_verdict(
+                        self.headers.get(CONTEXT_EPOCH_HEADER), current)
+                    if verdict == EPOCH_MISMATCH:
+                        return DISCARDED_READ
+                    return produce(fresh_api)
+            except ConcurrencyConflictError:
+                # Measured directly (not merely reasoned about): a contended
+                # `BEGIN IMMEDIATE` on SQLite does not always honour the
+                # connection's busy-timeout the way a mid-transaction
+                # SHARED->RESERVED promotion is documented NOT to (see
+                # `SqlStore.transaction`'s own SQLite-branch comment) —  a
+                # fresh connection's very FIRST `BEGIN IMMEDIATE`, racing
+                # another connection's ALREADY-HELD RESERVED lock, was
+                # observed to fail immediately with `sqlite3.OperationalError
+                # ("database is locked")` rather than retrying for the full
+                # bound, which `SqlStore.transaction`'s own exception handler
+                # already translates into this `ConcurrencyConflictError`
+                # (`db_errors.py`'s `lock_not_available` classification — the
+                # SAME translation an ordinary contended WRITE gets). Two
+                # concurrent scoped reads on file-backed SQLite (each opening
+                # their OWN fresh store) can hit this same path against each
+                # other, not only against a writer. Left uncaught, this
+                # would propagate as an unhandled exception and surface to
+                # the client as a bare 500 — a worse failure than the
+                # mechanism it is supposed to protect: "could not confirm
+                # exclusivity" must fail CLOSED (discard) here for exactly
+                # the same reason `epoch_fence_acquire_shared`'s PostgreSQL
+                # timeout already does (round-N finding 2) rather than
+                # surface a raw internal error for what is, from the
+                # client's point of view, an ordinary races-with-a-write
+                # scoped read.
+                return DISCARDED_READ
+        finally:
+            fresh_store.close()
+
+    def _send_discarded_read(self) -> None:
+        """The answer to a scoped read whose selection moved while it was in
+        transport: ``204 No Content``, no body, nothing about what was asked
+        for.
+
+        A 2xx because nothing went wrong — the operator superseded this request
+        themselves, and a refusal they would have to read as a page error is the
+        wrong report of that. EMPTY because the echoed epoch confers no
+        authority whatsoever: a discard must never be able to return data the
+        ceiling would have refused, so it returns no data at all, for any
+        Season, always.
+        """
+        self.send_response(204)
+        self.send_header("Cache-Control", "no-store")
+        self._security_headers()
+        self.end_headers()
+
+    def _with_context_epoch(self, payload, epoch):
+        """Attach an ALREADY-DERIVED epoch to a context payload the client will
+        render from, so the reads of that render pass can echo the selection
+        they were rendered under.
+
+        THE CALLER DERIVES THE EPOCH, AND *WHEN* IT DERIVES IT IS THE CONTRACT.
+        Nothing gates ``GET /api/context`` or ``GET /api/context/options``, so a
+        concurrent switch for the SAME account — a second tab, another device —
+        can commit between the two reads this response is built from. Only one
+        order fails safe:
+
+          * DERIVE THE EPOCH FIRST, then read the tuple. A switch landing in
+            between yields the NEW tuple with the OLD epoch, so the client's
+            reads echo a stale epoch and are DISCARDED (204). It re-reads and
+            moves on.
+          * Deriving it AFTER would yield the OLD tuple with the NEW epoch —
+            the client renders a selection it has left while echoing the epoch
+            of the one it is on, so its reads are ADMITTED and then judged
+            against a tuple they were not rendered under. That is the 404 this
+            whole mechanism exists to prevent, reintroduced by the fix itself.
+
+        ``POST /api/context`` is the exception and takes the opposite order for
+        the same reason: it derives AFTER its own commit, inside the exclusive
+        gate hold, so no other switch for that user can interleave at all and
+        the epoch it hands back is exactly the row it just wrote.
+
+        Applied HERE rather than in ``api/service.py`` deliberately: the epoch
+        is transport metadata about a request/response pair, not part of the
+        domain view of a context, and `api/service.py` stays out of this diff so
+        the exact-Season ceiling is byte-identical.
+
+        An error payload is returned untouched — it carries no tuple to be an
+        epoch of, and adding a key would disturb ``_send_api``'s error mapping.
+        """
+        if not isinstance(payload, dict) or "error" in payload:
+            return payload
+        enriched = dict(payload)
+        enriched["context_epoch"] = epoch
+        return enriched
+
     def _dispatch_get(self):
         path = self.path.split("?", 1)[0]
         api = STATE.api
@@ -1607,7 +2197,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "A signed-in account is required."}}, 401)
-            return self._send_api(api.get_active_context(user_id, role, scope))
+            # The context epoch rides along (#159 follow-up; effective-tuple
+            # resolution #159 review finding 2): this is one of the three
+            # places the client LEARNS its context, and a scoped read can
+            # only echo the selection it was rendered under if the render knew
+            # its name. Purely additive — a client that ignores it is unchanged.
+            # Derived BEFORE the tuple is read, which is the fail-safe order —
+            # see `_with_context_epoch`.
+            epoch = api.context.current_epoch(user_id, role, scope)
+            return self._send_api(self._with_context_epoch(
+                api.get_active_context(user_id, role, scope), epoch))
         if path == "/api/context/options":
             # The AUTHORIZED Program/Season/League options for the switcher
             # (#159, League axis #345), filtered through the same role/scope
@@ -1622,8 +2221,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "A signed-in account is required."}}, 401)
-            return self._send_api(
-                api.get_context_options(user_id, role, scope))
+            # The epoch rides along here too, and this is the one that matters
+            # most in practice: `app.js` renders from `contextOptions.selected`,
+            # so this response is what a render pass is rendered UNDER. Carrying
+            # both in ONE payload is what makes them consistent by construction
+            # — the client can never pair a tuple with an epoch from a different
+            # instant, because it never sees them apart. Derived BEFORE the
+            # options are read: see `_with_context_epoch` for why that order,
+            # and not the other one, is the one that fails safe.
+            epoch = api.context.current_epoch(user_id, role, scope)
+            return self._send_api(self._with_context_epoch(
+                api.get_context_options(user_id, role, scope), epoch))
         if path == "/api/setup/hierarchy":
             # Nested setup tree for the operator's mental model (#166 PR C).
             # It carries player_count leaves, so gate it like the player list
@@ -1715,9 +2323,15 @@ class Handler(BaseHTTPRequestHandler):
             # critical section. The ceiling itself is untouched: this read is
             # still refused with the same generic 404 when the Season it names
             # is not the selected one.
-            with self._context_read_hold(user_id):
-                payload = api.get_venue_grant_candidates(
-                    mvc.group(1), user_id, role, scope)
+            # ...and the late-arrival half (#159 follow-up): if this read was
+            # rendered under a selection the operator has since left, it is
+            # DISCARDED in front of the ceiling rather than judged by it.
+            payload = self._read_under_context_gate(
+                user_id, role, scope,
+                lambda svc: svc.get_venue_grant_candidates(
+                    mvc.group(1), user_id, role, scope))
+            if payload is DISCARDED_READ:
+                return self._send_discarded_read()
             return self._send_api(payload)
 
         if path == "/api/v2/setup/overview":
@@ -1826,9 +2440,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(payload, code)
             # PHASE B of the context gate (#159) — same shape, same reason, and
             # the same untouched ceiling as the candidates route above.
-            with self._context_read_hold(user_id):
-                payload = api.list_season_venue_access(
-                    mv2va.group(1), user_id, role, scope)
+            payload = self._read_under_context_gate(
+                user_id, role, scope,
+                lambda svc: svc.list_season_venue_access(
+                    mv2va.group(1), user_id, role, scope))
+            if payload is DISCARDED_READ:
+                return self._send_discarded_read()
             return self._send_api(payload)
         if path == "/api/v2/onboarding/status":
             if self._operator_only("/api/v2/onboarding/status"):
@@ -1941,6 +2558,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self._send_api(api.list_guardian_links())
         if path == "/api/officials":
+            # Installation-wide staff directory for the assign control (#30).
+            # Assigned officials on a game remain visible through that game's
+            # separately-authorized sheet payload. The #367 Dashboard read may
+            # also retain its distinct active-context projection (home Club or
+            # in-scope assignment); this route is the unscoped global pool and
+            # is only for operators who may assign from it.
+            if self._operator_only("/api/setup/official"):
+                return
             return self._send_api({"officials": api.get_officials()})
         if path == "/api/players":
             # League-wide player list for the Setup "Players" card (#114) —
@@ -1997,17 +2622,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(
                 api.get_notifications(role.value, scope, user_id=user_id))
         if path == "/api/notifications/deliveries":
-            # Delivery-queue overview for operators (#58). Exposes internal
-            # queue state, so it is operator-only (invalid cookie → 401,
-            # non-operator → 403 via the drain endpoint's permission).
-            if self._operator_only("/api/notifications/deliveries/process"):
+            # Delivery-queue overview for operators (#58) — every row
+            # includes a stored contact destination, so this is a SENSITIVE
+            # read (#124/#426 review finding 2). _operator_only's own
+            # refusal (401/403) is now durably audited (#426 review
+            # finding 1: "A Viewer refusal stopped at _operator_only and
+            # recorded no denial") via audit_category; an ALLOWED caller
+            # falls through to _sensitive_get, whose OWN policy+audit gate
+            # makes the actual disclosure decision on the real actor,
+            # exactly like the contacts route below.
+            if self._operator_only(
+                    "/api/notifications/deliveries/process",
+                    audit_category=SensitiveFieldCategory.CONTACT_DESTINATION):
                 return
-            return self._send_api(api.get_delivery_overview())
+            return self._sensitive_get(api.get_delivery_overview)
         if path == "/api/notifications/contacts":
-            # Contact registry listing for operators (#60); same guard.
-            if self._operator_only("/api/notifications/contacts"):
+            # Contact registry listing (#60) — a sensitive read (#124).
+            # _operator_only durably audits its OWN refusal (#426 review
+            # finding 1, see its docstring); an ALLOWED caller falls
+            # through to _sensitive_get, which passes the real
+            # role/user_id/request_id straight into the facade's OWN
+            # policy+audit gate — never the no-principal shape a signed-in
+            # Admin used to be recorded under. See _sensitive_get's own
+            # docstring for the 401-vs-403 handling on ITS OWN resolution.
+            if self._operator_only(
+                    "/api/notifications/contacts",
+                    audit_category=SensitiveFieldCategory.CONTACT_DESTINATION):
                 return
-            return self._send_api(api.list_contact_destinations())
+            return self._sensitive_get(api.list_contact_destinations)
         if path == "/api/notifications/preferences":
             # A recipient's channel preferences (#81). Operator → any recipient;
             # a signed-in user → only their own. recipient_ref via query string.
@@ -2028,10 +2670,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(
                 api.list_calendar_feed_tokens(actor_type, actor_ref))
         if path == "/api/notifications/device-tokens":
-            # Device token registry listing for operators (#65); same guard.
-            if self._operator_only("/api/notifications/device-tokens"):
+            # Device token registry listing for operators (#65) — a
+            # sensitive read (#124/#426 round-3 review finding 1: a raw
+            # device token is the same class of protected value a raw
+            # contact destination is). Same shape as the contacts route
+            # above: _operator_only durably audits its OWN refusal, an
+            # ALLOWED caller falls through to _sensitive_get, which passes
+            # the real role/user_id/request_id into the facade's OWN
+            # policy+audit gate.
+            if self._operator_only(
+                    "/api/notifications/device-tokens",
+                    audit_category=SensitiveFieldCategory.CONTACT_DESTINATION):
                 return
-            return self._send_api(api.list_device_tokens())
+            return self._sensitive_get(api.list_device_tokens)
         if path == "/api/me/assignments":
             # The signed-in official's own inbox (#55). Identity comes from the
             # session cookie, with the same rules as /api/auth/me: no cookie →
@@ -2123,16 +2774,69 @@ class Handler(BaseHTTPRequestHandler):
             # the generic EMPTY standings shape. Unordered, a switch commiting
             # mid-read makes that empty answer arrive for a Division the
             # operator has selected and is looking at.
-            with self._context_read_hold(user_id):
-                payload = api.get_standings(sd.group(1), user_id, role, scope)
+            # The late-arrival discard is wired here for the same reason this
+            # route is in `CONTEXT_SCOPED_READ_ROUTES` at all — that table is
+            # the authoritative definition and every entry gets the same
+            # treatment. `app.js` does not enrol this read today, so no request
+            # carries the header and the branch is INERT until one does; wiring
+            # it now is what stops the four routes drifting apart.
+            payload = self._read_under_context_gate(
+                user_id, role, scope,
+                lambda svc: svc.get_standings(sd.group(1), user_id, role, scope))
+            if payload is DISCARDED_READ:
+                return self._send_discarded_read()
             return self._send_api(payload)
         # #283 Slice D: LeagueSeason-wide standings (across all its Divisions),
         # keyed by (league_id, season_id). Exhibition games are excluded.
         lss = re.match(
             r"^/api/standings/league-season/([^/]+)/([^/]+)$", path)
         if lss:
-            return self._send_api(api.get_league_season_standings(
-                lss.group(1), lss.group(2)))
+            # #202: this sat in the AUTHENTICATED namespace but passed no
+            # identity, so it answered any anonymous caller — while its
+            # per-Division sibling directly above required a session. It was
+            # read as harmless on the grounds that its payload matched the
+            # deliberate public route's byte for byte. It does not: this is the
+            # OPERATOR aggregate (`public_only=False`), so it counts UNPUBLISHED
+            # games' final results and, on a drifted Game, returns a
+            # data_integrity_error naming that Game's id. Both are exactly what
+            # the public variant's skip-before-integrity-check exists to
+            # withhold (#83). The payloads agree only until a draft carries a
+            # final result, so the sameness that made it look like a public
+            # alias was a property of the fixture, not of the route.
+            #
+            # It therefore takes its sibling's contract in full: a real session,
+            # then the named LeagueSeason bound to the caller's ACTIVE tuple.
+            # The scraping ceiling the public route carries is not the fix and
+            # is not added here — an operator read behind a session and its own
+            # active tuple is not an anonymous scraping surface, and the sibling
+            # rate-limits nothing either.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            # PHASE B, for the same reason the sibling takes it: now that this
+            # route resolves the active tuple, a switch committing mid-read
+            # turns a legitimately-requested table into the generic not_found.
+            # THROUGH THE COMMON EPOCH GATE (#159 review finding 1), not the
+            # bare hold: this route is listed in `CONTEXT_SCOPED_READ_ROUTES`
+            # alongside its per-Division sibling immediately above, and a bare
+            # `_context_read_hold` gives it PHASE B's ordering against an
+            # in-flight switch but skips the late-arrival epoch comparison
+            # entirely — a read dispatched before a switch but arriving after
+            # it reached the ceiling and answered the ordinary `not_found`
+            # instead of the contract's empty 204/no-service-call discard the
+            # other four listed routes already give it.
+            payload = self._read_under_context_gate(
+                user_id, role, scope,
+                lambda svc: svc.get_league_season_standings(
+                    lss.group(1), lss.group(2), user_id, role, scope))
+            if payload is DISCARDED_READ:
+                return self._send_discarded_read()
+            return self._send_api(payload)
         # Public, no-auth surface (#83): schedule / standings / game detail,
         # public-safe fields only. Reachable unauthenticated in production.
         # Rate-limited (#131) — generous, since the public portal itself
@@ -2214,9 +2918,14 @@ class Handler(BaseHTTPRequestHandler):
             # tuple inside this call and refuses a scenario that is not in it
             # with the generic `_scenario_not_found`. The ceiling is untouched
             # — only WHEN it may be evaluated relative to a commit changes.
-            with self._context_read_hold(user_id):
-                payload = api.get_schedule_scenario(
-                    scenario_get.group(1), user_id, role, scope)
+            # Same wiring, same inertness-until-enrolled note as
+            # /api/standings/<division_id> above.
+            payload = self._read_under_context_gate(
+                user_id, role, scope,
+                lambda svc: svc.get_schedule_scenario(
+                    scenario_get.group(1), user_id, role, scope))
+            if payload is DISCARDED_READ:
+                return self._send_discarded_read()
             return self._send_api(payload)
         if path == "/api/auth/me":
             # Consistent with POST role resolution (#50): no cookie → signed out,
@@ -2256,18 +2965,85 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "forbidden",
                     "message": "You cannot view private data for this game.",
                     "details": {"role": role.value}}}, 403)
+            # ADMISSION AND PROJECTION SHARE ONE BOUNDARY (#427 round 2,
+            # blocker 1). The preflight above is kept for fast denial and is
+            # NOT the authoritative gate: it answers a boolean and discards
+            # both the game it fetched and the side it resolved, so this
+            # dispatch used to fetch and resolve them a SECOND time, and the
+            # gap between the two was a disclosure window. A membership
+            # transferred, ended or deactivated in that gap left `own_team`
+            # empty, which collapsed through `own_side() -> None` into
+            # `get_board`'s HOME default — a caller who had just lost their
+            # authority received HOME's private pool, status block,
+            # notifications and audit stream with `restricted: false`.
+            # Reproduced over a real authenticated session parked between the
+            # two reads (200, `team_id` naming HOME) on Memory, SQLite and
+            # two-connection PostgreSQL.
+            #
+            # So there is ONE resolution now, and everything below reads
+            # admission, the game and the TRUSTED SIDE off that single
+            # record rather than asking the store again. This is the
+            # read-path twin of the write path's rule: a preflight may deny
+            # fast, but the authoritative answer is resolved once and
+            # carried. Nothing here ever consults a client-supplied side.
+            private_read = resolve_private_game_read(
+                role, scope, gid, api.store)
+            if not private_read.admitted:
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": "You cannot view private data for this game.",
+                    "details": {"role": role.value}}}, 403)
+            # `own_team` keeps its `""`-for-absent spelling so every leaf
+            # below is byte-for-byte unchanged; it is empty ONLY for the
+            # audiences that have no side of their own by design (an
+            # unscoped operator, an assigned official) — an admitted
+            # Coach/Player always carries a real, participating side, because
+            # that is precisely what admission now proves.
+            own_team = private_read.own_team or ""
+            side_ids = private_read.side_ids
             if sub == "board":
-                return self._send_api(api.get_board(gid))
+                # A single-sided read: answer for the caller's OWN side.
+                # `own_side` returns None for a caller who has no side of
+                # their own (unscoped operator, assigned official), which
+                # leaves the facade's existing home default in place — those
+                # are exactly the callers who may read either side anyway.
+                board_team = lineup_visibility.own_side(
+                    role, own_team, *side_ids)
+                return self._send_api(api.get_board(
+                    gid, team_id=board_team, viewer_role=role))
             if sub == "lineups":
-                return self._send_api(api.get_lineups(gid))
+                # Two-sided, projected per role by the facade
+                # (`services/lineup_visibility.py`): own side only for a
+                # Coach/Player with the opponent marked RESTRICTED, the
+                # submitted-lineup projection for an assigned official, and
+                # the unchanged full two-side private read for an unscoped
+                # operator.
+                return self._send_api(api.get_lineups(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "officials":
                 return self._send_api({"officials": api.get_officials_for_game(gid)})
+            # THE THREE FLAT-LIST SIBLINGS (#427 final blocker). They sat
+            # behind the SAME single gate as /board and /lineups and carried
+            # the same absent team-level narrowing, so projecting only the two
+            # lineup reads left the identical pivot one path segment away:
+            # /roster-status hard-coded HOME for everybody exactly as
+            # get_board used to, /roster returned both sides' seats, and
+            # /substitutes returned both sides' substitute workflow to either
+            # Coach AND to an assigned official. Each now receives the SAME
+            # trusted `own_team` the two reads above receive — resolved once,
+            # for the whole family, never from the query string or the body —
+            # and the facade projects on it (`lineup_visibility.
+            # route_audience`). An unscoped operator is unchanged on all
+            # three.
             if sub == "roster-status":
-                return self._send_api(api.get_roster_status(gid))
+                return self._send_api(api.get_roster_status(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "roster":
-                return self._send_api(api.get_roster(gid))
+                return self._send_api(api.get_roster(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "substitutes":
-                return self._send_api(api.get_substitutes(gid))
+                return self._send_api(api.get_substitutes(
+                    gid, viewer_role=role, viewer_team_id=own_team))
             if sub == "reschedule":
                 # A game's own reschedule-request history/current pending
                 # request (#29) — same private-game-data gate as roster/
@@ -2276,34 +3052,93 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_api(
                     {"requests": api.list_reschedule_requests(gid)})
             if sub == "availability-summary":
-                # Availability rollup for a team (#89). The #73 gate above only
-                # proves the caller belongs to *a* team in this game — it does
-                # not bound *which* team's summary they may read. Add a
-                # team-level scope check (#89 review): a coach/player may read
-                # only their own team; operators (league admin / arena manager)
-                # any team in the game. The team defaults to the caller's own
-                # scope when not specified.
+                # THE FIFTH LEAF OF THE SAME FAMILY (#427 final blocker,
+                # round 2) — and the ONLY one that reads a side from the
+                # QUERY STRING, which is why it was the last one still open.
+                #
+                # Its narrowing used to be spelled inline here and named only
+                # COACH and PLAYER, so an assigned OFFICIAL fell straight
+                # through it: measured tri-store over a real session,
+                # `?team_id=<either side>` answered an official 200 with that
+                # side's whole candidate pool, NAMES and per-player
+                # availability included — precisely the two classes the
+                # `/lineups` projection strips for that exact role one path
+                # segment away. The shipped Roster tab fired it on every
+                # render, and its side toggle switched teams.
+                #
+                # So the decision moves to the facade, where the other four
+                # siblings already make it, keyed on the SAME trusted
+                # `own_team` resolved once above and the SAME
+                # `lineup_visibility.route_audience`: an unscoped operator
+                # keeps the hint unchanged, a Coach/Player has it IGNORED in
+                # favour of their trusted side (ignored, not refused — the
+                # siblings answer a hinted call identically to an un-hinted
+                # one), and an assigned official is refused 403 rather than
+                # handed an empty summary. A side is never trusted from the
+                # query string.
                 from urllib.parse import parse_qs, urlparse
                 qs = parse_qs(urlparse(self.path).query)
-                # Resolve the caller's own team authoritatively (#160): a Coach's
-                # stored team_id, a Player's live team from player_id — never a
-                # stale stored team_id — so the opponent-summary block holds for
-                # a Player whose scope is player_id only.
-                own_team = own_team_id(role, scope, api.store) or ""
+                # BYTE-FOR-BYTE the binding that stood here before, name
+                # included: this is the same client-supplied team the
+                # substitute-candidates and substitute-addable leaves bind
+                # from the identical expression in this same function, and
+                # `_dispatch_get`'s tracked-name set is flat, so spelling it
+                # differently here would say these are different kinds of
+                # value when they are one. What CHANGED is downstream — it is
+                # now a HINT handed to the facade to be adjudicated against
+                # the trusted side, never the side itself. The own-team
+                # default is retained because the facade's FULL branch would
+                # apply it anyway (`team_id or viewer_team_id`), so an
+                # unscoped operator's un-hinted call resolves exactly what it
+                # always has.
                 team_id = (qs.get("team_id") or [own_team])[0]
-                if role in (Role.COACH, Role.PLAYER) and own_team \
-                        and team_id != own_team:
-                    return self._send_json({"error": {
-                        "code": "forbidden",
-                        "message": "You can only view your own team's "
-                                   "availability."}}, 403)
-                return self._send_api(
-                    api.get_availability_summary(gid, team_id))
+                return self._send_api(api.get_availability_summary(
+                    gid, team_id,
+                    viewer_role=role, viewer_team_id=own_team))
             if sub == "substitute-candidates":
-                # Coach outreach queue (#112): manage_roster only — a player
-                # must not see the operator candidate list even for their own
-                # game. A coach is further bound to their own team; operators
-                # (league admin / arena manager) may read any team's queue.
+                # THE SIXTH LEAF OF THE SAME FAMILY (#427 final blocker,
+                # round 3) — the second and last one that reads a side from
+                # the QUERY STRING.
+                #
+                # WHY IT IS HERE AT ALL. Round 2 closed the fifth leaf
+                # (`availability-summary`) and wrote the rule into
+                # `docs/architecture/api-contract.md` in the SAME commit:
+                # "A side is never trusted from the query string or the body
+                # — a `?team_id=` naming the opponent is *ignored* for a
+                # scoped caller, so a hinted request returns exactly what the
+                # un-hinted one returns", over a list of routes that NAMES
+                # `substitute-candidates`. This leaf did not do that. It kept
+                # its own inline narrowing, which answered a hinted call
+                # DIFFERENTLY from an un-hinted one (403 vs 200) — so the
+                # contract that shipped was false for one of the routes it
+                # names, and the family had two hint-reading leaves
+                # adjudicating a hint two different ways. That divergence is
+                # the exact shape this blocker exists to remove.
+                #
+                # WHAT CHANGES, PRECISELY. The MANAGE_ROSTER gate below is a
+                # ROLE-CAPABILITY question ("may this kind of caller manage a
+                # roster at all") and is untouched — a Player and an assigned
+                # Official are refused by it exactly as before, with the same
+                # message. What moves to the facade is the SIDE question,
+                # onto the SAME trusted `own_team` and the SAME
+                # `lineup_visibility.route_audience` the other five siblings
+                # use: an unscoped operator keeps the hint, a Coach has it
+                # IGNORED in favour of their trusted side, and any other
+                # audience is refused rather than served a `candidates: []`
+                # that would claim this team has nobody to call.
+                #
+                # AND THE LOCAL RE-RESOLUTION GOES WITH IT. This leaf used to
+                # rebind `own_team = scope.get("team_id")`, a SECOND answer to
+                # "which side is the caller's" standing beside the one the
+                # dispatch resolves once above. The two agree for a Coach
+                # today and nothing pinned that they must — which is the
+                # drift `game_scoped_own_team_id` was hoisted to end. The one
+                # behaviour this deletes is an operator whose session happens
+                # to carry a `team_id` defaulting to it: an operator role has
+                # NO own side by definition (`game_scoped_own_team_id`
+                # returns None for it), a stray scope value is not an
+                # authority, and their un-hinted default is now the same home
+                # default `/board` and `/roster-status` already give them.
                 from urllib.parse import parse_qs, urlparse
                 if not can(role, Permission.MANAGE_ROSTER):
                     return self._send_json({"error": {
@@ -2311,18 +3146,19 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "Only a coach or operator can view the "
                                    "substitute outreach queue."}}, 403)
                 qs = parse_qs(urlparse(self.path).query)
-                own_team = scope.get("team_id") or ""
                 team_id = (qs.get("team_id") or [own_team])[0] or None
-                if role == Role.COACH and own_team and team_id != own_team:
-                    return self._send_json({"error": {
-                        "code": "forbidden",
-                        "message": "You can only view your own team's queue."}}, 403)
-                return self._send_api(
-                    api.get_substitute_candidates(gid, team_id))
+                return self._send_api(api.get_substitute_candidates(
+                    gid, team_id,
+                    viewer_role=role, viewer_team_id=own_team))
             if sub == "substitute-addable":
-                # Eligible-but-not-yet-enrolled team players a coach could add
-                # as a substitute candidate (#114) — same manage_roster +
-                # own-team gate as substitute-candidates above.
+                # THE SEVENTH LEAF, and the same change for the same reason:
+                # eligible-but-not-yet-enrolled players of one side (#114) are
+                # that side's private candidate pool, named, and this leaf
+                # bound the side the same two ways
+                # `substitute-candidates` did. Same untouched MANAGE_ROSTER
+                # capability gate, same trusted `own_team`, same
+                # `route_audience` — see that leaf's comment above for the
+                # whole reasoning.
                 from urllib.parse import parse_qs, urlparse
                 if not can(role, Permission.MANAGE_ROSTER):
                     return self._send_json({"error": {
@@ -2330,14 +3166,10 @@ class Handler(BaseHTTPRequestHandler):
                         "message": "Only a coach or operator can view "
                                    "addable substitutes."}}, 403)
                 qs = parse_qs(urlparse(self.path).query)
-                own_team = scope.get("team_id") or ""
                 team_id = (qs.get("team_id") or [own_team])[0] or None
-                if role == Role.COACH and own_team and team_id != own_team:
-                    return self._send_json({"error": {
-                        "code": "forbidden",
-                        "message": "You can only view your own team's roster."}}, 403)
-                return self._send_api(
-                    api.get_addable_substitutes(gid, team_id))
+                return self._send_api(api.get_addable_substitutes(
+                    gid, team_id,
+                    viewer_role=role, viewer_team_id=own_team))
         if path.startswith("/api/"):
             # Cross-method 405 (#271): a GET on a known POST-only path → 405 +
             # Allow; a truly unknown /api path → 404.
@@ -2431,6 +3263,23 @@ class Handler(BaseHTTPRequestHandler):
         if self._store_unavailable():
             return
         self._method_fallback("DELETE")
+
+    def __getattr__(self, name):
+        """Route every otherwise-unimplemented HTTP verb through our contract.
+
+        ``BaseHTTPRequestHandler`` normally answers a missing ``do_<VERB>``
+        method with an HTML 501 before application routing runs. A declarative
+        route boundary cannot enumerate every extension method (TRACE,
+        PROPFIND, and future tokens), so expose a handler dynamically: known
+        paths receive the same JSON 405 + ``Allow`` as PUT/PATCH/DELETE and
+        unknown paths receive the same JSON 404. Non-handler attributes retain
+        normal ``AttributeError`` behavior.
+        """
+        if name.startswith("do_") and len(name) > 3:
+            method = name[3:]
+            return lambda: self._method_fallback(method)
+        raise AttributeError(
+            f"{type(self).__name__!s} has no attribute {name!r}")
 
     def do_HEAD(self):
         """HEAD contract (#271): a body-suppressed mirror of the authenticated
@@ -2626,9 +3475,31 @@ class Handler(BaseHTTPRequestHandler):
         if oavs:
             if self._official_guard(oavs.group(1)):
                 return
+            # Strict body schema (#202), AFTER the authorization guard so a
+            # caller who may not touch this official learns nothing about the
+            # body shape. #271 hardened /api/games/<id>/availability but never
+            # reached this sibling, which built its kwargs from bare
+            # ``body.get`` calls: a ``note`` → ``notes`` typo wrote the window
+            # with note=None (the operator's note silently lost at 200), a
+            # ``status`` → ``staus`` typo refused only BY ACCIDENT because the
+            # enum then saw None — leaking that internal None into the
+            # operator-facing message with no ``details`` naming a field — and
+            # a missing ``start_time`` reached the service as None and crashed
+            # the comparison there (500 internal_error). Naming the fields here
+            # makes all three a stable, zero-write 400.
+            try:
+                check_body(body,
+                           allowed={"start_time", "end_time", "status", "note"},
+                           required=("start_time", "end_time", "status"),
+                           types={"start_time": str, "end_time": str,
+                                  "status": str, "note": str})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             # Attribute the change to the signed-in user, not a client-supplied
             # actor_id, so the audit trail (#88) cannot be forged. The guard
-            # above already established the session is valid.
+            # above already established the session is valid. ``actor_id`` is
+            # not in ``allowed`` above, so a forged one is now refused outright
+            # rather than accepted-and-ignored.
             _role, _scope, actor_uid, _err = self._resolve_role()
             return self._send_api(api.set_official_availability(
                 oavs.group(1), body.get("start_time"), body.get("end_time"),
@@ -2729,9 +3600,22 @@ class Handler(BaseHTTPRequestHandler):
             jid, gid = mga.group(1), mga.group(2)
             if self._guardian_link_or_403(guid, jid):
                 return
+            # Strict body schema (#202), AFTER the verified-link gate so the
+            # schema can never be used to tell "wrong shape" from "not your
+            # junior". This route hardcoded ``body.get("availability_status",
+            # "pending")``, so a guardian declaring their junior UNAVAILABLE
+            # with a typo'd key got 200 and a PENDING row — a silent WRONG
+            # write, not merely a dropped key. ``availability_status`` is
+            # required here rather than defaulted: an attendance record the
+            # guardian never asked for must not be invented from an empty body.
+            try:
+                check_body(body, allowed={"availability_status"},
+                           required=("availability_status",),
+                           types={"availability_status": str})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.set_availability(
-                gid, jid, body.get("availability_status", "pending"),
-                "guardian", guid))
+                gid, jid, body.get("availability_status"), "guardian", guid))
         mgs = re.match(
             r"^/api/me/guardian/([^/]+)/substitute-opportunities/([^/]+)/"
             r"(accept-offer|decline-offer)$", path)
@@ -2789,20 +3673,80 @@ class Handler(BaseHTTPRequestHandler):
             # nothing can be admitted mid-quiesce and straddle the commit.
             # Bounded: see `ContextSwitchGate._await`. Nothing else in the
             # application takes this gate; no mutation is a participant.
+            #
+            # PR #423: kept exactly as above, UNCHANGED, alongside (not
+            # replaced by) the new database-coordinated epoch fence
+            # `ContextService.set_with_league` now also takes internally
+            # (`user_fence_key(user_id)`, first statement of its own
+            # snapshot) — the owner's explicit instruction is to keep this
+            # gate and Phase-A's arrival-ticket machinery (`CONTEXT_GATE.
+            # arrive()` in `do_GET`) intact rather than retire them in this
+            # round, layering the new, cross-process-capable primitive
+            # underneath rather than removing what already works in-process.
+            #
+            # STILL calling ``api.set_active_context`` here, by this exact
+            # name — the seam ``tests/test_context_switch_server_exit.py``
+            # wraps (``self._wrap(self.api, "set_active_context", ...)``,
+            # four separate tests) to park a switch mid-flight and assert
+            # the writer-vs-writer/reader-vs-writer ORDERING this whole gate
+            # exists to prove — but round-N review finding 3 fixed WHAT this
+            # call does: ``include_epoch=True`` folds the write AND the
+            # response epoch into the SAME serializable snapshot
+            # (``ContextService.set_with_league_and_epoch``, via
+            # ``ApiService.set_active_context``'s own widened signature —
+            # see that method's docstring), replacing the two-transaction
+            # shape (write, then a SEPARATE ``current_epoch()`` read) an
+            # earlier revision of this comment defended as "fully closed
+            # in-process by CONTEXT_GATE.exclusive" — true for two switches
+            # racing WITHIN one process, but not for two independent
+            # replicas: replica B could commit a second switch for this same
+            # user between replica A's write and A's separate epoch read,
+            # and A would hand its caller an epoch for B's selection. Nesting
+            # the fold INSIDE the unchanged ``CONTEXT_GATE.exclusive`` wrap
+            # is composition, not a replacement — Phase-A's arrival tickets
+            # keep the exact same consumer they always had, and the ONE call
+            # below is still the ONE code path both concerns share, so the
+            # existing test seam parks the real write exactly as before.
             with CONTEXT_GATE.exclusive(user_id):
-                payload = api.set_active_context(
+                payload, epoch = api.set_active_context(
                     user_id, role, scope,
                     body.get("program_id"), body.get("season_id"),
-                    body.get("league_id"))
+                    body.get("league_id"), include_epoch=True)
+                # `epoch` is None on a refused write (`payload` is then the
+                # error dict) — `_with_context_epoch` already no-ops on any
+                # payload carrying an "error" key, so passing None through
+                # is inert rather than needing its own branch here.
+                payload = self._with_context_epoch(payload, epoch)
             return self._send_api(payload)
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.
         role, scope, user_id, err = self._resolve_role()
         if err is not None:
+            # #426 round-2 review finding 2: durably audit a denial HERE
+            # too — a missing/invalid session refused at THIS generic gate,
+            # for one of the sensitive routes _audit_sensitive_post_denial
+            # recognizes, is exactly as much an access attempt as the
+            # authorize()-refused case three lines below, and the GET
+            # side's _operator_only(audit_category=...) already covers its
+            # own 401 the same way.
+            self._audit_sensitive_post_denial(path, None, user_id)
             code, payload = err
             return self._send_json(payload, code)
         if not authorize(role, path):
+            # #426 round-2 review finding 2 (closing the residual gap the
+            # FIRST #426 review round's own note here left open — see the
+            # PR body's #426 history for the full accounting): a
+            # Coach/Viewer refused HERE
+            # (MANAGE_SETUP/MANAGE_SCHEDULE, for the contacts-active-toggle
+            # / deliveries retry|ignore routes) now durably audits a
+            # CONTACT_DESTINATION denial row too, the SAME way the GET
+            # routes' _operator_only(audit_category=...) already does.
+            # _audit_sensitive_post_denial is a call BESIDE this node, not
+            # a change to it or to `required_permission(path)` below — the
+            # generic-gate shape route_extract.py recognizes here is
+            # unchanged.
+            self._audit_sensitive_post_denial(path, role, user_id)
             perm = required_permission(path)
             return self._send_json({"error": {
                 "code": "forbidden",
@@ -3314,12 +4258,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.process_notification_deliveries())
 
         # Dead-letter operations (#80): requeue or permanently ignore one row.
+        # Both echo the row's stored destination — a sensitive read (#124/
+        # #426 review finding 2) — so the ONE role/user_id this route's
+        # generic authorize() gate (above) already resolved is propagated
+        # through, with a fresh per-request correlation id.
         dr = re.match(r"^/api/notifications/deliveries/([^/]+)/retry$", path)
         if dr:
-            return self._send_api(api.retry_notification_delivery(dr.group(1)))
+            return self._send_api(api.retry_notification_delivery(
+                dr.group(1), actor_role=role, actor_user_id=user_id,
+                request_id=api._mint_request_id()))
         di = re.match(r"^/api/notifications/deliveries/([^/]+)/ignore$", path)
         if di:
-            return self._send_api(api.ignore_notification_delivery(di.group(1)))
+            return self._send_api(api.ignore_notification_delivery(
+                di.group(1), actor_role=role, actor_user_id=user_id,
+                request_id=api._mint_request_id()))
 
         # Contact registry: register/update a real destination (#60). No
         # delete route — a contact destination is never erased, only
@@ -3337,9 +4289,18 @@ class Handler(BaseHTTPRequestHandler):
         # longer counted as live.
         cda = re.match(r"^/api/notifications/contacts/([^/]+)/active$", path)
         if cda:
-            _role, _scope, actor_uid, _err = self._resolve_role()
+            # The response echoes the stored destination — a sensitive read
+            # (#124/#426 review finding 1) — so this route propagates the
+            # ONE role/user_id this route's generic authorize() gate
+            # (above) already resolved, instead of re-resolving the session
+            # a second time and discarding the role. A second
+            # `_resolve_role()` call here previously threw away the
+            # already-known role, which is exactly what defaulted this
+            # route's disclosure to the retired no-principal
+            # "operator_boundary" shape rather than the real actor.
             return self._send_api(api.set_contact_destination_active(
-                cda.group(1), bool(body.get("active")), actor_id=actor_uid))
+                cda.group(1), bool(body.get("active")), actor_id=user_id,
+                actor_role=role, request_id=api._mint_request_id()))
 
         # Device token registry: register / activate-deactivate (#65).
         if path == "/api/notifications/device-tokens":
@@ -3348,8 +4309,14 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("token"), body.get("label")))
         dt = re.match(r"^/api/notifications/device-tokens/([^/]+)/active$", path)
         if dt:
+            # The response echoes the stored raw token — a sensitive read
+            # (#124/#426 round-3 review finding 1) — so this route
+            # propagates the ONE role/user_id this route's generic
+            # authorize() gate (above) already resolved, the SAME
+            # convention the contacts-active-toggle route above uses.
             return self._send_api(api.set_device_token_active(
-                dt.group(1), bool(body.get("active"))))
+                dt.group(1), bool(body.get("active")), actor_id=user_id,
+                actor_role=role, request_id=api._mint_request_id()))
 
         # Retire/reactivate a notification preference (#232 review 4) — the
         # audited, non-destructive counterpart to the contact-destination
@@ -3387,6 +4354,20 @@ class Handler(BaseHTTPRequestHandler):
                 scope=body.get("scope"), actor_id=user_id))
         acc = re.match(r"^/api/accounts/([^/]+)/active$", path)
         if acc:
+            # Strict body schema (#202), same family as the account-create
+            # check above. ``bool(body.get("active"))`` collapses a MISSING key
+            # to False, so ``{"activ": false}`` — one transposed character —
+            # used to DEACTIVATE the account and revoke its live sessions at
+            # 200. The bool type check matters just as much: ``bool("false")``
+            # is True, so a JSON-typed client bug would ACTIVATE where it meant
+            # to deactivate. ``required`` (not ``present``) so an explicit null
+            # is refused too; a literal ``false`` passes, since it is neither
+            # None nor "".
+            try:
+                check_body(body, allowed={"active"}, required=("active",),
+                           types={"active": bool})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             res = api.set_user_account_active(acc.group(1), bool(body.get("active")))
             if isinstance(res, dict) and "error" not in res and not res.get("active"):
                 # Deactivating an account must end any session it already has,
@@ -3399,6 +4380,18 @@ class Handler(BaseHTTPRequestHandler):
             # the server-resolved signed-in admin, never a client body value.
             # The raw `scope` value is passed through UNCOERCED so the service
             # can reject a non-object shape as a stable 400.
+            #
+            # Strict body schema (#202): the binding must travel INSIDE
+            # `scope`, exactly as on the create route above. A misplaced
+            # top-level `team_id` already failed closed, but reported the
+            # misleading `scope_required` instead of naming the misplaced key,
+            # and any other stray key was dropped at 200. Only the key set is
+            # checked here — no `types` entry for `scope` — so a non-object
+            # scope keeps reaching the service and its `invalid_scope` answer.
+            try:
+                check_body(body, allowed={"scope"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.rebind_user_account_scope(
                 scp.group(1), body.get("scope"), actor_id=user_id))
         rv = re.match(r"^/api/accounts/([^/]+)/sessions/([^/]+)/revoke$", path)
@@ -3454,6 +4447,33 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/games/([^/]+)/(.+)$", path)
         if m:
             gid, action = m.group(1), m.group(2)
+            # THE AUTHORIZED TEAM, threaded into every Coach-reachable
+            # roster/substitute command below so each one can REVALIDATE it
+            # under its own Season lock, before any write (#205, owner
+            # comments 5373064375 and 5391127041). `scope_violation` above
+            # stays exactly as it is — a cheap PREFLIGHT for fast denial —
+            # but it is no longer the authoritative gate: it takes no locks,
+            # runs outside every transaction, and DISCARDS the team it
+            # resolves.
+            #
+            # ONLY FOR A COACH, and `None` for everyone else. `None` means
+            # "impose no team constraint", which is the correct and only
+            # correct answer for the callers whose authority was established
+            # elsewhere and never came from a team: Player self-service
+            # (`/api/me/substitute-opportunities/...`, `_require_player_
+            # scope`), Guardian (`/api/me/guardian/...`, `_require_guardian_
+            # scope` + `_guardian_link_or_403`) — both of which are handled
+            # EARLIER in do_POST and never reach this block at all — and the
+            # unscoped League Admin/Arena Manager, who by design are "not
+            # resource-scoped here" (web/scope.py) and reach these rows under
+            # their own permissions.
+            #
+            # It costs no new lookup: `scope["team_id"]` is the coach's
+            # permanently-bound team and is already in hand. The service is
+            # deliberately NOT asked to infer it from `actor_id` — the ruling
+            # forbids that, and the coach<->team binding only exists up here.
+            coach_team = (scope or {}).get("team_id") \
+                if role == Role.COACH else None
             if action == "availability":
                 # Strict schema (#271): reject unknown keys so a typo'd status
                 # field can't be silently recorded as the default `pending`, and
@@ -3479,22 +4499,28 @@ class Handler(BaseHTTPRequestHandler):
                     }}, 400)
                 return self._send_api(api.set_availability(
                     gid, pid, status_val,
-                    body.get("response_source", "player"), user_id))
+                    body.get("response_source", "player"), user_id,
+                    authorized_team_id=coach_team))
             if action == "availability/remind":
                 # One-click reminder to players who haven't responded (#89).
                 return self._send_api(api.remind_unresponded(
-                    gid, body.get("team_id") or scope.get("team_id"), user_id))
+                    gid, body.get("team_id") or scope.get("team_id"), user_id,
+                    authorized_team_id=coach_team))
             if action == "build-roster":
                 return self._send_api(api.auto_build_roster(
-                    gid, body.get("team_id"), user_id))
+                    gid, body.get("team_id"), user_id,
+                    authorized_team_id=coach_team))
             if action == "roster/select":
                 return self._send_api(api.select_roster(
-                    gid, body.get("player_ids", []), user_id))
+                    gid, body.get("player_ids", []), user_id,
+                    authorized_team_id=coach_team))
             if action == "roster/remove":
-                return self._send_api(api.remove_player(gid, pid, user_id))
+                return self._send_api(api.remove_player(
+                    gid, pid, user_id, authorized_team_id=coach_team))
             if action == "roster/copy-previous":
                 return self._send_api(api.copy_previous_roster(
-                    gid, body.get("team_id"), user_id))
+                    gid, body.get("team_id"), user_id,
+                    authorized_team_id=coach_team))
             if action == "officials/assign":
                 return self._send_api(api.assign_official(
                     gid, body.get("official_id"), body.get("role", "referee"),
@@ -3529,26 +4555,35 @@ class Handler(BaseHTTPRequestHandler):
                     new_ice_slot_id=body.get("new_ice_slot_id"),
                     note=body.get("note"), actor_id=user_id))
             if action == "substitutes/enroll":
-                return self._send_api(api.enroll_substitute(gid, pid, user_id))
+                return self._send_api(api.enroll_substitute(
+                    gid, pid, user_id, authorized_team_id=coach_team))
             if action == "substitutes/withdraw":
-                return self._send_api(api.withdraw_substitute(gid, pid, user_id))
+                return self._send_api(api.withdraw_substitute(
+                    gid, pid, user_id, authorized_team_id=coach_team))
             if action == "substitutes/add-candidate":
                 # Coach/operator adds an arbitrary eligible team player
                 # directly to the substitute pool (#114) — same enroll, a
                 # different (coach-side) actor and permission than the
                 # player's own self-service substitutes/enroll above.
                 return self._send_api(
-                    api.add_substitute_candidate(gid, pid, user_id))
+                    api.add_substitute_candidate(
+                        gid, pid, user_id, authorized_team_id=coach_team))
             sub = re.match(r"^substitutes/([^/]+)/(offer|accept|decline|add-to-roster)$", action)
             if sub:
                 player_id, op = sub.group(1), sub.group(2)
                 if op == "offer":
                     return self._send_api(api.offer_substitute(
-                        gid, player_id, user_id, expires_at=body.get("expires_at")))
+                        gid, player_id, user_id, expires_at=body.get("expires_at"),
+                        authorized_team_id=coach_team))
                 fn = {"accept": api.accept_substitute,
                       "decline": api.decline_substitute,
                       "add-to-roster": api.add_substitute_to_roster}[op]
-                return self._send_api(fn(gid, player_id, user_id))
+                # Threaded through the SHARED `fn(...)` call, deliberately,
+                # never bound into the dict above: three different methods are
+                # reached as VALUES there, so binding it per-value would be
+                # three call sites to keep in step instead of one.
+                return self._send_api(fn(gid, player_id, user_id,
+                                         authorized_team_id=coach_team))
             coach = {"roster/lock": api.lock_roster,
                      "roster/unlock": api.unlock_roster,
                      "cancel": api.cancel_game}.get(action)
@@ -3681,7 +4716,48 @@ class Handler(BaseHTTPRequestHandler):
         }
         call = _V1_REASSIGN_CALL.get(combo)
         if call is not None:
-            return self._guarded_mutation(targets, call, actor_id, role, scope)
+            # round-N+1 (finding 1 Memory/SQLite rework, design §8.6 row 15):
+            # ``("player", "team")`` is a Player/Team reassignment — neither
+            # "player" nor "team" is in ``ApiService._EPOCH_FENCE_KINDS``, so
+            # ``_guarded_attempt`` (reached below, via ``_guarded_mutation``
+            # -> ``setup_guarded_mutation``) does NOT take ``LIFECYCLE_GATE``
+            # for this combo the way it does for the epoch-material kinds —
+            # and it CANNOT be added there by widening that set, which would
+            # over-broadly fence EVERY guarded Player mutation (create,
+            # update, delete, activate…), not merely reassignment. The gate
+            # therefore has to be taken HERE, the one dispatch site that
+            # knows this SPECIFIC combo is epoch-material, and — critically —
+            # BEFORE ``_guarded_mutation`` opens its transaction: taking it
+            # from INSIDE ``ApiService.assign_player_team`` itself would be
+            # too late for this call path (that method also runs NESTED
+            # inside ``_guarded_attempt``'s already-open
+            # ``store.transaction()`` here, and acquiring the gate while a
+            # store lock is held is the exact AB-BA hazard this whole
+            # mechanism exists to avoid — see ``services/context_gate.py``'s
+            # LOCK ORDER note). See ``api/service.py``'s
+            # ``SetupService.assign_player_team`` docstring for why the
+            # DATABASE-coordinated fence does not have this problem (it is
+            # designed to be taken as a statement INSIDE an already-open
+            # transaction, unconditionally, every call path).
+            #
+            # ONE call site, not a branch that duplicates it — `route_extract`
+            # (#202/#422) tracks this exact call as the route's dispatch
+            # decision and raises on an unmodelled second shape of it. Also
+            # NOT a ternary on `combo` — `route_extract` does not model
+            # those for a tracked dispatch subject either (it asks for
+            # if/elif instead); an if-STATEMENT assigning a plain local
+            # (never itself treated as a dispatch subject) keeps the actual
+            # call below to the ONE, single, unconditional shape the
+            # extractor already recognises. The
+            # `ContextSwitchGate.exclusive` primitive's own falsy-key no-op
+            # (`services/context_gate.py`) is what gives "gate only for
+            # this one combo" its effect.
+            gate_key = None
+            if combo == ("player", "team"):
+                gate_key = _LIFECYCLE_GATE_KEY
+            with LIFECYCLE_GATE.exclusive(gate_key):
+                return self._guarded_mutation(
+                    targets, call, actor_id, role, scope)
         return self._send_json({"error": {
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
@@ -4291,7 +5367,25 @@ class Handler(BaseHTTPRequestHandler):
         }
         call = _V2_REASSIGN_CALL.get(combo)
         if call is not None:
-            return self._guarded_mutation(targets, call, actor_id, role, scope)
+            # round-N+1 (design §8.6 row 15): the v2 mirror of the SAME
+            # conditional wrap (single call site, gate keyed None/no-op for
+            # every OTHER combo) the v1 reassign dispatch takes just above —
+            # see that call site's own comment for the full reasoning,
+            # including why this must be ONE `self._guarded_mutation(...)`
+            # call (not a branch that duplicates it) and an if-STATEMENT
+            # assigning a plain local (not a ternary on `combo`) —
+            # ``route_extract`` models neither of the alternatives.
+            # ``("team", "league")`` needs no matching special case here:
+            # its own DESTINATION target is already kind ``"league"``, which
+            # IS in ``_EPOCH_FENCE_KINDS``, so ``_guarded_attempt`` takes the
+            # gate for it automatically, same as the database-coordinated
+            # fence already does — see ``_EPOCH_FENCE_KINDS``'s own comment.
+            gate_key = None
+            if combo == ("player", "team"):
+                gate_key = _LIFECYCLE_GATE_KEY
+            with LIFECYCLE_GATE.exclusive(gate_key):
+                return self._guarded_mutation(
+                    targets, call, actor_id, role, scope)
         return self._send_json({"error": {
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
@@ -4550,6 +5644,67 @@ class Handler(BaseHTTPRequestHandler):
                     b.get("from_season_id"), mrf.group(1),
                     b.get("selections"), actor_id),
                 actor_id, role, scope)
+        # New-Season copy-forward (#159): preview then atomically create a
+        # Season AND carry forward Team/League registrations from a source
+        # Season in one guarded step -- "a new Season can be previewed/copied
+        # forward without mutating the prior Season". Modeled on ice-
+        # availability's preview/commit fingerprint pair (#158) and composed
+        # from create_season + the SAME selection-processing core roll-
+        # forward uses just above (#233 Slice C2 / #159), so a fingerprint
+        # here means the same kind of thing it does there. Division-level
+        # placement is deliberately NOT carried onto the new registration --
+        # see SetupService.preview_new_season_copy_forward's docstring for
+        # the full contract and the ``division_pending`` flag the preview
+        # response carries per selection. There is no path id: unlike
+        # roll-forward, the target Season does not exist until commit mints
+        # it, so both preview and commit take the Season identity entirely
+        # from the body (``program_id`` + the new ``name``).
+        mcf = re.match(r"^seasons/copy-forward/(preview|commit)$", entity)
+        if mcf:
+            fields = ("program_id", "name", "start_date", "end_date",
+                      "source_season_id", "selections")
+            kwargs = {k: b.get(k) for k in fields}
+            # PROGRAM-AXIS (#409), matching create_season exactly -- the
+            # Season axis is MINTED, not consumed, by both preview and
+            # commit, so only the saved PROGRAM is required; source_season_id
+            # is READ (its registrations are what preview describes and
+            # commit carries forward), so it is bounded by that same saved
+            # PROGRAM -- the identical two-Season shape roll-forward uses
+            # just above, applied here because create_season's own "season"
+            # kind is exactly what this route mints too.
+            targets = [("program", b.get("program_id") or None),
+                      ("season", b.get("source_season_id") or None,
+                       "program")]
+            is_commit = mcf.group(1) == "commit"
+            # #202: same "one guarded call, ternary-selected mutation"
+            # shape as the archive/reopen pair just below -- kind and
+            # targets are identical for preview and commit (both MINT the
+            # same "season" axis), so only the callable differs. The
+            # boolean is resolved to a plain local (`is_commit`) BEFORE
+            # the ternary, deliberately: route_extract.py's dispatch-shape
+            # walker refuses outright ("does not model ternaries; rewrite
+            # as if/elif") the moment an ``ast.IfExp`` test directly
+            # mentions a tracked match object like `mcf` -- see
+            # route_extract.py's own ``if isinstance(node, ast.IfExp):``
+            # handling. This SAME function's two PRE-EXISTING ternaries of
+            # that exact direct-test shape (``mar.group(2) == 'archive'``
+            # just below, and ``kind == 'venue'`` elsewhere in
+            # ``_handle_setup_v2``) each carry their own reviewed
+            # ``_AUDIT_WAIVERS`` entry for it; testing `is_commit` here
+            # instead of `mcf.group(1) == "commit"` directly keeps the
+            # ternary's test a bare name the walker has no objection to,
+            # so this route needs neither a new waiver nor any other
+            # touch to route_extract.py at all -- narrower than adding
+            # one, per this slice's own scope.
+            mutation = ((lambda: api.commit_new_season_copy_forward(
+                            copy_forward_fingerprint=b.get(
+                                "copy_forward_fingerprint"),
+                            actor_id=actor_id, **kwargs))
+                       if is_commit else
+                       (lambda: api.preview_new_season_copy_forward(
+                            actor_id=actor_id, **kwargs)))
+            return self._guarded_create(
+                "season", targets, mutation, actor_id, role, scope)
         # Season lifecycle (#159): archive → read-only historical; reopen →
         # active (requires a reason). Only ``reason`` is accepted in the body.
         mar = re.match(r"^seasons/([^/]+)/(archive|reopen)$", entity)
@@ -4565,6 +5720,31 @@ class Handler(BaseHTTPRequestHandler):
             # blocker in a different costume.
             call = (api.archive_season if mar.group(2) == "archive"
                     else api.reopen_season)
+            # EXCLUSIVE on LIFECYCLE_GATE (#159 review finding 3): orders this
+            # commit against every scoped read currently between its epoch
+            # check and its dependent service call — see that gate's own
+            # module-level comment.
+            #
+            # round-N+1: the explicit `with LIFECYCLE_GATE.exclusive(...):`
+            # wrap that used to live HERE was REMOVED, not merely relocated —
+            # `api/service.py`'s `_guarded_attempt` (which `_guarded_mutation`
+            # -> `setup_guarded_mutation` always reaches below) now takes the
+            # SAME gate itself, unconditionally, for every kind in
+            # `_EPOCH_FENCE_KINDS` — and `"season"` (this route's target kind)
+            # is one of them, same as it always was for the database-
+            # coordinated fence. Keeping BOTH wraps would have made this ONE
+            # request take `LIFECYCLE_GATE.exclusive` TWICE, back to back, on
+            # the SAME thread: `ContextSwitchGate` is not reentrant (it has no
+            # notion of "the same thread already holds this"), so the INNER
+            # acquisition would see the OUTER ticket as a still-registered,
+            # lower-seq writer for the same key and block on it — a genuine
+            # same-thread self-block, bounded only by the gate's own
+            # `wait_timeout` (an artificial multi-second stall on every single
+            # archive/reopen call, not a correctness bug but a very real
+            # latency and flakiness regression). `_guarded_attempt`'s wrap
+            # covers `_guarded_mutation`'s FULL authorization/lock/audit
+            # sequence exactly as this removed wrap did — same scope, one
+            # fewer place to keep in sync with `_EPOCH_FENCE_KINDS`.
             return self._guarded_mutation(
                 [("season", mar.group(1))],
                 lambda: call(mar.group(1), reason=b.get("reason"),
@@ -4801,6 +5981,14 @@ class Server(ThreadingHTTPServer):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
+    # FAIL CLOSED HERE, before anything else (#159 review finding 4): a
+    # production deployment with HS_CONTEXT_EPOCH_SECRET unset or too short
+    # must refuse to boot outright, not silently fall back to an unkeyed hash
+    # and not serve even one request before the misconfiguration is found.
+    # Outside production this returns the documented demo key and never
+    # raises, so a plain `python3 -m hockey_scheduler.web.server` keeps
+    # working with zero configuration.
+    epoch_secret()
     # Configure the delivery worker loop from env and start it if enabled (#79).
     # ApiService keeps a disabled loop by default (safe for tests); only the
     # running server process reads env and may spin the background thread.

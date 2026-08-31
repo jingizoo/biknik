@@ -12,6 +12,9 @@ before that version's statements run (see ``_PRE_MIGRATION_CHECKS`` in
 ``sql_store``). They are plain SELECTs — no writes — so they are safe to re-run.
 """
 
+import re
+import unicodedata
+
 from ..domain.jersey import MAX_JERSEY_NUMBER, MIN_JERSEY_NUMBER
 
 
@@ -1316,3 +1319,613 @@ def assert_no_duplicate_rink_external_refs(conn):
             f"{len(duplicates)} rink_code value(s) already back more than "
             f"one Rink: {shown}{more}. Merge or retag the duplicate Rink(s) "
             "before upgrading.")
+
+
+def find_duplicate_device_tokens(conn):
+    """``(recipient_ref, token, [row_id, ...])`` for every ``(recipient_ref,
+    token)`` pair shared by more than one DeviceToken row.
+
+    Only non-null pairs are considered — matching migration 055's partial
+    unique index, which excludes NULL-bearing rows because both SQLite and
+    PostgreSQL treat NULLs as distinct.
+
+    The recipient_ref/token VALUES are returned here because this function's
+    own job is to identify the concrete duplicate key (and this module's
+    tests need to assert detection is correct) — but a device token is a
+    live push credential, so no caller may place the value in an exception,
+    log line, or any other place an operator or CI run might capture its
+    output. ``assert_no_duplicate_device_tokens`` below, the only production
+    caller, reports the row ids only, never the value (#426 round-5 review
+    finding 1) — and even the id is treated as untrusted there, never
+    trusted just because it came off this table's PRIMARY KEY column (#426
+    round-6 review finding 1)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT recipient_ref, token FROM device_tokens "
+        "WHERE recipient_ref IS NOT NULL AND token IS NOT NULL "
+        "GROUP BY recipient_ref, token HAVING COUNT(*) > 1")
+    dup_keys = {(row["recipient_ref"], row["token"]) for row in cur.fetchall()}
+    if not dup_keys:
+        return []
+    cur.execute(
+        "SELECT id, recipient_ref, token FROM device_tokens "
+        "WHERE recipient_ref IS NOT NULL AND token IS NOT NULL")
+    grouped = {}
+    for r in cur.fetchall():
+        key = (r["recipient_ref"], r["token"])
+        if key in dup_keys:
+            grouped.setdefault(key, []).append(r["id"])
+    return sorted((k[0], k[1], sorted(ids)) for k, ids in grouped.items())
+
+
+# device_tokens.id is an UNRESTRICTED ``TEXT PRIMARY KEY`` (migration 001) —
+# nothing in the schema constrains its shape or length. Every row this
+# process itself creates gets one via ``SqlStore.next_id("devtok")``
+# (sql_store.py's ``upsert_device_token``), which always yields exactly
+# ``devtok_`` followed by a positive decimal counter with no leading zero —
+# the SAME ``<prefix>_<n>`` convention ``next_id`` uses for every other
+# table in this store (e.g. DataAccessLog's ``daccess_<n>``, see
+# ``list_data_access``'s own docstring). But data a MIGRATION runs against
+# can predate any guarantee this process makes today, or have been written
+# by a bug, a restore, or a direct DB edit that never went through
+# ``next_id`` at all — a dirty-upgrade guard cannot assume the very column
+# it is diagnosing is trustworthy just because it happens to be a primary
+# key (#426 round-6 review finding 1: the reviewer planted a pre-055
+# duplicate whose id WAS the secret and had it echoed verbatim). Anchored
+# with ``\A``/``\Z``, not ``^``/``$``: Python's ``$`` also matches
+# immediately before a trailing newline, so ``^devtok_5$`` would (with
+# ``re.match``, though not with ``.fullmatch`` — this spells out the
+# anchors explicitly rather than leaning on that distinction) treat
+# ``"devtok_5\n"`` as if it had no suffix. ``\Z`` has no such exception.
+# The digit count is capped at 18 (not left unbounded via ``[0-9]*``) so an
+# otherwise-shaped but absurdly long counter value can never itself blow up
+# the message this backs — belt and suspenders alongside the hard cap
+# ``_sanitize_label`` applies to every label regardless of shape.
+_DEVICE_TOKEN_ROW_ID_RE = re.compile(r"\Adevtok_[1-9][0-9]{0,17}\Z")
+
+# Applied to EVERY label this module puts in a raised message, including
+# one that already matched the grammar above (#426 round-6 review finding
+# 1: "escape/strip control characters defensively even on values that do
+# pass the grammar, in case the grammar itself has a gap") and including
+# the ordinal fallback this module generates itself. Belt and suspenders,
+# not a substitute for the grammar check: a label that matched
+# ``_DEVICE_TOKEN_ROW_ID_RE`` cannot structurally contain a control
+# character (the pattern admits only ``devtok_`` plus digits), but this
+# still runs on it, in case that pattern is ever loosened without updating
+# this comment. ``Cc``/``Cf``/``Cs``/``Co``/``Cn`` cover control, format,
+# surrogate, private-use and unassigned code points respectively — the
+# categories a terminal, log shipper, or downstream parser could render as
+# something other than inert visible text (a raw newline or CR is Cc, for
+# instance, and is exactly what would forge a fake extra log line).
+_UNSAFE_LABEL_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+# Generous relative to any legitimate label: the longest a grammar-passing
+# id can be is ``len("devtok_") + 18 == 25`` characters, and the ordinal
+# fallback (``"row #" + a small int``) is shorter still.
+_MAX_SAFE_LABEL_CHARS = 40
+
+_MAX_DEVICE_TOKEN_GROUPS_SHOWN = 20
+_MAX_DEVICE_TOKEN_ROWS_SHOWN_PER_GROUP = 20
+# A final hard backstop on the whole assembled message, independent of (and
+# in addition to) the two caps above — so a future change to either cap, or
+# to the surrounding prose, can never itself reopen an unbounded message
+# (#426 round-6 review finding 1: "Bound the total message size").
+_MAX_DEVICE_TOKEN_MESSAGE_CHARS = 4000
+
+
+def _sanitize_label(label: str) -> str:
+    """Strip control/format/surrogate/private-use/unassigned characters and
+    hard-cap length. See ``_UNSAFE_LABEL_CATEGORIES``/``_MAX_SAFE_LABEL_CHARS``
+    above for why this runs on every label unconditionally (#426 round-6
+    review finding 1)."""
+    cleaned = "".join(
+        ch for ch in label
+        if unicodedata.category(ch) not in _UNSAFE_LABEL_CATEGORIES)
+    return cleaned[:_MAX_SAFE_LABEL_CHARS]
+
+
+def _safe_device_token_row_label(row_id, ordinal: int) -> str:
+    """One duplicate-group row id, safe to place in a migration-abort
+    message (#426 round-6 review finding 1).
+
+    ``row_id`` is a value read from the database this migration is about to
+    alter, not one this process generated — see ``_DEVICE_TOKEN_ROW_ID_RE``
+    above for why it is never trusted outright. A value that matches
+    this table's actual generated shape is named directly (sanitized
+    defensively regardless, per ``_sanitize_label``); anything else —
+    including a value that merely resembles the shape, or one that is a
+    plain non-string — is replaced by a bounded ordinal that carries no
+    information about the withheld id at all, so an operator still gets an
+    actionable, stable per-group position (``row #1``, ``row #2``, …)
+    without this module ever gambling on unknown row content."""
+    if isinstance(row_id, str) and _DEVICE_TOKEN_ROW_ID_RE.fullmatch(row_id):
+        return _sanitize_label(row_id)
+    return _sanitize_label(f"row #{ordinal}")
+
+
+def assert_no_duplicate_device_tokens(conn):
+    """Abort migration 055 if any (recipient_ref, token) pair already backs
+    more than one DeviceToken row (#426 round-4 review finding 1) — the
+    unlocked read-then-save/insert this migration's index backstops could
+    persist exact duplicates pre-fix, so on a deployed database
+    ``CREATE UNIQUE INDEX`` might otherwise fail with an opaque driver
+    error; naming the conflicting row ids lets an operator resolve it
+    first.
+
+    Deliberately never interpolates the recipient_ref or token VALUE into
+    the exception (#426 round-5 review finding 1): a device token is a live
+    production push credential, and this check's failure is exactly the
+    kind of message a startup/deployment log captures verbatim — the
+    review's own reproduction planted two rows and found the raw token
+    inside the raised ``MigrationDataError``. Row ids are both sufficient
+    to repair the row directly (look the id up, then deactivate or delete
+    it) and safe to disclose IF they actually look like an id this store
+    would generate — so no fingerprint or other reversible/correlatable
+    encoding of the secret value is used, the ids alone already suffice for
+    an operator to act.
+
+    Round-5's fix stopped there and trusted every row id unconditionally.
+    round-6's review went one step further and planted the SECRET IN THE
+    ID itself (``device_tokens.id`` is an unconstrained ``TEXT PRIMARY
+    KEY`` — nothing stops a pre-migration row, however it got there, from
+    having one) and had it echoed verbatim. Every id is now passed through
+    ``_safe_device_token_row_label``: only a value shaped exactly like this
+    store's own ``next_id("devtok")`` output is named directly (still
+    defensively re-sanitized even then); anything else — a live secret, a
+    newline that would forge a fake log line, an implausibly long value —
+    is replaced by a bounded per-group ordinal instead. The number of
+    groups shown, the number of rows shown per group, and the assembled
+    message's total length are each independently capped, so neither an
+    enormous fan-out of duplicate pairs nor an enormous fan-out of rows
+    within one pair can make this message unbounded."""
+    duplicates = find_duplicate_device_tokens(conn)
+    if duplicates:
+        group_strs = []
+        shown_groups = duplicates[:_MAX_DEVICE_TOKEN_GROUPS_SHOWN]
+        for _ref, _tok, ids in shown_groups:
+            shown_ids = ids[:_MAX_DEVICE_TOKEN_ROWS_SHOWN_PER_GROUP]
+            labels = [_safe_device_token_row_label(rid, i + 1)
+                      for i, rid in enumerate(shown_ids)]
+            hidden_rows = len(ids) - len(shown_ids)
+            more_rows = ("" if hidden_rows <= 0
+                        else f" (+{hidden_rows} more row(s))")
+            group_strs.append(f"rows {', '.join(labels)}{more_rows}")
+        shown = "; ".join(group_strs)
+        hidden_groups = len(duplicates) - len(shown_groups)
+        more = "" if hidden_groups <= 0 else f" (+{hidden_groups} more)"
+        message = (
+            "Cannot enforce one DeviceToken per (recipient_ref, token): "
+            f"{len(duplicates)} pair(s) already back more than one row. "
+            "The recipient_ref/token values are withheld from this message "
+            "because a device token is a live push credential -- the "
+            f"offending row id(s): {shown}{more}. Look up those rows "
+            "directly and deactivate or delete the extra one(s) before "
+            "upgrading.")
+        raise MigrationDataError(message[:_MAX_DEVICE_TOKEN_MESSAGE_CHARS])
+
+
+# --------------------------------------------------------------------------- #
+# 059 season roster membership (#205 Slice A): deterministic backfill of      #
+# active Players into SeasonRosterMembership rows on the Team + LeagueSeason  #
+# spine. Every shape of source data the backfill cannot translate             #
+# deterministically is REPORTED here (row-level, bounded) and aborts the      #
+# upgrade — never guessed through, never silently skipped.                    #
+# --------------------------------------------------------------------------- #
+def find_active_players_with_missing_team(conn):
+    """Active Players whose ``team_id`` resolves to no Team row.
+
+    Migration 059's backfill derives a membership from the player's Team's
+    active Season registrations, so a dangling ``team_id`` has NO deterministic
+    target. Skipping such a player silently would strand them with no
+    membership at the consumer cutover — a silent eligibility loss — so the
+    row is reported instead. Inactive players are not backfilled and so are
+    not reported."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, p.team_id AS team_id FROM players p "
+        "LEFT JOIN teams t ON t.id = p.team_id "
+        "WHERE p.is_active = 1 AND t.id IS NULL")
+    return sorted((row["player_id"], row["team_id"]) for row in cur.fetchall())
+
+
+def find_teams_with_duplicate_active_season_registrations(conn):
+    """Teams holding MORE THAN ONE active registration that resolves to the
+    same non-archived Season.
+
+    The spine guarantees at most one (a Team has one permanent League, and a
+    League has at most one LeagueSeason per Season), so a duplicate can only
+    be legacy/corrupted data predating full enforcement. Backfilling through
+    one would mint two ``active`` memberships per (player, Season) — exactly
+    what migration 059's partial unique index forbids — so which registration
+    the players' Season participation "means" is ambiguous and must be
+    resolved by an operator, not guessed. Archived Seasons are exempt: the
+    backfill never writes into them."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT r.team_id AS team_id, ls.season_id AS season_id "
+        "FROM season_team_registrations r "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
+        "WHERE r.active = 1 "
+        "GROUP BY r.team_id, ls.season_id HAVING COUNT(*) > 1")
+    return sorted((row["team_id"], row["season_id"]) for row in cur.fetchall())
+
+
+def find_backfill_candidate_jersey_duplicates(conn):
+    """Active (team, jersey) duplicates among the players migration 059 will
+    actually backfill — teams with an active registration in a non-archived
+    Season.
+
+    Migration 038's partial unique index makes this state impossible on a
+    correctly-migrated database, but 059 inserts into a NEW
+    (league_season, team, jersey) unique scope and must never trust another
+    migration's constraint as its own preflight (#201 discipline: report the
+    offending rows, don't surface an opaque driver error). Deliberately
+    scoped to backfill candidates only, so an upgrade is never blocked by a
+    duplicate on a team the backfill would not touch."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.team_id AS team_id, p.jersey_number AS jersey_number "
+        "FROM players p "
+        "WHERE p.is_active = 1 AND p.jersey_number IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM season_team_registrations r "
+        "            JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "            JOIN seasons s ON s.id = ls.season_id "
+        "            WHERE r.team_id = p.team_id AND r.active = 1 "
+        "            AND s.status = 'active') "
+        "GROUP BY p.team_id, p.jersey_number HAVING COUNT(*) > 1")
+    return sorted((row["team_id"], row["jersey_number"])
+                  for row in cur.fetchall())
+
+
+def find_active_players_with_dangling_registration_target(conn):
+    """Active players whose Team's active registration points at a
+    ``league_season_id`` that does not exist (#205 review round 1 finding
+    3).
+
+    Migration 059's backfill INSERT reaches this row only through an INNER
+    JOIN onto ``league_seasons`` — a dangling target does not error, it is
+    SILENTLY DROPPED, so the backfill would complete with FEWER memberships
+    than the permanent model actually grants that player today (a silent
+    eligibility loss, not a loud failure). Reported here so it aborts the
+    upgrade instead."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, r.id AS registration_id, "
+        "r.league_season_id AS league_season_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "LEFT JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "WHERE p.is_active = 1 AND ls.id IS NULL")
+    return sorted((row["player_id"], row["registration_id"],
+                  row["league_season_id"]) for row in cur.fetchall())
+
+
+def find_active_players_with_dangling_league_season_parents(conn):
+    """Active players whose registration's LeagueSeason exists, but ITS
+    ``season_id`` or ``league_id`` does not resolve (#205 review round 1
+    finding 3) — the SAME silent-exclusion risk as
+    :func:`find_active_players_with_dangling_registration_target`, one join
+    further out, and equally unreported by the migration's INNER JOIN
+    chain."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, r.league_season_id AS league_season_id, "
+        "ls.season_id AS season_id, ls.league_id AS league_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "LEFT JOIN seasons s ON s.id = ls.season_id "
+        "LEFT JOIN leagues lg ON lg.id = ls.league_id "
+        "WHERE p.is_active = 1 AND (s.id IS NULL OR lg.id IS NULL)")
+    return sorted((row["player_id"], row["league_season_id"],
+                  row["season_id"], row["league_id"])
+                 for row in cur.fetchall())
+
+
+# A scope-spine key is BROKEN when either side is MISSING or the two
+# disagree — spelled out longhand because neither engine's null-safe
+# operator is both portable and correct here (#205 review round 3 blocker
+# 1). Measured on this box against SQLite 3.x and PostgreSQL 16 over the
+# five-row truth table (NULL/NULL, NULL/x, x/NULL, x/x, x/y):
+#
+#   * ``a != b`` — the form these checks USED to use — matches only x/y on
+#     BOTH engines: every NULL row evaluates UNKNOWN and is filtered out.
+#     That IS the defect: identical across engines, and identically wrong.
+#   * ``a IS NOT b`` — SQLite's null-safe operator — is a hard SYNTAX ERROR
+#     on PostgreSQL (``syntax error at or near "b"``), so it cannot be
+#     shared by a store that runs on both.
+#   * ``a IS DISTINCT FROM b`` — PostgreSQL's spelling, and parseable on
+#     recent SQLite builds — matches NULL/x, x/NULL and x/y on both, but
+#     deliberately NOT NULL/NULL: two missing keys are "not distinct". For
+#     a SCOPE SPINE that is exactly backwards — a Team with no Program and
+#     a League with no Program is two missing scope keys, not agreement —
+#     so it would still let the very rows this blocker is about through.
+#     It also depends on the SQLite build's vintage.
+#   * The form below matches NULL/NULL, NULL/x, x/NULL and x/y — IDENTICAL
+#     row sets on both engines, and the semantics the spine actually needs.
+#
+# Uses only ``IS NULL``/``!=``/``OR``, all core SQL, so it needs no dialect
+# translation. Formatted with ``.format(a=..., b=...)`` over trusted
+# in-module column names only — never over caller input.
+_MISSING_OR_UNEQUAL = "({a} IS NULL OR {b} IS NULL OR {a} != {b})"
+
+
+def find_active_players_with_team_league_mismatch(conn):
+    """Active players (real backfill candidates: registration/LeagueSeason
+    resolve, Season resolves and is active) whose Team's OWN permanent
+    League disagrees with the registration's LeagueSeason League (#205
+    review round 1 finding 3).
+
+    The live SERVICE path enforces this identical rule 7 analog on every
+    ``create_season_roster_membership`` call (``team.league_id != ls.
+    league_id``); migration 059's backfill trusts ``league_season_id``
+    blindly instead. A registration corrupted to point at ANOTHER League's
+    LeagueSeason in the same active Season currently passes every existing
+    preflight check and silently backfills a membership whose Team and
+    LeagueSeason disagree.
+
+    #205 review round 3 blocker 1 — a MISSING ``teams.league_id`` is a
+    violation too, not an exemption. This check used to carry an explicit
+    ``AND t.league_id IS NOT NULL``, so a candidate Team with NO League at
+    all slipped past cleanly and 059 backfilled a membership onto a spine
+    with no League on the Team side — while the service's own registration
+    path (``register_team_for_season``, #283 Slice E rule 2) will not even
+    leave an actively-registered Team league-less: it ASSIGNS the League it
+    is registering into. A Team that reaches this state did so outside the
+    service, and 059 must report it rather than materialize a membership
+    the live system could not have produced. See ``_MISSING_OR_UNEQUAL``
+    for why the comparison is spelled out longhand rather than using an
+    engine's null-safe operator."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, t.id AS team_id, "
+        "t.league_id AS team_league_id, ls.id AS league_season_id, "
+        "ls.league_id AS ls_league_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
+        "WHERE p.is_active = 1 AND "
+        + _MISSING_OR_UNEQUAL.format(a="t.league_id", b="ls.league_id"))
+    return sorted((row["player_id"], row["team_id"], row["team_league_id"],
+                  row["league_season_id"], row["ls_league_id"])
+                 for row in cur.fetchall())
+
+
+def find_active_players_with_program_mismatch(conn):
+    """Active players (real backfill candidates) whose registration's
+    LeagueSeason binds a League and a Season from DIFFERENT Programs (#205
+    review round 1 finding 3).
+
+    ``league.program_id == season.program_id`` is an invariant the SERVICE
+    layer enforces when a ``LeagueSeason`` is first bound
+    (``_link_league_season``); this is the migration-time backstop for data
+    that reached this state some other way (a restored backup, a direct
+    write) — the exact defense-in-depth posture ``find_teams_with_
+    duplicate_active_season_registrations`` already takes for a DIFFERENT
+    invariant this same backfill depends on.
+
+    #205 review round 3 blocker 1 — ``lg.program_id != s.program_id`` was
+    the whole predicate, so a NULL on EITHER side evaluated UNKNOWN and the
+    row was filtered out rather than reported: a League with no Program, or
+    a Season with no Program, backfilled cleanly. The service refuses both
+    (``_link_league_season`` raises ``league_season_program_mismatch`` when
+    one side is NULL and the other is not), so neither shape is reachable
+    through the live system. Now compared with ``_MISSING_OR_UNEQUAL``,
+    which reports a missing key on either side — including BOTH missing,
+    which ``IS DISTINCT FROM`` would call agreement."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, ls.id AS league_season_id, "
+        "lg.id AS league_id, lg.program_id AS league_program_id, "
+        "s.id AS season_id, s.program_id AS season_program_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
+        "JOIN leagues lg ON lg.id = ls.league_id "
+        "WHERE p.is_active = 1 AND "
+        + _MISSING_OR_UNEQUAL.format(a="lg.program_id", b="s.program_id"))
+    return sorted((row["player_id"], row["league_season_id"],
+                  row["league_id"], row["league_program_id"],
+                  row["season_id"], row["season_program_id"])
+                 for row in cur.fetchall())
+
+
+def find_active_players_with_team_program_mismatch(conn):
+    """Active players (real backfill candidates) whose Team's OWN
+    ``program_id`` disagrees with the registration's League (#205 review
+    round 2 finding 1 — a fresh external review of this exact migration,
+    found AFTER ``find_active_players_with_team_league_mismatch`` and
+    ``find_active_players_with_program_mismatch`` above already shipped).
+
+    Those two existing checks validate ``team.league_id == ls.league_id``
+    and ``league.program_id == season.program_id`` — together they make the
+    League/LeagueSeason/Season leg of the spine coherent, but NEITHER one
+    ever reads ``teams.program_id`` at all. A Team carries its OWN
+    ``program_id`` (``domain/models.py``'s ``Team.program_id`` — a SEPARATE
+    column from ``league_id``, kept consistent with the League's Program by
+    the SERVICE layer per that field's own docstring: ``the invariant
+    league.program_id == team.program_id ... is enforced in the service
+    layer``), so a direct write that changes a Team's ``program_id`` alone
+    — leaving its ``league_id``, and that League's own League/LeagueSeason/
+    Season chain, otherwise perfectly coherent — passes BOTH existing
+    checks cleanly and still backfills: the review demonstrated exactly
+    this on SQLite (preflight clean, migration 059 backfilled anyway) and
+    it reproduces identically on PostgreSQL (see
+    ``MembershipBackfillSpineTest.test_team_program_mismatch_aborts_and_
+    repairs``). The resulting row would claim a Team's participation under
+    a Program the Team itself disagrees with, encoding a scope boundary
+    that cannot actually exist — exactly the kind of impossible state
+    ``find_active_players_with_program_mismatch`` already treats as
+    migration-blocking for the League/Season leg, now closed for the
+    Team/League leg too, with the SAME defense-in-depth posture (a direct
+    write bypassing service validation, not a normal service-level
+    mutation, which the service layer already forbids).
+
+    #205 review round 3 blocker 1 — like its Team/League sibling above,
+    this check used to carry an explicit ``AND t.program_id IS NOT NULL``,
+    exempting a candidate Team with NO Program from the very scope check
+    it exists to perform. ``register_team_for_season`` refuses a
+    program-less Team on the canonical path (``team_program_mismatch``,
+    #283/#233 C2), so 059 must report the row rather than backfill a
+    membership whose Team names no Program at all."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, t.id AS team_id, "
+        "t.program_id AS team_program_id, lg.id AS league_id, "
+        "lg.program_id AS league_program_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
+        "JOIN leagues lg ON lg.id = ls.league_id "
+        "WHERE p.is_active = 1 AND "
+        + _MISSING_OR_UNEQUAL.format(a="t.program_id", b="lg.program_id"))
+    return sorted((row["player_id"], row["team_id"], row["team_program_id"],
+                  row["league_id"], row["league_program_id"])
+                 for row in cur.fetchall())
+
+
+def assert_season_roster_membership_backfill_ready(conn):
+    """Abort migration 059 (#205 Slice A) unless the membership backfill is
+    fully deterministic for every row it would derive.
+
+    Read-only: raises :class:`MigrationDataError` with bounded row-level
+    diagnostics and leaves all data unchanged, so re-running the upgrade after
+    the operator resolves each named row applies cleanly (same idempotent
+    re-run contract as migrations 029/035).
+
+    #205 review round 1 finding 3 — the original checks covered ``players.
+    team_id`` dangling, same-Season registration duplicates, and jersey
+    duplicates, but never validated that the registration's OWN spine
+    (LeagueSeason -> Season/League) resolves, nor that the resolved spine is
+    COHERENT (Team's League matches the LeagueSeason's League; the League's
+    Program matches the Season's) — every check below closes one of those
+    gaps, each independently proven able to slip past the ORIGINAL checks
+    and reach ``INSERT`` (see test_season_roster_membership.py's
+    ``MembershipBackfillSpineTest``).
+
+    #205 review round 2 finding 1 — round 1's coherence checks validated
+    League<->LeagueSeason and League<->Season, but never the Team's OWN
+    ``program_id`` against either: a Team whose ``program_id`` disagrees
+    with its League's (while ``league_id`` itself, and the whole League/
+    LeagueSeason/Season chain, stay perfectly coherent) passed every check
+    above cleanly and still backfilled on both SQLite and PostgreSQL —
+    ``find_active_players_with_team_program_mismatch`` closes that gap the
+    same way its Round 1 siblings closed theirs.
+
+    #205 review round 3 blocker 1 — every coherence check above compared
+    two scope keys for INEQUALITY and therefore only ever reported UNEQUAL
+    NON-NULL pairs. A MISSING key was not a violation: two of the checks
+    excluded it outright (``AND t.league_id IS NOT NULL``, ``AND
+    t.program_id IS NOT NULL``) and the third let SQL's three-valued logic
+    do it silently (``lg.program_id != s.program_id`` is UNKNOWN, not TRUE,
+    when either side is NULL). All four of ``teams.league_id``,
+    ``teams.program_id``, ``leagues.program_id`` and ``seasons.program_id``
+    were demonstrated NULL on an otherwise-valid active candidate with this
+    aggregate returning clean and 059 backfilling anyway, on SQLite AND
+    PostgreSQL. A missing scope key is now reported by the same check that
+    owns that key (see ``_MISSING_OR_UNEQUAL``), so the backfill can no
+    longer materialize a membership on a spine the live service refuses to
+    produce."""
+    dangling = find_active_players_with_missing_team(conn)
+    dup_regs = find_teams_with_duplicate_active_season_registrations(conn)
+    dup_jerseys = find_backfill_candidate_jersey_duplicates(conn)
+    dangling_reg_target = find_active_players_with_dangling_registration_target(conn)
+    dangling_ls_parents = find_active_players_with_dangling_league_season_parents(conn)
+    team_league_mismatch = find_active_players_with_team_league_mismatch(conn)
+    program_mismatch = find_active_players_with_program_mismatch(conn)
+    team_program_mismatch = find_active_players_with_team_program_mismatch(conn)
+    if not any((dangling, dup_regs, dup_jerseys, dangling_reg_target,
+               dangling_ls_parents, team_league_mismatch, program_mismatch,
+               team_program_mismatch)):
+        return
+
+    problems = []
+    if dangling:
+        shown = ", ".join(
+            f"player {p} (team_id={t!r})" for p, t in dangling[:20])
+        more = "" if len(dangling) <= 20 else f" (+{len(dangling) - 20} more)"
+        problems.append(
+            f"{len(dangling)} active player(s) reference a Team that does "
+            f"not exist, so no membership target can be derived: {shown}{more}")
+    if dup_regs:
+        shown = ", ".join(
+            f"team {t} in season {s}" for t, s in dup_regs[:20])
+        more = "" if len(dup_regs) <= 20 else f" (+{len(dup_regs) - 20} more)"
+        problems.append(
+            f"{len(dup_regs)} team(s) hold more than one active registration "
+            f"resolving to the same Season, so a single membership per "
+            f"(player, Season) cannot be chosen: {shown}{more}")
+    if dup_jerseys:
+        shown = ", ".join(
+            f"team {t}/#{j}" for t, j in dup_jerseys[:20])
+        more = ("" if len(dup_jerseys) <= 20
+                else f" (+{len(dup_jerseys) - 20} more)")
+        problems.append(
+            f"{len(dup_jerseys)} active (team, jersey) pair(s) among backfill "
+            f"candidates are duplicated: {shown}{more}")
+    if dangling_reg_target:
+        shown = ", ".join(
+            f"player {p} (registration={r!r} -> league_season={ls!r})"
+            for p, r, ls in dangling_reg_target[:20])
+        more = ("" if len(dangling_reg_target) <= 20
+                else f" (+{len(dangling_reg_target) - 20} more)")
+        problems.append(
+            f"{len(dangling_reg_target)} active player(s) have a Team "
+            f"registration pointing at a LeagueSeason that does not exist: "
+            f"{shown}{more}")
+    if dangling_ls_parents:
+        shown = ", ".join(
+            f"player {p} (league_season={ls!r}, season={s!r}, league={lg!r})"
+            for p, ls, s, lg in dangling_ls_parents[:20])
+        more = ("" if len(dangling_ls_parents) <= 20
+                else f" (+{len(dangling_ls_parents) - 20} more)")
+        problems.append(
+            f"{len(dangling_ls_parents)} active player(s) resolve to a "
+            f"LeagueSeason whose Season or League does not exist: "
+            f"{shown}{more}")
+    if team_league_mismatch:
+        shown = ", ".join(
+            f"player {p} (team={t!r} league={tl!r} vs "
+            f"league_season={ls!r} league={lsl!r})"
+            for p, t, tl, ls, lsl in team_league_mismatch[:20])
+        more = ("" if len(team_league_mismatch) <= 20
+                else f" (+{len(team_league_mismatch) - 20} more)")
+        problems.append(
+            f"{len(team_league_mismatch)} active player(s) would backfill a "
+            f"membership whose Team and LeagueSeason are MISSING or "
+            f"disagree on League: {shown}{more}")
+    if program_mismatch:
+        shown = ", ".join(
+            f"player {p} (league_season={ls!r}: league {lg!r}/program "
+            f"{lgp!r} vs season {s!r}/program {sp!r})"
+            for p, ls, lg, lgp, s, sp in program_mismatch[:20])
+        more = ("" if len(program_mismatch) <= 20
+                else f" (+{len(program_mismatch) - 20} more)")
+        problems.append(
+            f"{len(program_mismatch)} active player(s) resolve to a "
+            f"LeagueSeason whose League and Season are MISSING a Program or "
+            f"belong to different Programs: {shown}{more}")
+    if team_program_mismatch:
+        shown = ", ".join(
+            f"player {p} (team={t!r}/program {tp!r} vs "
+            f"league={lg!r}/program {lgp!r})"
+            for p, t, tp, lg, lgp in team_program_mismatch[:20])
+        more = ("" if len(team_program_mismatch) <= 20
+                else f" (+{len(team_program_mismatch) - 20} more)")
+        problems.append(
+            f"{len(team_program_mismatch)} active player(s) would backfill a "
+            f"membership whose Team's own Program is MISSING or disagrees "
+            f"with its League's: {shown}{more}")
+    raise MigrationDataError(
+        "Cannot backfill Season roster memberships (#205 Slice A): "
+        + "; ".join(problems)
+        + ". Fix or deactivate the named rows before upgrading — the backfill "
+          "reports ambiguity rather than guessing.")

@@ -28,8 +28,21 @@ orders entirely before this request (it sees the old scope) or entirely after it
 (it sees the new scope) — the result can never be a hybrid of the two (e.g. an
 old Program set with a now-empty Season set). Memory/SQLite get the same guarantee
 for free: each store's per-INSTANCE transaction lock (not a process-wide one)
-fully serializes every transaction taken through that store, and on SQLite the
-``BEGIN IMMEDIATE`` of #392 extends it to any other connection on the file.
+fully serializes every transaction taken through that store, and on SQLite a
+WRITE-capable snapshot's ``BEGIN IMMEDIATE`` (#392) additionally extends it to
+any other connection on the file. A genuinely READ-only snapshot (``resolve``,
+``options`` and every League-aware read below; ``_snapshot``'s own
+``read_only=True``, round-N+2, PR #423) opens with ``BEGIN DEFERRED`` instead —
+a SHARED, not RESERVED, file lock — which is strictly weaker at the SQLite
+engine level but delivers the identical isolation for the read's own duration
+(SQLite cannot let ANY writer reach EXCLUSIVE, the lock a write actually needs,
+while this SHARED lock is held — see ``SqlStore.transaction``'s own docstring
+for the full argument); the only thing it gives up is refusing to also block a
+concurrent connection that merely holds RESERVED (write INTENT, not yet a
+write), which is precisely what a scoped read's own dedicated connection
+(``_read_under_context_gate_sqlite``'s ``fresh_store``, round-N+1 finding 1)
+holds for the duration of its ``produce()`` call — the regression this
+distinction fixes.
 
 **League is the optional third axis (#345).** It is added ADDITIVELY: ``resolve``,
 ``options`` and ``set`` keep their exact pre-#345 signatures and tuple shapes, and
@@ -51,6 +64,8 @@ from ..domain import ActiveContext, SeasonStatus
 from ..domain.errors import (
     ConcurrencyConflictError, NotFoundError, ValidationError)
 from . import context_scope
+from .context_epoch import context_epoch as _epoch_hash
+from .epoch_fence import user_fence_key
 from .league_scope import exact_league_season_or_conflict
 
 # The context authorization + selection runs under one SERIALIZABLE snapshot so a
@@ -60,11 +75,14 @@ from .league_scope import exact_league_season_or_conflict
 # attempt re-reads a fresh consistent snapshot. Memory/SQLite serialize via each
 # store's own per-INSTANCE transaction lock (a ``threading.RLock``, not — as this
 # said before — a process-wide one), so no SERIALIZATION conflict arises there.
-# On SQLite the retry is not dead code, though: since #392 ``transaction()``
-# opens with ``BEGIN IMMEDIATE``, so a second connection to the same file can
-# make BEGIN itself fail ``lock_not_available`` after the busy handler gives up,
-# and that lands here as the same ConcurrencyConflictError. This loop already
-# handles it.
+# On SQLite the retry is not dead code, though: a WRITE-capable snapshot's
+# ``BEGIN IMMEDIATE`` (#392) can make BEGIN itself fail ``lock_not_available``
+# once another connection's already-held RESERVED outlasts the busy handler,
+# and a READ-only snapshot's ``BEGIN DEFERRED`` (round-N+2, ``_snapshot``'s
+# ``read_only=True``, PR #423) can — far more rarely, since SHARED conflicts
+# with much less — hit the identical failure if its first read races another
+# connection's held EXCLUSIVE past the same busy handler. Either shape lands
+# here as the same ConcurrencyConflictError. This loop already handles both.
 _SNAPSHOT_ISOLATION = "SERIALIZABLE"
 _MAX_SNAPSHOT_RETRIES = 10
 
@@ -106,23 +124,65 @@ class ContextService:
         self.store = store
         self.clock = clock
 
-    def _snapshot(self, work):
+    def _snapshot(self, work, read_only=False):
         """Run ``work()`` inside ONE serializable transaction, so the whole
         authorization computation + selection (and, for ``set``, the write) reads
         a single consistent snapshot — the result always corresponds wholly to
         the pre- OR post-revocation scope, never a hybrid. Retry a bounded number
         of times on a serialization conflict (each retry re-reads a fresh
         snapshot); a domain error (e.g. a non-oracle not-found) is not a conflict,
-        so it propagates immediately and unchanged."""
+        so it propagates immediately and unchanged.
+
+        ``read_only`` (round-N+2 regression fix, PR #423) is THIS CALL's own
+        promise that ``work()`` performs no write — forwarded verbatim to
+        ``store.transaction(read_only=...)``, never inferred here. Every
+        caller below states it explicitly: the several entry points with no
+        row-lock concept at all (``resolve``, ``options``,
+        ``options_with_league``, ``options_with_saved``,
+        ``resolve_epoch_state``) always pass ``True``; ``resolve_with_league``
+        and ``resolve_saved_with_league`` pass ``not lock`` — even their
+        ``lock=True`` form takes no store WRITE, only a locked READ
+        (``get_active_context_for_update``), but on SQLite that locked read's
+        whole point is to make a concurrent writer wait for it (#386), which
+        needs the SAME write-strength file lock a real write does; passing
+        ``read_only=True`` there would silently defeat that guarantee instead
+        of raising, which is exactly why it is spelled ``not lock`` rather
+        than assumed. ``_set_locked``/``_set_with_league_locked`` never pass
+        it (default ``False``): both genuinely write inside ``work()``, so
+        they always need the SAME write-strength transaction this method
+        opened before ``read_only`` existed.
+
+        See ``SqlStore.transaction``'s own docstring for the mechanism this
+        buys (a SHARED, not RESERVED, SQLite file lock) and why it does not
+        weaken the snapshot's isolation guarantee above."""
         for attempt in range(_MAX_SNAPSHOT_RETRIES):
             try:
-                with self.store.transaction(isolation=_SNAPSHOT_ISOLATION):
+                with self.store.transaction(
+                        isolation=_SNAPSHOT_ISOLATION, read_only=read_only):
                     return work()
             except ConcurrencyConflictError:
                 if attempt == _MAX_SNAPSHOT_RETRIES - 1:
                     raise
         # Unreachable: the loop either returns or re-raises on the last attempt.
         raise AssertionError("snapshot retry loop exited without a result")
+
+    def _next_generation_locked(self, user_id):
+        """The generation to write on THIS commit (#159 review findings 2+5):
+        the currently persisted row's generation (0 if none has ever been
+        written) plus one. MUST be called immediately before the write, and
+        both MUST run inside the SAME ``_snapshot`` — the read-then-write is
+        made atomic by that transaction's isolation (a bounded retry on
+        conflict), exactly the pattern every other read-then-write in this
+        service already relies on, not by any locking done here.
+
+        A MONOTONIC counter rather than a timestamp on purpose: two commits
+        landing inside the same wall-clock tick would write the same
+        ``updated_at``, so a token derived from the tuple + timestamp could
+        reuse itself across an A -> B -> A round trip. This can't, because it
+        is READ before each write and always written one higher than what was
+        just read — never derived from a clock at all."""
+        current = self.store.get_active_context(user_id) if user_id else None
+        return (getattr(current, "generation", 0) or 0) + 1
 
     # -- resolution --------------------------------------------------------
     def resolve(self, user_id: Optional[str], role, scope) -> _Resolved:
@@ -146,7 +206,9 @@ class ContextService:
         def work():
             program, season = self._resolve_locked(user_id, role, scope)
             return _detached(program), _detached(season)
-        return self._snapshot(work)
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and work() above performs no write.
+        return self._snapshot(work, read_only=True)
 
     def _resolve_locked(self, user_id, role, scope) -> _Resolved:
         """The validated ``(program, season)`` live rows — MUST run inside the
@@ -220,7 +282,9 @@ class ContextService:
                                  [_detached(s) for s in seasons]))
             sel_program, sel_season = self._resolve_locked(user_id, role, scope)
             return programs, _detached(sel_program), _detached(sel_season)
-        return self._snapshot(work)
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and work() above performs no write.
+        return self._snapshot(work, read_only=True)
 
     # -- League axis (#345) ------------------------------------------------
     # Additive throughout: `resolve`/`options`/`set` above keep their exact
@@ -299,7 +363,12 @@ class ContextService:
             league = self._resolve_league_locked(
                 user_id, role, scope, program, season)
             return _detached(program), _detached(season), _detached(league)
-        return self._snapshot(work)
+        # read_only=not lock (round-N+2): work() itself never writes, but
+        # lock=True's whole point is a locked READ strong enough to make a
+        # concurrent writer wait for it (#386 — see this method's own
+        # docstring above) — read_only=True there would silently defeat that,
+        # so this stays tied to `lock`, never assumed True.
+        return self._snapshot(work, read_only=not lock)
 
     def resolve_saved_with_league(self, user_id: Optional[str], role, scope,
                                   lock=False):
@@ -349,7 +418,12 @@ class ContextService:
                 user_id, role, scope, lock=lock)
             return (_detached(saved), _detached(program), _detached(season),
                     _detached(league))
-        return self._snapshot(work)
+        # read_only=not lock (round-N+2): same reasoning as
+        # resolve_with_league's own call site — lock=True's row lock (#386)
+        # needs write-strength on SQLite even though work() itself never
+        # writes; lock=False (the #409 preflight's own call, the exact path
+        # this round's regression traced to) genuinely does not.
+        return self._snapshot(work, read_only=not lock)
 
     def _saved_locked(self, user_id, role, scope, lock=False):
         """The persisted row and the axes it still validly names, as LIVE rows —
@@ -402,8 +476,11 @@ class ContextService:
         time, where it can report a precise reason, not silently by omission
         here.
         """
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and _options_locked performs no write.
         return self._snapshot(
-            lambda: self._options_locked(user_id, role, scope))
+            lambda: self._options_locked(user_id, role, scope),
+            read_only=True)
 
     def _options_locked(self, user_id, role, scope):
         """The switcher's enumeration + RESOLVED selection, already detached —
@@ -476,7 +553,115 @@ class ContextService:
             return (programs, sel_program, sel_season, sel_league,
                     _detached(saved_program), _detached(saved_season),
                     _detached(saved_league))
-        return self._snapshot(work)
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and work() above performs no write.
+        return self._snapshot(work, read_only=True)
+
+    # -- epoch (#159 review findings 2+5) -----------------------------------
+    # Everything the context epoch (services/context_epoch.py) needs to hash:
+    # the EFFECTIVE resolved (program, season, league) `resolve_with_league`
+    # would render -- not the raw saved row, which can differ from it whenever
+    # the saved Program/Season is deleted/unauthorized and `_fallback` stands
+    # in, or whenever the fallback's OWN candidate set changes (a fallback
+    # Season getting archived moves who `_fallback` would pick even though
+    # nothing about THIS user's saved row changed) -- plus the persisted
+    # switch generation, which needs no row-lifecycle argument at all: it is
+    # what makes the epoch move on every switch regardless of what the clock
+    # or the resolution do.
+
+    def _epoch_material_locked(self, user_id, role, scope):
+        """``(generation, program, season, league)`` — MUST run inside the
+        caller's transaction; a caller that returns these across the lock
+        boundary detaches them first (see :meth:`resolve_epoch_state`).
+
+        Deliberately NOT built on top of :meth:`resolve_with_league`: that
+        method opens its OWN ``_snapshot``, so a caller already holding a
+        transaction needs this un-snapshotted form to join it rather than
+        nesting a second one — the same reason every other ``_locked``
+        helper in this class exists (:meth:`_resolve_locked`,
+        :meth:`_saved_locked`, :meth:`_options_locked`,
+        :meth:`_resolve_league_locked`).
+
+        CORRECTION (round-N+3 review finding 2): an earlier revision of this
+        sentence named that caller as ``ContextService.run_scoped_read``,
+        "#159 review finding 3" — NO SUCH METHOD EXISTS. It named a revision
+        that was BUILT AND REJECTED (see this class's own NOTE below, on
+        #159 review finding 3, for the full account of why; and
+        ``services/context_epoch.py``'s module docstring for the
+        client-facing half of the same correction, already accurate). The
+        ordering guarantee in front of a dependent scoped read is bought by
+        GATES — ``web/server.py``'s ``Handler._read_under_context_gate``
+        (the in-process ``ContextSwitchGate``/``LIFECYCLE_GATE`` holds) and
+        the PostgreSQL ``epoch_fence`` advisory locks layered alongside
+        them — never a shared database transaction. THE ACTUAL CALLER
+        TODAY, singular, is :meth:`resolve_epoch_state`, which opens its OWN
+        ``_snapshot`` around exactly this helper and nothing wider; this
+        extraction exists for the reuse stated above, not because a wider
+        caller currently exists.
+        """
+        row = self.store.get_active_context(user_id) if user_id else None
+        generation = (getattr(row, "generation", 0) or 0) if row else 0
+        program, season = self._resolve_locked(user_id, role, scope)
+        league = self._resolve_league_locked(
+            user_id, role, scope, program, season)
+        return generation, program, season, league
+
+    def resolve_epoch_state(self, user_id, role, scope):
+        """``(generation, program, season, league)`` read under ONE snapshot
+        and DETACHED — the public, self-contained form of
+        :meth:`_epoch_material_locked` for a caller (``current_epoch`` below)
+        that only needs the epoch's material and is not also running a
+        dependent read under the same lock."""
+        def work():
+            generation, program, season, league = self._epoch_material_locked(
+                user_id, role, scope)
+            return (generation, _detached(program), _detached(season),
+                    _detached(league))
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and _epoch_material_locked performs no write.
+        return self._snapshot(work, read_only=True)
+
+    def current_epoch(self, user_id, role, scope) -> str:
+        """The CURRENT context-epoch token for ``user_id`` (#159 review
+        finding 2), derived from the EFFECTIVE resolution rather than the raw
+        saved row. Used by the three places the client learns its context
+        (``GET /api/context``, ``GET /api/context/options``, and the ``POST
+        /api/context`` response, all in ``web/server.py``).
+
+        A falsy ``user_id`` is hashed with NO resolution attempted — there is
+        no role/scope-driven material to resolve for a caller with no
+        identity, and :func:`context_epoch.context_epoch` already has a
+        well-defined, stable answer for that case that cannot collide with a
+        real (if empty) resolution, because the id itself is part of the
+        material."""
+        if not user_id:
+            return _epoch_hash(None, 0, None, None, None)
+        generation, program, season, league = self.resolve_epoch_state(
+            user_id, role, scope)
+        return _epoch_hash(user_id, generation, program, season, league)
+
+    # NOTE on #159 review finding 3 (the check->service TOCTOU): an earlier
+    # revision of this fix added a `run_scoped_read` here that wrapped the
+    # epoch comparison AND the dependent service call in one `_snapshot` —
+    # correct in isolation, but it holds the store's own lock
+    # (`SqlStore`/`InMemoryStore` `self._lock`, ACQUIRED FOR THE WHOLE
+    # TRANSACTION) across whatever `produce()` does, which is unbounded from
+    # this method's point of view. That deadlocked the EXISTING
+    # `test_context_switch_server_exit.py` harness, which parks a read
+    # INSIDE a wrapped ApiService method (i.e. inside that transaction) and
+    # then has the MAIN TEST THREAD read the store directly via `SqlStore.
+    # _get`'s OWN `with self._lock:` — a different thread blocking on a lock
+    # the parked thread holds while waiting on the harness to un-park it,
+    # which the blocked main thread can now never reach. It is also a live
+    # concern outside tests: a slow or blocked dependent read would hold the
+    # store's ONE process-wide lock for its full duration, stalling every
+    # OTHER request that touches the store at all, not only the one racing
+    # a lifecycle mutation. The fix that landed instead orders scoped reads
+    # against archive/reopen with a GATE (the same proven shape
+    # `web/server.py`'s `CONTEXT_GATE` already uses for the switch
+    # dimension) rather than a shared database transaction — see
+    # `web/server.py`'s `LIFECYCLE_GATE` and `Handler._read_under_context_
+    # gate`. This method stays store-transaction-free on purpose.
 
     # Every League-selection refusal uses this ONE message/reason, whatever the
     # underlying cause (#364 owner ruling): nonexistent, cross-Program,
@@ -584,7 +769,93 @@ class ContextService:
         This never CREATES a binding: an unbound pair is refused, and binding a
         League to a Season stays the authorized, audited job of
         ``setup_service.create_league_season``.
+
+        UNCHANGED three-tuple contract (PR #423): every existing caller —
+        production and the ~60 call sites across
+        ``tests/test_league_context_canonical.py``,
+        ``tests/test_active_context_league.py`` and
+        ``tests/test_league_context_races.py`` — unpacks exactly
+        ``(program, season, league)``. See :meth:`set_with_league_and_epoch`
+        for the epoch-returning variant the facade uses; this method is now a
+        thin wrapper over the same underlying work so the two can never drift
+        apart, and drops the fourth element rather than changing this
+        widely-depended-on shape.
         """
+        program, season, league, _epoch = self._set_with_league_locked(
+            user_id, role, scope, program_id, season_id, league_id)
+        return program, season, league
+
+    def set_with_league_and_epoch(self, user_id: Optional[str], role, scope,
+                                  program_id, season_id, league_id=None):
+        """Same as :meth:`set_with_league`, but ALSO returns the epoch
+        derived from the SAME snapshot as the write (PR #423 design §8.1) —
+        ``(program, season, league, epoch)``.
+
+        CALLED BY THE FACADE, UNCONDITIONALLY (correction: an earlier
+        revision of this docstring claimed the opposite — that claim went
+        stale the moment round-N review finding 3 landed, and sat
+        uncorrected through a full review round; it is fixed here).
+        ``api/service.py``'s ``set_active_context`` calls this method —
+        never plain :meth:`set_with_league` — on every invocation. Its own
+        ``include_epoch`` keyword controls only whether the epoch is kept
+        in *that method's* return value (dropped for the ~200 legacy
+        callers expecting a bare dict) or paired with the payload (the ONE
+        production caller, ``web/server.py``'s ``POST /api/context``
+        handler); the underlying call, and the single-snapshot epoch
+        derivation it buys, always happens.
+
+        THE RACE THIS CLOSES. Before finding 3, the HTTP handler called
+        :meth:`set_with_league` (the write, one transaction) and THEN a
+        SEPARATE ``current_epoch()`` call (a second, independent
+        transaction) to build the response epoch. Between those two
+        transactions, another replica could commit a second switch for the
+        SAME user, and the response would then describe THAT replica's
+        selection rather than the one this request's own write just made.
+        Folding the write and the epoch derivation into ONE ``_snapshot``
+        (what :meth:`_set_with_league_locked` does) makes "the epoch
+        matches the row this response carries" true by construction.
+
+        WHY THIS CLOSES THE CROSS-PROCESS CASE TOO, not merely the
+        in-process one ``CONTEXT_GATE.exclusive(user_id)`` (still held,
+        unchanged, at the HTTP call site) already covered on its own.
+        :meth:`_set_with_league_locked`'s ``work()`` acquires
+        ``epoch_fence_acquire_exclusive(user_fence_key(user_id))`` — a REAL
+        PostgreSQL advisory lock — FIRST, before any row is read, and holds
+        it for the WHOLE transaction: the epoch is derived at the END of
+        that SAME ``work()``, still inside the same held lock, released
+        only at commit. A second replica's own call to this method for the
+        SAME user therefore cannot even START its write until this one's
+        lock releases: the two calls fully serialize, one committing
+        (write and epoch together, atomically) before the other's
+        ``epoch_fence_acquire_exclusive`` is even granted. There is no
+        window for a second replica's write to land between THIS call's
+        write and an epoch read, because there is no separate read left to
+        land inside — the gap the earlier (now-corrected) revision of this
+        docstring described as a "narrow, stated residual gap" is closed,
+        not merely narrowed. See ``tests/test_epoch_fence_cross_replica.py``
+        for the real two-process, real-authenticated-HTTP proof of exactly
+        this claim (round-N+1 finding 3): two independent server
+        processes, a deterministic A->B->A (and B->A->B, and a genuinely
+        concurrent) ordering, every response's epoch independently
+        recomputed from a fresh read of the persisted row.
+
+        Kept as a SEPARATE method from :meth:`set_with_league`, rather than
+        changing that method's own return shape, so the widely-depended-on
+        two/three-tuple contract ~60 existing test call sites unpack stays
+        untouched — the two public methods differ only in whether the
+        epoch is dropped, sharing one validation/write/epoch-derivation
+        implementation in :meth:`_set_with_league_locked`."""
+        return self._set_with_league_locked(
+            user_id, role, scope, program_id, season_id, league_id)
+
+    def _set_with_league_locked(self, user_id: Optional[str], role, scope,
+                                program_id, season_id, league_id=None):
+        """Shared implementation for :meth:`set_with_league` /
+        :meth:`set_with_league_and_epoch` — always returns the full
+        ``(program, season, league, epoch)`` four-tuple; the two public
+        methods differ only in whether they drop the epoch, so the
+        validation/write/epoch-derivation logic exists in exactly one
+        place."""
         if not user_id:
             raise ValidationError(
                 "A signed-in user is required to set a working context.")
@@ -593,6 +864,15 @@ class ContextService:
                                   {"reason": "field_required"})
 
         def work():
+            # PR #423: the epoch fence's EXCLUSIVE hold, FIRST — before any
+            # read or lock below, matching the design's general "truly first"
+            # placement (§4.2/§4.4/§8.1). Per-user key: this writer already
+            # holds the affected account's own id, so it is row 1 of the
+            # design's per-user class, ordered against a scoped read's shared
+            # hold on the SAME key (``web/server.py``'s
+            # ``_read_under_context_gate``). Auto-released at this
+            # ``_snapshot``'s commit/rollback.
+            self.store.epoch_fence_acquire_exclusive(user_fence_key(user_id))
             # `sid` is a LOCAL working copy of the requested season_id, never a
             # rebinding of the enclosing parameter. Two reasons, both real:
             # assigning the closure variable would make Python treat it as local
@@ -658,11 +938,30 @@ class ContextService:
             # so a concurrent unbind / archive / revocation / competing context
             # write either orders wholly before this (and is seen, and refuses)
             # or wholly after it — never a half-applied or stale tuple.
+            generation = self._next_generation_locked(user_id)
             self.store.set_active_context(ActiveContext(
                 id=user_id, program_id=program_id, season_id=sid,
-                updated_at=self.clock(), league_id=league_id))
-            return (_detached(program), _detached(season), _detached(league))
+                updated_at=self.clock(), league_id=league_id,
+                generation=generation))
+            # PR #423 (design §8.1): the RESPONSE epoch, computed HERE, in the
+            # SAME snapshot as the write — not a second, separate
+            # `current_epoch()` call after commit. `server.py`'s own comment
+            # at the call site explains why a second call was needed before
+            # this fold existed: a second concurrent switch for the same user
+            # could otherwise land between the write and that second read and
+            # hand back an epoch for a selection this caller never asked for.
+            # Folding it into one snapshot makes "same transaction as the
+            # write" literally true for the epoch this response carries,
+            # rather than approximately true via the caller's own gate.
+            epoch = _epoch_hash(user_id, generation, program, season, league)
+            return (_detached(program), _detached(season), _detached(league),
+                    epoch)
 
+        # read_only defaults to False here (round-N+2): work() genuinely
+        # writes (set_active_context above), so this stays at the ORIGINAL
+        # write-strength transaction every caller of this method already
+        # depended on — unlike every read-only entry point above, this one
+        # must never pass read_only=True.
         return self._snapshot(work)
 
     # -- mutation ----------------------------------------------------------
@@ -687,7 +986,35 @@ class ContextService:
         None). Carrying one over would leave a League bound to a Program/Season
         it may not belong to — the one state the League axis must never reach.
         Callers that want to preserve or set a League use
-        :meth:`set_with_league`."""
+        :meth:`set_with_league`.
+
+        UNCHANGED two-tuple contract (PR #423): every existing caller (all in
+        ``tests/`` — the facade's ``set_active_context`` always routes
+        through :meth:`set_with_league`, even for a two-axis body, per
+        ``api/service.py``'s own docstring) unpacks exactly
+        ``(program, season)``. See :meth:`set_and_epoch` for the
+        epoch-returning variant."""
+        program, season, _epoch = self._set_locked(
+            user_id, role, scope, program_id, season_id)
+        return program, season
+
+    def set_and_epoch(self, user_id: Optional[str], role, scope,
+                      program_id, season_id):
+        """Same as :meth:`set`, but ALSO returns the epoch derived from the
+        SAME snapshot as the write (PR #423 design §8.1) —
+        ``(program, season, epoch)``. Not currently called in production —
+        the facade's ``set_active_context`` always routes through plain
+        :meth:`set_with_league` (see that method's own corrected docstring:
+        its epoch-returning twin, :meth:`set_with_league_and_epoch`, is ALSO
+        not wired to the facade this round). Added for symmetry and so a
+        future two-axis-only HTTP path gets the same same-snapshot epoch
+        guarantee without re-deriving this logic."""
+        return self._set_locked(user_id, role, scope, program_id, season_id)
+
+    def _set_locked(self, user_id: Optional[str], role, scope,
+                    program_id, season_id):
+        """Shared implementation for :meth:`set` / :meth:`set_and_epoch` —
+        always returns ``(program, season, epoch)``."""
         if not user_id:
             raise ValidationError(
                 "A signed-in user is required to set a working context.")
@@ -696,6 +1023,9 @@ class ContextService:
                                   {"reason": "field_required"})
 
         def work():
+            # PR #423: same placement/reasoning as set_with_league's own
+            # fence acquisition above — truly first, per-user key.
+            self.store.epoch_fence_acquire_exclusive(user_fence_key(user_id))
             programs = context_scope.authorized_program_ids(
                 self.store, role, scope, user_id)
             program = (self.store.get_program(program_id)
@@ -712,12 +1042,22 @@ class ContextService:
                 if season_id not in seasons or season is None:
                     raise NotFoundError("Season not found or not accessible.",
                                         {"reason": "season_not_accessible"})
+            generation = self._next_generation_locked(user_id)
             self.store.set_active_context(ActiveContext(
                 id=user_id, program_id=program_id, season_id=season_id,
-                updated_at=self.clock()))
-            return _detached(program), _detached(season)
+                updated_at=self.clock(),
+                generation=generation))
+            # PR #423 (design §8.1): the two-axis form has no League, so the
+            # epoch hash's league argument is simply None -- context_epoch
+            # already treats a None league as "no League selected"
+            # (context_epoch.py), the same value resolve()/set() without a
+            # League always produced.
+            epoch = _epoch_hash(user_id, generation, program, season, None)
+            return _detached(program), _detached(season), epoch
 
         # Validation + write share ONE serializable snapshot (with bounded retry),
         # so a concurrent revocation is either seen here (rejected non-oracle) or
         # ordered entirely after this call — never a half-applied hybrid.
+        # read_only defaults to False (round-N+2): work() genuinely writes
+        # (set_active_context above).
         return self._snapshot(work)

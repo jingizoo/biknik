@@ -4,8 +4,22 @@
 let view = "dashboard";     // dashboard|setup|import|calendar|games|roster|activity|public|readiness|player_home
 let gameView = "coach";     // coach | player (roster)
 let rosterSide = "home";    // home | away — which lineup the roster tab shows (#25)
+// Whether the user CHOSE the side above, as opposed to landing on the
+// default. #427: a scoped Coach must not LAND on the redacted opponent tab,
+// but must still be able to open it deliberately and read why it is closed —
+// so the auto-correction below applies only while this is false.
+let rosterSideChosen = false;
 let rosterTeamId = null;    // team_id of the currently shown lineup (for copy)
 let currentGame = null;     // game id whose roster we're viewing
+// The last batch-seating outcome (copy-previous / auto-fill) for THIS game and
+// side (#427). Carries identity — {game_id, team_id, source, seated[],
+// skipped[{player_id,name,reason}], deferred[]} — so the partial-result
+// warning can NAME the players who were not seated instead of reducing the
+// whole outcome to a copied count. Held in module state rather than in a
+// toast because the warning must SURVIVE the re-render the action itself
+// triggers: a toast is cleared by switchTab() and auto-clears after 4s, and a
+// coach who looks away misses the only statement that anything was skipped.
+let rosterBatch = null;
 let pickedPlayer = null;
 let wizard = null;          // {slot_id, league_id, division_id, home_id, away_id} when scheduling
 let iceBuilder = null;      // {form, preview} when the Ice Availability Builder is open (#158)
@@ -91,6 +105,87 @@ let contextSwitchSeq = 0;
 // token issued."
 let iceOperationSeq = 0;
 let importOperationSeq = 0;
+// Monotonic pass token for render() ITSELF (#215 browser-shard-3 flake) --
+// the same idiom as iceOperationSeq/importOperationSeq above, and for exactly
+// the reason stated there: "a stale response can just as easily be wrong
+// within the SAME context ... firing two of the same kind back to back and
+// having them resolve out of order -- none of which touch contextRevision at
+// all." render() is that surface too, and it was the one that never got a
+// token of its own. It is `async`, the overwhelming majority of its ~170 call
+// sites fire it WITHOUT awaiting, and every one of its DOM writes happens
+// AFTER its fetch chain -- so two renders started back to back in ONE context
+// resolve in whatever order the network returns, and the LOSER paints last.
+//
+// The failure that motivated this: demo-lifecycle.js's step (4). The
+// empty-state "Load demo data" click (the [data-demo-load] handler ->
+// afterDemoLifecycleChange -> render()) was still awaiting /api/demo/overview
+// when the header menu's reset action fired its own un-awaited render() (the
+// #demo-dropdown [data-demo-action] handler). The newer
+// pass painted and wired the typed-confirmation modal; the older pass then
+// landed, ran `c.innerHTML = viewHtml` and rebuilt the modal from
+// demoConfirmModalHtml -- whose markup ALWAYS emits an empty
+// #demo-confirm-input and a `disabled` [data-demo-confirm]. So the operator's
+// typed RESET and the enabled button were destroyed in the window between the
+// enable check and the click: the confirm click could never become
+// actionable, and the lifecycle POST was never issued at all. In CI that read
+// as a bare `page.waitForResponse: Timeout 30000ms exceeded`, because the
+// click promise never settled either.
+//
+// Bumped SYNCHRONOUSLY at the top of render(), before any await, so the
+// newest pass always wins; each pass snapshots it and rechecks it IMMEDIATELY
+// AFTER EVERY await, in render()'s own frame, before that response is applied
+// to anything. Standing down is safe by construction here (unlike the
+// contextRevision guards, which rely on the caller to schedule a follow-up
+// render): the pass that superseded this one is itself in flight and is the
+// one that paints.
+//
+// WHY EVERY await AND NOT ONLY THE DOM BOUNDARIES (#215 owner correction).
+// The first version of this guard was checked at the two DOM boundaries only
+// -- the catch block's banner and the paint below setChrome(). That protected
+// the DOM and, on its own, introduced a failure the pre-token code could not
+// produce. render() writes roughly twenty-five MODULE-level names on its way
+// down (currentGame, usersSelected, usersState, publicState, schedulerState,
+// importState, notifPrefs, feedTokens, deliveryState, officialsPool,
+// playersList, leagueTeams, seasonRegs, ... ), and a superseded pass went on
+// writing all of them before standing down at the paint. Before the token the
+// loser wrote state AND painted: wrong, but DOM and state agreed. After it,
+// the WINNER owns the DOM while the LOSER's writes land last -- a torn
+// combination, and every click handler in this file reads module state rather
+// than the DOM, so the next click acts on the loser's value. Observed as
+// exactly that: the Users view showing an account selected with its live
+// session listed under it, while `usersSelected` had been cleared by a
+// superseded pass, so Revoke posted to /api/accounts/null/... and the session
+// stayed signed in (e2e/coach-scope.js's final leg).
+//
+// So the recheck sits between the RESPONSE and its USE, which is what makes
+// the parity with iceOperationSeq/importOperationSeq above real rather than
+// merely claimed: those recheck before applying a response too (see the
+// Validate/Commit handlers, which set importState only after the check). A
+// per-await check is exact here, not merely conservative: JS is
+// single-threaded, so a newer render() can only claim the token while this
+// pass is SUSPENDED at an await -- the run between two awaits is a critical
+// section during which `renderPass` cannot move. Checking on every resume is
+// therefore both necessary and sufficient for "a superseded pass performs no
+// further module-level write".  Starting a newer render is not the only event
+// that supersedes a pass: changing identity does too, before the new identity
+// reaches its first render().  resetTransientUiState() therefore advances the
+// same token synchronously at that boundary, so an old privileged response
+// cannot land in the post-auth/pre-render window and repopulate state that the
+// reset just destroyed.
+//
+// The alternative shape -- stage everything pass-locally and commit
+// atomically at the boundary -- was rejected for THIS function: at least
+// eight of those names are read back INSIDE render() between their write and
+// the boundary (currentGame by the six game-scoped fetches below it,
+// playersList by commitSetupWorkflowCards, usersState.accounts and
+// usersSelected by the two statements after them, publicState.division by its
+// own standings fetch, standingsDivision by its fetch, schedulerState by
+// reconcileDraftSelection, importState.contextRevision by its own re-seed),
+// several of them through helpers that reach for module state directly. A
+// staged copy would have to be threaded through all of those, changing
+// intra-render behaviour, to buy nothing the per-await check does not already
+// guarantee.
+let renderPass = 0;
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -531,7 +626,115 @@ let contextScopedReadController = null;
 // failed.
 const contextScopedReadsInFlight = new Set();
 // The app's own statement of intent, read by the regression journey.
-const contextScopedReadAborts = [];   // {method, url, generation, at}
+const contextScopedReadAborts = [];   // {method, url, generation, dispatched,
+                                      //  discarded, at}
+
+// ===== THE CONTEXT EPOCH (#159 follow-up to #415) ========================
+//
+// WHY THE BARRIER ABOVE AND THE SERVER GATE BELOW IT ARE NOT ENOUGH. The gate
+// orders by ARRIVAL AT `do_GET`. This file orders by FETCH DISPATCH. Between
+// those two instants sits an interval neither process owns -- the browser's
+// request queue and the wire -- and a scoped read can sit in it across a whole
+// switch:
+//
+//     render() dispatches GET .../seasons/season_3/venue-candidates
+//     the operator switches; cancelContextScopedReads() aborts it, the promise
+//       SETTLES, and awaitContextScopedReadSettlement() therefore RETURNS
+//     POST /api/context reaches the server FIRST and commits
+//     only THEN does the GET reach do_GET -- and, having arrived after the
+//       writer, is correctly judged against the NEW tuple and correctly
+//       refused 404 by the unchanged exact-Season ceiling
+//
+// Nothing there is a bug: it is a correct answer to a question the operator
+// already withdrew. CI records it on main@1de50d7 and main@e385bfb, DESKTOP
+// leg of setup-state-matrix, with this file's own ledger showing that read as
+// generation=5 dispatched=true.
+//
+// AN ABORT IS NOT A CANCELLATION ON THE WIRE. `AbortController.abort()`
+// settles OUR promise. It does not un-send a request already dispatched and it
+// cannot stop the server answering one it has not yet read. So the missing
+// fact travels ON THE READ ITSELF: every scoped read echoes the SERVER-ISSUED
+// epoch of the selection it was rendered under, and the server discards
+// (204, no body, no ceiling) any read whose echo no longer matches the
+// persisted selection.
+//
+// NOTHING IS STORED ANYWHERE to make that work -- not here and not on the
+// server, which derives the epoch from the row it already persists. There is no
+// ledger to evict from and no TTL to expire, so a read delayed by an hour is
+// judged exactly as correctly as one delayed by a millisecond. See
+// backend/hockey_scheduler/services/context_epoch.py.
+//
+// IT GIVES THE CLIENT NO POWER IT DID NOT HAVE. Echoing a stale epoch throws
+// away YOUR OWN read; echoing the current one on a genuinely stale question
+// gets today's 404, unchanged; echoing garbage throws away your own read. The
+// header can never widen scope, never identify, and never serve a byte the
+// ceiling would have refused.
+//
+// THE ONE INVARIANT, and both halves of it were learned the hard way:
+//
+//   1. IT IS WRITTEN ONLY WHERE `contextOptions.selected` IS WRITTEN -- the
+//      whole-payload adoption in loadContextOptions() and the POST echo in
+//      sendContextSwitch(), and nowhere else. Both come from ONE server
+//      response, so the tuple and its epoch can never straddle a switch.
+//      It is also deliberately NOT cleared where `contextOptions` survives:
+//      see resetTransientUiState(), where clearing it left a tuple with no
+//      epoch and brought the CI 404 straight back.
+//   2. IT IS READ ONCE PER RENDER PASS, beside the Season id that pass will
+//      ask about, and passed DOWN to getJSONContextScoped -- never read at
+//      fetch time. A render captures its Season id and then awaits many times
+//      before issuing these reads; reading the epoch at the end of that would
+//      pair an old Season with a new epoch, the server would find the echo
+//      CURRENT, admit the read, and refuse it at the ceiling. That is the 404,
+//      reintroduced by the mechanism meant to remove it.
+//
+// Both rules say the same thing: the epoch must describe the tuple this file
+// is RENDERING, at the instant it decided what to render.
+let contextEpoch = null;
+
+// THE OTHER HALF OF THE DISCARD CONTRACT: "the client re-reads and moves on."
+// A 204 discard is the server saying "the selection or its Season's lifecycle
+// moved after you rendered". For an IN-APP switch the app has already moved
+// on — sendContextSwitch() adopts the fresh tuple+epoch from the POST echo and
+// re-renders — so a discarded read from the superseded pass needs nothing.
+// But the epoch also moves on changes THIS PAGE never performed: a switch or
+// an archive/reopen in a second tab, another operator archiving the selected
+// Season, or any raw API use (the venue-access-cleanup journey archives via
+// the API precisely because the shipped UI has no archive control). After one
+// of those, this page's reads discard while the app still believes its pass is
+// current — and without this function they would discard FOREVER, rendering
+// empty lists where history belongs (CI shard 2 caught exactly that: the
+// just-archived Season's allowed-venues history rendered "0 venues").
+//
+// So: when a CURRENT-generation read is discarded, re-read the options — which
+// adopts the fresh tuple and epoch TOGETHER, the only sanctioned adoption
+// point — and re-render under them. Generation-stale discards are excluded on
+// purpose: their successor pass is already running with a fresh pair, and
+// resyncing for them would fetch options once per abandoned read.
+//
+// TERMINATION, not a loop: after the adoption the page echoes the CURRENT
+// epoch, so its reads are admitted and no further discard fires. Another
+// discard can only be caused by another real change, each of which converges
+// the same way. The in-flight guard collapses a burst of discards from one
+// render pass (every Season's reads of one surface) into ONE options fetch.
+let contextEpochResyncInFlight = false;
+function requestContextEpochResync() {
+  if (contextEpochResyncInFlight) return;
+  contextEpochResyncInFlight = true;
+  (async () => {
+    try {
+      await loadContextOptions();
+      renderContextSwitcher();
+      // The same invalidation an in-app switch performs once its canonical
+      // new selection is known: supersede the pass whose reads were
+      // discarded (it may still be mid-flight, writing empties) and rebind
+      // revision-stamped consumers to the selection as it actually is.
+      contextRevision += 1;
+      render();
+    } finally {
+      contextEpochResyncInFlight = false;
+    }
+  })();
+}
 
 function contextScopedReadSignal() {
   if (!contextScopedReadController) {
@@ -554,7 +757,16 @@ function contextScopedReadSignal() {
 // reason the gate exists), so enrolment here is a UX nicety -- it stops a stale
 // answer from being rendered -- and never the ordering guarantee. Do not read
 // "not enrolled here" as "not context-scoped"; read the server table.
-async function getJSONContextScoped(p) {
+//
+// `renderedEpoch` is the epoch the CALLER captured beside the tuple it is
+// asking about, and it is a REQUIRED argument in spirit rather than a
+// convenience: this function must never read `contextEpoch` itself. The whole
+// point is that the caller's Season id and the echoed epoch come from the SAME
+// instant, and a fetch happens many awaits after that instant. Omitting it
+// sends no header, which the server treats exactly as a pre-#159 client — the
+// old 404 is then possible again, so a new call site that forgets this forfeits
+// the protection rather than silently getting a wrong-but-plausible one.
+async function getJSONContextScoped(p, renderedEpoch) {
   const generation = contextScopedReadGeneration;
   const signal = contextScopedReadSignal();
   let markSettled;
@@ -575,9 +787,19 @@ async function getJSONContextScoped(p) {
   //            the correct answer if the controller ever outlives a
   //            cancellation, and because a silently-dispatched read would be
   //            the one failure mode this whole barrier exists to prevent.
-  const abortedResult = (dispatched) => {
+  //   `discarded` marks the third shape, added with the epoch: the request was
+  //            delivered AND answered, but the server recognised it as one the
+  //            operator had superseded and answered 204 with no body. There is
+  //            no `requestfailed` for it and no 404 either -- which is the
+  //            entire point -- so it is recorded here as an abort (it is one)
+  //            with the extra field saying which kind. `dispatched` stays true
+  //            because it was; the settlement journey reconciles FAILURES
+  //            against dispatched aborts, so an extra abort with no matching
+  //            failure is inert there.
+  const abortedResult = (dispatched, discarded) => {
     contextScopedReadAborts.push({ method: "GET", url: p, generation,
-                                   dispatched, at: Date.now() });
+                                   dispatched, discarded: !!discarded,
+                                   at: Date.now() });
     return CONTEXT_READ_ABORTED;
   };
   try {
@@ -586,7 +808,47 @@ async function getJSONContextScoped(p) {
     // correct answer: do not dispatch it, so the server never sees a request
     // the ceiling would have to refuse.
     if (signal.aborted) return abortedResult(false);
-    const response = await fetch(p, { credentials: "same-origin", signal });
+    // THE EPOCH THIS READ WAS RENDERED UNDER — the caller's, captured with the
+    // tuple, never this function's view of `contextEpoch` at fetch time (see
+    // the note on the signature). Omitted entirely when there is none yet, e.g.
+    // before the first contextOptions load: the server treats an absent epoch
+    // as today's behaviour, so an un-epoched read is never WORSE off than it
+    // was before this existed — only unimproved.
+    const response = await fetch(p, { credentials: "same-origin", signal,
+      headers: renderedEpoch ? { "X-Context-Epoch": renderedEpoch } : {} });
+    // THE SERVER DISCARDED IT, because the selection moved while this request
+    // was in transport. A 204 carries no body, so there is nothing to drain and
+    // nothing to parse; classifying it as an abort is not a convenience but the
+    // literal truth -- it is the withdrawal we already made, finally taking
+    // effect at the only place that could apply it.
+    //
+    // WHEN THIS IS ACTUALLY REACHED, because it is not the common case and
+    // saying otherwise would be false. A read that cancelContextScopedReads()
+    // aborted never sees any response at all: Chromium tears the request down
+    // and the `catch` below classifies it. This branch is for the read the
+    // client CANNOT cancel -- one enrolled AFTER that cancellation, by a
+    // render() that ran while the switch's POST was still in flight. It is
+    // dispatched under the old epoch on a fresh, un-aborted controller, and the
+    // commit lands while it is still on the wire. `e2e/context-switch-late-
+    // arrival.js`'s held-POST leg drives exactly that.
+    //
+    // Checked BEFORE readApiResponse(): that helper maps an empty 2xx to `{}`,
+    // a SUCCESS-shaped value with no `error` key, which is indistinguishable to
+    // a caller from a real empty answer. Returning the abort sentinel instead
+    // keeps `result === CONTEXT_READ_ABORTED` a legitimate test and puts the
+    // read in the abort ledger the journeys reconcile, rather than leaving a
+    // discard looking like data.
+    if (response.status === 204) {
+      // A discard of a read the app still considers CURRENT means the change
+      // that moved the epoch happened outside this page (second tab, another
+      // operator, an API archive/reopen) — re-read the options and re-render,
+      // or these reads would discard forever. A generation-stale discard is
+      // the in-app case: its successor pass already carries the fresh pair.
+      if (generation === contextScopedReadGeneration) {
+        requestContextEpochResync();
+      }
+      return abortedResult(true, true);
+    }
     // Drains the body -- see SETTLEMENT MEANS THE BODY IS DRAINED above.
     const body = await readApiResponse(response);
     // Delivered in full, but the tuple moved while it was arriving. The body
@@ -747,6 +1009,100 @@ function placementSaveToast(result, successMessage) {
 
 /* ---------- shared ---------- */
 const bannerClass = (s) => s === "open_slot" ? "alert" : s === "needs_substitute" ? "warn" : s === "roster_confirmed" ? "ok" : "neutral";
+
+/* ---------- batch seating: the partial outcome, made visible (#427) -------
+   The owner's ruling: "the operator-facing response must make the partial
+   outcome visible … show the partial-result warning on desktop and 390px
+   rather than reducing it to a copied count."
+
+   ONE code->text map, here and nowhere else. The server's skip reasons are
+   STABLE MACHINE CODES (services/membership_spine.py) precisely so the UI can
+   translate them; a second table somewhere else is how a code ends up meaning
+   two different things on two screens. An UNKNOWN code falls back to the code
+   itself rather than to silence — a reason the server added and the UI has
+   not learned yet must still reach the operator, visibly wrong rather than
+   invisibly absent. */
+// Every SPINE leg collapses to one sentence on purpose: an operator cannot
+// act on "the denormalized season disagrees", and the remedy for all of them
+// is the same Setup remedy. The distinct machine codes are still what the
+// audit row records, so the diagnosis is not lost — only the wording is
+// shared.
+const SETUP_SPINE_TEXT =
+  "this game's league/season setup is inconsistent — check the team in Setup";
+const SKIP_REASON_TEXT = {
+  // discovery-stage: the history itself cannot prove the seat
+  prior_seat_unattributed:
+    "the previous game's roster row predates side tracking, so it can't be "
+    + "proved they played for this team — add them by hand",
+  // the player's own season registration
+  membership_transferred: "transferred to another team",
+  membership_released: "released from the team",
+  membership_inactive: "season registration is inactive",
+  membership_injured: "listed as injured",
+  membership_applicant: "season registration is still pending approval",
+  membership_other_team: "registered to a different team this season",
+  membership_other_league_season: "registered in a different competition",
+  no_eligible_membership: "no season registration on file",
+  player_inactive: "no longer an active player",
+  membership_player_missing: "the player record no longer exists",
+  // the TEAM's participation, not the player's — one message, because the
+  // remedy is the same for all of them and it is a Setup remedy
+  team_not_registered:
+    "the team's registration for this season is not active",
+  team_registration_conflict:
+    "the team has conflicting season registrations — fix them in Setup",
+  membership_team_missing: SETUP_SPINE_TEXT,
+  membership_season_missing: SETUP_SPINE_TEXT,
+  membership_league_season_missing: SETUP_SPINE_TEXT,
+  membership_league_mismatch: SETUP_SPINE_TEXT,
+  membership_program_mismatch: SETUP_SPINE_TEXT,
+  membership_denormalized_season_mismatch: SETUP_SPINE_TEXT,
+  // not an eligibility problem at all — the roster simply filled up
+  roster_target_met: "the roster was already full",
+};
+const skipReasonText = (code) => SKIP_REASON_TEXT[code] || code;
+const namedSkips = (rows) => rows
+  .map((r) => `${r.name || r.player_id} (${skipReasonText(r.reason)})`)
+  .join("; ");
+// The ONE sentence spoken in the live region — deliberately a summary, so the
+// polite announcement stays short while the persistent block below carries
+// every name. Returns "" when there is nothing partial to say.
+function rosterBatchAnnouncement(b) {
+  if (!b || !b.skipped.length) return "";
+  const n = b.skipped.length;
+  const verb = b.source === "auto_build_roster" ? "Auto-fill" : "Copy";
+  return b.seated.length
+    ? `${verb} added ${b.seated.length} player${b.seated.length === 1 ? "" : "s"}; `
+      + `${n} could not be added.`
+    : `${verb} added no players — ${n} candidate${n === 1 ? "" : "s"} `
+      + `${n === 1 ? "is" : "are"} not eligible.`;
+}
+// The PERSISTENT statement, rendered into the same .ros-warn block above the
+// roster toolbar that already carries the open-slot / backed-out warnings —
+// it survives every re-render, which the toast does not.
+//
+// Identity-gated (#365's discipline): a result belongs to the game and side
+// it was produced for, so switching game or lineup tab drops it rather than
+// letting a stale warning describe the wrong bench.
+function rosterBatchWarningHtml() {
+  const b = rosterBatch;
+  if (!b || b.game_id !== currentGame || b.team_id !== rosterTeamId) return "";
+  if (!b.skipped.length) return "";
+  const head = b.seated.length
+    ? `${b.seated.length} of ${b.seated.length + b.skipped.length} `
+      + `player${b.seated.length + b.skipped.length === 1 ? "" : "s"} added.`
+    // ZERO-SEAT: a successful call that seated nobody. It must not read as a
+    // failure, and it must not read as "nothing happened" either.
+    : `No players were added — none of the `
+      + `${b.skipped.length} candidate${b.skipped.length === 1 ? "" : "s"} `
+      + `is currently eligible.`;
+  const items = b.skipped.map((r) =>
+    `<li>${esc(r.name || r.player_id)} — ${esc(skipReasonText(r.reason))}</li>`
+  ).join("");
+  return `<div class="ros-warn ros-partial">
+    <div class="rp-head">⚠ ${esc(head)} Not added:</div>
+    <ul class="rp-list">${items}</ul></div>`;
+}
 // Same ok/warn/alert/neutral → green/orange/red/gray mapping the .banner
 // classes use (styles.css), so a roster status badge never disagrees with the
 // banner shown for the same status elsewhere (#118 Phase 3.2).
@@ -801,6 +1157,18 @@ const dayOf = (iso) => (iso || "").slice(0, 10);
 // zone and could print a different day than the time beside it.
 const fmtRowDate = (iso) => { const d = dayOf(iso); return d ? fmtDate(d) : ""; };
 
+/* A schedule row whose roster status this reader is not entitled to (#205).
+   The server OMITS `roster_status` entirely for such a row and flags it, so
+   nothing here may fall back to reading the absent key: every consumer below
+   asks `["roster_confirmed","locked"].includes(g.roster_status)`, and a
+   missing key answers that `false` — which would render as "Roster open" /
+   "not confirmed", i.e. the opponent's private state represented as an empty
+   operational state, the exact thing the omission exists to avoid. */
+const ROSTER_STATUS_HIDDEN = "Not shown for your role";
+const rosterStatusKnown = (g) => !g.roster_status_restricted;
+const rosterConfirmed = (g) => rosterStatusKnown(g)
+  && ["roster_confirmed", "locked"].includes(g.roster_status);
+
 // Per-game triage: derive a status badge + a staffing note from the schedule
 // row's real fields (officials assigned/accepted, roster status, result).
 function gameTriage(g) {
@@ -808,11 +1176,17 @@ function gameTriage(g) {
     return { badge: "final", label: "Final", note: "Result final", noteCls: "ok" };
   const assigned = g.officials_assigned || 0;
   const accepted = g.officials_accepted || 0;
-  const rosterOk = ["roster_confirmed", "locked"].includes(g.roster_status);
+  const rosterOk = rosterConfirmed(g);
   if (assigned === 0)
     return { badge: "needs", label: "Needs staff", note: "No officials assigned", noteCls: "bad" };
   if (accepted < assigned)
     return { badge: "needs", label: "Needs staff", note: "Officials pending acceptance", noteCls: "warn" };
+  // The roster leg is UNKNOWN, not failed — so neither "Roster open" (which
+  // asserts that team has an unconfirmed roster) nor "Ready" (which asserts
+  // it is set) may be claimed. Its own badge says which of the two checks
+  // actually passed and which was withheld.
+  if (!rosterStatusKnown(g))
+    return { badge: "partial", label: "Officials set", note: "Roster status not shown", noteCls: "muted" };
   if (!rosterOk)
     return { badge: "needs", label: "Roster open", note: "Roster not confirmed", noteCls: "warn" };
   return { badge: "ready", label: "Ready", note: "Officials & roster set", noteCls: "ok" };
@@ -2727,8 +3101,11 @@ function renderDashboard(ov, standings) {
 
   // Staffing gaps across all scheduled games.
   const needStaff = games.filter((g) => g.result_status !== "final" && gameTriage(g).badge === "needs");
+  // A row whose roster status is WITHHELD is not counted as "to confirm":
+  // that would assert an unconfirmed roster for a team this reader cannot
+  // see, and would put a number on this tile that no screen can explain.
   const toConfirm = games.filter((g) =>
-    g.result_status !== "final" && !["roster_confirmed", "locked"].includes(g.roster_status));
+    g.result_status !== "final" && rosterStatusKnown(g) && !rosterConfirmed(g));
 
   const pill = (cls, txt) => `<span class="ds-pill ${cls}">${esc(txt)}</span>`;
   const stat = (label, n, sub, pillHtml) => `
@@ -4308,11 +4685,19 @@ function renderSeasonParticipation(hv, ov, sv) {
   // candidate route now refuses the read that feeds the Allow picker. So the
   // selected Season still shows its OWN allowed-venues history, names included
   // -- that is what a historical Season is for -- but offers no control that
-  // cannot succeed. Read off `contextOptions.selected.read_only`, the same
-  // signal behind the switcher's "archived (read-only)" label and #ctx-ro
-  // badge, so this can never disagree with what the context bar shows.
-  const selectionIsReadOnly = !!(contextOptions && contextOptions.selected
-    && contextOptions.selected.read_only);
+  // cannot succeed.
+  //
+  // Read off the SEASON ROW's own `read_only` (see `isHistoricalSeason`
+  // below), not `contextOptions.selected.read_only`. This side carried the
+  // SAME staleness bug as the fetch loop and for the same reason: the cache is
+  // written only by a /api/context/options fetch, so in the window after an
+  // archive of the SELECTED Season this surface painted the Allow picker, the
+  // Revoke buttons and the permanent-cleanup action on a Season whose every
+  // one of those writes fails `season_archived`. The fetch-side fix alone
+  // would not have closed it -- `grantableFor` unions the scoped overview
+  // venues, so the picker had real facilities to list even with zero
+  // candidates fetched. `s` comes from the hierarchy this render pass read, so
+  // the controls and the server's refusal now answer to one fact.
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -4407,9 +4792,15 @@ function renderSeasonParticipation(hv, ov, sv) {
       // venues" — a claim this surface is no longer entitled to make.
       // ...and when the SELECTED Season is archived it is read-only HISTORY:
       // its own grant rows still render, names and all, but every control that
-      // would mutate them is gone (see `selectionIsReadOnly` above).
+      // would mutate them is gone (see the note above the map).
       const isSelectedSeason = s.id === selectedSeasonId;
-      const isHistoricalSeason = isSelectedSeason && selectionIsReadOnly;
+      // `s.read_only` is THIS Season's own row from the same-pass hierarchy —
+      // the server's own answer to "would a write here be refused" — so it can
+      // never lag behind an archive the way the cached context signal did. The
+      // `isSelectedSeason` conjunct stays because only the selected Season has
+      // fetched rows to render at all; every other Season takes the
+      // no-request placeholder branch regardless of its lifecycle.
+      const isHistoricalSeason = isSelectedSeason && !!s.read_only;
       const seasonAccessRows = isSelectedSeason
         ? (seasonVenueAccess[s.id] || []) : [];
       const venueNameById = {};
@@ -7686,7 +8077,8 @@ function renderWizard(ov) {
 // its own Open-Roster/Publish buttons are never nested inside a button.
 function gamesRow(g) {
   const t = gameTriage(g);
-  const badgeCls = { final: "gray", needs: "blocked", ready: "available" }[t.badge] || "gray";
+  const badgeCls = { final: "gray", needs: "blocked", ready: "available",
+                     partial: "gray" }[t.badge] || "gray";
   const expanded = gamesExpanded.has(g.game_id);
   const head = `<button class="li li-btn games-row" data-games-toggle="${esc(g.game_id)}" aria-expanded="${expanded}">
     <span class="li-time">${fmt(g.start_time)}</span>
@@ -7695,9 +8087,17 @@ function gamesRow(g) {
     <span class="pill ${badgeCls}">${esc(t.label)}</span>
     <span class="games-caret" aria-hidden="true">${expanded ? "▲" : "▼"}</span></button>`;
   if (!expanded) return head;
-  const confirmed = g.roster_status === "roster_confirmed" || g.roster_status === "locked";
-  const ck = (ok, lbl, meta) => `<div class="check ${ok ? "ok" : "todo"}"><span class="ic">${ok ? "✓" : "○"}</span>
+  const confirmed = rosterConfirmed(g);
+  // THREE states, not two (#205): `ok === null` is "withheld", which is
+  // neither done nor to-do. `ck(false, …)` renders ○ + the "todo" class and
+  // would claim this team's roster is not confirmed — a false operational
+  // claim about the other team rather than a true one about the reader.
+  const ck = (ok, lbl, meta) => {
+    const cls = ok === null ? "unknown" : ok ? "ok" : "todo";
+    const ic = ok === null ? "–" : ok ? "✓" : "○";
+    return `<div class="check ${cls}"><span class="ic">${ic}</span>
     <span class="lbl">${lbl}</span>${meta ? `<span class="meta">${meta}</span>` : ""}</div>`;
+  };
   // #277: the schedule review shows the same derived reserved span as the
   // calendar and the scheduler's draft rows (one backend derivation).
   const rsv = g.reserved
@@ -7705,7 +8105,9 @@ function gamesRow(g) {
     : "";
   const detail = `<div class="games-detail">
     ${ck(true, "Ice slot allocated")}${rsv}
-    ${ck(confirmed, "Roster", prettyStatus(g.roster_status))}
+    ${rosterStatusKnown(g)
+       ? ck(confirmed, "Roster", prettyStatus(g.roster_status))
+       : ck(null, "Roster", ROSTER_STATUS_HIDDEN)}
     ${ck((g.officials_assigned || 0) > 0 && (g.officials_accepted || 0) === g.officials_assigned, "Officials",
          g.officials_assigned ? `${g.officials_accepted}/${g.officials_assigned} accepted` : "None assigned")}
     ${ck(false, "Locker rooms", "Follow-up")}
@@ -7735,7 +8137,12 @@ function renderGames(ov) {
   // derived from the data actually present; status uses gameTriage's own label
   // so the filter and the row badge can never disagree.
   const f = gamesFilter;
-  const STATUSES = ["Needs staff", "Roster open", "Ready", "Final"];
+  // "Officials set" is gameTriage's label for a row whose roster status is
+  // withheld (#205). Offered only when such a row is actually present, per
+  // this block's own rule that the options come from the data — for an
+  // operator, who is entitled to every row's status, the list is unchanged.
+  const STATUSES = ["Needs staff", "Roster open", "Ready", "Final"]
+    .concat(all.some((g) => !rosterStatusKnown(g)) ? ["Officials set"] : []);
   const rinkNames = [...new Set(all.map((g) => g.rink_name).filter(Boolean))].sort();
   const shown = all.filter((g) => {
     if (f.division !== "all" && g.division_id !== f.division) return false;
@@ -7792,7 +8199,12 @@ const AVAIL_PILL = { available: "available", unavailable: "blocked",
 const AVAIL_LABEL = { all: "All", available: "Available", unavailable: "Unavailable",
   maybe: "Maybe", no_response: "No response" };
 
-function renderAvailSummary() {
+function renderAvailSummary(side) {
+  // WITHHELD IS NOT ABSENT (#427 final blocker, round 2). A side this caller
+  // does not read in full has no availability rollup for them, and the fetch
+  // is skipped rather than fired at a route that refuses it -- so say that,
+  // instead of silently omitting the card.
+  if (side && !isFullSide(side)) return restrictedNote("availability");
   if (!availSummary) return "";
   const c = availSummary.counts;
   const chip = (key) => {
@@ -7855,23 +8267,118 @@ function rosterGamePicker(ov) {
   </div>`;
 }
 
+/* ---------- Opponent-side redaction (#427) ----------
+   TWO LEVELS OF "RESTRICTED", and they are different states. render()'s own
+   `lineups.error` branch below already shows a whole-screen "Restricted"
+   banner when the caller is outside the GAME entirely and the read 403s
+   (#73/#154). This is the narrower one: the caller is legitimately inside
+   the game and reads their OWN side in full, while the OPPONENT'S side --
+   and only that -- is withheld. Same word because it is the same idea at a
+   different scope; different markup, so neither assertion can be satisfied
+   by the other.
+
+   A side a scoped Coach/Player may not read comes back with
+   `restricted: true` and `players: null` -- deliberately NOT `players: []`,
+   because an empty list already means something else, and something
+   operationally different, on both of these screens ("No lineup submitted."
+   on the Game Sheet, "No players on the roster yet" on the roster view).
+   Rendering redaction as emptiness would tell a coach their opponent had
+   failed to submit a lineup. These two helpers are the ONE place that decides
+   how a redacted side looks, so the roster view and the Game Sheet cannot
+   drift apart about it. */
+function isRestrictedSide(side) {
+  return !!(side && side.restricted);
+}
+/* WHICH SIDES CARRY PRIVATE WORKFLOW STATE, asked of the SERVER'S OWN LABEL
+   rather than guessed from the signed-in role (#427 final blocker, round 2).
+
+   `isRestrictedSide` is not the same question and could not answer this one.
+   An assigned official's `/lineups` sides come back `projection:
+   "submitted_lineup"` with `restricted: false` -- correctly, they ARE being
+   shown that side's submitted lineup -- so every "not restricted" gate read
+   TRUE for them and the Roster tab fetched
+   `/availability-summary?team_id=<the side being shown>` on every render,
+   with the side toggle switching teams. That route now refuses an official,
+   as it should, and a gate that keeps firing it would turn the leak into a
+   guaranteed 403 on every render instead of closing the screen honestly.
+
+   `full` is the ONE projection that carries per-player availability,
+   candidates and substitute workflow, so it is the ONE that may ask for
+   them. Keying on the label rather than on `currentUser.role` means the
+   server decides, once, for every role that exists now or later -- the same
+   reason `isRestrictedSide` exists rather than a role test. */
+function isFullSide(side) {
+  return !!(side && side.projection === "full");
+}
+function restrictedNote(kind) {
+  // `kind` only changes the WORDING; every one of them says the same thing --
+  // WITHHELD, not absent. One function, so the redacted look cannot drift
+  // between the screens that show it.
+  const COPY = {
+    sheet: ["Opponent lineup not shown",
+      "Only your own team's lineup is shown to you. An operator or an assigned official sees both."],
+    roster: ["Opponent lineup not shown",
+      "You manage your own team. The opposing lineup is private to their coach."],
+    // #427 final blocker: /board withholds `notifications`, `audit` and
+    // `audit_count` from a caller with no side of their own (an assigned
+    // official). Rendering that as `[]` would print "No notifications yet."
+    // and "No audit entries." -- claims that this GAME has had no activity,
+    // which is a different and false statement, and exactly the
+    // empty-operational-state mistake the redacted lineup already avoids.
+    activity: ["Game activity not shown",
+      "This game's notification and audit trail is private to the teams playing and the league office."],
+    // #427 final blocker round 2: an assigned official reads the SUBMITTED
+    // lineup, and per-player availability is not part of it. Saying so beats
+    // rendering nothing -- an absent card reads as "there is no availability
+    // data", the same empty-operational-state mistake as `players: []`.
+    availability: ["Availability not shown",
+      "Per-player availability is private to each team's coach and the league office. You are shown the submitted lineup."],
+    // The candidate pool and the substitute workflow, withheld together --
+    // they are one subject (who is NOT in the lineup and might be) and the
+    // submitted-lineup projection carries neither.
+    workflow: ["Candidate and substitute list not shown",
+      "Who else could play, and this team's substitute workflow, are private to their coach and the league office. You are shown the submitted lineup."],
+  };
+  const [title, detail] = COPY[kind] || COPY.roster;
+  return `<div class="restricted-side" data-restricted>
+    <div class="rs-head"><span class="badge gray">\u{1F512} Restricted</span></div>
+    <div class="rs-title">${esc(title)}</div>
+    <div class="rs-note">${esc(detail)}</div></div>`;
+}
+
 function renderRoster(lineups, ov) {
   if (!lineups) return `<div class="empty">Select a game from the Games tab.</div>`;
   if (!(rosterSide in lineups)) rosterSide = "home";
+  // Never LAND a scoped caller on the redacted tab (#427): if the side we
+  // would show is restricted and the other is not, that other one is theirs.
+  // Only while the user has not chosen a side themselves -- opening the
+  // opponent tab deliberately must show them WHY it is closed, not bounce.
+  const otherSide = rosterSide === "home" ? "away" : "home";
+  if (!rosterSideChosen && isRestrictedSide(lineups[rosterSide])
+      && !isRestrictedSide(lineups[otherSide])) {
+    rosterSide = otherSide;
+  }
   const side = lineups[rosterSide];
   rosterTeamId = side.team_id;
   const tab = (key, icon, label) => {
     const l = lineups[key];
-    return `<button class="ls ${rosterSide === key ? "active" : ""}" data-side="${key}">
+    // A restricted side has no private `status` to summarise. Say why the tab
+    // is closed rather than printing a status it does not carry -- and never
+    // read `l.status.status` off a `null`.
+    const sub = isRestrictedSide(l) ? "Restricted" : prettyStatus(l.status.status);
+    return `<button class="ls ${rosterSide === key ? "active" : ""}${isRestrictedSide(l) ? " restricted" : ""}" data-side="${key}">
       <span class="ls-team">${icon} ${esc(l.team_name)}</span>
-      <span class="ls-sub">${label} · ${prettyStatus(l.status.status)}</span></button>`;
+      <span class="ls-sub">${label} \u00b7 ${sub}</span></button>`;
   };
-  return `${rosterGamePicker(ov)}<div class="lineup-switch">${tab("home", "🏠", "Home")}${tab("away", "✈️", "Away")}</div>
-    <div class="segmented">
+  const body = isRestrictedSide(side)
+    ? restrictedNote("roster")
+    : `<div class="segmented">
       <button class="seg ${gameView === "coach" ? "active" : ""}" data-view="coach">Coach</button>
       <button class="seg ${gameView === "player" ? "active" : ""}" data-view="player">Player</button>
     </div><div style="padding-top:8px">${gameView === "coach" ? coachBody(side, ov) : playerBody(side)}</div>
-    ${renderAvailSummary()}`;
+    ${renderAvailSummary(side)}`;
+  return `${rosterGamePicker(ov)}<div class="lineup-switch">${tab("home", "\u{1F3E0}", "Home")}${tab("away", "\u2708\uFE0F", "Away")}</div>
+    ${body}`;
 }
 
 /* ---------- Game Sheet (read-only, both lineups) (#48) ---------- */
@@ -7883,6 +8390,20 @@ function fmtDateTime(iso) {
   return `${date} · ${fmt(iso)}`;
 }
 function sheetSide(side, label) {
+  // A RESTRICTED side keeps its public team name and says it is withheld
+  // (#427). It must NOT fall through to the code below, whose "No lineup
+  // submitted." empty state is a claim about the opponent's preparedness
+  // rather than about this reader's access.
+  if (isRestrictedSide(side)) {
+    return `<section class="gs-side gs-side-restricted">
+      <header class="gs-side-head">
+        <div><div class="gs-side-team">${esc(side.team_name)}</div>
+          <div class="gs-side-label">${esc(label)}</div></div>
+        <span class="badge gray">\u{1F512} Restricted</span>
+      </header>
+      ${restrictedNote("sheet")}
+    </section>`;
+  }
   const s = side.status;
   const occupying = side.players
     .filter((p) => p.group === "selected" && !p.backed_out)
@@ -9558,7 +10079,7 @@ function availableGroups(available, s, locked) {
     if (!list.length) return "";
     const need = open > 0 ? `<span class="need">need ${open}</span>` : `<span class="need ok">full</span>`;
     const rows = list.map((p) => playerRow(p,
-      `${posTag(p)}${locked ? "" : `<button class="act primary" data-act="select" data-id="${esc(p.id)}">Add</button>`}`)).join("");
+      `${posTag(p)}${ineligibleBadge(p)}${locked || !isSeatable(p) ? "" : `<button class="act primary" data-act="select" data-id="${esc(p.id)}">Add</button>`}`)).join("");
     return `<div class="avail-group"><div class="avail-head">${label} ${need}</div>${rows}</div>`;
   };
   const body = available.length
@@ -9572,6 +10093,26 @@ function availableGroups(available, s, locked) {
 // /api/games/{gid}/substitute-candidates, with a Send Offer for each enrolled
 // candidate that fits an open slot (offer → the player accepts/declines), plus
 // the existing Add-now coach override. Falls back to nothing until loaded.
+/* ---------- Ineligible-but-visible rows (#427) ----------
+   A row can be DURABLY OWNED by this side and still be unseatable: an
+   enrollment survives its candidate's participation ending, so the owning
+   Coach can still clean it up, while `substitutes_enrolled` (a LIVE count)
+   correctly drops. The service refuses an add/seat on such a row, so a UI
+   that offers the control is offering a rejected action -- and the coach
+   learns that only by pressing it and reading an error.
+
+   `eligible: false` on the row is that state, and these two helpers are the
+   ONE place that renders it: a visible label, and NO `data-act` attribute at
+   all on the disabled control (not merely `disabled`), so neither a click
+   nor the keyboard traversal the e2e journey uses can dispatch a seat. */
+function ineligibleBadge(p) {
+  return p.eligible === false
+    ? '<span class="badge red" data-ineligible>Ineligible</span>' : "";
+}
+function isSeatable(p) {
+  return p.eligible !== false;
+}
+
 const SUB_STATUS_BADGE = {
   enrolled: '<span class="badge blue">Enrolled</span>',
   offered: '<span class="badge orange">Offered</span>',
@@ -9705,6 +10246,19 @@ function coachBody(board, ov) {
   const subs = board.players.filter((p) => p.group === "substitute");
 
   if (!board.players.length) {
+    // WHAT AN EMPTY `players` MEANS DEPENDS ON THE PROJECTION (#427 final
+    // blocker, round 2). On a `full` side it really is the whole population,
+    // so "this team has no players, add them in Setup" is a true and useful
+    // instruction. On a SUBMITTED_LINEUP side it is only the players
+    // SUBMITTED -- the candidate pool was never sent -- so the same sentence
+    // becomes a false claim about another team's roster, made to a reader who
+    // is simply not being shown it. The honest reading there is the Game
+    // Sheet's own: nothing has been submitted yet, and the rest is withheld.
+    if (!isFullSide(board)) {
+      return `<div class="banner neutral"><h2>No lineup submitted</h2>
+        <p>This team has not submitted a lineup for this game yet.</p></div>
+        ${restrictedNote("workflow")}`;
+    }
     return `<div class="banner neutral"><h2>No roster yet</h2>
       <p>The home team has no players. Add players in Setup first (team player
       management is a follow-up: #25).</p></div>`;
@@ -9722,7 +10276,12 @@ function coachBody(board, ov) {
   if (s.open_goalie_slots > 0) warn.push(`Need ${s.open_goalie_slots} more goalie${plural(s.open_goalie_slots)}.`);
   if (s.open_skater_slots > 0) warn.push(`Need ${s.open_skater_slots} more skater${plural(s.open_skater_slots)}.`);
   if (backedOut.length) warn.push(`${backedOut.length} player${plural(backedOut.length)} backed out or removed — re-confirm or refill.`);
-  const warnHtml = warn.length ? `<div class="ros-warn">⚠ ${warn.map(esc).join(" ")}</div>` : "";
+  // The last batch outcome sits in its OWN .ros-warn block, immediately above
+  // the toolbar that produced it (#427). Separate from the slot warnings
+  // because it names players and reasons as a list rather than a run-on
+  // sentence, and because it must be identity-gated to this game and side.
+  const warnHtml = (warn.length ? `<div class="ros-warn">⚠ ${warn.map(esc).join(" ")}</div>` : "")
+    + rosterBatchWarningHtml();
 
   const toolbar = canEdit ? `<div class="ros-toolbar">
     <button class="act ghost" data-act="copy">⧉ Copy previous roster</button>
@@ -9751,12 +10310,38 @@ function coachBody(board, ov) {
   // not computed on the common coach path where outreachPanel replaces it.
   const subPoolCard = () => `<div class="section-title">Substitute pool</div>
     <div class="card">${subs.length ? subs.map((p) => {
-      const canAdd = canEdit && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
-      const ctrl = SUB_STATUS_BADGE[p.sub_status] || SUB_STATUS_BADGE.enrolled;
+      // #427: an INELIGIBLE row is never addable, whatever the slot counts
+      // say -- the service would refuse the seat.
+      const canAdd = canEdit && isSeatable(p)
+        && (p.slot_type === "goalie" ? s.open_goalie_slots > 0 : s.open_skater_slots > 0);
+      const ctrl = `${SUB_STATUS_BADGE[p.sub_status] || SUB_STATUS_BADGE.enrolled}${ineligibleBadge(p)}`;
       const btn = !canEdit ? "" : canAdd ? `<button class="act primary" data-act="add" data-id="${esc(p.id)}">Add</button>`
+        : !isSeatable(p) ? `<button class="act ghost" disabled title="This player is no longer eligible for this game — remove the enrolment instead.">Can't add</button>`
         : `<button class="act ghost" disabled>No slot</button>`;
       return playerRow(p, `${posTag(p)}${ctrl}${btn}`);
     }).join("") : `<div class="empty">No substitutes enrolled.</div>`}</div>`;
+
+  // #427: enrolments this side DURABLY OWNS whose candidate can no longer
+  // play. `substitutes_enrolled` is a LIVE count and correctly drops them, and
+  // /substitute-candidates -- the outreach queue that normally replaces the
+  // pool card above -- drops them too, on purpose: they are not offerable.
+  // But the ROW is still ours and still there, and the owning Coach is the
+  // only person who can clear it. Without this block it would be invisible on
+  // the one screen that can act on it. Cleanup ONLY: withdraw, never add or
+  // seat, because the service refuses those (see
+  // ParticipationEndingDoesNotFlipTheDurableSide).
+  //
+  // Only needed on the OUTREACH path: the fallback pool card above already
+  // lists every substitute row this side owns, and already renders a stale
+  // one with its Ineligible badge and a disabled control. Rendering both
+  // would show the same body twice.
+  const staleSubs = subs.filter((p) => !isSeatable(p));
+  const cleanupCard = () => !staleSubs.length ? "" : `<div class="section-title">Needs cleanup (${staleSubs.length})</div>
+    <div class="card">${staleSubs.map((p) => playerRow(p,
+      `${posTag(p)}${ineligibleBadge(p)}${canEdit
+        ? `<button class="act danger ghost" data-act="withdraw" data-id="${esc(p.id)}">Remove enrolment</button>`
+        : ""}`)).join("")}
+      <div class="empty">No longer eligible for this game — these enrolments can only be removed.</div></div>`;
 
   // Footer: lock control for roster managers, else a read-only note by role/scope.
   let footer;
@@ -9779,13 +10364,29 @@ function coachBody(board, ov) {
   }
 
   const total = s.target_goalies + s.target_skaters;
+  // WHAT A NON-FULL SIDE MUST NOT CLAIM (#427 final blocker, round 2). The
+  // two sections below are built from the candidate and substitute
+  // populations, and the SUBMITTED_LINEUP projection carries NEITHER -- it
+  // sends the selected rows and nothing else. Rendered by a screen written
+  // for the full side they collapse to their FULL-shaped empty states:
+  // "Available players (0) / All eligible players are on the roster or in the
+  // sub pool." and "No substitutes enrolled." Both are operational claims
+  // about THIS TEAM's preparedness, both are false, and both are exactly the
+  // failure the ruling names -- restricted data represented as an empty
+  // operational state rather than as withheld. So a side this caller does
+  // not read in full gets the withheld note in their place, from the SAME
+  // one-place helper the redacted opponent and the withheld activity log
+  // already use. The submitted lineup itself is real and stays.
+  const workflow = isFullSide(board)
+    ? `${availableGroups(available, s, !canEdit)}
+    ${subCandidates ? outreachPanel(canEdit) + cleanupCard() : subPoolCard()}`
+    : restrictedNote("workflow");
   return `
     <div class="banner ${bannerClass(s.status)}"><h2>${prettyStatus(s.status)}</h2><p>${esc(s.message)}</p></div>
     ${summary}${warnHtml}${toolbar}
     <div class="section-title">Roster (${onRoster.length}/${total})</div>
     <div class="card">${rosterRows}</div>
-    ${availableGroups(available, s, !canEdit)}
-    ${subCandidates ? outreachPanel(canEdit) : subPoolCard()}
+    ${workflow}
     ${footer}
     ${renderReschedulePanel(canRoster, ov)}
     `;
@@ -9836,7 +10437,9 @@ function playerBody(board) {
 
 /* ---------- Activity ---------- */
 const AUDIT_LABEL = {
-  roster_selected: "Roster selected", availability_set: "Availability updated",
+  roster_selected: "Roster selected",
+  roster_batch_seated: "Roster batch seated",
+  availability_set: "Availability updated",
   player_backed_out: "Player backed out", substitute_enrolled: "Substitute enrolled",
   substitute_withdrawn: "Substitute withdrawn", substitute_offered: "Substitute offered",
   substitute_accepted: "Substitute accepted", substitute_declined: "Substitute declined",
@@ -9925,19 +10528,36 @@ function renderActivity(board, ov) {
       : "Open a game roster to see its game activity.";
     return operatorSection + `<div class="section-title">Game</div><div class="card"><div class="empty">${note}</div></div>`;
   }
-  const names = {}; board.players.forEach((p) => (names[p.id] = p.name));
+  // WHICH activity this caller is being shown, stated by the server (#427
+  // final blocker) rather than inferred from a short list: "full" for an
+  // unscoped operator, "own_side" for a Coach/Player, "withheld" for a caller
+  // entitled to none of it. `audit_count` is counted over what was SENT, so
+  // it is never a count of rows that were withheld.
+  const withheld = board.audit_scope === "withheld";
+  const ownSide = board.audit_scope === "own_side";
+  const names = {}; (board.players || []).forEach((p) => (names[p.id] = p.name));
   const feed = [...(board.notifications || [])].reverse();
   const audit = [...(board.audit || [])].reverse();
   const dotFor = { coach: "var(--blue)", player: "var(--green)", team: "var(--purple)", guardian: "#b07bd6" };
-  const fHtml = feed.length ? feed.map((n) => tlRow(fmt(n.at),
+  // An OWN-SIDE feed that happens to be empty must not claim the game has had
+  // no activity -- it means "none of it was yours".
+  const emptyFeed = ownSide ? "No activity for your team yet." : "No notifications yet.";
+  const emptyAudit = ownSide ? "No audit entries for your team yet." : "No audit entries.";
+  const fHtml = withheld ? restrictedNote("activity") : (feed.length ? feed.map((n) => tlRow(fmt(n.at),
     `${esc(n.message)} <span style="color:var(--muted)">· to ${esc(n.audience)}${n.subject_player_id && names[n.subject_player_id] ? " · " + esc(names[n.subject_player_id]) : ""}</span>`,
-    dotFor[n.audience])).join("") : `<div class="empty">No notifications yet.</div>`;
-  const aHtml = audit.length ? audit.map((a) => tlRow(fmt(a.at),
+    dotFor[n.audience])).join("") : `<div class="empty">${esc(emptyFeed)}</div>`);
+  const aHtml = withheld ? restrictedNote("activity") : (audit.length ? audit.map((a) => tlRow(fmt(a.at),
     `<strong>${esc(AUDIT_LABEL[a.action] || a.action)}</strong>${a.subject_player_id && names[a.subject_player_id] ? " · " + esc(names[a.subject_player_id]) : ""}`,
-    "#94a3b8")).join("") : `<div class="empty">No audit entries.</div>`;
+    "#94a3b8")).join("") : `<div class="empty">${esc(emptyAudit)}</div>`);
+  // No count at all when the collection was withheld -- printing "(null)" or
+  // "(0)" would be the cardinality claim the server deliberately does not make.
+  const auditTitle = withheld ? "Game audit" : `Game audit (${board.audit_count})`;
+  const scopeNote = ownSide
+    ? `<div class="empty" data-activity-scope>Your own team's entries only. An operator sees the whole game's log.</div>`
+    : "";
   return `${operatorSection}
-    <div class="section-title">Game notifications</div><div class="card">${fHtml}</div>
-    <div class="section-title">Game audit (${board.audit_count})</div><div class="card">${aHtml}</div>
+    <div class="section-title">Game notifications</div><div class="card">${scopeNote}${fHtml}</div>
+    <div class="section-title">${esc(auditTitle)}</div><div class="card">${aHtml}</div>
     <div class="section-title">Delivery</div><div class="card">${stub("📨", "Push / email delivery", "Worker + device tokens", 32)}</div>`;
 }
 
@@ -10125,13 +10745,38 @@ async function submitSetup(kind) {
   await render();
 }
 
+// Take ONE batch-seating response and turn it into (a) the persistent
+// warning's state and (b) at most ONE live-region announcement (#427).
+//
+// SPOKEN EXACTLY ONCE. `toast` is set here and the `await render()` that
+// follows every rosterAction() drives updateToast() a single time — the same
+// route announceCardStatus() uses, and the same reason: #toast-root is the
+// ONE sitewide `role="status" aria-live="polite"` region (index.html), so
+// minting a second one per surface would speak the same sentence twice.
+// A response that skipped NOBODY says nothing at all: a fully successful
+// auto-fill or copy is already visible in the roster that just re-rendered.
+function recordRosterBatch(r) {
+  if (!r || r.error || !Array.isArray(r.skipped)) return;
+  rosterBatch = {
+    game_id: currentGame, team_id: r.team_id || rosterTeamId,
+    source: r.source, seated: r.seated || [], skipped: r.skipped,
+    deferred: r.deferred || [],
+  };
+  const said = rosterBatchAnnouncement(rosterBatch);
+  if (said) { toast = said; toastIsError = false; }
+}
+
 async function rosterAction(act, id) {
   toast = "";
   const B = `/api/games/${currentGame}`;
-  if (act === "build") await post(`${B}/build-roster`, { team_id: rosterTeamId });
+  // BOTH batch entry points route through the SAME renderer (#427). "build"
+  // used to DISCARD its response entirely and "copy" reduced its response to
+  // a copied count, so a partial outcome — the whole point of the ruling —
+  // was invisible on one and unstated on the other.
+  if (act === "build") recordRosterBatch(await post(`${B}/build-roster`, { team_id: rosterTeamId }));
   else if (act === "select") await post(`${B}/roster/select`, { player_ids: [id] });
   else if (act === "remove") await post(`${B}/roster/remove`, { player_id: id });
-  else if (act === "copy") { const r = await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }); if (r && !r.error) toast = `Copied ${r.copied} player${r.copied === 1 ? "" : "s"} from the previous game.`; }
+  else if (act === "copy") recordRosterBatch(await post(`${B}/roster/copy-previous`, { team_id: rosterTeamId }));
   else if (act === "confirm") await post(`${B}/availability`, { player_id: id, availability_status: "available" });
   else if (act === "backout") await post(`${B}/availability`, { player_id: id, availability_status: "unavailable" });
   else if (act === "enroll") await post(`${B}/substitutes/enroll`, { player_id: id });
@@ -10180,6 +10825,21 @@ function setChrome(ov) {
 
 async function render() {
   updateToast();
+  // Claim this pass BEFORE anything else (see `renderPass` above): the claim
+  // must be synchronous and must precede the factory-reset early return
+  // below, so that a render already awaiting its fetch chain is superseded by
+  // that synchronous success paint too, not just by a fetching pass.
+  //
+  // From here to the paint boundary the rule is uniform and has no
+  // exceptions: EVERY await in this function is followed immediately by
+  // `if (renderPass !== myRenderPass) return;`, in this frame, before the
+  // response it just took delivery of is applied to any module-level name.
+  // Three reads (`oppDetail`, `guardianHome`, `gOppDetail`) had to be split
+  // into a local read and a separate commit to make that order expressible at
+  // all -- assigning a module name straight out of an await expression lands
+  // the write before any guard can run. Anything added below inherits the
+  // rule; e2e/coach-scope.js's final leg is what fails if it does not.
+  const myRenderPass = ++renderPass;
   const c = document.getElementById("content");
   document.body.dataset.view = view;
   // #367 review: a completed factory reset (#256) already cleared this
@@ -10323,6 +10983,7 @@ async function render() {
       c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     }
     ov = await getJSON("/api/demo/overview");
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     if (ov && ov.error) throw new Error(ov.error.message);
     // Default the working game to the first one this user can actually open —
@@ -10336,31 +10997,48 @@ async function render() {
       currentGame = (acc[0] || ov.schedule[0]).game_id;
     }
     board = (view === "activity" && currentGame) ? await getJSON(`/api/games/${currentGame}/board`) : null;
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     // The roster tab and the game sheet both use both sides' lineups (#25/#48).
     lineups = (["roster", "sheet"].includes(view) && currentGame)
       ? await getJSON(`/api/games/${currentGame}/lineups`) : null;
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     // Availability rollup for the roster screen's selected side (#89).
     availSummary = null;
-    if (view === "roster" && lineups && lineups[rosterSide] && !lineups.error) {
+    // #427: only a side this caller reads in FULL has an availability rollup
+    // they may read, and asking anyway would be a guaranteed 403 on every
+    // render. Round 2 tightened this from "not restricted" to "full": an
+    // assigned official's sides are `submitted_lineup`, not `restricted`, so
+    // the old test passed for them and this fetch was the live UI path by
+    // which they recovered both sides' candidate pool -- names, per-player
+    // availability and all -- with the side toggle switching teams.
+    if (view === "roster" && lineups && !lineups.error
+        && isFullSide(lineups[rosterSide])) {
       const tid = lineups[rosterSide].team_id;
       const s = await getJSON(
         `/api/games/${currentGame}/availability-summary?team_id=${tid}`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (s && !s.error) availSummary = s;
     }
     // Coach substitute outreach queue for the shown side (#112), operator-only.
     subCandidates = null;
     addableSubs = null;
+    // Same tightening, same reason: the outreach queue and the addable list
+    // are substitute WORKFLOW state, which only a `full` side carries. The
+    // `manage_roster` gate happens to exclude officials today, but this must
+    // not depend on a role check agreeing with the server's projection.
     if (view === "roster" && gameView === "coach" && hasPerm("manage_roster")
-        && lineups && lineups[rosterSide] && !lineups.error) {
+        && lineups && !lineups.error && isFullSide(lineups[rosterSide])) {
       const tid = lineups[rosterSide].team_id;
       const q = await getJSON(
         `/api/games/${currentGame}/substitute-candidates?team_id=${tid}`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (q && !q.error) subCandidates = q;
       // Eligible-but-not-yet-enrolled team players a coach can add directly
       // (#114) — a separate list from the outreach queue above, which only
       // ever shows players who already have some enrollment.
       const a = await getJSON(
         `/api/games/${currentGame}/substitute-addable?team_id=${tid}`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (a && !a.error) addableSubs = a;
     }
     // Coach dashboard action card (#146): the next upcoming game's
@@ -10374,8 +11052,10 @@ async function render() {
       const next = nextUpcomingGame(coachTeamGames(ov, currentUser.scope.team_id));
       if (next) {
         const av = await getJSON(`/api/games/${next.game_id}/availability-summary`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (av && !av.error) dashAvailability = av;
         const sq = await getJSON(`/api/games/${next.game_id}/substitute-candidates`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (sq && !sq.error) dashSubQueue = sq;
       }
     }
@@ -10388,6 +11068,7 @@ async function render() {
         && (hasPerm("manage_roster") || hasPerm("manage_schedule"))
         && currentGame) {
       const rr = await getJSON(`/api/games/${currentGame}/reschedule`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (rr && !rr.error) rescheduleRequests = rr.requests;
     }
     // The Setup view itself isn't permission-hidden (any signed-in role can
@@ -10413,6 +11094,7 @@ async function render() {
     // used to crash for them, since it was fetched only under manage_setup).
     if (view === "setup" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
       const svr = await getJSON("/api/v2/setup/overview");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
       svOk = !!(svr && !svr.error);
       if (svOk) sv = svr;
@@ -10423,6 +11105,7 @@ async function render() {
     // bundled into the public demo overview.
     if (view === "setup" && hasPerm("manage_setup")) {
       const pl = await getJSON("/api/players");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       // #367 owner ruling / observed flake: this generation check was
       // MISSING here, and `playersList` is MODULE-level state read at paint
       // time rather than a local like `ov`/`sv`. So a superseded render()
@@ -10443,6 +11126,7 @@ async function render() {
       // so needs_assignment/teams_without_division match the canonical
       // parentage rules exactly instead of a client-side reinterpretation.
       const hvr = await getJSON("/api/v2/setup/hierarchy");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (contextRevision !== myRenderContext) return;  // superseded
       if (hvr && !hvr.error) hv = hvr;
       // Season participation (#180, cut to v2 canonical #233 Slice B2b): a
@@ -10473,6 +11157,25 @@ async function render() {
       // the ruling removed, one HTTP hop further down.
       const selectedSeasonId = (contextOptions && contextOptions.selected
         && contextOptions.selected.season_id) || null;
+      // THE EPOCH IS CAPTURED HERE, IN THE SAME STATEMENT GROUP AS THE TUPLE
+      // IT DESCRIBES (#159 follow-up), and passed down to the two scoped reads
+      // below rather than read at their fetch.
+      //
+      // `selectedSeasonId` is a LOCAL, captured once at the top of this block
+      // and then used many awaits later — that is the whole reason the reads
+      // can name a Season the page has since left. Reading `contextEpoch` at
+      // fetch time instead would pair THAT Season with an epoch from a later
+      // instant, and if a switch had landed in between the server would find
+      // the echo CURRENT, admit the read, and refuse it at the ceiling: the
+      // 404, reintroduced by the mechanism meant to remove it. Captured here,
+      // the pair is consistent by construction and the answer to a superseded
+      // read is a discard.
+      //
+      // The `contextRevision !== myRenderContext` guards below make the same
+      // read unreachable in most interleavings, but they are a SUPERSET signal
+      // owned by other concerns and they are not what this correctness argument
+      // should rest on. This makes the pairing a fact rather than a consequence.
+      const renderedContextEpoch = contextEpoch;
       // ...and an ARCHIVED selection fetches no candidates at all (#369 owner
       // ruling, follow-up). An archived Season is read-only history: the grant
       // this list feeds fails `season_archived`, so asking for candidates both
@@ -10481,13 +11184,29 @@ async function render() {
       // refuses that read generically, so issuing it would only produce a 404
       // per render; the gate is here so the request is never made and the
       // read-only surface holds nothing to render a picker from.
-      // `read_only` is the SAME signal the context bar's "archived
-      // (read-only)" option label and #ctx-ro badge already use -- it comes
-      // straight off /api/context/options' `selected`.
-      const selectionIsReadOnly = !!(contextOptions && contextOptions.selected
-        && contextOptions.selected.read_only);
+      //
+      // The gate reads the SEASON ROW's own `read_only` (below), NOT
+      // `contextOptions.selected.read_only`. That distinction is the whole fix.
+      // `contextOptions` is a client-side CACHE of the last
+      // /api/context/options fetch, so between an archive of the SELECTED
+      // Season and the next options load it still said "writable" -- the guard
+      // passed, the request went out, and the server answered its deliberate
+      // 404. CI shard 1 and this file's own e2e journeys caught it as an
+      // undeclared 404 on .../season_3/venue-candidates, roughly one run in
+      // three. Refreshing the cache harder would have left the defect CLASS
+      // alive, depending on every future mutation remembering to invalidate.
+      // `hv` was fetched a few lines above IN THIS PASS, so its `read_only` is
+      // as fresh as any client-side value can be -- which is NOT the same as
+      // current. They ARE two separate reads and they CAN describe different
+      // moments: a Season archived after the hierarchy response but before this
+      // request reaches the service still yields the deliberate 404. That
+      // residual window is a known, owner-accepted limit of a client-side
+      // guard, closed separately at the server contract (#203 transport work).
+      // An earlier version of this comment claimed the two reads could not
+      // differ; that was false, and contradicted this PR's own description.
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         // Same reason as the player list above, and more acute: this loop
         // awaits once per Program and twice per Season, so it is the widest
         // window in render() for a context switch to land mid-flight while
@@ -10510,6 +11229,7 @@ async function render() {
         }
         for (const s of (program.seasons || [])) {
           const rr = await getJSON(`/api/v2/setup/seasons/${s.id}/team-registrations`);
+          if (renderPass !== myRenderPass) return;  // superseded (#215)
           if (contextRevision !== myRenderContext) return;  // superseded
           seasonRegs[s.id] = (rr && rr.registrations) || [];
           // The SELECTED Season only -- see the ruling note above. Every other
@@ -10529,7 +11249,9 @@ async function render() {
             // stays exactly as it was: it is a discard-after-arrival check and
             // was never the thing that stopped the request.
             const va = await getJSONContextScoped(
-              `/api/v2/setup/seasons/${s.id}/venue-access`);
+              `/api/v2/setup/seasons/${s.id}/venue-access`,
+              renderedContextEpoch);
+            if (renderPass !== myRenderPass) return;  // superseded (#215)
             if (contextRevision !== myRenderContext) return;  // superseded
             seasonVenueAccess[s.id] = (va && va.venue_access) || [];
             // Grant CANDIDATES for this Season (#369 review): its own
@@ -10540,14 +11262,44 @@ async function render() {
             // Arena Manager gets a 403 here and simply has no picker, rather
             // than being handed every linked Venue in the installation by the
             // overview.
-            // Skipped outright for a READ-ONLY (archived) selection: no
-            // request is issued, so the archived surface can render no picker
-            // even by accident.
-            if (!selectionIsReadOnly) {
+            // TWO gates, closing two different holes.
+            //
+            // (i) `setupView === "hierarchy"` -- the SUB-VIEW that consumes
+            //     this list. `seasonVenueCandidates` is read in exactly one
+            //     place (`grantableFor`), called from exactly one function
+            //     (`renderSeasonParticipation`), reached from exactly one
+            //     branch (`setupView === "hierarchy"`). On the Setup HUB and
+            //     RECORDS sub-views this pass fetched the cross-Program
+            //     candidate directory and then discarded it unrendered, which
+            //     is the disclosure #369's ruling narrowed leaking back in
+            //     through a sub-view the ruling never considered -- its own
+            //     words are "fetched only where it is used". Every
+            //     `setupView = "hierarchy"` assignment happens BEFORE the
+            //     render() that must paint the picker (the segmented control,
+            //     and the `participation` / `venue_access` deep-link
+            //     destinations), so the surfaces that DO use it still get it.
+            //
+            //     This also removes a whole class of doomed request. An
+            //     archive that lands DURING a pass -- after the hierarchy read
+            //     above and before this fetch -- is a genuine race that no
+            //     client-side guard can win, because gate (ii) can only be as
+            //     fresh as the read it came from. The only way not to lose that
+            //     race is not to have issued the request, and a hub render now
+            //     issues none at all. It stays open on the hierarchy sub-view,
+            //     narrowed to the gap between those two reads.
+            //
+            // (ii) `!s.read_only` -- a READ-ONLY (archived) selection asks for
+            //     nothing, so the archived surface can render no picker even
+            //     by accident. `s.read_only` is this Season's OWN row out of
+            //     the hierarchy this pass just read -- see the note above the
+            //     loop for why the cached context signal cannot be used here.
+            if (setupView === "hierarchy" && !s.read_only) {
               // Scoped for the same reason as venue-access above -- and this is
               // the exact request CI shard 1 recorded 404ing at 390px.
               const vc = await getJSONContextScoped(
-                `/api/v2/setup/seasons/${s.id}/venue-candidates`);
+                `/api/v2/setup/seasons/${s.id}/venue-candidates`,
+                renderedContextEpoch);
+              if (renderPass !== myRenderPass) return;  // superseded (#215)
               if (contextRevision !== myRenderContext) return;  // superseded
               seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
             }
@@ -10599,23 +11351,31 @@ async function render() {
       let progress = setupProgressRead(CARD_READ.UNAUTHORIZED, null);
       if (hasPerm("manage_arena")) {
         const pr = await getJSON("/api/v2/setup/progress");
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (contextRevision !== myRenderContext) return;  // superseded
         progress = setupProgressReadOf(pr);
       }
       commitSetupWorkflowCards({ sv: sv, ov: ov, players: playersList,
         svOk: svOk, playersOk: playersOk, progress: progress });
     }
-    // The game sheet also needs the officials pool for its assign control (#30).
-    if (view === "sheet") {
+    // The game sheet needs the installation-wide officials pool only for its
+    // operator-only assign control (#30).  Non-operators still see already-
+    // assigned officials through the game-scoped lineups payload and may see
+    // #367's separate active-context Dashboard projection; neither contract
+    // requires probing the private global directory just to render this sheet.
+    if (view === "sheet" && hasPerm("manage_schedule")) {
       const op = await getJSON("/api/officials");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       officialsPool = (op && op.officials) || [];
     }
     // The signed-in official's inbox (#55).
     if (view === "inbox") inbox = await getJSON("/api/me/assignments");
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     // The official's own availability windows (#88).
     officialAvailability = [];
     if (view === "inbox" && inbox && inbox.official_id) {
       const av = await getJSON(`/api/officials/${inbox.official_id}/availability`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (av && !av.error) officialAvailability = av.availability || [];
     }
     // The signed-in player's own home screen (#107): next game, attendance,
@@ -10624,21 +11384,36 @@ async function render() {
       // Skip the heavy player-home read while an opportunity detail is open —
       // renderPlayerHome short-circuits to the detail and discards playerHome.
       if (!oppDetailGame) playerHome = await getJSON("/api/me/player-home");
-      oppDetail = oppDetailGame
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
+      // Read, CHECK, then commit -- `oppDetail` is module-level, so assigning
+      // straight out of the await expression would land the write before any
+      // guard could run (#215 owner correction).
+      const oppDetailRead = oppDetailGame
         ? await getJSON(`/api/me/substitute-opportunities/${encodeURIComponent(oppDetailGame)}`)
         : null;
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
+      oppDetail = oppDetailRead;
     }
     // The signed-in guardian's linked-junior surface (#26): each verified
     // junior's Player Home payload, plus a junior-scoped opportunity detail
     // when one is open. Same skip-the-list-while-detail-open shape as above.
     if (view === "guardian_home") {
-      if (!gOpp) guardianHome = await getJSON("/api/me/guardian/home");
-      gOppDetail = gOpp
+      // Same read/check/commit split as `oppDetail` above: both names are
+      // module-level (#215 owner correction).
+      if (!gOpp) {
+        const guardianHomeRead = await getJSON("/api/me/guardian/home");
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
+        guardianHome = guardianHomeRead;
+      }
+      const gOppDetailRead = gOpp
         ? await getJSON(`/api/me/guardian/${encodeURIComponent(gOpp.jid)}/substitute-opportunities/${encodeURIComponent(gOpp.game_id)}`)
         : null;
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
+      gOppDetail = gOppDetailRead;
     }
     // Notifications feed drives the bell badge on every view (#32).
     const nf = await getJSON("/api/notifications");
+    if (renderPass !== myRenderPass) return;  // superseded (#215)
     if (nf && !nf.error) notifState = nf;
     // Pilot readiness checklist (#104), operator-only. Everything else the
     // card needs (app mode/store/delivery mode, demo data + fixture counts)
@@ -10651,6 +11426,7 @@ async function render() {
     // whenever this operator-only endpoint has a hiccup.
     if (view === "readiness" && hasPerm("manage_setup")) {
       const rd = await getJSON("/api/readiness");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       readinessCheck = (rd && !rd.error) ? rd : null;
     }
     // Self-service channel preferences for the signed-in user (#81).
@@ -10661,6 +11437,7 @@ async function render() {
       if (ref) {
         const pr = await getJSON(
           `/api/notifications/preferences?recipient_ref=${encodeURIComponent(ref)}`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (pr && !pr.error) notifPrefs = pr;
       }
     }
@@ -10672,6 +11449,7 @@ async function render() {
       if (actor) {
         const ft = await getJSON(`/api/calendar-feeds?actor_type=${actor.actor_type}`
           + `&actor_ref=${encodeURIComponent(actor.actor_ref)}`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (ft && !ft.error) feedTokens = (ft.feed_tokens || []).filter((t) => !t.revoked);
       }
     }
@@ -10683,6 +11461,7 @@ async function render() {
         getJSON("/api/notifications/deliveries"),
         getJSON("/api/notifications/device-tokens"),
       ]);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       officialsPool = (op && op.officials) || [];
       deliveryState = {
         contacts: (contacts && contacts.contacts) || [],
@@ -10708,6 +11487,7 @@ async function render() {
         schedulerState.preview = null;
       }
       const dr = await getJSON("/api/scheduler/drafts");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       const drafts = (dr && dr.draft_games) || [];
       const previousDrafts = schedulerState.drafts;
       schedulerState.drafts = drafts;
@@ -10750,12 +11530,14 @@ async function render() {
     // Account/session admin, League-Admin only (#78).
     if (view === "users" && hasPerm("manage_users")) {
       const acc = await getJSON("/api/accounts");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       usersState.accounts = (acc && acc.user_accounts) || [];
       if (usersSelected && !usersState.accounts.some((a) => a.id === usersSelected)) {
         usersSelected = null;
       }
       if (usersSelected) {
         const s = await getJSON(`/api/accounts/${usersSelected}/sessions`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         usersState.sessions = (s && s.sessions) || [];
       } else {
         usersState.sessions = [];
@@ -10765,17 +11547,21 @@ async function render() {
       // (#114); manage_users implies manage_setup for every role that holds
       // it today (only league admin), so this fetch never 403s in practice.
       const gl = await getJSON("/api/guardians/links");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       guardianLinksState = Array.isArray(gl) ? gl : [];
       const pl = await getJSON("/api/players");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       playersList = Array.isArray(pl) ? pl : [];
       // Officials pool for the create-account form's Official scope dropdown
       // (#135) — same data the game sheet's assign control already uses.
       const op = await getJSON("/api/officials");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       officialsPool = (op && op.officials) || [];
     }
     // Public surface (#83): schedule + standings from public-safe endpoints.
     if (view === "public") {
       const sch = await getJSON("/api/public/schedule");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       // A 5xx/non-JSON outage (now surfaced by getJSON as {error}) routes to the
       // shared "Could not load data" + Retry banner below, not an empty schedule.
       if (sch && sch.error) throw new Error(sch.error.message);
@@ -10785,6 +11571,7 @@ async function render() {
       }
       if (publicTab === "standings" && publicState.division) {
         const st = await getJSON(`/api/public/standings/${publicState.division}`);
+        if (renderPass !== myRenderPass) return;  // superseded (#215)
         if (st && st.error) throw new Error(st.error.message);
         publicState.standings = st;
       }
@@ -10796,11 +11583,13 @@ async function render() {
       }
       standings = standingsDivision
         ? await getJSON(`/api/standings/${standingsDivision}`) : null;
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     }
     // The Dashboard shows a standings snapshot for the first division.
     if (view === "dashboard" && ov.divisions[0]) {
       standings = await getJSON(`/api/standings/${ov.divisions[0].id}`);
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
       if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     }
     // Home/Tasks hub setup-progress card (#330) — only for a role that can
@@ -10814,6 +11603,12 @@ async function render() {
     // held model whose tuple has moved as stale, so blanking it from here
     // would only discard data the stale contract says to keep showing.
   } catch (e) {
+    // Superseded (see `renderPass`): a newer render() owns #content. This
+    // pass's failure is not the current pass's failure -- painting the
+    // backend-error banner here would replace whatever the newer pass has
+    // already put on screen with an error for a question nobody is still
+    // asking, and would settle its focus intent on this pass's behalf.
+    if (renderPass !== myRenderPass) return;
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
       <p>The backend may not be running. ${esc(e.message || e)}</p></div>
@@ -10832,6 +11627,18 @@ async function render() {
     return;
   }
 
+  // THE stale-paint boundary (see `renderPass`) -- the LAST of this pass's
+  // supersession checks, not the only one: every await above already rechecks
+  // the token before applying its response, so a pass that reaches this line
+  // has provably written no module state since a newer pass appeared. What is
+  // left to protect here is the DOM. Everything below this line writes to the
+  // document -- the header chrome, the demo menu, the context switcher, the
+  // Restricted banner, and the `c.innerHTML = viewHtml` paint that rebuilds
+  // the modal from scratch. A pass that a newer render() has already
+  // superseded must write NONE of it: the newer pass is in flight and is the
+  // one that paints, so standing down here leaves the newest state on screen
+  // instead of overwriting it with this pass's older data.
+  if (renderPass !== myRenderPass) return;
   setChrome(ov);
   updateNotifBadge();
   // Keep the header demo control's Load↔Reset label in step with the actual
@@ -11333,14 +12140,14 @@ async function render() {
   if (view === "setup") restorePendingCardWriteFocus();
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
-  c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
+  c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; rosterSideChosen = true; toast = ""; render(); });
   // Roster game picker (#154): switching the game resets the per-game view
   // state (side, availability filter, the coach's fetched sub queues) so the
   // new game's roster never renders against the previous game's data.
   const rosterGameSel = c.querySelector("#roster-game");
   if (rosterGameSel) rosterGameSel.onchange = () => {
     currentGame = rosterGameSel.value;
-    rosterSide = "home"; availFilter = "all";
+    rosterSide = "home"; rosterSideChosen = false; availFilter = "all";
     availSummary = null; subCandidates = null; addableSubs = null; rescheduleRequests = null;
     toast = ""; render();
   };
@@ -12881,6 +13688,12 @@ function resetTransientViewState(next) {
   // Same discipline for the guardian surface (#26): leaving "My Players"
   // clears any open junior checkout confirm / opportunity detail.
   if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
+  // A batch-seating outcome describes ONE visit to ONE game's roster (#427).
+  // It is already identity-gated to (currentGame, rosterTeamId) so a game or
+  // lineup switch drops it on its own; this clears it on the way OUT so
+  // coming back to the roster never reopens a warning about work the coach
+  // has since finished elsewhere.
+  if (next !== "roster") rosterBatch = null;
 }
 
 function switchTab(next) {
@@ -13098,6 +13911,18 @@ async function loadContextOptions() {
   const o = await getJSON("/api/context/options");
   if (mySeq !== contextOptionsLoadSeq) return;  // superseded by a newer load
   contextOptions = (o && !o.error) ? o : null;
+  // THE EPOCH AND THE TUPLE ARE ADOPTED TOGETHER, from the same payload, under
+  // the same supersession guard. That is the invariant the whole mechanism
+  // rests on: what this file echoes on a scoped read must be the epoch of the
+  // tuple this file is rendering. Two separate assignments -- or adopting the
+  // epoch from a response that did not also carry `selected` -- would let the
+  // pair straddle a switch, which either discards live reads or admits dead
+  // ones. A failed/superseded load leaves the previous epoch in place rather
+  // than clearing it, so a transient options failure does not silently turn the
+  // page's reads back into un-epoched ones.
+  if (contextOptions && contextOptions.context_epoch) {
+    contextEpoch = contextOptions.context_epoch;
+  }
 }
 // Restore on load: the persisted context is already loaded above; if the URL
 // carries a DIFFERENT context, adopt it — delegating the authorization decision
@@ -13532,6 +14357,17 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
     // refetch below.
     contextOptions.saved = { program_id: r.program_id,
       season_id: r.season_id, league_id: r.league_id };
+    // ...and the EPOCH moves with them, from the same echo, in the same block
+    // (#159 follow-up). The rule is one line long and this is the second and
+    // last place that obeys it: the epoch is adopted exactly where
+    // `contextOptions.selected` is written, never anywhere else. Adopting it a
+    // statement earlier -- as soon as the POST answered, before `selected` was
+    // patched -- would leave a window in which the page renders the OLD tuple
+    // while echoing the NEW epoch, and every scoped read issued in that window
+    // would be ADMITTED and then judged against a selection it was not
+    // rendered under, which is precisely the 404 this whole mechanism exists
+    // to prevent. Guarded by the same `if (contextOptions)` for that reason.
+    if (r.context_epoch) contextEpoch = r.context_epoch;
   }
   // Second bump (#331 review round 8): the FIRST bump above only made the
   // PRIOR selection's mutations uncommittable at intent time, before
@@ -13966,6 +14802,12 @@ function gateChrome() {
 // across a persona switch would show one user's confirmation/secret to the
 // next signed-in user.
 function resetTransientUiState() {
+  // Invalidate every render owned by the departing identity BEFORE clearing
+  // any of its state. signIn() awaits context reconciliation between setUser()
+  // and the arriving identity's render(); without this boundary claim, a
+  // privileged response delivered in that window still holds the current
+  // renderPass and can write the private data straight back after this reset.
+  renderPass += 1;
   checkoutConfirm = null; oppDetailGame = null; oppDetail = null;
   gCheckout = null; gOpp = null; gOppDetail = null;
   newFeedUrl = null;
@@ -13978,6 +14820,7 @@ function resetTransientUiState() {
   // different operator's session could get published by a click the new
   // operator never meant to make.
   rosterSide = "home";
+  rosterSideChosen = false;
   availFilter = "all";
   gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };
   gamesExpanded = new Set();
@@ -13990,6 +14833,11 @@ function resetTransientUiState() {
   // without a page reload, that role would see the previous operator's
   // fetched player roster.
   playersList = [];
+  // officialsPool is the installation-wide staff directory and is fetched
+  // only for MANAGE_SCHEDULE/MANAGE_USERS surfaces.  Destroy it at the same
+  // identity boundary as playersList so a no-reload operator -> lower-role
+  // switch cannot retain the previous operator's private pool in memory.
+  officialsPool = [];
   // guardianLinksState (#35) isn't currently reachable by a lower-privileged
   // role either — renderUsers() gates its whole body (including the
   // Guardian Links card) on hasPerm("manage_users") before touching this
@@ -14145,6 +14993,27 @@ function resetTransientUiState() {
   // superseded switch already does.
   contextSwitchQueued = null;
   contextSwitchSeq += 1;
+  // `contextEpoch` IS DELIBERATELY NOT CLEARED HERE (#159 follow-up), and this
+  // is the one place that looks like it should be. It was, in the first cut of
+  // this change, and that reintroduced the very 404 the epoch exists to
+  // prevent: `contextOptions` deliberately SURVIVES an identity change (see the
+  // paragraph below — it is the last server-confirmed selection, and the hash
+  // is rewound to it), so clearing the epoch beside it leaves the page holding
+  // a tuple with no epoch. The next render then issues scoped reads for the
+  // DEPARTING identity's Season with no header at all, the server treats that
+  // as "no epoch supplied" and applies the ceiling, and the answer is the CI
+  // 404 — reproduced locally in `setup-state-matrix`'s phone leg as
+  // `GET .../seasons/season_3/venue-candidates -> 404` with the abort ledger
+  // showing `generation=5 dispatched=true`.
+  //
+  // THE RULE IS THE PAIRING, not the lifetime: the epoch must travel with
+  // whatever tuple this file is rendering, and go stale exactly when that tuple
+  // does. Kept here, those same reads echo the departing identity's epoch, the
+  // server compares it against the ARRIVING session's own row, it cannot match,
+  // and they are discarded (204) instead of refused. Nothing is disclosed by
+  // keeping it: it is an opaque digest that identifies nothing and authorizes
+  // nothing, and `contextOptions` beside it holds actual Program and Season
+  // names.
   // ...and the same for a switch whose POST has already LEFT but has not yet
   // been ANSWERED. #369 made sendContextSwitch() publish the intended
   // selection into location.hash BEFORE its POST, so the hash can never lag
