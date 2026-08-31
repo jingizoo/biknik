@@ -957,12 +957,24 @@ _DO_HEAD_SAFE_SHAPE = (
     "self._head_only = True",
     "try:\n    self.do_GET()\nfinally:\n    self._head_only = False",
 )
+#: The exact degraded-store-aware HEAD shape.  Its guard sits inside ``try`` so
+#: ``_head_only`` is always restored and is set before the 503 is serialized;
+#: that is what preserves GET's representation headers while suppressing bytes.
+_DO_HEAD_DEGRADED_SAFE_SHAPE = (
+    "self._head_only = True",
+    "try:\n    if self._store_unavailable():\n        return\n    self.do_GET()\n"
+    "finally:\n    self._head_only = False",
+)
 #: The EXACT (post-docstring) body of ``do_OPTIONS`` today. Same rationale.
 _DO_OPTIONS_SAFE_SHAPE = (
     "path = self.path.split('?', 1)[0]",
     "methods = self._supported_methods(path)",
     "if not methods:\n    return self._send_status(404)",
     "return self._send_status(204, [('Allow', ', '.join(sorted(methods)))])",
+)
+_DO_OPTIONS_DEGRADED_SAFE_SHAPE = (
+    "if self._store_unavailable():\n    return",
+    *_DO_OPTIONS_SAFE_SHAPE,
 )
 
 
@@ -1074,9 +1086,10 @@ class _DispatchWalker:
     def _require_safe_verb_shape(self, name: str, fn: ast.FunctionDef) -> None:
         """Raise unless ``fn`` (a ``do_<VERB>`` NOT walked as a dispatch entry
         point) is one of the shapes server.py is known to use for a verb that
-        selects no route: a bare ``self._method_fallback(<VERB>)`` (PUT,
-        PATCH, DELETE, and any future verb following the same convention), or
-        ``do_HEAD``'s / ``do_OPTIONS``'s own exact bodies. Anything else --
+        selects no route: a bare ``self._method_fallback(<VERB>)`` (PUT, PATCH,
+        DELETE, and any future verb following the same convention), or
+        ``do_HEAD``'s /
+        ``do_OPTIONS``'s own exact bodies. Anything else --
         real routing logic, a renamed local, an added statement, a wholly new
         verb that doesn't follow the fallback convention -- raises, every
         time, because the comparison is the COMPLETE body, not a name.
@@ -1085,9 +1098,11 @@ class _DispatchWalker:
         body = _without_leading_docstring(fn.body)
         unparsed = tuple(ast.unparse(stmt) for stmt in body)
         if name == "do_HEAD":
-            safe = unparsed == _DO_HEAD_SAFE_SHAPE
+            safe = unparsed in (
+                _DO_HEAD_SAFE_SHAPE, _DO_HEAD_DEGRADED_SAFE_SHAPE)
         elif name == "do_OPTIONS":
-            safe = unparsed == _DO_OPTIONS_SAFE_SHAPE
+            safe = unparsed in (
+                _DO_OPTIONS_SAFE_SHAPE, _DO_OPTIONS_DEGRADED_SAFE_SHAPE)
         else:
             safe = unparsed == (f"self._method_fallback({verb!r})",)
         if safe:

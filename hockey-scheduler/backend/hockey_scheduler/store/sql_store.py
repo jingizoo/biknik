@@ -835,7 +835,18 @@ class SqlStore:
         # concluded (#426 review finding 4) — see transaction()'s outermost
         # finally and add_data_access_durable()'s own docstring.
         self._pending_durable_data_access = []
-        migrate(self.conn, self.dialect)
+        try:
+            migrate(self.conn, self.dialect)
+        except Exception:
+            # Construction never returned a usable store, so no caller can own
+            # or close this connection.  A migration/programming failure must
+            # fail boot, but it must not orphan the already-open connection on
+            # that path.
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
     def set_dependent_conflict_resolver(self, resolver) -> None:
         """Register the callback that turns a DependentDeleteConflict (a

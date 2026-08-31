@@ -10,6 +10,49 @@ import sqlite3
 from typing import Optional, Tuple
 
 
+class StoreConnectionError(RuntimeError):
+    """The configured database could not be reached while connecting.
+
+    This phase-specific wrapper is intentionally narrower than a driver's
+    ``OperationalError``: the same broad driver type can also be raised later
+    by migrations or queries, where degrading as ``store_unreachable`` would
+    hide a real boot/programming failure.
+    """
+
+
+def _postgres_is_unreachable(exc) -> bool:
+    """Whether a psycopg connect failure positively identifies availability.
+
+    Psycopg deliberately maps both network failures *and* invalid libpq
+    options (for example ``sslmode=bogus`` or a non-numeric port) to the same
+    broad ``OperationalError`` with no SQLSTATE.  Degrading on that type alone
+    would hide configuration errors indefinitely.  SQLSTATE class 08 is the
+    server/driver connection-exception class; for failures that happen before
+    a server can supply SQLSTATE, accept only libpq's concrete DNS/socket/
+    timeout diagnostics.  Unknown shapes fail closed at boot.
+    """
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate:
+        return sqlstate.startswith("08") or sqlstate == "57P03"
+
+    message = str(exc).casefold()
+    return any(marker in message for marker in (
+        "failed to resolve host ",
+        "could not translate host name ",
+        "could not connect to server",
+        "connection refused",
+        "connection reset by peer",
+        "connection timed out",
+        "connection timeout expired",
+        "timeout expired",
+        "network is unreachable",
+        "no route to host",
+        "server closed the connection unexpectedly",
+        "could not receive data from server",
+        "could not send data to server",
+    ))
+
+
 class Dialect:
     def __init__(self, paramstyle: str, backend: str):
         self.paramstyle = paramstyle
@@ -55,8 +98,16 @@ def connect(url: str) -> Tuple[object, Dialect, Optional[str]]:
         # set would move the failures somewhere less obvious instead of
         # removing them. SQL_ASCII is what `initdb` produces under LC_ALL=C,
         # a very common way to script a cluster.
-        conn = psycopg.connect(url, autocommit=True, row_factory=dict_row,
-                               client_encoding="UTF8")
+        try:
+            conn = psycopg.connect(url, autocommit=True, row_factory=dict_row,
+                                   client_encoding="UTF8")
+        except psycopg.OperationalError as exc:
+            # OperationalError is not itself an availability verdict: libpq
+            # uses it for malformed ports, invalid SSL modes, authentication,
+            # serialization failures, and genuine network outages alike.
+            if not _postgres_is_unreachable(exc):
+                raise
+            raise StoreConnectionError(str(exc)) from exc
         return conn, Dialect("pyformat", "postgres"), None
 
     if url.startswith("sqlite:///"):

@@ -12,12 +12,14 @@ import os
 import re
 import ssl
 import sys
+import uuid
 import traceback
 from contextlib import contextmanager
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 from datetime import datetime, timedelta
 
@@ -44,7 +46,7 @@ from ..services.context_epoch import (
 from ..services.context_gate import (
     CONTEXT_GATE, LIFECYCLE_GATE, LIFECYCLE_GATE_KEY as _LIFECYCLE_GATE_KEY)
 from ..services.epoch_fence import EPOCH_FENCE_GLOBAL_KEY, user_fence_key
-from ..store import SqlStore, create_store
+from ..store import SqlStore, StoreConnectionError, create_store
 from .auth import (
     DEFAULT_TTL_SECONDS,
     DEMO_PASSWORD,
@@ -312,7 +314,112 @@ class DemoState:
         # Demo mode boots to a CLEAN SLATE (#215): an empty setup the operator
         # can Load sample data into or build by hand. (Production ignores `seed`
         # and preserves its durable store.)
-        self.reset(seed=False)
+        #
+        # AN UNREACHABLE STORE MUST NOT KILL THE PROCESS. `STATE = DemoState()`
+        # runs at MODULE IMPORT, so an exception here escapes
+        # `from .server import serve` and the process exits before binding a
+        # port. Observed in production: a managed Postgres whose host stopped
+        # resolving took the whole service down with `No open ports detected` --
+        # no health endpoint, no readiness endpoint, nothing to ask.
+        #
+        # That defeated guards this server already has: `/api/health` answers
+        # 503 deliberately "or a bricked instance is never restarted", and
+        # `/api/readiness` exists to report deployment problems. Neither can
+        # answer if the module cannot finish importing.
+        #
+        # SCOPE (#203): this records the failure and keeps serving. It does NOT
+        # attempt recovery -- self-healing, its retry schedule and the worker
+        # lifecycle are a separate change with their own review, because each
+        # adds contract that this one does not need to make an outage
+        # diagnosable.
+        self.boot_error: Optional[str] = None
+        self.boot_error_ref: Optional[str] = None
+        try:
+            self.reset(seed=False)
+        except StoreConnectionError as exc:
+            # At this call site the phase-specific type comes from the initial
+            # psycopg.connect() boundary.  A missing driver, authentication,
+            # bootstrap, migration, or programming error therefore still fails
+            # fast instead of masquerading indefinitely as an unreachable DB.
+            self.api = None
+            self.game_id = None
+            self.ids = {}
+            self._record_boot_error(exc)
+
+    @staticmethod
+    def _redact(text: str, database_url: Optional[str] = None) -> str:
+        """Strip credentials before ANYTHING writes this, including the log.
+
+        Sanitizing only the response would move the leak rather than remove it:
+        #203 requires that credentials never be logged either. A store failure
+        can carry `scheme://user:pass@host/db`, a bare `password=...`, or a
+        token, so they are redacted once, where the text is captured.
+        """
+        # libpq treats the first unencoded ``@`` as the end of userinfo.  If a
+        # password itself contains ``@``, the driver's DNS error can therefore
+        # contain only ``<password-tail>@<real-host>`` -- no scheme and no
+        # ``password=`` marker for the generic patterns below to recognise.
+        # Derive that exact malformed authority from the configured URL and
+        # remove it before recording the exception.  Never publish the URL or
+        # any parsed credential; this is a one-way sanitization input only.
+        if database_url:
+            driver_host = ""
+            try:
+                # Use the same parser as the production driver first.  In the
+                # exact libpq defect being contained, an unencoded password
+                # ``@`` becomes part of *its* host value (including odd IPv6
+                # shapes such as ``TAIL@[``), which stdlib URL parsing cannot
+                # reproduce reliably.
+                from psycopg.conninfo import conninfo_to_dict
+                driver_host = conninfo_to_dict(database_url).get("host", "")
+            except (ImportError, TypeError, ValueError):
+                pass
+            if "@" in driver_host:
+                text = text.replace(driver_host, "***")
+
+            try:
+                parsed = urlsplit(database_url)
+                password = unquote(parsed.password or "")
+                host = parsed.hostname or ""
+            except (TypeError, ValueError):
+                password = host = ""
+            if "@" in password and host:
+                leaked_authority = f"{password.split('@', 1)[1]}@{host}"
+                text = text.replace(leaked_authority, "***")
+
+        # Greedy userinfo deliberately reaches the LAST ``@`` before the host,
+        # so a raw URL containing an unencoded ``@`` in its password is consumed
+        # atomically instead of leaving the password tail behind.
+        text = re.sub(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/]+)@",
+                      r"\1***:***@", text)
+        return re.sub(
+            r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)"
+            r"\s*[=:]\s*(?:'(?:\\.|[^'\\])*'|"
+            r"\"(?:\\.|[^\"\\])*\"|\S+)",
+            r"\1=***", text)
+
+    def _record_boot_error(self, exc) -> None:
+        """Full (redacted) cause to the log; only a category goes public."""
+        self.boot_error = self._redact(
+            f"{type(exc).__name__}: {exc}", os.environ.get("DATABASE_URL"))
+        self.boot_error_ref = uuid.uuid4().hex[:8]
+        print(f"[boot ref={self.boot_error_ref}] store unavailable, serving 503: "
+              f"{self.boot_error}", file=sys.stderr, flush=True)
+
+    def public_store_failure(self) -> dict:
+        """The SANITIZED shape the public endpoints and the 503 body share.
+
+        `/api/health` and `/api/readiness` are documented public and
+        non-sensitive, so the exception text must not travel on them -- a store
+        failure can name an internal host, a user, a database or a path. The
+        reference correlates a response to the full cause in the log.
+        """
+        return {"status": "unavailable", "reason": "store_unreachable",
+                "reference": self.boot_error_ref}
+
+    @property
+    def store_available(self) -> bool:
+        return getattr(self, "api", None) is not None
 
     def _make_api(self, store):
         # Email/push transports come from EMAIL_MODE / SMTP_* (#63) and
@@ -349,12 +456,21 @@ class DemoState:
         # whatever is there and only bootstrap the first admin from env if the
         # store has no accounts yet.
         if _app_mode() == "production":
-            self.api = self._make_api(store)
+            try:
+                api = self._make_api(store)
+                bootstrap_admin_from_env(api, os.environ)
+                RATE_LIMITER.reset()  # (#131) fresh process → clean slate
+                LOGIN_THROTTLE.reset()  # (#267) clear login lockouts too
+            except Exception:
+                # Nothing has been published yet.  Release the candidate store
+                # deterministically, then let configuration/programming errors
+                # fail boot with their real category instead of degrading as a
+                # fake connectivity outage.
+                self._close_store(store, None)
+                raise
+            self.api = api
             self.game_id = None
             self.ids = {}
-            bootstrap_admin_from_env(self.api, os.environ)
-            RATE_LIMITER.reset()  # (#131) fresh process → clean rate-limit slate
-            LOGIN_THROTTLE.reset()  # (#267) clear login lockouts on rebuild too
             self._close_store(old_store, store)
             return
 
@@ -1480,6 +1596,34 @@ class Handler(BaseHTTPRequestHandler):
     # right lifetime for it.
     _context_read_ticket = None
 
+    # Verbs whose representation is genuinely zero-length. HEAD is deliberately
+    # absent: it writes no bytes, but its headers describe the GET representation.
+    _BODYLESS_VERBS = ("OPTIONS",)
+
+    def _store_unavailable(self) -> bool:
+        """True (and a 503 already sent) when the store never came up.
+
+        Reached before store-dependent work for every HTTP verb: GET, POST,
+        HEAD and OPTIONS call it directly, while PUT/PATCH/DELETE and every
+        dynamically synthesized extension verb converge on the guarded
+        ``_method_fallback`` boundary. Health and readiness are exempt HERE
+        rather than by route order; they are exactly the two endpoints whose
+        purpose is to report this condition.
+        """
+        if STATE.store_available:
+            return False
+        if self.path.split("?", 1)[0] in ("/api/health", "/api/readiness"):
+            return False
+        if self.command in self._BODYLESS_VERBS:
+            self._send_status(503)
+            return True
+        self._send_json({"error": {
+            "code": "store_unavailable",
+            "message": "The service is running but cannot reach its database.",
+            "details": {"reason": "store_unreachable",
+                        "reference": STATE.boot_error_ref}}}, 503)
+        return True
+
     def do_GET(self):
         """Dispatch a GET, registering an ARRIVAL with the context gate first
         when the path is one of the exact-Season scoped reads (#159).
@@ -1498,6 +1642,8 @@ class Handler(BaseHTTPRequestHandler):
         write raises ``BrokenPipeError`` on a vanished client — so no gate hold
         can outlive the handler.
         """
+        if self._store_unavailable():
+            return
         path = self.path.split("?", 1)[0]
         if not is_context_scoped_read(path):
             return self._dispatch_get()
@@ -2386,6 +2532,26 @@ class Handler(BaseHTTPRequestHandler):
             status["factory_reset_enabled"] = (
                 _app_mode() == "production" and _allow_production_factory_reset())
             return self._send_json(status)
+        if path in ("/api/health", "/api/readiness"):
+            if not STATE.store_available:
+                # THE PAIR THAT MUST ANSWER WHILE THE STORE IS DOWN. Both
+                # normally delegate to a facade that does not exist yet, so the
+                # answer comes from process state: 503 (so the platform marks
+                # the instance unhealthy) plus a sanitized category and a
+                # reference an operator can grep for in the log.
+                #
+                # Keep the route predicate and the runtime-state predicate
+                # nested.  The fail-closed route extractor owns the former and
+                # deliberately refuses compound dispatch expressions it cannot
+                # prove; the latter is ordinary runtime state, not routing.
+                return self._send_json({
+                    "status": "unavailable",
+                    "app_mode": _app_mode(),
+                    "store": STATE.public_store_failure(),
+                    "detail": "The service is running but has not reached its "
+                              "database. The full cause is in the server log "
+                              "under this reference.",
+                }, 503)
         if path == "/api/health":
             # Liveness + dependency snapshot (#90). Public, non-sensitive.
             # The STATUS CODE carries the verdict (#404): a platform health
@@ -3089,9 +3255,9 @@ class Handler(BaseHTTPRequestHandler):
     def _send_status(self, code: int, extra_headers=None) -> None:
         """Send a bodyless response (status line + standard headers, no body).
 
-        Used for HEAD/OPTIONS and other empty responses (#271): a HEAD or a 204
-        must never write a body, so this sends ``Content-Length: 0`` and ends
-        the headers without a payload.
+        Used for OPTIONS and other genuinely empty responses (#271). HEAD uses
+        the normal GET serializer with body writes suppressed so its metadata
+        describes the GET representation rather than an empty payload.
         """
         self.send_response(code)
         self.send_header("Content-Length", "0")
@@ -3109,6 +3275,11 @@ class Handler(BaseHTTPRequestHandler):
         where applicable); an unknown ``/api/...`` path → JSON 404; any other
         path → JSON 404.
         """
+        # PUT/PATCH/DELETE and every __getattr__-synthesized extension method
+        # converge here.  Guarding the shared boundary keeps a future token
+        # from bypassing degraded mode without duplicating a path policy.
+        if self._store_unavailable():
+            return
         path = self.path.split("?", 1)[0]
         methods = self._supported_methods(path)
         if methods:
@@ -3176,6 +3347,12 @@ class Handler(BaseHTTPRequestHandler):
         POST-only path falls through do_GET's tail to a bodyless 405 + Allow."""
         self._head_only = True
         try:
+            # HEAD suppresses bytes, not GET's representation metadata.  Set
+            # the suppression flag BEFORE the degraded guard so its 503 carries
+            # the same Content-Type/Content-Length as degraded GET while still
+            # writing a zero-byte body.
+            if self._store_unavailable():
+                return
             self.do_GET()
         finally:
             self._head_only = False
@@ -3183,6 +3360,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         """OPTIONS contract (#271): a known path → 204 (+ ``Allow``); an unknown
         path → 404. Always bodyless."""
+        if self._store_unavailable():
+            return
         path = self.path.split("?", 1)[0]
         methods = self._supported_methods(path)
         if not methods:
@@ -3190,6 +3369,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_status(204, [("Allow", ", ".join(sorted(methods)))])
 
     def do_POST(self):
+        if self._store_unavailable():
+            return
         path = self.path.split("?", 1)[0]
         # Confirm the path actually supports POST *before* touching the body
         # (#271). Otherwise a malformed body on a non-POST path 400s as
@@ -5873,12 +6054,23 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     # Configure the delivery worker loop from env and start it if enabled (#79).
     # ApiService keeps a disabled loop by default (safe for tests); only the
     # running server process reads env and may spin the background thread.
-    STATE.api.delivery_loop = delivery_loop_from_env(STATE.api.delivery,
-                                                     os.environ)
-    if STATE.api.delivery_loop.start():
-        print(f"Delivery worker loop started "
-              f"(every {STATE.api.delivery_loop.interval_seconds}s, "
-              f"batch {STATE.api.delivery_loop.batch_size}).")
+    # SKIPPED when the store never came up: there is no facade to hang a loop
+    # on, and dereferencing it here would raise BEFORE `Server(...)` binds --
+    # reintroducing the exact `No open ports detected` failure this change
+    # exists to prevent. Binding the port is what makes the instance
+    # diagnosable at all.
+    if STATE.store_available:
+        STATE.api.delivery_loop = delivery_loop_from_env(STATE.api.delivery,
+                                                         os.environ)
+        if STATE.api.delivery_loop.start():
+            print(f"Delivery worker loop started "
+                  f"(every {STATE.api.delivery_loop.interval_seconds}s, "
+                  f"batch {STATE.api.delivery_loop.batch_size}).")
+    else:
+        print(f"[boot ref={STATE.boot_error_ref}] starting WITHOUT a store. "
+              f"Data routes answer 503; /api/health and /api/readiness report "
+              f"the reason. This build does NOT self-heal -- recovery is a "
+              f"separate change (#203).", file=sys.stderr, flush=True)
     httpd = Server((host, port), Handler)
     print(f"Hockey Scheduler demo running at http://{host}:{port}")
     print("Open that URL in your browser. Press Ctrl+C to stop.")
@@ -5887,7 +6079,13 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
-        STATE.api.delivery_loop.stop()
+        # ONLY when a facade and a loop actually exist. `serve()` deliberately
+        # permits `STATE.api is None`, so an unconditional stop here raised
+        # AttributeError while shutting down a degraded instance -- masking a
+        # clean teardown in precisely the lifecycle this change introduces.
+        loop = getattr(getattr(STATE, "api", None), "delivery_loop", None)
+        if loop is not None:
+            loop.stop()
 
 
 if __name__ == "__main__":
