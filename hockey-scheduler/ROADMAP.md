@@ -166,9 +166,12 @@ Ship as ordered slices; **do not** land #205 as one large migration PR.
    Six bounded slices: (1) preferences + League policy config; (2) eligibility,
    ranking, explainable selection; (3) offer/accept/decline/timeout state
    machine; (4) notifications + auto next-candidate retry; (5) captain/manager
-   override with authz + audit; (6) operator UI + e2e. **Policy and state-machine
-   design (slices 1–3) may begin earlier, but implementation must not land ahead
-   of #205, and #287's five open design questions must be settled first.**
+   override with authz + audit; (6) operator UI + e2e. **The #205
+   LeagueSeason/membership eligibility boundary required by #287 is now on
+   `main`, while #205 remains open for its remaining epic work. The repository
+   owner settled #287's five design questions on 2026-08-29 in #435.
+   Production integration remains separately authorized and must reuse that
+   eligibility boundary through the bounded slices above.**
 7. **#276** — privacy-minimized Coach Team directory.
 8. **#275** — Guardian invite-by-email, activation and consent acceptance.
 9. **#278** — C/LW/RW/D/G positions, game lines/pairs/goalie designation, and

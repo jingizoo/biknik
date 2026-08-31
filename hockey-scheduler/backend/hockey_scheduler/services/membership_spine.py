@@ -130,8 +130,11 @@ MEMBERSHIP_STATUS_REASONS = {
 
 # A membership exists at this EXACT LeagueSeason, and grants current
 # participation — but on a team that is not playing in this game. The
-# "borrowed from another club" shape; cross-team borrowing is off (#287
-# open question 4 is unruled), so it is a skip, not a seat.
+# "borrowed from another club" shape. The approved #287 design limits future
+# matching candidates to the same LeagueSeason, requires explicit League policy
+# for cross-Division projection, and excludes cross-League candidates. That
+# future matching projection is not wired or authorized at this current-
+# participation boundary, so every other-team membership remains a skip.
 MEMBERSHIP_OTHER_TEAM = "membership_other_team"
 
 # The player DOES hold current participation in this game — but on the

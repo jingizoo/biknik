@@ -9,8 +9,9 @@ Covers, on Memory, SQLite, and PostgreSQL:
   by the shared per-field validators, same-team registration duplicates
   hard-refused, and BOTH stripped from every default facade payload
   (AC[2]) with an explicit operator opt-in mirroring include_email;
-* the 1-7 skill rating (owner ruling on #287 assigns the field here) with
-  unrated (None) as a first-class state;
+* the existing global/provisional 1-7 skill value, with unrated (None) as a
+  first-class state; the approved canonical League-context rating remains a
+  separately authorized #273 model rather than this Player field;
 * duplicate WARNINGS: exact same-name-on-one-Team records lacking
   disambiguating data append a player_duplicate_warning audit and appear
   in player_duplicate_report — never a block, never a merge (AC[4]);

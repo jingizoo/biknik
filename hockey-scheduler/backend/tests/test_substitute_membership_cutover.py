@@ -19,8 +19,11 @@ nothing else does. Concretely, both directions:
 
 FAIL-CLOSED BOUNDARIES KEPT. Cross-boundary substitution stays CLOSED: an
 eligible membership with a THIRD team (same Season, not in the game) grants
-nothing — #287 open question 4 (who may substitute across League/Division
-boundaries) is an unruled owner question, so the gate keeps today's posture.
+nothing. The approved #287 design limits future matching candidates to the
+same LeagueSeason, requires explicit League policy for cross-Division
+projection, and excludes cross-League candidates. That future matching
+projection is not wired or authorized at this current-participation boundary,
+so every other-team membership remains a skip.
 applicant/inactive/injured memberships hold no current participation and
 terminal rows are immutable history: none of them grants eligibility. A
 bound game whose LeagueSeason row dangles resolves NOBODY rather than
