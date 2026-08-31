@@ -333,13 +333,26 @@ accept(offer_id, authenticated_responder):
     require offer is OFFERED
     atomically record the first authenticated ACCEPT response observation,
         using the authoritative transition time
-    atomically revalidate vacancy and complete candidate eligibility, then:
-        - if the authoritative transition time is before expires_at, commit
-          OFFERED -> ACCEPTED, fill exactly one vacancy, invalidate any
-          competing stale attempt, and append one ACCEPTED audit
-        - otherwise commit OFFERED -> EXPIRED, append one EXPIRED audit, and
-          record one idempotent next-attempt intent; the separate response
-          observation preserves that the candidate tried to accept
+    atomically revalidate authoritative time, vacancy offerability, complete
+        candidate eligibility, and eligibility-relevant projection/source
+        versions, then select exactly one outcome in this precedence order:
+        - if the Game or vacancy is no longer offerable or the vacancy was
+          filled, commit OFFERED -> CANCELLED and append one CANCELLED audit;
+          make no roster mutation and record no next-attempt intent
+        - otherwise, at or after expires_at, commit OFFERED -> EXPIRED, append
+          one EXPIRED audit, make no roster mutation, and record one idempotent
+          next-attempt intent
+        - otherwise, if the offered candidate no longer passes every hard or
+          competition-boundary gate or an eligibility-relevant projection/source
+          version drifted, commit OFFERED -> INVALIDATED, append one INVALIDATED
+          audit, make no roster mutation, and record one idempotent next-attempt
+          intent
+        - otherwise commit OFFERED -> ACCEPTED, fill exactly one vacancy,
+          invalidate any competing stale attempt, and append one ACCEPTED audit
+    the separate response observation remains durable for every outcome and
+        preserves that the candidate tried to accept
+    CANCELLED takes precedence only when the vacancy is no longer offerable;
+        for an otherwise offerable vacancy, expiry still wins at the deadline
     return the committed terminal outcome
 
 decline(offer_id, authenticated_responder):
@@ -442,6 +455,8 @@ and defence.
 | V18 participation-only fairness | Current LeagueSeason history contains one finalized Game with a recorded occupying/participating roster row, one accepted-but-cancelled Game, one accepted but scheduled-and-unplayed Game, and one no-show | `FAIRNESS` | Completed-substitute count is 1. The acceptance, cancellation, scheduled-but-unplayed Game, and no-show are excluded. | Owner-approved Q1/Q2 (2026-08-29) |
 | V19 no late offer | Authoritative `as_of`/`offered_at` equals or follows `game_start`; response window is positive | Any | `expires_at <= offered_at`; no OFFERED row, offer audit, or notification intent is created and the result is `NO_VALID_OFFER_WINDOW`. A server-attributed audit of that refusal may still be recorded. | Owner-approved Q5 (2026-08-29) |
 | V20 terminal retry | (a) An authorized responder repeats accept or decline after its command reached a terminal outcome; (b) timeout already set `EXPIRED`, then the responder submits its first late response and repeats it | Any | The stored terminal outcome is returned with no second roster row, terminal audit, or next-attempt intent. In (a), the existing response observation is unchanged. In (b), the first authenticated late response creates the one durable observation; the repeat cannot replace or duplicate it. | Idempotency/concurrency contract |
+| V21 accept after vacancy closes | Before `expires_at`, the offered candidate accepts after the Game/vacancy was closed or the vacancy was filled by another authoritative action | Any | The first authenticated `ACCEPT` observation is recorded exactly once; the attempt becomes `CANCELLED` with one audit, no roster mutation by this command, and no next-attempt intent. A retry returns `CANCELLED` without duplicating any effect. | Revalidation/concurrency contract |
+| V22 accept after candidate invalidation | Before `expires_at`, the offered candidate accepts after losing a hard or competition-boundary eligibility fact, or after a validated projection/source version drifts; the vacancy remains offerable | Any | The first authenticated `ACCEPT` observation is recorded exactly once; the attempt becomes `INVALIDATED` with one audit, no roster fill, and one idempotent next-attempt intent. A retry returns `INVALIDATED` without duplicating any effect. | Revalidation/concurrency contract |
 
 The vectors above record design contracts, including the five owner-approved
 policy rulings. They do not claim that production integration exists.
