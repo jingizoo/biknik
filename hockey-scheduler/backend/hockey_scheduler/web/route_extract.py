@@ -3402,7 +3402,7 @@ _AUDIT_WAIVERS = {
     # #426 round-2 review finding 2: durably audit a denial at do_POST's
     # own two generic refusal points (the resolve_role() 401 three lines
     # above this if, and the authorize() 403 this if itself gates) for the
-    # sensitive routes _sensitive_post_audit_target (a module-level table,
+    # sensitive routes _sensitive_post_audit_target (RouteSpec metadata,
     # not a hidden dispatcher -- see its own docstring) names. Both calls
     # are bare statements taking the tracked `path` -- the SAME "a call
     # consuming a tracked name needs its own review" shape every other
@@ -3425,12 +3425,12 @@ _AUDIT_WAIVERS = {
         "AFTER `not authorize(role, path)` (waived immediately above) has "
         "already refused the request -- a pure side effect recording that "
         "already-made decision, not a second dispatch. `path` is tracked "
-        "only because `_sensitive_post_audit_target` (a module-level "
-        "lookup table matched against 3 fixed regexes, not a callable "
-        "chosen by `path`) needs it to decide WHICH category/purpose (or "
-        "none) to audit under -- the SAME 'derives a value FROM path, "
-        "chooses no route' shape `required_permission(path)`'s own "
-        "waiver two entries above already covers for an identical reason",
+        "only because `_sensitive_post_audit_target` (validated RouteSpec "
+        "metadata on 4 fixed routes, not a callable chosen by `path`) "
+        "needs it to decide WHICH category/purpose (or none) to audit "
+        "under -- the SAME 'derives a value FROM path, chooses no route' "
+        "shape `required_permission(path)`'s own waiver two entries above "
+        "already covers for an identical reason",
     ("do_POST", "self._guardian_link_or_403(guid, jid)", "if_test", "mga"):
         "POST sibling of get_me_guardian_id_substitute_opportunities_id's "
         "own identical-text waiver above (see that entry for the general "

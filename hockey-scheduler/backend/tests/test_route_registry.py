@@ -15,6 +15,11 @@ The exact-Season context-read fence is also registry-driven now. Its five
 ``RouteSpec.context_read_fence`` markers are resolved by production before
 dispatch and pinned in both directions below.
 
+The sensitive POST transport-denial audit class follows the same contract:
+category and purpose live on the four matching ``RouteSpec`` rows, while the
+production selector and the exhaustive tests below refuse narrowing,
+widening, malformed metadata, and ambiguous matches.
+
 ``_GET_ROUTES``/``_POST_ROUTES`` were the same kind of hand-maintained table
 through the #202 routespec-inventory step; the #202 WIRING step replaced
 their SOURCE with a live derivation from this registry (every concrete GET
@@ -33,7 +38,7 @@ import unittest
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
-from hockey_scheduler.domain import Permission
+from hockey_scheduler.domain import Permission, SensitiveFieldCategory
 from hockey_scheduler.web import authz
 from hockey_scheduler.web import server as srv
 from hockey_scheduler.web.route_extract import (
@@ -41,8 +46,10 @@ from hockey_scheduler.web.route_extract import (
 )
 from hockey_scheduler.web.route_registry import (
     BY_KEY, BY_NAME, CONTEXT_SCOPED_READ_SPECS, REGISTRY, UNCLASSIFIED,
+    SENSITIVE_POST_DENIAL_SPECS,
     context_scoped_read_specs, runtime_context_read_spec,
-    runtime_get_auth_spec,
+    runtime_get_auth_spec, runtime_sensitive_post_denial_spec,
+    sensitive_post_denial_specs,
 )
 
 WALKER = extract_walker()
@@ -63,6 +70,21 @@ _EXPECTED_CONTEXT_SCOPED_READS = {
         "/api/v2/setup/seasons/{}/venue-access",
     "get_v2_setup_seasons_id_venue_candidates":
         "/api/v2/setup/seasons/{}/venue-candidates",
+}
+
+_EXPECTED_SENSITIVE_POST_DENIALS = {
+    "post_notifications_contacts_id_active": (
+        SensitiveFieldCategory.CONTACT_DESTINATION,
+        "set_contact_destination_active"),
+    "post_notifications_deliveries_id_ignore": (
+        SensitiveFieldCategory.CONTACT_DESTINATION,
+        "ignore_notification_delivery"),
+    "post_notifications_deliveries_id_retry": (
+        SensitiveFieldCategory.CONTACT_DESTINATION,
+        "retry_notification_delivery"),
+    "post_notifications_device_tokens_id_active": (
+        SensitiveFieldCategory.CONTACT_DESTINATION,
+        "set_device_token_active"),
 }
 
 
@@ -87,6 +109,21 @@ def _runtime_context_read_map(registry):
         spec = runtime_context_read_spec(sample_path(source.template), registry)
         if spec is not None:
             selected[spec.name] = spec.template
+    return selected
+
+
+def _runtime_sensitive_post_denial_map(registry):
+    """Resolve every concrete POST through the production audit selector."""
+    selected = {}
+    for source in registry:
+        if source.method != "POST" or source.kind != "route":
+            continue
+        spec = runtime_sensitive_post_denial_spec(
+            sample_path(source.template), registry)
+        if spec is not None:
+            selected[spec.name] = (
+                spec.transport_denial_audit_category,
+                spec.transport_denial_audit_purpose)
     return selected
 
 
@@ -1026,6 +1063,105 @@ class ContextReadFenceContractTests(unittest.TestCase):
                                     "Ambiguous RouteSpec context-read fence"):
             runtime_context_read_spec(
                 "/api/scheduler/scenarios/example", (spec, duplicate))
+
+
+class SensitivePostDenialContractTests(unittest.TestCase):
+    """The transport-denial audit class is one fail-closed RouteSpec fact."""
+
+    @staticmethod
+    def _mutate(target, **changes):
+        return tuple(
+            dataclasses.replace(spec, **changes)
+            if spec is target else spec
+            for spec in REGISTRY)
+
+    def test_runtime_sensitive_post_denial_is_the_complete_class(self):
+        self.assertEqual(_runtime_sensitive_post_denial_map(REGISTRY),
+                         _EXPECTED_SENSITIVE_POST_DENIALS)
+        self.assertEqual(
+            {spec.name: (spec.transport_denial_audit_category,
+                         spec.transport_denial_audit_purpose)
+             for spec in SENSITIVE_POST_DENIAL_SPECS},
+            _EXPECTED_SENSITIVE_POST_DENIALS)
+        self.assertFalse(hasattr(srv, "_SENSITIVE_POST_AUDIT_ROUTES"))
+
+        for name, expected in _EXPECTED_SENSITIVE_POST_DENIALS.items():
+            with self.subTest(name=name):
+                spec = BY_NAME[name]
+                path = sample_path(spec.template)
+                self.assertIs(runtime_sensitive_post_denial_spec(path), spec)
+                self.assertIs(runtime_sensitive_post_denial_spec(
+                    path + "?ignored=1"), spec)
+                self.assertEqual(srv._sensitive_post_audit_target(path),
+                                 expected)
+
+    def test_runtime_sensitive_post_denial_detects_narrowing_and_widening(self):
+        enrolled = BY_NAME["post_notifications_deliveries_id_retry"]
+        narrowed = self._mutate(
+            enrolled,
+            transport_denial_audit_category=None,
+            transport_denial_audit_purpose=None)
+        self.assertNotEqual(_runtime_sensitive_post_denial_map(narrowed),
+                            _EXPECTED_SENSITIVE_POST_DENIALS)
+
+        unenrolled = BY_NAME["post_notifications_deliveries_process"]
+        widened = self._mutate(
+            unenrolled,
+            transport_denial_audit_category=(
+                SensitiveFieldCategory.CONTACT_DESTINATION),
+            transport_denial_audit_purpose="process_notification_deliveries")
+        self.assertNotEqual(_runtime_sensitive_post_denial_map(widened),
+                            _EXPECTED_SENSITIVE_POST_DENIALS)
+
+    def test_runtime_sensitive_post_denial_rejects_half_filled_metadata(self):
+        target = BY_NAME["post_notifications_deliveries_process"]
+        mutations = (
+            {"transport_denial_audit_category":
+             SensitiveFieldCategory.CONTACT_DESTINATION},
+            {"transport_denial_audit_purpose": "unexpected_purpose"},
+        )
+        for changes in mutations:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(RuntimeError, "must be paired"):
+                    sensitive_post_denial_specs(
+                        self._mutate(target, **changes))
+
+    def test_runtime_sensitive_post_denial_rejects_invalid_values(self):
+        target = BY_NAME["post_notifications_deliveries_id_retry"]
+        mutations = (
+            {"transport_denial_audit_category": "contact_destination"},
+            {"transport_denial_audit_purpose": ""},
+            {"transport_denial_audit_purpose": 7},
+        )
+        for changes in mutations:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(RuntimeError, "metadata is invalid"):
+                    sensitive_post_denial_specs(
+                        self._mutate(target, **changes))
+
+    def test_runtime_sensitive_post_denial_rejects_wrong_route_shapes(self):
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        for target in (BY_NAME["get_accounts"],
+                       BY_NAME["post_games_id_action"]):
+            with self.subTest(target=target.name):
+                mutated = self._mutate(
+                    target,
+                    transport_denial_audit_category=category,
+                    transport_denial_audit_purpose="unexpected_purpose")
+                with self.assertRaisesRegex(RuntimeError,
+                                            "concrete POST routes"):
+                    sensitive_post_denial_specs(mutated)
+
+    def test_runtime_sensitive_post_denial_ambiguity_fails_closed(self):
+        spec = BY_NAME["post_notifications_deliveries_id_retry"]
+        duplicate = dataclasses.replace(
+            spec, name="duplicate_post_notifications_delivery_retry")
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "Ambiguous RouteSpec sensitive POST denial audit"):
+            runtime_sensitive_post_denial_spec(
+                "/api/notifications/deliveries/example/retry",
+                (spec, duplicate))
 
 
 class MethodTableNarrowingTests(unittest.TestCase):
