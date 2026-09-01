@@ -25,6 +25,11 @@ well. Its eight concrete v1/v2 routes carry the parent kind and request-body
 field together; production and the exhaustive tests below refuse narrowing,
 widening, half-filled metadata, wrong route shapes, and ambiguous matches.
 
+The generic destination half is also registry-driven. All sixteen concrete
+v1/v2 ``assign-*`` routes carry the destination kind and request-body field;
+load-time validation requires complete coverage and exact agreement with the
+narrower writable-parent declaration wherever both apply.
+
 ``_GET_ROUTES``/``_POST_ROUTES`` were the same kind of hand-maintained table
 through the #202 routespec-inventory step; the #202 WIRING step replaced
 their SOURCE with a live derivation from this registry (every concrete GET
@@ -51,9 +56,11 @@ from hockey_scheduler.web.route_extract import (
 )
 from hockey_scheduler.web.route_registry import (
     BY_KEY, BY_NAME, CONTEXT_SCOPED_READ_SPECS, REGISTRY, UNCLASSIFIED,
-    REASSIGNMENT_PARENT_SPECS, SENSITIVE_POST_DENIAL_SPECS,
+    REASSIGNMENT_DESTINATION_SPECS, REASSIGNMENT_PARENT_SPECS,
+    SENSITIVE_POST_DENIAL_SPECS,
     context_scoped_read_specs, runtime_context_read_spec,
-    reassignment_parent_specs, runtime_get_auth_spec,
+    reassignment_destination_specs, reassignment_parent_specs,
+    runtime_get_auth_spec, runtime_reassignment_destination_spec,
     runtime_reassignment_parent_spec, runtime_sensitive_post_denial_spec,
     sensitive_post_denial_specs,
 )
@@ -104,6 +111,32 @@ _EXPECTED_REASSIGNMENT_PARENTS = {
         "organization", "operator_organization_id"),
     "post_v2_setup_rink_id_assign_venue": ("venue", "venue_id"),
     "post_v2_setup_team_id_assign_club": ("club", "club_id"),
+    "post_v2_setup_venue_id_assign_organization": (
+        "organization", "organization_id"),
+}
+
+_EXPECTED_REASSIGNMENT_DESTINATIONS = {
+    "post_setup_division_id_assign_level": ("league", "level_id"),
+    "post_setup_league_id_assign_organization": (
+        "organization", "organization_id"),
+    "post_setup_player_id_assign_team": ("team", "team_id"),
+    "post_setup_rink_id_assign_venue": ("venue", "venue_id"),
+    "post_setup_season_team_registration_id_assign_division": (
+        "division", "division_id"),
+    "post_setup_team_id_assign_club": ("club", "club_id"),
+    "post_setup_venue_id_assign_organization": (
+        "organization", "organization_id"),
+    "post_v2_setup_division_id_assign_league": ("league", "league_id"),
+    "post_v2_setup_player_id_assign_team": ("team", "team_id"),
+    "post_v2_setup_program_id_assign_organization": (
+        "organization", "operator_organization_id"),
+    "post_v2_setup_rink_id_assign_venue": ("venue", "venue_id"),
+    "post_v2_setup_season_team_registration_id_assign_division": (
+        "division", "division_id"),
+    "post_v2_setup_season_team_registration_id_assign_league": (
+        "league", "league_id"),
+    "post_v2_setup_team_id_assign_club": ("club", "club_id"),
+    "post_v2_setup_team_id_assign_league": ("league", "league_id"),
     "post_v2_setup_venue_id_assign_organization": (
         "organization", "organization_id"),
 }
@@ -160,6 +193,21 @@ def _runtime_reassignment_parent_map(registry):
             selected[spec.name] = (
                 spec.reassignment_parent_kind,
                 spec.reassignment_parent_field)
+    return selected
+
+
+def _runtime_reassignment_destination_map(registry):
+    """Resolve every concrete POST through the destination selector."""
+    selected = {}
+    for source in registry:
+        if source.method != "POST" or source.kind != "route":
+            continue
+        spec = runtime_reassignment_destination_spec(
+            sample_path(source.template), registry)
+        if spec is not None:
+            selected[spec.name] = (
+                spec.reassignment_destination_kind,
+                spec.reassignment_destination_field)
     return selected
 
 
@@ -1313,6 +1361,146 @@ class ReassignmentParentContractTests(unittest.TestCase):
                 RuntimeError, "Ambiguous RouteSpec reassignment parent"):
             runtime_reassignment_parent_spec(
                 "/api/setup/rink/example/assign-venue", (spec, duplicate))
+
+
+class ReassignmentDestinationContractTests(unittest.TestCase):
+    """Every assign destination is one complete fail-closed RouteSpec fact."""
+
+    @staticmethod
+    def _mutate(target, **changes):
+        return tuple(
+            dataclasses.replace(spec, **changes)
+            if spec is target else spec
+            for spec in REGISTRY)
+
+    def test_runtime_reassignment_destination_is_the_complete_class(self):
+        self.assertEqual(
+            _runtime_reassignment_destination_map(REGISTRY),
+            _EXPECTED_REASSIGNMENT_DESTINATIONS)
+        self.assertEqual(
+            {spec.name: (spec.reassignment_destination_kind,
+                         spec.reassignment_destination_field)
+             for spec in REASSIGNMENT_DESTINATION_SPECS},
+            _EXPECTED_REASSIGNMENT_DESTINATIONS)
+        self.assertFalse(hasattr(srv, "_V1_REASSIGN_DEST"))
+        self.assertFalse(hasattr(srv, "_V2_REASSIGN_DEST"))
+
+    def test_reassignment_destination_target_reads_received_body_field(self):
+        self.assertEqual(
+            {spec.name for spec in REASSIGNMENT_DESTINATION_SPECS},
+            set(_EXPECTED_REASSIGNMENT_DESTINATIONS))
+        for name, expected in _EXPECTED_REASSIGNMENT_DESTINATIONS.items():
+            with self.subTest(name=name):
+                spec = BY_NAME[name]
+                path = sample_path(spec.template)
+                self.assertIs(
+                    runtime_reassignment_destination_spec(path), spec)
+                self.assertIs(
+                    runtime_reassignment_destination_spec(
+                        path + "?ignored=1"), spec)
+                destination_id = "destination-for-" + name
+                self.assertEqual(
+                    srv._reassignment_destination_target(
+                        path, {expected[1]: destination_id}),
+                    (expected[0], destination_id))
+                self.assertEqual(
+                    srv._reassignment_destination_target(
+                        path + "?ignored=1",
+                        {expected[1]: destination_id}),
+                    (expected[0], destination_id))
+                self.assertEqual(
+                    srv._reassignment_destination_target(
+                        path, {expected[1]: None}),
+                    (expected[0], None))
+
+        self.assertIsNone(srv._reassignment_destination_target(
+            "/api/v2/setup/team/example/delete", {}))
+
+    def test_runtime_reassignment_destination_refuses_narrowing(self):
+        enrolled = BY_NAME["post_v2_setup_team_id_assign_league"]
+        narrowed = self._mutate(
+            enrolled, reassignment_destination_kind=None,
+            reassignment_destination_field=None)
+        with self.assertRaisesRegex(RuntimeError, "require.*metadata"):
+            reassignment_destination_specs(narrowed)
+
+    def test_runtime_reassignment_destination_refuses_widening(self):
+        unenrolled = BY_NAME["post_games_id_action"]
+        widened = self._mutate(
+            unenrolled, reassignment_destination_kind="league",
+            reassignment_destination_field="league_id")
+        with self.assertRaisesRegex(RuntimeError,
+                                    "concrete POST assign routes"):
+            reassignment_destination_specs(widened)
+
+    def test_runtime_reassignment_destination_rejects_half_filled_metadata(self):
+        target = BY_NAME["post_v2_setup_team_id_assign_league"]
+        mutations = (
+            {"reassignment_destination_kind": None},
+            {"reassignment_destination_field": None},
+        )
+        for changes in mutations:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(RuntimeError, "must be paired"):
+                    reassignment_destination_specs(
+                        self._mutate(target, **changes))
+
+    def test_runtime_reassignment_destination_rejects_invalid_values(self):
+        target = BY_NAME["post_v2_setup_team_id_assign_league"]
+        mutations = (
+            {"reassignment_destination_kind": ""},
+            {"reassignment_destination_kind": "   "},
+            {"reassignment_destination_kind": 7},
+            {"reassignment_destination_field": ""},
+            {"reassignment_destination_field": "   "},
+            {"reassignment_destination_field": 7},
+        )
+        for changes in mutations:
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(RuntimeError,
+                                            "metadata is invalid"):
+                    reassignment_destination_specs(
+                        self._mutate(target, **changes))
+
+    def test_runtime_reassignment_destination_rejects_wrong_route_shapes(self):
+        cases = (
+            (BY_NAME["get_accounts"], {}),
+            (BY_NAME["post_games_id_action"], {}),
+            (BY_NAME["post_v2_setup_team_id_assign_league"],
+             {"kind": "family"}),
+        )
+        for target, extra in cases:
+            with self.subTest(target=target.name, extra=extra):
+                mutated = self._mutate(
+                    target,
+                    reassignment_destination_kind="organization",
+                    reassignment_destination_field="organization_id",
+                    **extra)
+                with self.assertRaisesRegex(RuntimeError,
+                                            "concrete POST assign routes"):
+                    reassignment_destination_specs(mutated)
+
+    def test_runtime_reassignment_destination_requires_parent_agreement(self):
+        target = BY_NAME["post_setup_rink_id_assign_venue"]
+        for changes in (
+                {"reassignment_destination_kind": "organization"},
+                {"reassignment_destination_field": "organization_id"}):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(RuntimeError,
+                                            "must agree"):
+                    reassignment_destination_specs(
+                        self._mutate(target, **changes))
+
+    def test_runtime_reassignment_destination_ambiguity_fails_closed(self):
+        spec = BY_NAME["post_v2_setup_team_id_assign_league"]
+        duplicate = dataclasses.replace(
+            spec, name="duplicate_post_v2_setup_team_id_assign_league")
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "Ambiguous RouteSpec reassignment destination"):
+            runtime_reassignment_destination_spec(
+                "/api/v2/setup/team/example/assign-league",
+                (spec, duplicate))
 
 
 class MethodTableNarrowingTests(unittest.TestCase):
