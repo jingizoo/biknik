@@ -160,12 +160,16 @@ class RouteSpec:
              route also accepts. The pair is all-or-nothing, valid only on a
              concrete POST ``assign-*`` route, and resolved fail-closed before
              the guarded mutation builds its authorization targets.
-    reassignment_destination_kind / reassignment_destination_field
+    reassignment_destination_kind / reassignment_destination_field /
+    reassignment_destination_nullable
              The generic destination authorization target for an ``assign-*``
-             route. The pair is all-or-nothing, valid only on a concrete POST
-             assign route, and resolved fail-closed before the guarded
-             mutation. When writable-parent metadata is also present, both
-             pairs must name the same kind and body field.
+             route and its strict one-field body contract. The three values
+             are all-or-nothing, valid only on a concrete POST assign route,
+             and resolved fail-closed before validation or the guarded
+             mutation. ``False`` means a non-empty string is required;
+             ``True`` means the field must be present but may explicitly be
+             null to unassign. When writable-parent metadata is also present,
+             both pairs must name the same kind and body field.
     note     free text; provenance for the odd entries.
     """
 
@@ -184,6 +188,7 @@ class RouteSpec:
     reassignment_parent_field: str | None = None
     reassignment_destination_kind: str | None = None
     reassignment_destination_field: str | None = None
+    reassignment_destination_nullable: bool | None = None
     note: str = ""
 
     @property
@@ -1785,10 +1790,11 @@ REGISTRY = (
               auth="session+MANAGE_SETUP", scope_axis="cross",
               reassignment_destination_kind="league",
               reassignment_destination_field="level_id",
+              reassignment_destination_nullable=True,
               note=("#202 repair root cause 1: the concrete leaf, not "
                     "the assign-\\w+ wildcard family that used to stand "
                     "in for it. _handle_reassign's own "
-                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "_V1_REASSIGN_CALL admits ONLY "
                     "(division, level) for this entity -- no other "
                     "assign-<word> on /api/setup/division/<id> reaches "
                     "anything but a 404. #202 auth: authz.py:288-290 "
@@ -1904,8 +1910,9 @@ REGISTRY = (
               reassignment_parent_field="organization_id",
               reassignment_destination_kind="organization",
               reassignment_destination_field="organization_id",
+              reassignment_destination_nullable=True,
               note=("#202 repair root cause 1: the concrete leaf. "
-                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "_V1_REASSIGN_CALL admits ONLY "
                     "(league, organization) for this entity. #202 auth: "
                     "authz.py:279-280, an explicit override (checked "
                     "BEFORE the venue|rink arena rule at 285-287, so this "
@@ -2042,8 +2049,9 @@ REGISTRY = (
               auth="session+MANAGE_SETUP", scope_axis="cross",
               reassignment_destination_kind="team",
               reassignment_destination_field="team_id",
+              reassignment_destination_nullable=False,
               note=("#202 repair root cause 1: the concrete leaf. "
-                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "_V1_REASSIGN_CALL admits ONLY "
                     "(player, team) for this entity. #202 auth: "
                     "authz.py:288-290 ((division|team|player)/[^/]+/"
                     "assign-\\w+) -> MANAGE_SETUP. #202 scope_axis: TWO "
@@ -2087,8 +2095,9 @@ REGISTRY = (
               reassignment_parent_field="venue_id",
               reassignment_destination_kind="venue",
               reassignment_destination_field="venue_id",
+              reassignment_destination_nullable=False,
               note=("#202 repair root cause 1: the concrete leaf. "
-                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "_V1_REASSIGN_CALL admits ONLY "
                     "(rink, venue) for this entity. #202 auth: authz.py:"
                     "285-287 ((venue|rink)/[^/]+/assign-\\w+) -> "
                     "MANAGE_ARENA. #202 scope_axis: THREE "
@@ -2139,6 +2148,7 @@ REGISTRY = (
               auth="session+MANAGE_SETUP", scope_axis="cross",
               reassignment_destination_kind="division",
               reassignment_destination_field="division_id",
+              reassignment_destination_nullable=True,
               note=("#202: authorize(role, path) -- the full path matches "
                     "none of authz.py's specific rules (279-290 name "
                     "specific entity words, not 'season-team-"
@@ -2226,8 +2236,9 @@ REGISTRY = (
               reassignment_parent_field="club_id",
               reassignment_destination_kind="club",
               reassignment_destination_field="club_id",
+              reassignment_destination_nullable=True,
               note=("#202 repair root cause 1: the concrete leaf. "
-                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "_V1_REASSIGN_CALL admits ONLY "
                     "(team, club) for this entity. #202 auth: authz.py:"
                     "288-290 ((division|team|player)/[^/]+/assign-\\w+) -> "
                     "MANAGE_SETUP. #202 scope_axis: THREE "
@@ -2274,8 +2285,9 @@ REGISTRY = (
               reassignment_parent_field="organization_id",
               reassignment_destination_kind="organization",
               reassignment_destination_field="organization_id",
+              reassignment_destination_nullable=True,
               note=("#202 repair root cause 1: the concrete leaf. "
-                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "_V1_REASSIGN_CALL admits ONLY "
                     "(venue, organization) for this entity. #202 auth: "
                     "authz.py:285-287 ((venue|rink)/[^/]+/assign-\\w+) -> "
                     "MANAGE_ARENA (the venue|rink group; contrast the "
@@ -2329,8 +2341,9 @@ REGISTRY = (
               scope_axis='cross',
               reassignment_destination_kind="league",
               reassignment_destination_field="league_id",
+              reassignment_destination_nullable=False,
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('division', id), ('league', dest)] (server.py:4143-4144); service.py:1858-1859 division in _SEASON_OWNED_TARGET_KINDS -> kinds - _PROGRAM_AXIS_TARGET_KINDS is nonempty -> Program+Season both required (service.py:1961-1968) || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
-                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "_V2_REASSIGN_CALL admits ONLY "
                     "(division, league) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/division/[^/]+/delete$",
               "/api/v2/setup/division/{}/delete",
@@ -2418,8 +2431,9 @@ REGISTRY = (
               scope_axis='program',
               reassignment_destination_kind="team",
               reassignment_destination_field="team_id",
+              reassignment_destination_nullable=False,
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('player', id), ('team', dest)] (server.py:4156-4157); service.py:1860-1862 player AND team both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
-                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "_V2_REASSIGN_CALL admits ONLY "
                     "(player, team) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/player/[^/]+/delete$",
               "/api/v2/setup/player/{}/delete",
@@ -2448,8 +2462,9 @@ REGISTRY = (
               reassignment_parent_field="operator_organization_id",
               reassignment_destination_kind="organization",
               reassignment_destination_field="operator_organization_id",
+              reassignment_destination_nullable=True,
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34, (program|division|team|player)/[^/]+/assign-\\w+) -- League Admin only. targets = [('program', id), ('organization', dest)] (server.py:4098-4114, 4140-4141); service.py:1860-1862 program AND organization both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
-                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "_V2_REASSIGN_CALL admits ONLY "
                     "(program, organization) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/program/[^/]+/delete$",
               "/api/v2/setup/program/{}/delete",
@@ -2471,8 +2486,9 @@ REGISTRY = (
               reassignment_parent_field="venue_id",
               reassignment_destination_kind="venue",
               reassignment_destination_field="venue_id",
+              reassignment_destination_nullable=False,
               note=("#202: Permission.MANAGE_ARENA (authz.py:31-32, (venue|rink)/[^/]+/assign-\\w+). targets = [('rink', id), ('venue', dest)] plus the writable_parent Venue declared on this RouteSpec; service.py:1860-1862 rink AND venue both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
-                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "_V2_REASSIGN_CALL admits ONLY "
                     "(rink, venue) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/rink/[^/]+/delete$",
               "/api/v2/setup/rink/{}/delete", "post_v2_setup_rink_id_delete",
@@ -2494,6 +2510,7 @@ REGISTRY = (
               scope_axis='cross',
               reassignment_destination_kind="division",
               reassignment_destination_field="division_id",
+              reassignment_destination_nullable=True,
               note=("#202: Permission.MANAGE_SETUP (authz.py:37-39). _guarded_mutation([('registration', id), ('division', did)], ...) (server.py:4303-4324); service.py:413-416, 1858-1859")),
     RouteSpec("POST",
               r"^/api/v2/setup/season-team-registration/[^/]+/assign-league$",
@@ -2504,6 +2521,7 @@ REGISTRY = (
               scope_axis='cross',
               reassignment_destination_kind="league",
               reassignment_destination_field="league_id",
+              reassignment_destination_nullable=False,
               note=("#202: Permission.MANAGE_SETUP (authz.py:37-39). _guarded_mutation([('registration', id), ('league', lid)], ...) (server.py:4286-4302); service.py:413-416 'registration' bridges to 'league_season'; service.py:1858-1859 league_season in _SEASON_OWNED_TARGET_KINDS")),
     RouteSpec("POST",
               r"^/api/v2/setup/season-team-registration/[^/]+/delete$",
@@ -2628,9 +2646,10 @@ REGISTRY = (
               reassignment_parent_field="club_id",
               reassignment_destination_kind="club",
               reassignment_destination_field="club_id",
+              reassignment_destination_nullable=True,
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('team', id), ('club', dest)] (server.py:4147-4148); service.py:1860-1862 team AND club both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: one of TWO concrete "
                     "leaves for this entity (see assign-league below) -- "
-                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit BOTH "
+                    "_V2_REASSIGN_CALL admits BOTH "
                     "(team, club) and (team, league); a wildcard target "
                     "silently conflated both into one over-broad spec")),
     RouteSpec("POST", r"^/api/v2/setup/team/[^/]+/assign-league$",
@@ -2640,6 +2659,7 @@ REGISTRY = (
               scope_axis='program',
               reassignment_destination_kind="league",
               reassignment_destination_field="league_id",
+              reassignment_destination_nullable=False,
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('team', id), ('league', dest)] (server.py:4153-4155), both in _PROGRAM_AXIS_TARGET_KINDS (service.py:1860-1862) so the #409 HTTP-boundary preflight requires only an explicit Program. NOTE the documented mid-transaction exception (server.py:4149-4155, service.py:1327-1361 _season_axis_guard): transfer_team_to_league's OWN transaction may discover, under its row locks, ACTIVE SeasonTeamRegistrations to rewrite, and at that instant the mutation becomes CROSS-AXIS and the two-axis rule is re-applied INSIDE the transaction. Data-dependent, not request-shape-dependent, so documented here rather than split into a second RouteSpec || ORIGINAL: ""#202 repair root cause 1: the other of the two "
                     "concrete leaves for this entity -- #283 Slice B, "
                     "promotion/relegation/transfer to a different "
@@ -2665,8 +2685,9 @@ REGISTRY = (
               reassignment_parent_field="organization_id",
               reassignment_destination_kind="organization",
               reassignment_destination_field="organization_id",
+              reassignment_destination_nullable=True,
               note=("#202: Permission.MANAGE_ARENA (authz.py:31-32). targets = [('venue', id), ('organization', dest)] plus the writable_parent Organization declared on this RouteSpec; service.py:1860-1862 venue AND organization both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
-                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "_V2_REASSIGN_CALL admits ONLY "
                     "(venue, organization) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/venue/[^/]+/delete$",
               "/api/v2/setup/venue/{}/delete",
@@ -2764,9 +2785,10 @@ _SENSITIVE_POST_DENIAL_MATCHERS = tuple(
 def reassignment_destination_specs(registry=None):
     """Return every assign route's generic destination contract.
 
-    Destination kind and request-body field are one policy fact. Every
-    concrete POST ``assign-*`` route must declare the pair: silently omitting
-    one would remove the destination authorization target. A half-populated,
+    Destination kind, request-body field, and nullability are one policy fact.
+    Every concrete POST ``assign-*`` route must declare all three: silently
+    omitting one would remove either the destination authorization target or
+    its strict required-vs-explicit-null request contract. A half-populated,
     mistyped, empty, or structurally misplaced declaration is likewise a
     registry defect and stops request handling.
 
@@ -2777,11 +2799,14 @@ def reassignment_destination_specs(registry=None):
     specs = REGISTRY if registry is None else registry
     half_filled = tuple(
         spec.name for spec in specs
-        if ((spec.reassignment_destination_kind is None)
-            != (spec.reassignment_destination_field is None)))
+        if sum(value is not None for value in (
+            spec.reassignment_destination_kind,
+            spec.reassignment_destination_field,
+            spec.reassignment_destination_nullable)) not in (0, 3))
     if half_filled:
         raise RuntimeError(
-            "Reassignment destination kind/field must be paired on: "
+            "Reassignment destination kind/field/nullability must be paired "
+            "on: "
             + ", ".join(half_filled))
 
     marked = tuple(
@@ -2792,7 +2817,8 @@ def reassignment_destination_specs(registry=None):
         if (type(spec.reassignment_destination_kind) is not str
             or not spec.reassignment_destination_kind.strip()
             or type(spec.reassignment_destination_field) is not str
-            or not spec.reassignment_destination_field.strip()))
+            or not spec.reassignment_destination_field.strip()
+            or type(spec.reassignment_destination_nullable) is not bool))
     if invalid_values:
         raise RuntimeError(
             "Reassignment destination metadata is invalid on: "

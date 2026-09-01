@@ -664,6 +664,27 @@ def _reassignment_destination_target(path: str, body: dict):
             body.get(spec.reassignment_destination_field) or None)
 
 
+def _validate_reassignment_body(path: str, body: dict):
+    """Apply the strict one-field body contract declared by an assign route.
+
+    The broad handler family still receives direct unit-test probes for
+    unknown entity/target combinations. ``None`` preserves their existing
+    not-found path; over HTTP the concrete POST admission table prevents those
+    non-routes reaching dispatch. Every admitted assign route is required at
+    registry load to resolve a complete destination contract.
+    """
+    spec = runtime_reassignment_destination_spec(path)
+    if spec is None:
+        return body
+    field = spec.reassignment_destination_field
+    schema = {"allowed": {field}, "types": {field: str}}
+    if spec.reassignment_destination_nullable:
+        schema["present"] = (field,)
+    else:
+        schema["required"] = (field,)
+    return check_body(body, **schema)
+
+
 # ONE gate per process, beside STATE and with the same lifetime — it orders
 # REQUESTS, not data, so it deliberately survives STATE.reset()/store swaps.
 # See services/context_gate.py for the ordering argument, the lock level, and
@@ -4679,38 +4700,14 @@ class Handler(BaseHTTPRequestHandler):
         api = STATE.api
         b = body
         combo = (entity, target)
-        # Strict schema (#271): each real reassign reads exactly one target key.
-        # A non-nullable relation (rink→venue, player→team) REQUIRES a str id; a
-        # nullable one (organization/level/club) must be PRESENT but may be null
-        # (so `{}` can't silently unassign — an explicit {"key": null} is the
-        # only way to clear it). Every id is type-checked before any store
-        # lookup. Zero writes/audits on rejection.
-        _NONE = type(None)
-        _V1_REASSIGN_SCHEMA = {
-            ("league", "organization"): dict(
-                allowed={"organization_id"}, present=("organization_id",),
-                types={"organization_id": (str, _NONE)}),
-            ("venue", "organization"): dict(
-                allowed={"organization_id"}, present=("organization_id",),
-                types={"organization_id": (str, _NONE)}),
-            ("rink", "venue"): dict(
-                allowed={"venue_id"}, required=("venue_id",),
-                types={"venue_id": str}),
-            ("division", "level"): dict(
-                allowed={"level_id"}, present=("level_id",),
-                types={"level_id": (str, _NONE)}),
-            ("team", "club"): dict(
-                allowed={"club_id"}, present=("club_id",),
-                types={"club_id": (str, _NONE)}),
-            ("player", "team"): dict(
-                allowed={"team_id"}, required=("team_id",),
-                types={"team_id": str}),
-        }
-        if combo in _V1_REASSIGN_SCHEMA:
-            try:
-                check_body(b, **_V1_REASSIGN_SCHEMA[combo])
-            except BodyError as exc:
-                return self._send_json(exc.payload, exc.status)
+        # Strict schema (#271): RouteSpec declares the one destination key and
+        # whether it is required or must be explicitly present but nullable.
+        # Every id is type-checked before any store lookup. Zero writes/audits
+        # on rejection.
+        try:
+            _validate_reassignment_body(self.path, b)
+        except BodyError as exc:
+            return self._send_json(exc.payload, exc.status)
         # #369 — target-record authorization, BOTH ENDS. A reassign moves a
         # record out of one parent and into another, so the caller must be
         # entitled to the SOURCE record it is moving AND to any non-null
@@ -4989,11 +4986,9 @@ class Handler(BaseHTTPRequestHandler):
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
             # division_id is nullable (null clears): must be PRESENT but may be
-            # null, so `{}` can't silently unassign.
+            # null, so `{}` can't silently unassign. RouteSpec owns that fact.
             try:
-                check_body(b, allowed={"division_id"},
-                           present=("division_id",),
-                           types={"division_id": (str, type(None))})
+                _validate_reassignment_body(self.path, b)
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             # #369 — both ends: the registration being edited (judged by its
@@ -5307,42 +5302,14 @@ class Handler(BaseHTTPRequestHandler):
         api = STATE.api
         b = body
         combo = (entity, target)
-        # Strict schema (#271): each real reassign reads exactly one target key
-        # (the v2 key set differs from v1). Non-nullable relations (division→
-        # league, team→league, player→team, rink→venue) REQUIRE a str id;
-        # nullable ones (program/team/venue organization/club) must be PRESENT
-        # but may be null (explicit-null unassign — `{}` can't silently clear).
-        # Every id is type-checked. Zero writes/audits on rejection.
-        _NONE = type(None)
-        _V2_REASSIGN_SCHEMA = {
-            ("program", "organization"): dict(
-                allowed={"operator_organization_id"},
-                present=("operator_organization_id",),
-                types={"operator_organization_id": (str, _NONE)}),
-            ("division", "league"): dict(
-                allowed={"league_id"}, required=("league_id",),
-                types={"league_id": str}),
-            ("team", "club"): dict(
-                allowed={"club_id"}, present=("club_id",),
-                types={"club_id": (str, _NONE)}),
-            ("team", "league"): dict(
-                allowed={"league_id"}, required=("league_id",),
-                types={"league_id": str}),
-            ("player", "team"): dict(
-                allowed={"team_id"}, required=("team_id",),
-                types={"team_id": str}),
-            ("rink", "venue"): dict(
-                allowed={"venue_id"}, required=("venue_id",),
-                types={"venue_id": str}),
-            ("venue", "organization"): dict(
-                allowed={"organization_id"}, present=("organization_id",),
-                types={"organization_id": (str, _NONE)}),
-        }
-        if combo in _V2_REASSIGN_SCHEMA:
-            try:
-                check_body(b, **_V2_REASSIGN_SCHEMA[combo])
-            except BodyError as exc:
-                return self._send_json(exc.payload, exc.status)
+        # Strict schema (#271): RouteSpec declares the one v2 destination key
+        # and whether it is required or explicitly-present nullable. Every id
+        # is type-checked before any store lookup. Zero writes/audits on
+        # rejection.
+        try:
+            _validate_reassignment_body(self.path, b)
+        except BodyError as exc:
+            return self._send_json(exc.payload, exc.status)
         # #369 — target-record authorization, BOTH ENDS: the SOURCE record being
         # moved and any non-null DESTINATION it is moving into (an explicit null
         # unassign has no destination to check). Both ends, the write and the
@@ -5561,10 +5528,10 @@ class Handler(BaseHTTPRequestHandler):
             self.path, b)
         ml = re.match(r"^season-team-registration/([^/]+)/assign-league$", entity)
         if ml:
-            # A registration's League is mandatory (non-nullable): required+str.
+            # A registration's League is mandatory (non-nullable); RouteSpec
+            # owns the required-string contract.
             try:
-                check_body(b, allowed={"league_id"}, required=("league_id",),
-                           types={"league_id": str})
+                _validate_reassignment_body(self.path, b)
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             # #369 — both ends: the registration (judged by its LeagueSeason)
@@ -5580,10 +5547,9 @@ class Handler(BaseHTTPRequestHandler):
             # v2: clearing the Division PRESERVES the required league_id; a set
             # Division must match the registration's League. division_id is
             # nullable — must be PRESENT but may be null (no silent unassign).
+            # RouteSpec owns that request contract.
             try:
-                check_body(b, allowed={"division_id"},
-                           present=("division_id",),
-                           types={"division_id": (str, type(None))})
+                _validate_reassignment_body(self.path, b)
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             # #369 — both ends: the registration and the destination Division
