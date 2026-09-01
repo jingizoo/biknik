@@ -1164,8 +1164,12 @@ class WaiverFingerprintTests(unittest.TestCase):
             route_extract_module._AUDIT_WAIVERS.update(saved)))
 
     def test_every_real_waiver_is_hit_exactly_once(self):
-        """The real server.py, unmodified: each of the 114 declared waivers
-        (119 before PR #427's final blocker, then +1 and -3 across its four
+        """The real server.py, unmodified: each of the 121 declared waivers
+        (114 before the reassignment-destination RouteSpec slice: +4 exact
+        registry-lookup sites, +3 registration guarded-mutation return sites,
+        +2 append guards, and -2 retired inline body-field reads = net +7).
+        The preceding 114 was 119 before PR #427's final blocker, then +1 and
+        -3 across its four
         rounds -- verified commit by commit, because the prose breakdown
         below had gone stale against the number it explains and a count
         nobody can re-derive is not a gate:
@@ -1292,7 +1296,7 @@ class WaiverFingerprintTests(unittest.TestCase):
         dedicated proof for what the extra two parts catch that this
         exact-one-hit check alone would not."""
         walker = extract_walker()
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
         for key in route_extract_module._AUDIT_WAIVERS:
             with self.subTest(waiver=key):
                 self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
@@ -2863,7 +2867,7 @@ class WaiverTaintPropagationTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
 
 
 # --------------------------------------------------------------------------- #
@@ -3090,7 +3094,7 @@ class SubscriptCalleeAndReturnDispatchTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
 
 
 # --------------------------------------------------------------------------- #
@@ -3246,7 +3250,7 @@ class DefaultDenyExpressionOperandTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
 
 
 # --------------------------------------------------------------------------- #
@@ -3488,7 +3492,7 @@ class ExceptionDrivenRoutingTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
 
 
 # --------------------------------------------------------------------------- #
@@ -3802,7 +3806,7 @@ class CompositionalTaintTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
 
 
 # --------------------------------------------------------------------------- #
@@ -4439,7 +4443,7 @@ class ExecutionControlAndDataFlowTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
 
 
 # --------------------------------------------------------------------------- #
@@ -4792,7 +4796,7 @@ class LoopIterableAndReceiverChainDispatchTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
 
 
 # --------------------------------------------------------------------------- #
@@ -5178,7 +5182,7 @@ class TransparentCompositionCalleeTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
 
 
 # --------------------------------------------------------------------------- #
@@ -5563,7 +5567,7 @@ class CapturedArgumentTransferTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 121)
 
 
 class _EvilApiFacade:

@@ -160,6 +160,12 @@ class RouteSpec:
              route also accepts. The pair is all-or-nothing, valid only on a
              concrete POST ``assign-*`` route, and resolved fail-closed before
              the guarded mutation builds its authorization targets.
+    reassignment_destination_kind / reassignment_destination_field
+             The generic destination authorization target for an ``assign-*``
+             route. The pair is all-or-nothing, valid only on a concrete POST
+             assign route, and resolved fail-closed before the guarded
+             mutation. When writable-parent metadata is also present, both
+             pairs must name the same kind and body field.
     note     free text; provenance for the odd entries.
     """
 
@@ -176,6 +182,8 @@ class RouteSpec:
     transport_denial_audit_purpose: str | None = None
     reassignment_parent_kind: str | None = None
     reassignment_parent_field: str | None = None
+    reassignment_destination_kind: str | None = None
+    reassignment_destination_field: str | None = None
     note: str = ""
 
     @property
@@ -1775,6 +1783,8 @@ REGISTRY = (
               "/api/setup/division/{}/assign-level",
               "post_setup_division_id_assign_level", "_handle_reassign",
               auth="session+MANAGE_SETUP", scope_axis="cross",
+              reassignment_destination_kind="league",
+              reassignment_destination_field="level_id",
               note=("#202 repair root cause 1: the concrete leaf, not "
                     "the assign-\\w+ wildcard family that used to stand "
                     "in for it. _handle_reassign's own "
@@ -1892,6 +1902,8 @@ REGISTRY = (
               auth="session+MANAGE_SETUP", scope_axis="cross",
               reassignment_parent_kind="organization",
               reassignment_parent_field="organization_id",
+              reassignment_destination_kind="organization",
+              reassignment_destination_field="organization_id",
               note=("#202 repair root cause 1: the concrete leaf. "
                     "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
                     "(league, organization) for this entity. #202 auth: "
@@ -2028,6 +2040,8 @@ REGISTRY = (
               "/api/setup/player/{}/assign-team",
               "post_setup_player_id_assign_team", "_handle_reassign",
               auth="session+MANAGE_SETUP", scope_axis="cross",
+              reassignment_destination_kind="team",
+              reassignment_destination_field="team_id",
               note=("#202 repair root cause 1: the concrete leaf. "
                     "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
                     "(player, team) for this entity. #202 auth: "
@@ -2071,6 +2085,8 @@ REGISTRY = (
               auth="session+MANAGE_ARENA", scope_axis="cross",
               reassignment_parent_kind="venue",
               reassignment_parent_field="venue_id",
+              reassignment_destination_kind="venue",
+              reassignment_destination_field="venue_id",
               note=("#202 repair root cause 1: the concrete leaf. "
                     "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
                     "(rink, venue) for this entity. #202 auth: authz.py:"
@@ -2121,6 +2137,8 @@ REGISTRY = (
               "post_setup_season_team_registration_id_assign_division",
               "_handle_setup",
               auth="session+MANAGE_SETUP", scope_axis="cross",
+              reassignment_destination_kind="division",
+              reassignment_destination_field="division_id",
               note=("#202: authorize(role, path) -- the full path matches "
                     "none of authz.py's specific rules (279-290 name "
                     "specific entity words, not 'season-team-"
@@ -2135,11 +2153,11 @@ REGISTRY = (
                     "['registration'], api/service.py:413-420) -- edge = "
                     "(program, season, league) via _setup_target_edges "
                     "kind=='league_season' (api/service.py:834-860). The "
-                    "body's own 'division_id' destination is NOT a second "
-                    "_guarded_mutation target here (only the registration "
-                    "itself is, per server.py:3721-3742) but the "
-                    "registration's own edge already spans all three "
-                    "axes")),
+                    "body's own 'division_id' destination is the second "
+                    "_guarded_mutation target declared by this RouteSpec; "
+                    "the registration's own edge already spans all three "
+                    "axes, while the destination pin independently checks "
+                    "the named Division")),
     RouteSpec("POST", r"^/api/setup/season-team-registration/[^/]+/remove$",
               "/api/setup/season-team-registration/{}/remove",
               "post_setup_season_team_registration_id_remove",
@@ -2206,6 +2224,8 @@ REGISTRY = (
               auth="session+MANAGE_SETUP", scope_axis="cross",
               reassignment_parent_kind="club",
               reassignment_parent_field="club_id",
+              reassignment_destination_kind="club",
+              reassignment_destination_field="club_id",
               note=("#202 repair root cause 1: the concrete leaf. "
                     "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
                     "(team, club) for this entity. #202 auth: authz.py:"
@@ -2252,6 +2272,8 @@ REGISTRY = (
               auth="session+MANAGE_ARENA", scope_axis="cross",
               reassignment_parent_kind="organization",
               reassignment_parent_field="organization_id",
+              reassignment_destination_kind="organization",
+              reassignment_destination_field="organization_id",
               note=("#202 repair root cause 1: the concrete leaf. "
                     "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
                     "(venue, organization) for this entity. #202 auth: "
@@ -2305,6 +2327,8 @@ REGISTRY = (
               "post_v2_setup_division_id_assign_league", "_handle_reassign_v2",
               auth="session+MANAGE_SETUP",
               scope_axis='cross',
+              reassignment_destination_kind="league",
+              reassignment_destination_field="league_id",
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('division', id), ('league', dest)] (server.py:4143-4144); service.py:1858-1859 division in _SEASON_OWNED_TARGET_KINDS -> kinds - _PROGRAM_AXIS_TARGET_KINDS is nonempty -> Program+Season both required (service.py:1961-1968) || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
                     "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
                     "(division, league) for this entity")),
@@ -2392,6 +2416,8 @@ REGISTRY = (
               "post_v2_setup_player_id_assign_team", "_handle_reassign_v2",
               auth="session+MANAGE_SETUP",
               scope_axis='program',
+              reassignment_destination_kind="team",
+              reassignment_destination_field="team_id",
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('player', id), ('team', dest)] (server.py:4156-4157); service.py:1860-1862 player AND team both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
                     "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
                     "(player, team) for this entity")),
@@ -2420,6 +2446,8 @@ REGISTRY = (
               scope_axis='program',
               reassignment_parent_kind="organization",
               reassignment_parent_field="operator_organization_id",
+              reassignment_destination_kind="organization",
+              reassignment_destination_field="operator_organization_id",
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34, (program|division|team|player)/[^/]+/assign-\\w+) -- League Admin only. targets = [('program', id), ('organization', dest)] (server.py:4098-4114, 4140-4141); service.py:1860-1862 program AND organization both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
                     "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
                     "(program, organization) for this entity")),
@@ -2441,6 +2469,8 @@ REGISTRY = (
               scope_axis='program',
               reassignment_parent_kind="venue",
               reassignment_parent_field="venue_id",
+              reassignment_destination_kind="venue",
+              reassignment_destination_field="venue_id",
               note=("#202: Permission.MANAGE_ARENA (authz.py:31-32, (venue|rink)/[^/]+/assign-\\w+). targets = [('rink', id), ('venue', dest)] plus the writable_parent Venue declared on this RouteSpec; service.py:1860-1862 rink AND venue both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
                     "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
                     "(rink, venue) for this entity")),
@@ -2462,6 +2492,8 @@ REGISTRY = (
               "_handle_setup_v2",
               auth="session+MANAGE_SETUP",
               scope_axis='cross',
+              reassignment_destination_kind="division",
+              reassignment_destination_field="division_id",
               note=("#202: Permission.MANAGE_SETUP (authz.py:37-39). _guarded_mutation([('registration', id), ('division', did)], ...) (server.py:4303-4324); service.py:413-416, 1858-1859")),
     RouteSpec("POST",
               r"^/api/v2/setup/season-team-registration/[^/]+/assign-league$",
@@ -2470,6 +2502,8 @@ REGISTRY = (
               "_handle_setup_v2",
               auth="session+MANAGE_SETUP",
               scope_axis='cross',
+              reassignment_destination_kind="league",
+              reassignment_destination_field="league_id",
               note=("#202: Permission.MANAGE_SETUP (authz.py:37-39). _guarded_mutation([('registration', id), ('league', lid)], ...) (server.py:4286-4302); service.py:413-416 'registration' bridges to 'league_season'; service.py:1858-1859 league_season in _SEASON_OWNED_TARGET_KINDS")),
     RouteSpec("POST",
               r"^/api/v2/setup/season-team-registration/[^/]+/delete$",
@@ -2592,6 +2626,8 @@ REGISTRY = (
               scope_axis='program',
               reassignment_parent_kind="club",
               reassignment_parent_field="club_id",
+              reassignment_destination_kind="club",
+              reassignment_destination_field="club_id",
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('team', id), ('club', dest)] (server.py:4147-4148); service.py:1860-1862 team AND club both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: one of TWO concrete "
                     "leaves for this entity (see assign-league below) -- "
                     "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit BOTH "
@@ -2602,6 +2638,8 @@ REGISTRY = (
               "post_v2_setup_team_id_assign_league", "_handle_reassign_v2",
               auth="session+MANAGE_SETUP",
               scope_axis='program',
+              reassignment_destination_kind="league",
+              reassignment_destination_field="league_id",
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('team', id), ('league', dest)] (server.py:4153-4155), both in _PROGRAM_AXIS_TARGET_KINDS (service.py:1860-1862) so the #409 HTTP-boundary preflight requires only an explicit Program. NOTE the documented mid-transaction exception (server.py:4149-4155, service.py:1327-1361 _season_axis_guard): transfer_team_to_league's OWN transaction may discover, under its row locks, ACTIVE SeasonTeamRegistrations to rewrite, and at that instant the mutation becomes CROSS-AXIS and the two-axis rule is re-applied INSIDE the transaction. Data-dependent, not request-shape-dependent, so documented here rather than split into a second RouteSpec || ORIGINAL: ""#202 repair root cause 1: the other of the two "
                     "concrete leaves for this entity -- #283 Slice B, "
                     "promotion/relegation/transfer to a different "
@@ -2625,6 +2663,8 @@ REGISTRY = (
               scope_axis='program',
               reassignment_parent_kind="organization",
               reassignment_parent_field="organization_id",
+              reassignment_destination_kind="organization",
+              reassignment_destination_field="organization_id",
               note=("#202: Permission.MANAGE_ARENA (authz.py:31-32). targets = [('venue', id), ('organization', dest)] plus the writable_parent Organization declared on this RouteSpec; service.py:1860-1862 venue AND organization both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
                     "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
                     "(venue, organization) for this entity")),
@@ -2719,6 +2759,83 @@ def sensitive_post_denial_specs(registry=None):
 SENSITIVE_POST_DENIAL_SPECS = sensitive_post_denial_specs()
 _SENSITIVE_POST_DENIAL_MATCHERS = tuple(
     (spec, re.compile(spec.pattern)) for spec in SENSITIVE_POST_DENIAL_SPECS)
+
+
+def reassignment_destination_specs(registry=None):
+    """Return every assign route's generic destination contract.
+
+    Destination kind and request-body field are one policy fact. Every
+    concrete POST ``assign-*`` route must declare the pair: silently omitting
+    one would remove the destination authorization target. A half-populated,
+    mistyped, empty, or structurally misplaced declaration is likewise a
+    registry defect and stops request handling.
+
+    The narrower writable-parent check is defence in depth over the same
+    destination. When parent metadata is present, its kind and field must
+    therefore agree exactly with this generic target.
+    """
+    specs = REGISTRY if registry is None else registry
+    half_filled = tuple(
+        spec.name for spec in specs
+        if ((spec.reassignment_destination_kind is None)
+            != (spec.reassignment_destination_field is None)))
+    if half_filled:
+        raise RuntimeError(
+            "Reassignment destination kind/field must be paired on: "
+            + ", ".join(half_filled))
+
+    marked = tuple(
+        spec for spec in specs
+        if spec.reassignment_destination_kind is not None)
+    invalid_values = tuple(
+        spec.name for spec in marked
+        if (type(spec.reassignment_destination_kind) is not str
+            or not spec.reassignment_destination_kind.strip()
+            or type(spec.reassignment_destination_field) is not str
+            or not spec.reassignment_destination_field.strip()))
+    if invalid_values:
+        raise RuntimeError(
+            "Reassignment destination metadata is invalid on: "
+            + ", ".join(invalid_values))
+
+    invalid_routes = tuple(
+        spec.name for spec in marked
+        if (spec.method != "POST" or spec.kind != "route"
+            or "/assign-" not in spec.template))
+    if invalid_routes:
+        raise RuntimeError(
+            "Reassignment destination metadata is only valid on concrete "
+            "POST assign routes: " + ", ".join(invalid_routes))
+
+    missing_routes = tuple(
+        spec.name for spec in specs
+        if (spec.method == "POST" and spec.kind == "route"
+            and "/assign-" in spec.template
+            and spec.reassignment_destination_kind is None))
+    if missing_routes:
+        raise RuntimeError(
+            "Concrete POST assign routes require reassignment destination "
+            "metadata: " + ", ".join(missing_routes))
+
+    parent_mismatches = tuple(
+        spec.name for spec in specs
+        if ((spec.reassignment_parent_kind is not None
+             or spec.reassignment_parent_field is not None)
+            and (spec.reassignment_parent_kind,
+                 spec.reassignment_parent_field)
+            != (spec.reassignment_destination_kind,
+                spec.reassignment_destination_field)))
+    if parent_mismatches:
+        raise RuntimeError(
+            "Reassignment parent and destination metadata must agree on: "
+            + ", ".join(parent_mismatches))
+    return marked
+
+
+REASSIGNMENT_DESTINATION_SPECS = reassignment_destination_specs()
+_REASSIGNMENT_DESTINATION_MATCHERS = tuple(
+    (spec, re.compile(spec.pattern))
+    for spec in REASSIGNMENT_DESTINATION_SPECS)
 
 
 def reassignment_parent_specs(registry=None):
@@ -2850,4 +2967,26 @@ def runtime_reassignment_parent_spec(path: str, registry=None):
     if len(matches) > 1:
         raise RuntimeError(
             "Ambiguous RouteSpec reassignment parent for " + path)
+    return matches[0] if matches else None
+
+
+def runtime_reassignment_destination_spec(path: str, registry=None):
+    """Return the generic destination contract matching POST ``path``.
+
+    Every concrete assign route has exactly one such contract. More than one
+    match is a policy ambiguity and fails closed rather than selecting a kind
+    or request-body field by registry order.
+    """
+    path = path.split("?", 1)[0]
+    if registry is None:
+        matches = [
+            spec for spec, pattern in _REASSIGNMENT_DESTINATION_MATCHERS
+            if pattern.match(path)]
+    else:
+        matches = [
+            spec for spec in reassignment_destination_specs(registry)
+            if re.match(spec.pattern, path)]
+    if len(matches) > 1:
+        raise RuntimeError(
+            "Ambiguous RouteSpec reassignment destination for " + path)
     return matches[0] if matches else None

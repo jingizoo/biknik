@@ -2881,6 +2881,47 @@ _AUDIT_WAIVERS = {
      "assign_rhs", ""):
         "the v2 sibling of _handle_reassign's RouteSpec policy lookup above; "
         "the route is already decided by the v2 combo/schema dispatch",
+    ("_handle_reassign", "_reassignment_destination_target(self.path, b)",
+     "assign_rhs", ""):
+        "#202 RouteSpec reassignment-destination contract -- the route is "
+        "already fully decided upstream by `combo in _V1_REASSIGN_SCHEMA`; "
+        "this fail-closed registry lookup only builds the generic destination "
+        "authorization target",
+    ("_handle_reassign_v2",
+     "_reassignment_destination_target(self.path, b)", "assign_rhs", ""):
+        "the v2 sibling of _handle_reassign's RouteSpec destination lookup; "
+        "the route is already decided by the v2 combo/schema dispatch",
+    ("_handle_setup", "_reassignment_destination_target(self.path, b)",
+     "assign_rhs", ""):
+        "the v1 registration assign route is already decided by its exact "
+        "season-team-registration regex; this lookup only builds its second "
+        "authorization target",
+    ("_handle_setup_v2", "_reassignment_destination_target(self.path, b)",
+     "assign_rhs", ""):
+        "the v2 registration assign siblings of _handle_setup's destination "
+        "lookup; their exact regex branches already decided the route",
+    ("_handle_setup",
+     "self._guarded_mutation([('registration', ma.group(1)), "
+     "reassignment_destination], lambda: _v1.registration_to_v1(api."
+     "assign_season_team_division(ma.group(1), b.get('division_id') or None, "
+     "actor_id)), actor_id, role, scope)", "return_value", "ma"):
+        "the exact v1 registration assign-division branch has already "
+        "selected the route; the RouteSpec-derived value only replaces its "
+        "literal destination authorization tuple",
+    ("_handle_setup_v2",
+     "self._guarded_mutation([('registration', ml.group(1)), "
+     "reassignment_destination], lambda: api.assign_season_team_league("
+     "ml.group(1), b.get('league_id') or None, actor_id), actor_id, role, "
+     "scope)", "return_value", "ml"):
+        "the exact v2 registration assign-league sibling of the reviewed v1 "
+        "RouteSpec destination replacement",
+    ("_handle_setup_v2",
+     "self._guarded_mutation([('registration', ma.group(1)), "
+     "reassignment_destination], lambda: api.assign_season_team_division("
+     "ma.group(1), b.get('division_id') or None, actor_id, v2=True), "
+     "actor_id, role, scope)", "return_value", "ma"):
+        "the exact v2 registration assign-division sibling of the reviewed "
+        "v1 RouteSpec destination replacement",
     # -- #202 repair round 5, finding 1 -- newly REACHED now that a waived
     # call's RESULT keeps propagating through the ordinary fixed-point
     # mechanism instead of being erased the instant its call site is
@@ -2912,6 +2953,11 @@ _AUDIT_WAIVERS = {
         "guard, same reasoning) -- the "
         "route here is already decided upstream by `combo in "
         "_V2_REASSIGN_SCHEMA`",
+    ("_handle_reassign", "dest is not None", "if_test", ""):
+        "guards whether the RouteSpec destination lookup found the contract "
+        "for the already-decided v1 combo; append-or-not, not routing",
+    ("_handle_reassign_v2", "dest is not None", "if_test", ""):
+        "the v2 sibling of _handle_reassign's destination append guard",
     ("_handle_reassign", "self._V1_SETUP_KIND.get(entity, entity)",
      "tuple_element", ""):
         "#202 repair round 2 finding A -- a legacy-name-alias lookup "
@@ -3028,18 +3074,16 @@ _AUDIT_WAIVERS = {
         "the SAME derived method-admission source the registry's own gate "
         "is diffed against; see this waiver's own comment block above "
         "for the general shape",
-    ("_handle_reassign_v2",
-     "targets.append((dest[0], b.get(dest[1]) or None))", "bare_stmt",
+    ("_handle_reassign_v2", "targets.append(dest)", "bare_stmt",
      "dest is not None"):
         "#202 repair round 3, finding E -- `targets` is the AUTHORISATION-"
         "TARGET list fed to `_refuse_unchosen_context`/"
         "`_reject_target_outside_scope` below, seeded from `(entity, "
         "record_id)` (both tracked #369 write-side identifiers) -- which "
         "is what makes `targets` ITSELF read as tracked once a Call (`."
-        "append`) reaches it undisguised. `dest` is `_V2_REASSIGN_DEST."
-        "get(combo)`, a richly-tracked tuple-dict lookup (#202 repair root "
-        "cause 1) keyed on the ALREADY-DECIDED `combo` -- appending its "
-        "components onto the target list only widens the AUTHORISATION "
+        "append`) reaches it undisguised. `dest` is the fail-closed RouteSpec "
+        "destination contract for the ALREADY-DECIDED `combo` -- appending "
+        "it onto the target list only widens the AUTHORISATION "
         "check (#369: the destination row must also be writable), it does "
         "not choose a different template; the route was fully decided "
         "upstream by `combo in _V2_REASSIGN_SCHEMA`",
@@ -3079,12 +3123,12 @@ _AUDIT_WAIVERS = {
         "KNOWN LIMITATIONS section), so a same-named inner shadow of an "
         "outer tracked subject is indistinguishable from the real thing "
         "without this kind of human review",
-    ("_handle_reassign", "targets.append((dest[0], b.get(dest[1]) or None))",
+    ("_handle_reassign", "targets.append(dest)",
      "bare_stmt", "dest is not None"):
         "#202 repair round 3, finding E -- the v1 sibling of "
         "_handle_reassign_v2's own identical-shape waiver above (see that "
-        "entry): `dest` is `_V1_REASSIGN_DEST.get(combo)`, a richly-"
-        "tracked tuple-dict lookup keyed on the already-decided `combo`; "
+        "entry): `dest` is the RouteSpec contract for the already-decided "
+        "`combo`; "
         "appending it onto the authorisation-target list widens the #369 "
         "write-side ownership check, it does not choose a route",
     ("_handle_reassign", "check_body(b, **_V1_REASSIGN_SCHEMA[combo])",
@@ -3103,58 +3147,24 @@ _AUDIT_WAIVERS = {
         "target tuple), shadowing _handle_reassign's own tracked `target` "
         "parameter (the reassignment destination's entity kind) in name "
         "only",
-    # -- #202 repair round 5, finding 1 -- newly REACHED, all four, for the
-    # SAME reason as this dict's two new "parent is not None" entries above:
+    # -- #202 repair round 5, finding 1 -- newly REACHED for the same reason
+    # as this dict's two "parent is not None" entries above:
     # a waived call's RESULT no longer stops propagating the instant its
-    # call site is waived (see _propagates_taint's own docstring). Two
-    # consequences, both here:
-    #   (a) `_handle_reassign`'s SECOND `targets.append(...)` (the
+    # call site is waived (see _propagates_taint's own docstring).
+    # `_handle_reassign`'s SECOND `targets.append(...)` (the
     #       "writable_parent" one) was previously never even examined --
     #       `parent` wasn't tracked pre-round-5, so `_mentions_tracked`
-    #       found nothing in it -- unlike its v2 sibling and unlike this
-    #       same function's FIRST append (`dest`-based), both of which
-    #       were ALREADY reviewed pre-round-5 because `dest` reaches
-    #       `tracked` a DIFFERENT way (a LOCAL tuple-keyed dict literal,
-    #       recognised by the walker's own tuple-dict-lookup shape during
-    #       the walk, independent of _propagates_taint entirely) that
-    #       `parent`'s MODULE-LEVEL dict never gets;
-    #   (b) `_propagates_taint`'s scan of ANY bare statement/assignment no
-    #       longer stops at the FIRST waived call it meets -- it used to
-    #       `return False` for the WHOLE expression there, which incidentally
-    #       also hid every OTHER, unrelated call nested alongside it. Once a
-    #       `targets.append((X[0], b.get(X[1]) or None))` statement's outer
-    #       `.append(...)` call is (correctly) waived, the walk now
-    #       continues into its ARGUMENTS and reaches the previously-
-    #       unexamined `b.get(X[1])` inline call too -- `b` is the request
-    #       BODY dict (`b = body`, both handlers' own top line), and
-    #       `X[1]` (`dest[1]`) is a BODY KEY NAME the
-    #       already-decided combo/dest/parent lookup chose, e.g.
-    #       "organization_id" -- reading that one field's value to append
-    #       onto the SAME authorisation-target list the enclosing
-    #       `.append(...)` waiver already reviews. Not a routing decision
-    #       either: the route was fully decided upstream by `combo in
-    #       _V{1,2}_REASSIGN_SCHEMA`, unchanged by which body field gets
-    #       read here.
+    #       found nothing in it. The destination sibling is now a RouteSpec
+    #       helper result and has its own exact lookup, guard, and append
+    #       waivers above. Its former two inline `b.get(dest[1])` waivers were
+    #       retired with the handler-local destination dictionaries.
     ("_handle_reassign",
      "targets.append(parent)", "bare_stmt", "parent is not None"):
-        "#202 repair round 5, finding 1, consequence (a) -- the v1 sibling "
+        "#202 repair round 5, finding 1 -- the v1 sibling "
         "of _handle_reassign_v2's own identical-shape 'writable_parent' "
         "append waiver (this dict, round 3 finding E section); newly "
         "reached because `parent` now stays tracked past its own waived "
         "lookup -- see the comment block immediately above this entry",
-    ("_handle_reassign", "b.get(dest[1])", "boolop", "dest is not None"):
-        "#202 repair round 5, finding 1, consequence (b) -- reads the "
-        "request-body field the ALREADY-DECIDED `dest` (`_V1_REASSIGN_DEST."
-        "get(combo)`) names, to append onto the `targets` authorisation "
-        "list this dict's enclosing `targets.append(...)` waiver already "
-        "reviews (round 3, finding E); not a routing decision -- see the "
-        "comment block above this entry's group for the general shape",
-    ("_handle_reassign_v2", "b.get(dest[1])", "boolop", "dest is not None"):
-        "the v2 sibling of _handle_reassign's own identical-shape "
-        "`b.get(dest[1])` waiver above; same request-body field read for "
-        "the same already-decided `dest`, feeding the SAME `targets` list "
-        "_handle_reassign_v2's own `targets.append(...)` waiver (round 3, "
-        "finding E) already reviews",
     # -- #202 repair round 4, finding 1 -- newly examined now that a Call
     # reached DIRECTLY AS (or and/or/not-ed into) the WHOLE test has its
     # arguments scanned too, the same way finding E already did for a

@@ -62,7 +62,8 @@ from ..services import lineup_visibility
 from .rate_limit import LoginThrottle, RateLimiter
 from .route_registry import (
     REGISTRY, runtime_context_read_spec, runtime_get_auth_spec,
-    runtime_reassignment_parent_spec, runtime_sensitive_post_denial_spec,
+    runtime_reassignment_destination_spec, runtime_reassignment_parent_spec,
+    runtime_sensitive_post_denial_spec,
 )
 from .scope import (
     can_read_private_game_data, resolve_private_game_read, scope_violation)
@@ -647,6 +648,20 @@ def _reassignment_parent_target(path: str, body: dict):
     return (spec.reassignment_parent_kind,
             body.get(spec.reassignment_parent_field) or None,
             "writable_parent")
+
+
+def _reassignment_destination_target(path: str, body: dict):
+    """Build the generic destination target declared by ``path``'s RouteSpec.
+
+    Every concrete assign route has a destination contract. Explicit null is
+    preserved as the existing no-resource/no-oracle value so the guarded
+    mutation remains the single place that decides the refusal shape.
+    """
+    spec = runtime_reassignment_destination_spec(path)
+    if spec is None:
+        return None
+    return (spec.reassignment_destination_kind,
+            body.get(spec.reassignment_destination_field) or None)
 
 
 # ONE gate per process, beside STATE and with the same lifetime — it orders
@@ -4706,20 +4721,12 @@ class Handler(BaseHTTPRequestHandler):
         # decision and the write. A refusal serializes nothing, saves nothing
         # and audits nothing. The v1 wire word is translated first: "league"
         # here is a PROGRAM.
-        # combo → (canonical kind of the destination, its v1 body key). "level"
-        # is v1 for the competition LEAGUE, so the destination kind is "league".
-        _V1_REASSIGN_DEST = {
-            ("league", "organization"): ("organization", "organization_id"),
-            ("venue", "organization"): ("organization", "organization_id"),
-            ("rink", "venue"): ("venue", "venue_id"),
-            ("division", "level"): ("league", "level_id"),
-            ("team", "club"): ("club", "club_id"),
-            ("player", "team"): ("team", "team_id"),
-        }
-        dest = _V1_REASSIGN_DEST.get(combo)
+        # RouteSpec owns the canonical destination kind and v1 body key.
+        # In particular, v1 "level" means today's competition LEAGUE.
+        dest = _reassignment_destination_target(self.path, b)
         targets = [(self._V1_SETUP_KIND.get(entity, entity), record_id)]
         if dest is not None:
-            targets.append((dest[0], b.get(dest[1]) or None))
+            targets.append(dest)
         # ...and for the four relations a CREATE can also reach by id, the
         # destination must additionally satisfy the WRITE-side parent rule
         # (#369 review) — the same gate, and the same refusal, as the creates.
@@ -4977,6 +4984,8 @@ class Handler(BaseHTTPRequestHandler):
                         mr.group(1), b.get("team_id"),
                         b.get("division_id") or None, actor_id)),
                 actor_id, role, scope)
+        reassignment_destination = _reassignment_destination_target(
+            self.path, b)
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
             # division_id is nullable (null clears): must be PRESENT but may be
@@ -4993,8 +5002,7 @@ class Handler(BaseHTTPRequestHandler):
             # under the bridge row's own lock — outside it, the registration
             # could be re-pointed at another LeagueSeason after it was judged.
             return self._guarded_mutation(
-                [("registration", ma.group(1)),
-                 ("division", b.get("division_id") or None)],
+                [("registration", ma.group(1)), reassignment_destination],
                 lambda: _v1.registration_to_v1(
                     api.assign_season_team_division(
                         ma.group(1), b.get("division_id") or None, actor_id)),
@@ -5341,22 +5349,12 @@ class Handler(BaseHTTPRequestHandler):
         # audit run inside ONE transaction with both rows locked
         # (`_guarded_mutation`), so a commit that moves either end mid-request
         # cannot slip between the decision and the write. A refusal serializes
-        # nothing, saves nothing and audits nothing. v2 already speaks canonical
-        # kind names, so no alias translation here.
-        _V2_REASSIGN_DEST = {
-            ("program", "organization"): ("organization",
-                                          "operator_organization_id"),
-            ("division", "league"): ("league", "league_id"),
-            ("team", "club"): ("club", "club_id"),
-            ("team", "league"): ("league", "league_id"),
-            ("player", "team"): ("team", "team_id"),
-            ("rink", "venue"): ("venue", "venue_id"),
-            ("venue", "organization"): ("organization", "organization_id"),
-        }
-        dest = _V2_REASSIGN_DEST.get(combo)
+        # nothing, saves nothing and audits nothing. RouteSpec owns the
+        # canonical v2 destination kind and request-body field.
+        dest = _reassignment_destination_target(self.path, b)
         targets = [(entity, record_id)]
         if dest is not None:
-            targets.append((dest[0], b.get(dest[1]) or None))
+            targets.append(dest)
         # ...and for the relations a CREATE can also reach by id, the
         # destination must additionally satisfy the WRITE-side parent rule
         # (#369 review) — the same gate, and the same refusal, as the creates,
@@ -5559,6 +5557,8 @@ class Handler(BaseHTTPRequestHandler):
                     b.get("division_id") or None, actor_id,
                     league_id=b.get("league_id") or None),
                 actor_id, role, scope)
+        reassignment_destination = _reassignment_destination_target(
+            self.path, b)
         ml = re.match(r"^season-team-registration/([^/]+)/assign-league$", entity)
         if ml:
             # A registration's League is mandatory (non-nullable): required+str.
@@ -5571,8 +5571,7 @@ class Handler(BaseHTTPRequestHandler):
             # and the destination League. The bridge row's PARENT lookup runs
             # inside the guard's transaction, under the bridge row's own lock.
             return self._guarded_mutation(
-                [("registration", ml.group(1)),
-                 ("league", b.get("league_id") or None)],
+                [("registration", ml.group(1)), reassignment_destination],
                 lambda: api.assign_season_team_league(
                     ml.group(1), b.get("league_id") or None, actor_id),
                 actor_id, role, scope)
@@ -5592,8 +5591,7 @@ class Handler(BaseHTTPRequestHandler):
             # bridge row's PARENT lookup runs inside the guard's transaction,
             # under the bridge row's own lock.
             return self._guarded_mutation(
-                [("registration", ma.group(1)),
-                 ("division", b.get("division_id") or None)],
+                [("registration", ma.group(1)), reassignment_destination],
                 lambda: api.assign_season_team_division(
                     ma.group(1), b.get("division_id") or None, actor_id,
                     v2=True),
