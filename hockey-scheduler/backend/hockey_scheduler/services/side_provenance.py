@@ -1373,10 +1373,12 @@ TWO_SIDED_READERS = {
         "`SubstituteEnrollment.team_id`, never live membership and never the "
         "permanent pointer. Answering 'which side is this row on' for a game "
         "requires reading the game."),
-    ("services/roster_service.py", "cancel_game"): (
+    ("services/roster_service.py", "_cancel_game_locked"): (
         GAME_WIDE_WRITE,
         "cancelling a GAME cancels both sides' enrollments, because the "
-        "cancellation is a fact about the game rather than about a side."),
+        "cancellation is a fact about the game rather than about a side; the "
+        "private helper is the transaction-held body reached only from "
+        "cancel_game's game-wide command."),
     ("services/setup_service.py", "delete_game"): (
         GAME_WIDE_WRITE,
         "deleting a draft game removes both sides' rows with it, for the "

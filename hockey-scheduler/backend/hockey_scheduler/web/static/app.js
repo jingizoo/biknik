@@ -3827,6 +3827,8 @@ function cancelGameModalHtml(m) {
   return modalShell("danger", "Cancel this game?",
     `<p>You're about to cancel <strong>${esc(m.name || "this game")}</strong>. The
        fixture and any result history are kept — this is not a delete.</p>
+     <p>The current ice slot will be released immediately so another game can
+       use it. Its venue, rink, and scheduled time remain in history.</p>
      <p class="muted">Rosters can no longer be changed for a cancelled game.</p>`,
     `<button class="act ghost" data-modal-close>Keep game</button>
      <button class="act danger" data-cancel-game-confirm>Cancel game</button>`);
@@ -4180,7 +4182,7 @@ function wireModal(c) {
       toast = "";
       const res = await post(`/api/games/${m.game_id}/cancel`, {});
       modal = null;
-      if (res && !res.error) toast = "Game cancelled; history preserved.";
+      if (res && !res.error) toast = "Game cancelled; ice released and history preserved.";
       await render();
     };
   }
@@ -8103,8 +8105,18 @@ function gamesRow(g) {
   const rsv = g.reserved
     ? `<div class="slot-reserved">reserved ${fmt(g.reserved.reserved_start_time)}–${fmt(g.reserved.reserved_end_time)} (+${g.reserved.warmup_minutes}m warm-up, +${g.reserved.resurfacing_minutes}m resurfacing)</div>`
     : "";
+  const hist = g.historical_ice;
+  const histWhen = hist && hist.scheduled_start_time
+    ? `${fmt(hist.scheduled_start_time)}${hist.scheduled_end_time ? "–" + fmt(hist.scheduled_end_time) : ""}`
+    : "";
+  const histMeta = hist
+    ? [hist.venue_name, hist.rink_name, histWhen].filter(Boolean).map(esc).join(" · ")
+    : "Historical fixture retained";
+  const iceState = g.cancelled
+    ? ck(true, "Ice released", histMeta)
+    : ck(true, "Ice slot allocated");
   const detail = `<div class="games-detail">
-    ${ck(true, "Ice slot allocated")}${rsv}
+    ${iceState}${rsv}
     ${rosterStatusKnown(g)
        ? ck(confirmed, "Roster", prettyStatus(g.roster_status))
        : ck(null, "Roster", ROSTER_STATUS_HIDDEN)}

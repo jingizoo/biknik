@@ -95,7 +95,15 @@ def game_to_v1(result):
     """A Game result → the legacy v1 shape.
 
     Drops the internal competition ``league_id`` the v1 API never exposed, and
-    the ``game_type`` (#283 Slice D) / ``league_season_id`` (#283 Slice E)
-    fields the frozen v1 contract predates.
+    the ``game_type`` (#283 Slice D), ``league_season_id`` (#283 Slice E),
+    and cancellation-history snapshot (#428) fields the frozen v1 contract
+    predates.
     """
-    return _drop(result, {"league_id", "game_type", "league_season_id"})
+    return _drop(result, {
+        "league_id", "game_type", "league_season_id",
+        "cancelled_ice_slot_id", "cancelled_venue_id",
+        "cancelled_venue_name", "cancelled_venue_timezone",
+        "cancelled_rink_id", "cancelled_rink_name",
+        "cancelled_scheduled_start_time", "cancelled_scheduled_end_time",
+        "cancelled_ice_start_time", "cancelled_ice_end_time",
+    })

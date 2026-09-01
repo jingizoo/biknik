@@ -361,16 +361,33 @@ class SeasonVenueAccessContract:
         self.assertEqual(blocked["error"]["code"], "has_dependencies")
         self.assertIsNotNone(self.store.get_season_venue_access(granted["id"]))
 
-    def test_cleanup_blocked_by_cancelled_game(self):
+    def test_cleanup_succeeds_after_cancelled_game_snapshots_history(self):
         _, _, season, venue = self._fixture()
         granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
         division, home, away, slot = self._playable_game(season, venue)
         game = self.api.create_game(season, division, home, away, slot, actor_id=ACTOR)
-        self.api.cancel_game(game["id"], actor_id=ACTOR)
+        cancelled = self.api.cancel_game(game["id"], actor_id=ACTOR)
+        self.assertNotIn("error", cancelled, cancelled)
+        self.assertIsNone(cancelled["ice_slot_id"])
+        self.assertEqual(cancelled["cancelled_ice_slot_id"], slot)
+        historical_venue = self.store.get_venue(venue)
+        historical_rink = self.store.get_rink(
+            self.store.get_ice_slot(slot).rink_id)
+        self.assertEqual(cancelled["cancelled_venue_name"],
+                         historical_venue.name)
+        self.assertEqual(cancelled["cancelled_rink_name"],
+                         historical_rink.name)
         self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
-        blocked = self.api.delete_season_venue_access(granted["id"], actor_id=ACTOR)
-        self.assertEqual(blocked["error"]["code"], "has_dependencies")
-        self.assertIsNotNone(self.store.get_season_venue_access(granted["id"]))
+        cleaned = self.api.delete_season_venue_access(
+            granted["id"], actor_id=ACTOR)
+        self.assertNotIn("error", cleaned, cleaned)
+        self.assertIsNone(self.store.get_season_venue_access(granted["id"]))
+        history = self.store.get_game(game["id"])
+        self.assertTrue(history.cancelled)
+        self.assertIsNone(history.ice_slot_id)
+        self.assertEqual(history.cancelled_ice_slot_id, slot)
+        self.assertEqual(history.cancelled_venue_name, historical_venue.name)
+        self.assertEqual(history.cancelled_rink_name, historical_rink.name)
 
     def _make_draft_game(self, season, division, home, away, slot):
         """A draft game on ``slot`` — created through the normal (committed)

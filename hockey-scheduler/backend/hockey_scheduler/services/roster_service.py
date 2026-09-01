@@ -22,6 +22,7 @@ from ..domain import (
     GameAvailability,
     GameRosterEntry,
     GameStatus,
+    IceSlotStatus,
     MembershipStatus,
     NotificationEvent,
     Player,
@@ -42,6 +43,8 @@ from ..domain.errors import (
     AlreadySelectedError,
     GameCancelledError,
     InvalidTransitionError,
+    IntegrityConflictError,
+    ConcurrencyConflictError,
     NotAuthorizedError,
     NotEligibleError,
     NotEnrolledError,
@@ -227,6 +230,10 @@ def _transactional(fn):
         with self.store.transaction():
             return fn(self, *args, **kwargs)
     return wrapper
+
+
+class _CancelGameRaced(Exception):
+    """Internal retry signal when cancellation's pre-lock ice plan drifted."""
 
 
 class GameMembershipContext(NamedTuple):
@@ -4227,25 +4234,178 @@ class RosterService:
                 f"The roster is unlocked for {self._game_label(game)}.")
         return game
 
-    @_transactional
     def cancel_game(self, game_id: str, actor_id: Optional[str] = None) -> Game:
-        game = self._require_game(game_id)
-        game = self._guard_active_season(game)  # #159/#427 guard + re-fetch
-        was_cancelled = game.cancelled
-        game.cancelled = True
-        self.store.save_game(game)
-        # Cancel any active substitute enrollments.
-        for sub in self.store.substitutes_for_game(game_id):
-            if sub.status.is_active_enrollment:
-                sub.status = SubstituteStatus.CANCELLED
-                self.store.save_substitute(sub)
-        self._audit(game_id, AuditAction.GAME_CANCELLED, actor_id=actor_id)
-        if not was_cancelled:  # only on the transition (#87 idempotency)
+        """Cancel a fixture, preserve its ice history, and release occupancy.
+
+        #428 makes cancellation one atomic state transition: snapshot the
+        display-critical facility facts, detach the Game from its live IceSlot,
+        release an ALLOCATED slot, cancel active substitute enrollments, and
+        write exactly one audit.  Retrying an already-cancelled Game is a true
+        no-op; legacy in-memory rows that are cancelled-but-attached are repaired
+        without fabricating a second cancellation audit.
+
+        The lock order matches every placement writer: Program -> Team -> Rink
+        -> Season, with the IceSlot row locked only after the Season.  A move
+        that changes the source between the locator read and these locks causes
+        a clean transaction retry rather than snapshotting or freeing stale ice.
+        """
+        for attempt in range(3):
+            try:
+                with self.store.transaction():
+                    return self._cancel_game_locked(game_id, actor_id)
+            except _CancelGameRaced:
+                if attempt == 2:
+                    raise ConcurrencyConflictError(
+                        "This game's ice changed while cancellation was being "
+                        "processed; please retry.",
+                        {"reason": "cancel_raced", "game_id": game_id})
+
+    def _cancel_game_locked(self, game_id: str,
+                            actor_id: Optional[str]) -> Game:
+        game = self._require_game(game_id)  # pre-lock locator only
+        authority_season_id = season_guard.game_season_authority_id(
+            self.store, game)
+        season = (self.store.get_season(authority_season_id)
+                  if authority_season_id else None)
+        if season is not None and season.program_id:
+            self.store.get_program_for_update(season.program_id)
+        for team_id in sorted({tid for tid in
+                               (game.home_team_id, game.away_team_id) if tid}):
+            self.store.get_team_for_update(team_id)
+
+        # move_game shares these Team locks.  Once they are held, its current
+        # source slot is stable; verify it still matches the locator used to
+        # plan the Rink lock, otherwise retry from a fresh transaction.
+        fresh = self._require_game(game_id)
+        if (fresh.ice_slot_id != game.ice_slot_id
+                or fresh.home_team_id != game.home_team_id
+                or fresh.away_team_id != game.away_team_id
+                or fresh.league_season_id != game.league_season_id
+                or fresh.season_id != game.season_id):
+            raise _CancelGameRaced()
+        slot = (self.store.get_ice_slot(fresh.ice_slot_id)
+                if fresh.ice_slot_id else None)
+        rink_id = slot.rink_id if slot is not None else None
+        if rink_id:
+            self.store.get_rink_for_update(rink_id)
+
+        # Season comes after Rink in the global placement lock order.  The
+        # shared guard both checks archive state and re-fetches the Game under
+        # the Season lock; verify that neither its authority nor its ice moved.
+        fresh = self._guard_active_season(fresh)
+        if (fresh.ice_slot_id != game.ice_slot_id
+                or season_guard.game_season_authority_id(self.store, fresh)
+                   != authority_season_id):
+            raise _CancelGameRaced()
+
+        was_cancelled = fresh.cancelled
+        snapshot_values = (
+            fresh.cancelled_ice_slot_id,
+            fresh.cancelled_venue_id,
+            fresh.cancelled_venue_name,
+            fresh.cancelled_venue_timezone,
+            fresh.cancelled_rink_id,
+            fresh.cancelled_rink_name,
+            fresh.cancelled_scheduled_start_time,
+            fresh.cancelled_scheduled_end_time,
+            fresh.cancelled_ice_start_time,
+            fresh.cancelled_ice_end_time,
+        )
+        if any(value is not None for value in snapshot_values):
+            if not all(value is not None for value in snapshot_values):
+                raise IntegrityConflictError(
+                    "The game's cancellation history is incomplete; no live "
+                    "ice was changed.",
+                    {"reason": "cancellation_history_incomplete",
+                     "game_id": fresh.id})
+            if not was_cancelled:
+                raise IntegrityConflictError(
+                    "An active game cannot already carry cancellation "
+                    "history; no live ice was changed.",
+                    {"reason": "unexpected_cancellation_history",
+                     "game_id": fresh.id})
+        if was_cancelled and fresh.ice_slot_id is None:
+            return fresh
+
+        released_slot_id = fresh.ice_slot_id
+        if released_slot_id:
+            locked_slot = self.store.get_ice_slot_for_update(released_slot_id)
+            if locked_slot is None and fresh.cancelled_ice_slot_id is None:
+                raise IntegrityConflictError(
+                    "The game's ice slot no longer exists, so cancellation "
+                    "cannot preserve its history.",
+                    {"reason": "ice_slot_not_found",
+                     "ice_slot_id": released_slot_id})
+
+            # A prior partial snapshot can only come from legacy/manual data;
+            # never overwrite it with whichever live facility facts happen to
+            # exist now.  A new cancellation requires the complete live chain.
+            if fresh.cancelled_ice_slot_id is None:
+                rink = (self.store.get_rink(locked_slot.rink_id)
+                        if locked_slot is not None else None)
+                venue = (self.store.get_venue(rink.venue_id)
+                         if rink is not None else None)
+                if rink is None or venue is None:
+                    raise IntegrityConflictError(
+                        "The game's facility hierarchy is incomplete, so "
+                        "cancellation cannot preserve its history.",
+                        {"reason": "facility_history_unresolvable",
+                         "ice_slot_id": released_slot_id})
+                fresh.cancelled_ice_slot_id = locked_slot.id
+                fresh.cancelled_venue_id = venue.id
+                fresh.cancelled_venue_name = venue.name
+                fresh.cancelled_venue_timezone = venue.timezone
+                fresh.cancelled_rink_id = rink.id
+                fresh.cancelled_rink_name = rink.name
+                fresh.cancelled_scheduled_start_time = fresh.start_time
+                fresh.cancelled_scheduled_end_time = fresh.end_time
+                fresh.cancelled_ice_start_time = locked_slot.start_time
+                fresh.cancelled_ice_end_time = locked_slot.end_time
+
+            fresh.ice_slot_id = None
+            # A legacy cancelled row can coexist with a replacement active
+            # Game on the same slot.  Repairing the legacy row must not mark
+            # that occupied slot AVAILABLE.
+            other_active = any(
+                g.id != fresh.id and not g.cancelled
+                and g.ice_slot_id == released_slot_id
+                for g in self.store.all_games())
+            if (locked_slot is not None and not other_active
+                    and locked_slot.status == IceSlotStatus.ALLOCATED):
+                locked_slot.status = IceSlotStatus.AVAILABLE
+                self.store.save_ice_slot(locked_slot)
+
+        fresh.cancelled = True
+        self.store.save_game(fresh)
+
+        # Only the actual false -> true transition owns lifecycle effects.
+        # The legacy repair path above intentionally adds no second audit,
+        # notification, or substitute cancellation.
+        if not was_cancelled:
+            for sub in self.store.substitutes_for_game(game_id):
+                if sub.status.is_active_enrollment:
+                    sub.status = SubstituteStatus.CANCELLED
+                    self.store.save_substitute(sub)
+            self._audit(
+                game_id, AuditAction.GAME_CANCELLED, actor_id=actor_id,
+                detail={
+                    "released_ice_slot_id": fresh.cancelled_ice_slot_id,
+                    "venue_id": fresh.cancelled_venue_id,
+                    "venue_name": fresh.cancelled_venue_name,
+                    "rink_id": fresh.cancelled_rink_id,
+                    "rink_name": fresh.cancelled_rink_name,
+                    "scheduled_start_time": (
+                        fresh.cancelled_scheduled_start_time.isoformat()
+                        if fresh.cancelled_scheduled_start_time else None),
+                    "scheduled_end_time": (
+                        fresh.cancelled_scheduled_end_time.isoformat()
+                        if fresh.cancelled_scheduled_end_time else None),
+                })
             self._notify_game_change(
-                game, NotificationKind.GAME_CANCELLED, "Game cancelled",
-                f"{self._game_label(game)} has been cancelled.",
+                fresh, NotificationKind.GAME_CANCELLED, "Game cancelled",
+                f"{self._game_label(fresh)} has been cancelled.",
                 include_public=True)
-        return game
+        return fresh
 
     # ====================================================================
     # roster status engine

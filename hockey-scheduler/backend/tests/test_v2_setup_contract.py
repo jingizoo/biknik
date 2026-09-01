@@ -49,7 +49,12 @@ GAME_KEYS = {"id", "home_team_id", "start_time", "target_goalies",
              "target_skaters", "max_skaters", "away_team_id", "rink", "end_time",
              "roster_lock_time", "locked", "cancelled", "published", "season_id",
              "division_id", "ice_slot_id", "is_draft", "league_id", "game_type",
-             "league_season_id"}
+             "league_season_id", "cancelled_ice_slot_id",
+             "cancelled_venue_id", "cancelled_venue_name",
+             "cancelled_venue_timezone", "cancelled_rink_id",
+             "cancelled_rink_name", "cancelled_scheduled_start_time",
+             "cancelled_scheduled_end_time", "cancelled_ice_start_time",
+             "cancelled_ice_end_time"}
 
 
 class V2SetupContractTest(unittest.TestCase):
@@ -1046,13 +1051,12 @@ class V2SetupContractTest(unittest.TestCase):
             c, "POST", f"/api/v2/setup/season/{season['id']}/delete", {})
         self.assertEqual(status, 200, season_deleted)
 
-    def test_v2_season_venue_access_cleanup_blocked_by_game_history(self):
-        """#257 review: a revoked access row can be the ONLY explicit record
-        of why a Game's ice was allowed at this Venue for this Season, so
-        POST .../season-venue-access/{id}/delete must never purge it out
-        from under a draft, committed, cancelled, or published Game — real
-        HTTP end to end, mirroring #251's own game-history guard on
-        delete_season_team_registration."""
+    def test_v2_season_venue_access_cleanup_uses_live_game_dependencies(self):
+        """#257/#428: a revoked access row remains while any live Game or
+        committed draft still uses its Venue.  A cancelled Game is different:
+        cancellation first freezes the facility facts on the Game and detaches
+        live ice, after which access cleanup may proceed without erasing fixture
+        history.  Proved over real HTTP end to end."""
         c = self._admin()
         org = self._v2(c, "organization", {"name": "SVGH Org", "short_name": "SO"})
         program = self._program(c,
@@ -1137,11 +1141,21 @@ class V2SetupContractTest(unittest.TestCase):
                          [granted["id"]])
         self.assertTrue(still_there["venue_access"][0]["active"] is False)
 
-        # -- cancelling the game does NOT clear the block: cancelled games
-        #    remain permanent record, same as #251's own registration guard.
+        # -- #428: cancellation keeps permanent Game history but replaces its
+        #    LIVE venue/slot dependency with an immutable facility snapshot.
         status, cancelled = self._req(
             c, "POST", f"/api/games/{game['id']}/cancel", {})
         self.assertEqual(status, 200, cancelled)
+        self.assertTrue(cancelled["cancelled"])
+        self.assertIsNone(cancelled["ice_slot_id"])
+        self.assertEqual(cancelled["cancelled_ice_slot_id"], slot["id"])
+        self.assertEqual(cancelled["cancelled_venue_id"], venue["id"])
+        self.assertEqual(cancelled["cancelled_venue_name"], venue["name"])
+        self.assertEqual(cancelled["cancelled_rink_id"], rink["id"])
+        self.assertEqual(cancelled["cancelled_rink_name"], rink["name"])
+
+        # The committed scheduler draft remains a live dependency, so the
+        # access row still cannot be cleaned up yet.
         status, still_blocked = self._req(
             c, "POST",
             f"/api/v2/setup/season-venue-access/{granted['id']}/delete", {})
@@ -1158,12 +1172,20 @@ class V2SetupContractTest(unittest.TestCase):
             c, "POST", f"/api/v2/setup/game/{draft_game_id}/delete", {})
         self.assertEqual(status, 200, draft_deleted)
 
-        # The cancelled (but permanent) game still blocks — cleanup only
-        # succeeds once every Game referencing this Venue/Season is gone.
-        status, still_blocked3 = self._req(
+        # With the final LIVE dependency gone, cleanup succeeds.  The
+        # cancelled Game itself remains and still carries the exact immutable
+        # venue/rink/time facts even though neither its slot nor this access
+        # edge is live inventory any longer.
+        status, cleaned = self._req(
             c, "POST",
             f"/api/v2/setup/season-venue-access/{granted['id']}/delete", {})
-        self.assertEqual(status, 409, still_blocked3)
+        self.assertEqual(status, 200, cleaned)
+        historical = self.srv.STATE.api.store.get_game(game["id"])
+        self.assertTrue(historical.cancelled)
+        self.assertIsNone(historical.ice_slot_id)
+        self.assertEqual(historical.cancelled_ice_slot_id, slot["id"])
+        self.assertEqual(historical.cancelled_venue_name, venue["name"])
+        self.assertEqual(historical.cancelled_rink_name, rink["name"])
 
     # -- canonical validation: League required, Division optional -----------
     def test_v2_division_requires_league(self):
