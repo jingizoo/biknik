@@ -425,6 +425,13 @@ class WriteSchemaHttpTest(unittest.TestCase):
         handler._method_fallback = observed.append
         checked = 0
 
+        # ``do_`` contains no HTTP method token.  It must retain ordinary
+        # AttributeError semantics rather than being synthesized as a handler
+        # for the empty string.  This pins the lower boundary of the dynamic
+        # bridge as well as the valid-token sweep below.
+        with self.assertRaises(AttributeError):
+            getattr(handler, "do_")
+
         for width in widths:
             for chars in itertools.product(token_chars, repeat=width):
                 method = "".join(chars)
@@ -788,6 +795,10 @@ class WriteSchemaHttpTest(unittest.TestCase):
         status, headers, body = self._req(admin, "GET", "/api/auth/login")
         self.assertEqual(status, 405)
         self.assertEqual(body["error"]["code"], "method_not_allowed")
+        self.assertEqual(
+            body["error"]["message"],
+            "The GET method is not allowed for /api/auth/login.",
+        )
         allow = headers.get("Allow", "")
         self.assertIn("POST", allow)
         self.assertIn("OPTIONS", allow)
@@ -797,6 +808,10 @@ class WriteSchemaHttpTest(unittest.TestCase):
         status, headers, body = self._req(admin, "POST", "/api/players", {})
         self.assertEqual(status, 405)
         self.assertEqual(body["error"]["code"], "method_not_allowed")
+        self.assertEqual(
+            body["error"]["message"],
+            "The POST method is not allowed for /api/players.",
+        )
         allow = headers.get("Allow", "")
         for m in ("GET", "HEAD", "OPTIONS"):
             self.assertIn(m, allow)
