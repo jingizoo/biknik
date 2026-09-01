@@ -62,7 +62,7 @@ from ..services import lineup_visibility
 from .rate_limit import LoginThrottle, RateLimiter
 from .route_registry import (
     REGISTRY, runtime_context_read_spec, runtime_get_auth_spec,
-    runtime_sensitive_post_denial_spec,
+    runtime_reassignment_parent_spec, runtime_sensitive_post_denial_spec,
 )
 from .scope import (
     can_read_private_game_data, resolve_private_game_read, scope_violation)
@@ -195,31 +195,6 @@ _SETUP_PARENT_LISTS = {
     # inaccessible Program is byte-identical to a nonexistent one here too.
     "program": "Program",
 }
-
-# The same four relations reached by the OTHER verb (#369 review). A create is
-# not the only way to attach a record to a parent: ``assign-<target>`` moves an
-# existing one, and a gate on creates alone leaves the identical cross-owner
-# write open behind a different URL — proven, before this was added, by an
-# Arena Manager moving its own Rink under another creator's Venue and getting a
-# 200 on BOTH API versions.
-#
-# ``(entity, target)`` -> ``(parent kind, body key naming the new parent)``.
-# Only relations whose parent is one of the four kinds above appear here;
-# division→league / team→league / player→team have different parent kinds and
-# are governed elsewhere. A null id (the explicit unassign on the nullable
-# relations) is not gated — there is no parent to leak and nothing to probe.
-#
-# ``("league", "organization")`` is v1-only and ``("program", "organization")``
-# v2-only (legacy vocabulary: v1 "league" IS today's Program), so one table
-# serves both handlers without collision.
-_REASSIGN_PARENTS = {
-    ("league", "organization"): ("organization", "organization_id"),
-    ("program", "organization"): ("organization", "operator_organization_id"),
-    ("venue", "organization"): ("organization", "organization_id"),
-    ("rink", "venue"): ("venue", "venue_id"),
-    ("team", "club"): ("club", "club_id"),
-}
-
 
 # Method-405 routing table (#202 repair, wiring step; #271 origin). Two lists
 # of compiled path patterns, now DERIVED from route_registry.py rather than
@@ -656,6 +631,22 @@ def _sensitive_post_audit_target(path: str):
         return (spec.transport_denial_audit_category,
                 spec.transport_denial_audit_purpose)
     return None, None
+
+
+def _reassignment_parent_target(path: str, body: dict):
+    """Build the write-side parent target declared by ``path``'s RouteSpec.
+
+    ``None`` preserves routes whose destination is governed only by the
+    generic scope ceiling. A non-null body value becomes a second, narrower
+    ``writable_parent`` target under the same mutation lock; explicit null is
+    preserved as the existing no-parent/no-oracle case.
+    """
+    spec = runtime_reassignment_parent_spec(path)
+    if spec is None:
+        return None
+    return (spec.reassignment_parent_kind,
+            body.get(spec.reassignment_parent_field) or None,
+            "writable_parent")
 
 
 # ONE gate per process, beside STATE and with the same lifetime — it orders
@@ -4741,10 +4732,9 @@ class Handler(BaseHTTPRequestHandler):
         # `_guarded_mutation` TARGET rather than a bare preflight so the parent
         # decision is taken under the destination row's lock, inside the same
         # transaction as the move (#369 re-review's atomicity rule).
-        parent = _REASSIGN_PARENTS.get(combo)
+        parent = _reassignment_parent_target(self.path, b)
         if parent is not None:
-            targets.append((parent[0], b.get(parent[1]) or None,
-                            "writable_parent"))
+            targets.append(parent)
         # The preflight runs here rather than only inside `_guarded_mutation`
         # so an unauthorized target is still refused AHEAD of the unknown-combo
         # 404 below, exactly as before: a caller is never told a route shape is
@@ -5377,10 +5367,9 @@ class Handler(BaseHTTPRequestHandler):
         # It rides as a `_guarded_mutation` TARGET, not a bare preflight, so
         # the parent decision is taken under the destination row's lock inside
         # the same transaction as the move (#369 re-review's atomicity rule).
-        parent = _REASSIGN_PARENTS.get(combo)
+        parent = _reassignment_parent_target(self.path, b)
         if parent is not None:
-            targets.append((parent[0], b.get(parent[1]) or None,
-                            "writable_parent"))
+            targets.append(parent)
         # Preflighted here rather than only inside `_guarded_mutation` so an
         # unauthorized target is still refused AHEAD of both the ("team",
         # "league") body check and the unknown-combo 404 below, exactly as

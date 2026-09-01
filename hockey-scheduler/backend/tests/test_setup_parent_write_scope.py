@@ -415,28 +415,77 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
         self._post(admin, "venue", {"name": "own-legacy-link",
                                     "league_id": program["id"]}, api="v1")
 
-    def test_every_gated_reassign_relation_is_actually_in_the_table(self):
-        """The gate is table-driven, so the table IS the coverage.
+    def test_every_declared_reassign_parent_has_a_resolvable_list(self):
+        """Every RouteSpec parent kind must be executable by the live gate.
 
-        A relation silently dropped from it would reopen that one write with
-        no test failing anywhere -- the loop above exercises the mechanism on
-        two relations, and this pins the remaining three so adding a create
-        gate without its reassign twin cannot pass unnoticed.
+        Completeness and exact values are independently pinned by
+        ``test_route_registry`` over production's selector. This test owns the
+        cross-module invariant: every selected kind must name a parent list
+        the request-time refusal can actually resolve.
         """
-        from hockey_scheduler.web.server import (_REASSIGN_PARENTS,
-                                                 _SETUP_PARENT_LISTS)
+        from hockey_scheduler.web.route_registry import (
+            REASSIGNMENT_PARENT_SPECS)
+        from hockey_scheduler.web.server import _SETUP_PARENT_LISTS
+        for spec in REASSIGNMENT_PARENT_SPECS:
+            with self.subTest(spec=spec.name):
+                self.assertIn(spec.reassignment_parent_kind,
+                              _SETUP_PARENT_LISTS)
+
+    def test_every_reassign_parent_target_reads_the_received_body_id(self):
+        """The registry field name must reach the live target builder.
+
+        The registry contract independently pins metadata values. This is the
+        behavioural half: corrupting one ``reassignment_parent_field`` must
+        not silently turn the extra authorization target into ``None`` while
+        the broad destination check keeps the HTTP refusal green.
+        """
+        from hockey_scheduler.web.route_registry import (
+            REASSIGNMENT_PARENT_SPECS)
+
+        cases = {
+            "post_setup_league_id_assign_organization": (
+                "/api/setup/league/source/assign-organization",
+                {"organization_id": "organization-v1"},
+                ("organization", "organization-v1", "writable_parent")),
+            "post_setup_rink_id_assign_venue": (
+                "/api/setup/rink/source/assign-venue",
+                {"venue_id": "venue-v1"},
+                ("venue", "venue-v1", "writable_parent")),
+            "post_setup_team_id_assign_club": (
+                "/api/setup/team/source/assign-club",
+                {"club_id": "club-v1"},
+                ("club", "club-v1", "writable_parent")),
+            "post_setup_venue_id_assign_organization": (
+                "/api/setup/venue/source/assign-organization",
+                {"organization_id": "organization-v1-venue"},
+                ("organization", "organization-v1-venue",
+                 "writable_parent")),
+            "post_v2_setup_program_id_assign_organization": (
+                "/api/v2/setup/program/source/assign-organization",
+                {"operator_organization_id": "organization-v2-program"},
+                ("organization", "organization-v2-program",
+                 "writable_parent")),
+            "post_v2_setup_rink_id_assign_venue": (
+                "/api/v2/setup/rink/source/assign-venue",
+                {"venue_id": "venue-v2"},
+                ("venue", "venue-v2", "writable_parent")),
+            "post_v2_setup_team_id_assign_club": (
+                "/api/v2/setup/team/source/assign-club",
+                {"club_id": "club-v2"},
+                ("club", "club-v2", "writable_parent")),
+            "post_v2_setup_venue_id_assign_organization": (
+                "/api/v2/setup/venue/source/assign-organization",
+                {"organization_id": "organization-v2-venue"},
+                ("organization", "organization-v2-venue",
+                 "writable_parent")),
+        }
         self.assertEqual(
-            _REASSIGN_PARENTS,
-            {("league", "organization"): ("organization", "organization_id"),
-             ("program", "organization"): ("organization",
-                                           "operator_organization_id"),
-             ("venue", "organization"): ("organization", "organization_id"),
-             ("rink", "venue"): ("venue", "venue_id"),
-             ("team", "club"): ("club", "club_id")})
-        # Every kind the reassign table names must be one the gate can
-        # actually resolve a list for, or the lookup raises at request time.
-        for kind, _key in _REASSIGN_PARENTS.values():
-            self.assertIn(kind, _SETUP_PARENT_LISTS)
+            set(cases), {spec.name for spec in REASSIGNMENT_PARENT_SPECS})
+        for name, (path, body, expected) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.srv._reassignment_parent_target(path, body),
+                    expected)
 
     def test_a_second_account_cannot_reach_that_same_operator_org(self):
         """The other half of the case above: creator-ownership admits the
