@@ -1535,15 +1535,13 @@ class _DispatchWalker:
         The "earlier body always exits" gate is deliberate, not incidental:
         two siblings can legitimately share every key of a tuple-dict
         without either being dead code, when the first's body does NOT
-        unconditionally exit -- the real ``_handle_reassign_v2`` has
-        exactly this shape (``if combo in _V2_REASSIGN_SCHEMA:`` validates
-        the body and only returns on FAILURE, falling through on success to
-        an unrelated, independently-reachable ``dest =
-        _V2_REASSIGN_DEST.get(combo); if dest is not None:`` authorisation-
-        target lookup that happens to share every key). Flagging that
-        pairing was a genuine over-broad failure, found and closed by this
-        gate -- overlap alone is not ambiguity; overlap where the second
-        claim can PROVABLY never be reached is.
+        unconditionally exit -- the reassignment handler shape that exposed
+        this defect had one schema-validation branch returning only on
+        FAILURE, followed by an independently-reachable authorization-target
+        lookup over the same keys. Flagging that pairing was a genuine
+        over-broad failure, found and closed by this gate -- overlap alone is
+        not ambiguity; overlap where the second claim can PROVABLY never be
+        reached is.
 
         ``scope`` is fresh per :meth:`_walk_body` call (and threaded through
         an elif chain by :meth:`_walk_terminal_else`), so this only ever
@@ -1836,10 +1834,11 @@ class _DispatchWalker:
         :meth:`_tuple_keys_outcome` for the shared enumeration this and the
         single-key-equality form (``combo == (...)``) both reduce to.
 
-        This is the fix for the 13-for-13 substitution: ``_handle_reassign``'s
-        own ``_V1_REASSIGN_SCHEMA``/``_V2_REASSIGN_SCHEMA`` are exactly this
-        shape, and their key sets are the true reachable (entity, target)
-        pairs -- the wildcard the caller's bare regex would otherwise claim.
+        This is the fix for the 13-for-13 substitution. The reassignment
+        handlers' tuple-keyed call maps carry the true reachable
+        ``(entity, target)`` pairs -- the wildcard the caller's bare regex
+        would otherwise claim -- and the ``.get()`` equivalent is reduced
+        through this same key enumeration.
         """
         return self._tuple_keys_outcome(
             ctx, tuple_name, ctx.tuple_dicts[dict_name], test, dict_name)
@@ -2874,23 +2873,68 @@ _AUDIT_WAIVERS = {
     ("_handle_reassign", "_reassignment_parent_target(self.path, b)",
      "assign_rhs", ""):
         "#202 RouteSpec reassignment-parent contract -- the route is already "
-        "fully decided upstream by `combo in _V1_REASSIGN_SCHEMA`; this "
-        "fail-closed registry lookup only feeds `targets` for the #369 "
+        "admitted as one exact concrete POST upstream; this fail-closed "
+        "registry lookup only feeds `targets` for the #369 "
         "write-side parent-ownership check",
     ("_handle_reassign_v2", "_reassignment_parent_target(self.path, b)",
      "assign_rhs", ""):
         "the v2 sibling of _handle_reassign's RouteSpec policy lookup above; "
-        "the route is already decided by the v2 combo/schema dispatch",
+        "the route is already admitted as one exact concrete POST",
     ("_handle_reassign", "_reassignment_destination_target(self.path, b)",
      "assign_rhs", ""):
         "#202 RouteSpec reassignment-destination contract -- the route is "
-        "already fully decided upstream by `combo in _V1_REASSIGN_SCHEMA`; "
-        "this fail-closed registry lookup only builds the generic destination "
+        "already admitted as one exact concrete POST upstream; this fail-"
+        "closed registry lookup only builds the generic destination "
         "authorization target",
     ("_handle_reassign_v2",
      "_reassignment_destination_target(self.path, b)", "assign_rhs", ""):
         "the v2 sibling of _handle_reassign's RouteSpec destination lookup; "
-        "the route is already decided by the v2 combo/schema dispatch",
+        "the route is already admitted as one exact concrete POST",
+    ("_handle_reassign", "_validate_reassignment_body(self.path, b)",
+     "bare_stmt", ""):
+        "#202 RouteSpec reassignment body contract -- the concrete POST was "
+        "already admitted upstream; this call validates its one destination "
+        "field and cannot select another route",
+    ("_handle_reassign_v2", "_validate_reassignment_body(self.path, b)",
+     "bare_stmt", ""):
+        "the v2 sibling of the reviewed reassignment body validation call",
+    ("_handle_setup", "_validate_reassignment_body(self.path, b)",
+     "bare_stmt", "ma"):
+        "the exact v1 registration assign-division regex already selected "
+        "this branch; this call only validates its destination field",
+    ("_handle_setup_v2", "_validate_reassignment_body(self.path, b)",
+     "bare_stmt", "ml"):
+        "the exact v2 registration assign-league regex already selected this "
+        "branch; this call only validates its destination field",
+    ("_handle_setup_v2", "_validate_reassignment_body(self.path, b)",
+     "bare_stmt", "ma"):
+        "the exact v2 registration assign-division sibling of the reviewed "
+        "body validation call",
+    ("_handle_reassign",
+     "except BodyError as exc:\n    return self._send_json(exc.payload, "
+     "exc.status)", "try", ""):
+        "the RouteSpec body validator can raise only the stable BodyError "
+        "envelope returned here; this terminal handler sends that envelope "
+        "and cannot select a route from its payload",
+    ("_handle_reassign_v2",
+     "except BodyError as exc:\n    return self._send_json(exc.payload, "
+     "exc.status)", "try", ""):
+        "the v2 sibling of the reviewed terminal BodyError response",
+    ("_handle_setup",
+     "except BodyError as exc:\n    return self._send_json(exc.payload, "
+     "exc.status)", "try", "ma"):
+        "the exact v1 registration assign-division branch returns the "
+        "RouteSpec validator's stable error envelope directly",
+    ("_handle_setup_v2",
+     "except BodyError as exc:\n    return self._send_json(exc.payload, "
+     "exc.status)", "try", "ml"):
+        "the exact v2 registration assign-league sibling of the reviewed "
+        "terminal BodyError response",
+    ("_handle_setup_v2",
+     "except BodyError as exc:\n    return self._send_json(exc.payload, "
+     "exc.status)", "try", "ma"):
+        "the exact v2 registration assign-division sibling of the reviewed "
+        "terminal BodyError response",
     ("_handle_setup", "_reassignment_destination_target(self.path, b)",
      "assign_rhs", ""):
         "the v1 registration assign route is already decided by its exact "
@@ -2937,9 +2981,8 @@ _AUDIT_WAIVERS = {
     # extra authorisation-target entry -- the SAME `targets` list this
     # dict's own `targets.append(parent)` waiver already
     # reviews below, reached here as the bare `is not None` guard around
-    # it instead of the append itself. The route was fully decided
-    # upstream by `combo in _V1_REASSIGN_SCHEMA`, unchanged by this branch
-    # either way.
+    # it instead of the append itself. Exact POST admission plus the local
+    # reassignment call map already decide the route; this branch cannot.
     ("_handle_reassign", "parent is not None", "if_test", ""):
         "guards whether the RouteSpec lookup (waived two entries above) "
         "found a #369 write-side parent-ownership rule for the already-"
@@ -2950,9 +2993,8 @@ _AUDIT_WAIVERS = {
     ("_handle_reassign_v2", "parent is not None", "if_test", ""):
         "the v2 sibling of _handle_reassign's own identical-shape waiver "
         "immediately above (same RouteSpec lookup, same #369 append-or-not "
-        "guard, same reasoning) -- the "
-        "route here is already decided upstream by `combo in "
-        "_V2_REASSIGN_SCHEMA`",
+        "guard, same reasoning) -- exact POST admission plus the local call "
+        "map already decide the route",
     ("_handle_reassign", "dest is not None", "if_test", ""):
         "guards whether the RouteSpec destination lookup found the contract "
         "for the already-decided v1 combo; append-or-not, not routing",
@@ -2964,7 +3006,7 @@ _AUDIT_WAIVERS = {
         "(v1 'league' -> canonical 'program', identity for everything "
         "else) that only relabels the authorisation TARGET kind added to "
         "`targets`. NOT a routing decision: the route was already decided "
-        "by the regex + combo/schema dispatch upstream; this reshapes an "
+        "by exact POST admission plus the local call map; this reshapes an "
         "authorisation-check argument, the same 'produces a RESULT' shape "
         "as a captured group handed to a service",
     ("_handle_setup", "self._V1_SETUP_KIND.get(kind, kind)",
@@ -3085,8 +3127,8 @@ _AUDIT_WAIVERS = {
         "destination contract for the ALREADY-DECIDED `combo` -- appending "
         "it onto the target list only widens the AUTHORISATION "
         "check (#369: the destination row must also be writable), it does "
-        "not choose a different template; the route was fully decided "
-        "upstream by `combo in _V2_REASSIGN_SCHEMA`",
+        "not choose a different template; exact POST admission plus the "
+        "local call map already decide the route",
     ("_handle_reassign_v2",
      "targets.append(parent)", "bare_stmt", "parent is not None"):
         "#202 repair round 3, finding E -- same `targets` list as the "
@@ -3096,15 +3138,6 @@ _AUDIT_WAIVERS = {
         "extends the SAME "
         "authorisation-target list with the write-side parent-ownership "
         "check (#369), not a routing decision",
-    ("_handle_reassign_v2", "check_body(b, **_V2_REASSIGN_SCHEMA[combo])",
-     "bare_stmt", "combo in _V2_REASSIGN_SCHEMA"):
-        "#202 repair round 3, finding E -- request-BODY field validation "
-        "against the schema for the ALREADY-DECIDED `combo` (`combo in "
-        "_V2_REASSIGN_SCHEMA` chose the route upstream); `check_body` "
-        "raises `BodyError` on a malformed body, it does not choose "
-        "between templates -- the same 'produces a RESULT for a "
-        "post-dispatch concern' shape as every other waiver in this "
-        "dict, just reached as a bare statement instead of an assignment",
     ("_handle_reassign_v2", "len(target) > 2", "ifexp_test",
      "self._reject_target_outside_scope(target[0], target[1], actor_id, "
      "role, scope, target[2] if len(target) > 2 else 'scope')"):
@@ -3131,12 +3164,6 @@ _AUDIT_WAIVERS = {
         "`combo`; "
         "appending it onto the authorisation-target list widens the #369 "
         "write-side ownership check, it does not choose a route",
-    ("_handle_reassign", "check_body(b, **_V1_REASSIGN_SCHEMA[combo])",
-     "bare_stmt", "combo in _V1_REASSIGN_SCHEMA"):
-        "#202 repair round 3, finding E -- the v1 sibling of "
-        "_handle_reassign_v2's own identical-shape waiver above (see that "
-        "entry): request-body field validation against the schema for "
-        "the already-decided `combo`, not a routing decision",
     ("_handle_reassign", "len(target) > 2", "ifexp_test",
      "self._reject_target_outside_scope(target[0], target[1], actor_id, "
      "role, scope, target[2] if len(target) > 2 else 'scope')"):
@@ -3282,8 +3309,8 @@ _AUDIT_WAIVERS = {
         "the #369 write-side context check on the AUTHORISATION-TARGET "
         "list `targets`, built entirely from names this dict's own "
         "`targets.append(...)` waivers above already established are "
-        "'produces a RESULT, not a routing decision' (the route was fully "
-        "decided upstream by `combo in _V2_REASSIGN_SCHEMA`); this is the "
+        "'produces a RESULT, not a routing decision' (exact POST admission "
+        "plus the local call map already decide the route); this is the "
         "SAME `targets` list, now examined as a bare if-test instead of "
         "an assignment/append",
     ("_handle_reassign",
@@ -3294,8 +3321,8 @@ _AUDIT_WAIVERS = {
         "above (same #369 write-side context check on the SAME kind of "
         "authorisation-target list); newly reached because `targets` now "
         "stays tracked in v1 too, for the reasons this dict's round-5, "
-        "finding-1 waiver group above explains -- the route here is fully "
-        "decided upstream by `combo in _V1_REASSIGN_SCHEMA`",
+        "finding-1 waiver group above explains -- exact POST admission plus "
+        "the local call map already decide the route",
     # -- #202 repair round 5, finding 2b -- newly reached now that Return
     # statements are audited at all (see _propagates_taint's own
     # docstring's "captured" paragraph): `_guarded_mutation` is the OTHER
@@ -3305,8 +3332,8 @@ _AUDIT_WAIVERS = {
     # MUTATION CALLABLE, runs the target check, the row locks, the write
     # and the audit inside ONE transaction (server.py:1049-1075), and is
     # reached here as `return self._guarded_mutation(...)`, the function's
-    # own terminal statement. Not a routing decision either: the route was
-    # fully decided upstream by `combo in _V{1,2}_REASSIGN_SCHEMA`;
+    # own terminal statement. Not a routing decision either: exact POST
+    # admission plus the local reassignment call map already decide the route;
     # `_guarded_mutation` decides whether THIS caller may WRITE to the
     # already-identified target(s), the same authorisation question as
     # its two siblings, just running the actual mutation once that
@@ -3329,8 +3356,8 @@ _AUDIT_WAIVERS = {
      "return_value", "call is not None"):
         "the v2 sibling of _handle_reassign's own identical-shape waiver "
         "immediately above; `call` is `_V2_REASSIGN_CALL.get(combo)`, the "
-        "same local tuple-dict-lookup shape, and the route here is fully "
-        "decided upstream by `combo in _V2_REASSIGN_SCHEMA`",
+        "same local tuple-dict-lookup shape; exact POST admission plus that "
+        "lookup decide the route",
     ("_handle_reassign_v2",
      "self._reject_target_outside_scope(target[0], target[1], actor_id, "
      "role, scope, target[2] if len(target) > 2 else 'scope')", "if_test",
@@ -3705,66 +3732,6 @@ _AUDIT_WAIVERS = {
         "enclosing-if-text fingerprint (`substitute-candidates` vs "
         "`substitute-addable`) is what keeps the two from masquerading as "
         "one",
-    # -- #202 repair round 6, finding 1's OTHER new shape: a bare Subscript
-    # (no Call anywhere around it) keyed on a tracked name, independently
-    # audited the same way an unlisted Call already is (see
-    # `_propagates_taint`'s own new `ast.Subscript` branch). Both entries
-    # below are the SAME already-reviewed `check_body(b, **_SCHEMA[combo])`
-    # bare statement (round 3, finding E's own waiver, above) -- that
-    # waiver covers the CALL as a whole; the Subscript nested inside its
-    # `**kwargs` unpack is now ALSO independently visited and needs its
-    # own entry, the same "each real one still needs its own reviewed
-    # waiver" discipline this dict uses throughout. NOT a routing
-    # decision: `combo` is already PROVEN a valid key of this exact
-    # SCHEMA dict by the enclosing `combo in _V{1,2}_REASSIGN_SCHEMA`
-    # test, which is what selected this route in the first place (#202
-    # repair root cause 1) -- re-indexing the SAME dict by the SAME combo
-    # to unpack its value as `check_body` validation kwargs does not pick
-    # a different one.
-    ("_handle_reassign", "_V1_REASSIGN_SCHEMA[combo]", "keyword",
-     "combo in _V1_REASSIGN_SCHEMA"):
-        "the `**_V1_REASSIGN_SCHEMA[combo]` unpack inside `check_body(b, "
-        "**_V1_REASSIGN_SCHEMA[combo])` (round 3, finding E's own waiver "
-        "above covers that call as a whole) -- see this sub-group's own "
-        "comment for why the nested Subscript is not a second routing "
-        "decision",
-    ("_handle_reassign_v2", "_V2_REASSIGN_SCHEMA[combo]", "keyword",
-     "combo in _V2_REASSIGN_SCHEMA"):
-        "the v2 sibling of `_handle_reassign`'s own identical-shape waiver "
-        "immediately above -- same reasoning, `check_body(b, "
-        "**_V2_REASSIGN_SCHEMA[combo])` is round 3, finding E's own "
-        "pre-existing waiver for the call as a whole",
-    # -- #202 repair round 6, finding 2 -- newly reached now that a
-    # `with`/an implicit-exception-into-handler data flow is audited at
-    # all (this dict's own two entries below are the SECOND of those, the
-    # try-body-scoped except-handler check; finding 2's other three gaps
-    # -- closures, `with` context expressions, and the captured-exemption
-    # narrowing for dispatch selection -- need no waiver against the real
-    # server.py: it has no local closure that reads a tracked free
-    # variable, no `with` statement at all, and no captured id used to
-    # select-then-immediately-invoke a callable). Both entries below are
-    # the SAME shape: `except BodyError as exc: return self._send_json(
-    # exc.payload, exc.status)`, whose own enclosing try body is
-    # `check_body(b, **_V{1,2}_REASSIGN_SCHEMA[combo])` (round 3, finding
-    # E's own pre-existing waiver, several entries above, covers that
-    # call). NOT a routing decision: `check_body` raises `BodyError` on a
-    # malformed REQUEST BODY for the ALREADY-DECIDED `combo`, and this
-    # handler's only action is to translate that into the response --
-    # `exc.payload`/`exc.status` are returned directly, never inspected or
-    # compared to select a different template -- the SAME "produces the
-    # final answer for an already-decided route" shape as every other
-    # `check_body`-adjacent waiver in this dict.
-    ("_handle_reassign",
-     "except BodyError as exc:\n    return self._send_json(exc.payload, "
-     "exc.status)", "try", "combo in _V1_REASSIGN_SCHEMA"):
-        "the exception handler for `check_body`'s own BodyError, "
-        "translating a malformed-body failure straight into the "
-        "response -- see this sub-group's own comment above",
-    ("_handle_reassign_v2",
-     "except BodyError as exc:\n    return self._send_json(exc.payload, "
-     "exc.status)", "try", "combo in _V2_REASSIGN_SCHEMA"):
-        "the v2 sibling of `_handle_reassign`'s own identical-shape "
-        "waiver immediately above -- same reasoning",
     # #202 repair round 13, finding 1 (external review): the retired
     # `_captured_arg_safe_callee` structural exemption (see
     # `_TRUSTED_BINDING_SOURCES`'s own module comment, just above

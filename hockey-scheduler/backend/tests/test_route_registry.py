@@ -64,6 +64,7 @@ from hockey_scheduler.web.route_registry import (
     runtime_reassignment_parent_spec, runtime_sensitive_post_denial_spec,
     sensitive_post_denial_specs,
 )
+from hockey_scheduler.web.validation import BodyError
 
 WALKER = extract_walker()
 LIVE = {route.key: route for route in WALKER.routes.values()}
@@ -116,29 +117,31 @@ _EXPECTED_REASSIGNMENT_PARENTS = {
 }
 
 _EXPECTED_REASSIGNMENT_DESTINATIONS = {
-    "post_setup_division_id_assign_level": ("league", "level_id"),
+    "post_setup_division_id_assign_level": ("league", "level_id", True),
     "post_setup_league_id_assign_organization": (
-        "organization", "organization_id"),
-    "post_setup_player_id_assign_team": ("team", "team_id"),
-    "post_setup_rink_id_assign_venue": ("venue", "venue_id"),
+        "organization", "organization_id", True),
+    "post_setup_player_id_assign_team": ("team", "team_id", False),
+    "post_setup_rink_id_assign_venue": ("venue", "venue_id", False),
     "post_setup_season_team_registration_id_assign_division": (
-        "division", "division_id"),
-    "post_setup_team_id_assign_club": ("club", "club_id"),
+        "division", "division_id", True),
+    "post_setup_team_id_assign_club": ("club", "club_id", True),
     "post_setup_venue_id_assign_organization": (
-        "organization", "organization_id"),
-    "post_v2_setup_division_id_assign_league": ("league", "league_id"),
-    "post_v2_setup_player_id_assign_team": ("team", "team_id"),
+        "organization", "organization_id", True),
+    "post_v2_setup_division_id_assign_league": (
+        "league", "league_id", False),
+    "post_v2_setup_player_id_assign_team": ("team", "team_id", False),
     "post_v2_setup_program_id_assign_organization": (
-        "organization", "operator_organization_id"),
-    "post_v2_setup_rink_id_assign_venue": ("venue", "venue_id"),
+        "organization", "operator_organization_id", True),
+    "post_v2_setup_rink_id_assign_venue": ("venue", "venue_id", False),
     "post_v2_setup_season_team_registration_id_assign_division": (
-        "division", "division_id"),
+        "division", "division_id", True),
     "post_v2_setup_season_team_registration_id_assign_league": (
-        "league", "league_id"),
-    "post_v2_setup_team_id_assign_club": ("club", "club_id"),
-    "post_v2_setup_team_id_assign_league": ("league", "league_id"),
+        "league", "league_id", False),
+    "post_v2_setup_team_id_assign_club": ("club", "club_id", True),
+    "post_v2_setup_team_id_assign_league": (
+        "league", "league_id", False),
     "post_v2_setup_venue_id_assign_organization": (
-        "organization", "organization_id"),
+        "organization", "organization_id", True),
 }
 
 
@@ -207,7 +210,8 @@ def _runtime_reassignment_destination_map(registry):
         if spec is not None:
             selected[spec.name] = (
                 spec.reassignment_destination_kind,
-                spec.reassignment_destination_field)
+                spec.reassignment_destination_field,
+                spec.reassignment_destination_nullable)
     return selected
 
 
@@ -1379,11 +1383,15 @@ class ReassignmentDestinationContractTests(unittest.TestCase):
             _EXPECTED_REASSIGNMENT_DESTINATIONS)
         self.assertEqual(
             {spec.name: (spec.reassignment_destination_kind,
-                         spec.reassignment_destination_field)
+                         spec.reassignment_destination_field,
+                         spec.reassignment_destination_nullable)
              for spec in REASSIGNMENT_DESTINATION_SPECS},
             _EXPECTED_REASSIGNMENT_DESTINATIONS)
-        self.assertFalse(hasattr(srv, "_V1_REASSIGN_DEST"))
-        self.assertFalse(hasattr(srv, "_V2_REASSIGN_DEST"))
+        server_source = SERVER_PATH.read_text()
+        for retired in ("_V1_REASSIGN_DEST", "_V2_REASSIGN_DEST",
+                        "_V1_REASSIGN_SCHEMA", "_V2_REASSIGN_SCHEMA"):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, server_source)
 
     def test_reassignment_destination_target_reads_received_body_field(self):
         self.assertEqual(
@@ -1416,11 +1424,65 @@ class ReassignmentDestinationContractTests(unittest.TestCase):
         self.assertIsNone(srv._reassignment_destination_target(
             "/api/v2/setup/team/example/delete", {}))
 
+    def test_reassignment_body_validation_uses_the_declared_field_and_nullability(self):
+        """All 16 assign routes enforce their exact one-field wire contract."""
+        self.assertEqual(
+            {spec.name for spec in REASSIGNMENT_DESTINATION_SPECS},
+            set(_EXPECTED_REASSIGNMENT_DESTINATIONS))
+        self.assertEqual(
+            {value[2] for value in _EXPECTED_REASSIGNMENT_DESTINATIONS.values()},
+            {False, True})
+
+        def reason(path, body):
+            with self.assertRaises(BodyError) as raised:
+                srv._validate_reassignment_body(path, body)
+            return raised.exception.payload["error"]["details"]["reason"]
+
+        for name, (_, field, nullable) in \
+                _EXPECTED_REASSIGNMENT_DESTINATIONS.items():
+            with self.subTest(name=name):
+                path = sample_path(BY_NAME[name].template)
+                valid = {field: "destination-id"}
+                self.assertIs(
+                    srv._validate_reassignment_body(path, valid), valid)
+                self.assertIs(
+                    srv._validate_reassignment_body(
+                        path + "?ignored=1", valid), valid)
+                self.assertEqual(reason(path, {}), "field_required")
+                self.assertEqual(reason(path, {field: 7}), "wrong_type")
+                self.assertEqual(
+                    reason(path, {field: "destination-id", "extra": True}),
+                    "unknown_field")
+                if nullable:
+                    explicit_null = {field: None}
+                    self.assertIs(
+                        srv._validate_reassignment_body(path, explicit_null),
+                        explicit_null)
+                    # Preserve the existing check_body contract exactly: a
+                    # nullable field is presence-checked and string-typed, so
+                    # an empty string remains accepted and is normalized to
+                    # no destination by the target helper.
+                    empty_string = {field: ""}
+                    self.assertIs(
+                        srv._validate_reassignment_body(path, empty_string),
+                        empty_string)
+                else:
+                    self.assertEqual(
+                        reason(path, {field: None}), "field_required")
+                    self.assertEqual(
+                        reason(path, {field: ""}), "field_required")
+
+        unknown = {"anything": "unchanged"}
+        self.assertIs(
+            srv._validate_reassignment_body(
+                "/api/v2/setup/team/example/delete", unknown), unknown)
+
     def test_runtime_reassignment_destination_refuses_narrowing(self):
         enrolled = BY_NAME["post_v2_setup_team_id_assign_league"]
         narrowed = self._mutate(
             enrolled, reassignment_destination_kind=None,
-            reassignment_destination_field=None)
+            reassignment_destination_field=None,
+            reassignment_destination_nullable=None)
         with self.assertRaisesRegex(RuntimeError, "require.*metadata"):
             reassignment_destination_specs(narrowed)
 
@@ -1428,7 +1490,8 @@ class ReassignmentDestinationContractTests(unittest.TestCase):
         unenrolled = BY_NAME["post_games_id_action"]
         widened = self._mutate(
             unenrolled, reassignment_destination_kind="league",
-            reassignment_destination_field="league_id")
+            reassignment_destination_field="league_id",
+            reassignment_destination_nullable=False)
         with self.assertRaisesRegex(RuntimeError,
                                     "concrete POST assign routes"):
             reassignment_destination_specs(widened)
@@ -1438,6 +1501,7 @@ class ReassignmentDestinationContractTests(unittest.TestCase):
         mutations = (
             {"reassignment_destination_kind": None},
             {"reassignment_destination_field": None},
+            {"reassignment_destination_nullable": None},
         )
         for changes in mutations:
             with self.subTest(changes=changes):
@@ -1454,6 +1518,9 @@ class ReassignmentDestinationContractTests(unittest.TestCase):
             {"reassignment_destination_field": ""},
             {"reassignment_destination_field": "   "},
             {"reassignment_destination_field": 7},
+            {"reassignment_destination_nullable": 0},
+            {"reassignment_destination_nullable": 1},
+            {"reassignment_destination_nullable": "true"},
         )
         for changes in mutations:
             with self.subTest(changes=changes):
@@ -1475,6 +1542,7 @@ class ReassignmentDestinationContractTests(unittest.TestCase):
                     target,
                     reassignment_destination_kind="organization",
                     reassignment_destination_field="organization_id",
+                    reassignment_destination_nullable=True,
                     **extra)
                 with self.assertRaisesRegex(RuntimeError,
                                             "concrete POST assign routes"):
