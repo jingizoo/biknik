@@ -415,28 +415,21 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
         self._post(admin, "venue", {"name": "own-legacy-link",
                                     "league_id": program["id"]}, api="v1")
 
-    def test_every_gated_reassign_relation_is_actually_in_the_table(self):
-        """The gate is table-driven, so the table IS the coverage.
+    def test_every_declared_reassign_parent_has_a_resolvable_list(self):
+        """Every RouteSpec parent kind must be executable by the live gate.
 
-        A relation silently dropped from it would reopen that one write with
-        no test failing anywhere -- the loop above exercises the mechanism on
-        two relations, and this pins the remaining three so adding a create
-        gate without its reassign twin cannot pass unnoticed.
+        Completeness and exact values are independently pinned by
+        ``test_route_registry`` over production's selector. This test owns the
+        cross-module invariant: every selected kind must name a parent list
+        the request-time refusal can actually resolve.
         """
-        from hockey_scheduler.web.server import (_REASSIGN_PARENTS,
-                                                 _SETUP_PARENT_LISTS)
-        self.assertEqual(
-            _REASSIGN_PARENTS,
-            {("league", "organization"): ("organization", "organization_id"),
-             ("program", "organization"): ("organization",
-                                           "operator_organization_id"),
-             ("venue", "organization"): ("organization", "organization_id"),
-             ("rink", "venue"): ("venue", "venue_id"),
-             ("team", "club"): ("club", "club_id")})
-        # Every kind the reassign table names must be one the gate can
-        # actually resolve a list for, or the lookup raises at request time.
-        for kind, _key in _REASSIGN_PARENTS.values():
-            self.assertIn(kind, _SETUP_PARENT_LISTS)
+        from hockey_scheduler.web.route_registry import (
+            REASSIGNMENT_PARENT_SPECS)
+        from hockey_scheduler.web.server import _SETUP_PARENT_LISTS
+        for spec in REASSIGNMENT_PARENT_SPECS:
+            with self.subTest(spec=spec.name):
+                self.assertIn(spec.reassignment_parent_kind,
+                              _SETUP_PARENT_LISTS)
 
     def test_a_second_account_cannot_reach_that_same_operator_org(self):
         """The other half of the case above: creator-ownership admits the

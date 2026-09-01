@@ -2871,27 +2871,22 @@ _AUDIT_WAIVERS = {
         "route_registry.py's post_v2_setup_<entity>_id_delete specs); this "
         "ternary only reshapes the response for one of those already-"
         "enumerated leaves",
-    ("_handle_reassign", "_REASSIGN_PARENTS.get(combo)", "assign_rhs", ""):
-        "#202 repair round 2 finding A -- a MODULE-LEVEL authorisation-"
-        "parent lookup keyed on the already-tracked combo. NOT a routing "
-        "decision: the route was already fully decided upstream by `combo "
-        "in _V1_REASSIGN_SCHEMA`; this result only feeds `targets` for the "
-        "#369 write-side parent-ownership check, the same 'produces a "
-        "RESULT' shape as a captured group handed to a service, just not a "
-        "mechanical one (unlike a captured group or a Path property, "
-        "_REASSIGN_PARENTS being a plain module dict isn't something a "
-        "shape rule can tell apart from a genuine hidden route table, so "
-        "it is reviewed here instead)",
-    ("_handle_reassign_v2", "_REASSIGN_PARENTS.get(combo)", "assign_rhs", ""):
-        "same authorisation-parent lookup as _handle_reassign's own "
-        "waiver above, reached from the v2 handler -- the route is already "
-        "decided upstream by the v2 combo/schema dispatch; see that entry",
+    ("_handle_reassign", "_reassignment_parent_target(self.path, b)",
+     "assign_rhs", ""):
+        "#202 RouteSpec reassignment-parent contract -- the route is already "
+        "fully decided upstream by `combo in _V1_REASSIGN_SCHEMA`; this "
+        "fail-closed registry lookup only feeds `targets` for the #369 "
+        "write-side parent-ownership check",
+    ("_handle_reassign_v2", "_reassignment_parent_target(self.path, b)",
+     "assign_rhs", ""):
+        "the v2 sibling of _handle_reassign's RouteSpec policy lookup above; "
+        "the route is already decided by the v2 combo/schema dispatch",
     # -- #202 repair round 5, finding 1 -- newly REACHED now that a waived
     # call's RESULT keeps propagating through the ordinary fixed-point
     # mechanism instead of being erased the instant its call site is
     # waived (see _propagates_taint's own docstring, "A WAIVER SILENCES
     # THE CALL, NOT THE RESULT"). `parent` (bound two waiver entries above,
-    # from the SAME module-level `_REASSIGN_PARENTS.get(combo)` this
+    # from the SAME `_reassignment_parent_target(self.path, b)` lookup this
     # dict already reviews) now joins `tracked`, so the `is not None`
     # check on it -- previously invisible, because `parent` never reached
     # `tracked` at all -- is examined for the first time. NOT a routing
@@ -2899,14 +2894,13 @@ _AUDIT_WAIVERS = {
     # write-side parent-ownership rule to enforce (most reassign combos
     # don't need one), so this only decides whether to APPEND that one
     # extra authorisation-target entry -- the SAME `targets` list this
-    # dict's own `targets.append((parent[0], ...))` waiver already
+    # dict's own `targets.append(parent)` waiver already
     # reviews below, reached here as the bare `is not None` guard around
     # it instead of the append itself. The route was fully decided
     # upstream by `combo in _V1_REASSIGN_SCHEMA`, unchanged by this branch
     # either way.
     ("_handle_reassign", "parent is not None", "if_test", ""):
-        "#202 repair round 5, finding 1 -- guards whether the module-level "
-        "`_REASSIGN_PARENTS.get(combo)` lookup (waived two entries above) "
+        "guards whether the RouteSpec lookup (waived two entries above) "
         "found a #369 write-side parent-ownership rule for the already-"
         "decided combo; append-or-not, not a routing decision -- see the "
         "comment block immediately above this entry for the full "
@@ -2914,8 +2908,8 @@ _AUDIT_WAIVERS = {
         "for the SAME `targets` list reached as a bare statement instead",
     ("_handle_reassign_v2", "parent is not None", "if_test", ""):
         "the v2 sibling of _handle_reassign's own identical-shape waiver "
-        "immediately above (same module-level `_REASSIGN_PARENTS.get(combo)` "
-        "lookup, same #369 append-or-not guard, same reasoning) -- the "
+        "immediately above (same RouteSpec lookup, same #369 append-or-not "
+        "guard, same reasoning) -- the "
         "route here is already decided upstream by `combo in "
         "_V2_REASSIGN_SCHEMA`",
     ("_handle_reassign", "self._V1_SETUP_KIND.get(entity, entity)",
@@ -3050,13 +3044,12 @@ _AUDIT_WAIVERS = {
         "not choose a different template; the route was fully decided "
         "upstream by `combo in _V2_REASSIGN_SCHEMA`",
     ("_handle_reassign_v2",
-     "targets.append((parent[0], b.get(parent[1]) or None, "
-     "'writable_parent'))", "bare_stmt", "parent is not None"):
+     "targets.append(parent)", "bare_stmt", "parent is not None"):
         "#202 repair round 3, finding E -- same `targets` list as the "
         "immediately preceding waiver (this entry's own comment explains "
-        "why `targets` itself reads as tracked); `parent` is "
-        "`_REASSIGN_PARENTS.get(combo)`, already covered by its own "
-        "existing waiver above -- appending it extends the SAME "
+        "why `targets` itself reads as tracked); `parent` is the RouteSpec "
+        "contract already covered by its own waiver above -- appending it "
+        "extends the SAME "
         "authorisation-target list with the write-side parent-ownership "
         "check (#369), not a routing decision",
     ("_handle_reassign_v2", "check_body(b, **_V2_REASSIGN_SCHEMA[combo])",
@@ -3134,7 +3127,7 @@ _AUDIT_WAIVERS = {
     #       continues into its ARGUMENTS and reaches the previously-
     #       unexamined `b.get(X[1])` inline call too -- `b` is the request
     #       BODY dict (`b = body`, both handlers' own top line), and
-    #       `X[1]` (`dest[1]`/`parent[1]`) is a BODY KEY NAME the
+    #       `X[1]` (`dest[1]`) is a BODY KEY NAME the
     #       already-decided combo/dest/parent lookup chose, e.g.
     #       "organization_id" -- reading that one field's value to append
     #       onto the SAME authorisation-target list the enclosing
@@ -3143,8 +3136,7 @@ _AUDIT_WAIVERS = {
     #       _V{1,2}_REASSIGN_SCHEMA`, unchanged by which body field gets
     #       read here.
     ("_handle_reassign",
-     "targets.append((parent[0], b.get(parent[1]) or None, "
-     "'writable_parent'))", "bare_stmt", "parent is not None"):
+     "targets.append(parent)", "bare_stmt", "parent is not None"):
         "#202 repair round 5, finding 1, consequence (a) -- the v1 sibling "
         "of _handle_reassign_v2's own identical-shape 'writable_parent' "
         "append waiver (this dict, round 3 finding E section); newly "
@@ -3157,22 +3149,12 @@ _AUDIT_WAIVERS = {
         "list this dict's enclosing `targets.append(...)` waiver already "
         "reviews (round 3, finding E); not a routing decision -- see the "
         "comment block above this entry's group for the general shape",
-    ("_handle_reassign", "b.get(parent[1])", "boolop", "parent is not None"):
-        "same shape as this function's `b.get(dest[1])` waiver immediately "
-        "above, for the `parent`-keyed (\"writable_parent\") append instead "
-        "of the `dest`-keyed one",
     ("_handle_reassign_v2", "b.get(dest[1])", "boolop", "dest is not None"):
         "the v2 sibling of _handle_reassign's own identical-shape "
         "`b.get(dest[1])` waiver above; same request-body field read for "
         "the same already-decided `dest`, feeding the SAME `targets` list "
         "_handle_reassign_v2's own `targets.append(...)` waiver (round 3, "
         "finding E) already reviews",
-    ("_handle_reassign_v2", "b.get(parent[1])", "boolop", "parent is not None"):
-        "the v2 sibling of _handle_reassign's own identical-shape "
-        "`b.get(parent[1])` waiver above; same request-body field read for "
-        "the same already-decided `parent`, feeding the SAME `targets` "
-        "list _handle_reassign_v2's own 'writable_parent' append waiver "
-        "(round 3, finding E) already reviews",
     # -- #202 repair round 4, finding 1 -- newly examined now that a Call
     # reached DIRECTLY AS (or and/or/not-ed into) the WHOLE test has its
     # arguments scanned too, the same way finding E already did for a
