@@ -431,6 +431,62 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
                 self.assertIn(spec.reassignment_parent_kind,
                               _SETUP_PARENT_LISTS)
 
+    def test_every_reassign_parent_target_reads_the_received_body_id(self):
+        """The registry field name must reach the live target builder.
+
+        The registry contract independently pins metadata values. This is the
+        behavioural half: corrupting one ``reassignment_parent_field`` must
+        not silently turn the extra authorization target into ``None`` while
+        the broad destination check keeps the HTTP refusal green.
+        """
+        from hockey_scheduler.web.route_registry import (
+            REASSIGNMENT_PARENT_SPECS)
+
+        cases = {
+            "post_setup_league_id_assign_organization": (
+                "/api/setup/league/source/assign-organization",
+                {"organization_id": "organization-v1"},
+                ("organization", "organization-v1", "writable_parent")),
+            "post_setup_rink_id_assign_venue": (
+                "/api/setup/rink/source/assign-venue",
+                {"venue_id": "venue-v1"},
+                ("venue", "venue-v1", "writable_parent")),
+            "post_setup_team_id_assign_club": (
+                "/api/setup/team/source/assign-club",
+                {"club_id": "club-v1"},
+                ("club", "club-v1", "writable_parent")),
+            "post_setup_venue_id_assign_organization": (
+                "/api/setup/venue/source/assign-organization",
+                {"organization_id": "organization-v1-venue"},
+                ("organization", "organization-v1-venue",
+                 "writable_parent")),
+            "post_v2_setup_program_id_assign_organization": (
+                "/api/v2/setup/program/source/assign-organization",
+                {"operator_organization_id": "organization-v2-program"},
+                ("organization", "organization-v2-program",
+                 "writable_parent")),
+            "post_v2_setup_rink_id_assign_venue": (
+                "/api/v2/setup/rink/source/assign-venue",
+                {"venue_id": "venue-v2"},
+                ("venue", "venue-v2", "writable_parent")),
+            "post_v2_setup_team_id_assign_club": (
+                "/api/v2/setup/team/source/assign-club",
+                {"club_id": "club-v2"},
+                ("club", "club-v2", "writable_parent")),
+            "post_v2_setup_venue_id_assign_organization": (
+                "/api/v2/setup/venue/source/assign-organization",
+                {"organization_id": "organization-v2-venue"},
+                ("organization", "organization-v2-venue",
+                 "writable_parent")),
+        }
+        self.assertEqual(
+            set(cases), {spec.name for spec in REASSIGNMENT_PARENT_SPECS})
+        for name, (path, body, expected) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.srv._reassignment_parent_target(path, body),
+                    expected)
+
     def test_a_second_account_cannot_reach_that_same_operator_org(self):
         """The other half of the case above: creator-ownership admits the
         creator and nobody else. Without this, "allow rows you created" could
