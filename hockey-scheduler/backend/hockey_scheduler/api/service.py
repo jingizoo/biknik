@@ -10821,7 +10821,7 @@ class ApiService:
         # they are excluded from the LABELS here. The dedicated draft-review
         # view lists them.
         game_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
-                        if g.ice_slot_id and not g.is_draft
+                        if g.ice_slot_id and not g.is_draft and not g.cancelled
                         and _in_scope_game(g)}
         # Reserved ice, however, is PHYSICAL (#277 Slice B review): an active
         # committed draft blocks warm-up/resurfacing facility time exactly
@@ -10868,7 +10868,30 @@ class ApiService:
             # (#205 blocker, round 4). See `_schedule_roster_status`.
             row_status = self._schedule_roster_status(
                 g, role, scoped_team_id, scoped_player_id)
-            venue_name = None
+            historical_ice = None
+            if g.cancelled and g.cancelled_ice_slot_id:
+                historical_ice = {
+                    "ice_slot_id": g.cancelled_ice_slot_id,
+                    "venue_id": g.cancelled_venue_id,
+                    "venue_name": g.cancelled_venue_name,
+                    "venue_timezone": g.cancelled_venue_timezone,
+                    "rink_id": g.cancelled_rink_id,
+                    "rink_name": g.cancelled_rink_name,
+                    "scheduled_start_time": (
+                        g.cancelled_scheduled_start_time.isoformat()
+                        if g.cancelled_scheduled_start_time else None),
+                    "scheduled_end_time": (
+                        g.cancelled_scheduled_end_time.isoformat()
+                        if g.cancelled_scheduled_end_time else None),
+                    "ice_start_time": (
+                        g.cancelled_ice_start_time.isoformat()
+                        if g.cancelled_ice_start_time else None),
+                    "ice_end_time": (
+                        g.cancelled_ice_end_time.isoformat()
+                        if g.cancelled_ice_end_time else None),
+                }
+            venue_name = (historical_ice["venue_name"]
+                          if historical_ice else None)
             slot = self.store.get_ice_slot(g.ice_slot_id) if g.ice_slot_id else None
             if slot and slot.rink_id in rinks:
                 rk = rinks[slot.rink_id]
@@ -10889,10 +10912,13 @@ class ApiService:
                 "division_id": g.division_id,
                 "division_name": div.name if div else None,
                 "ice_slot_id": g.ice_slot_id,
-                "rink_name": g.rink, "venue_name": venue_name,
+                "rink_name": (historical_ice["rink_name"]
+                              if historical_ice else g.rink),
+                "venue_name": venue_name,
                 "start_time": g.start_time.isoformat(),
                 "published": g.published,
                 "cancelled": g.cancelled,  # Games view offers Cancel, not Delete (#215)
+                "historical_ice": historical_ice,
                 # Officials summary for the Games operations checklist (#30).
                 "officials_assigned": len(g_active),
                 "officials_accepted": sum(

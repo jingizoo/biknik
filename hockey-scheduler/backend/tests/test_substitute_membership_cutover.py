@@ -103,9 +103,21 @@ class _Fixture:
     therefore carries the LeagueSeason binding (#283 Slice E) the
     membership resolution starts from."""
 
+    def _bind_clock(self, api, store):
+        clock = FakeClock()
+        api.roster.clock = clock
+        # The real-HTTP variants seed through this facade but dispatch through
+        # ``srv.STATE.api`` over the same store.  Keep both sides on the same
+        # deterministic clock: otherwise the fixture's fixed future game is
+        # evaluated against wall time by the handler and eventually becomes a
+        # past game (the 2026-09-02 rollover made four unrelated controls fail
+        # on current main).  Non-HTTP stores never satisfy this identity check.
+        if srv.STATE.api.store is store:
+            srv.STATE.api.roster.clock = clock
+
     def _build(self, store):
         api = ApiService(store)
-        api.roster.clock = FakeClock()
+        self._bind_clock(api, store)
         org = api.create_organization("Org", "O", actor_id=ADMIN)
         program = api.create_program(
             "Prog", operator_organization_id=org["id"], actor_id=ADMIN)

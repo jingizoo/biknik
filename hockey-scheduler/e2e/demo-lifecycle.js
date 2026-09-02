@@ -197,6 +197,14 @@ async function checkViewport(browser, viewport) {
   const V = viewport.label;
   const getJson = (p) => page.evaluate(
     (u) => fetch(u, { credentials: "same-origin" }).then((r) => r.json()), p);
+  const postJson = (p, body) => page.evaluate(async ([u, payload]) => {
+    const response = await fetch(u, {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return { status: response.status, body: await response.json() };
+  }, [p, body]);
   const leagueCount = async () =>
     ((await getJson("/api/setup/hierarchy")).leagues || []).length;
   const openSetup = async () => {
@@ -442,9 +450,170 @@ async function checkViewport(browser, viewport) {
     }
     await page.unroute("**/api/demo/overview");
 
+    // (6) #428 cancellation is a lifecycle transition, not a delete.  Exercise
+    // the real Games UI at both viewports, including its keyboard paths, then
+    // prove the API's occupancy/history contract from the live response.
+    const beforeCancel = await getJson("/api/demo/overview");
+    const target = (beforeCancel.schedule || []).find(
+      (g) => !g.cancelled && g.ice_slot_id);
+    if (!target) throw new Error(`[${V}] no scheduled game with ice was available to cancel`);
+    const originalSlot = (beforeCancel.ice_slots || []).find(
+      (s) => s.id === target.ice_slot_id);
+    if (!originalSlot) throw new Error(`[${V}] target game's ice slot was absent before cancellation`);
+
+    await page.click('.tab[data-tab="games"]');
+    await page.waitForSelector(`[data-games-toggle="${target.game_id}"]`,
+      { timeout: 10000 });
+    await page.click(`[data-games-toggle="${target.game_id}"]`);
+    const cancelSelector = `[data-game-cancel="${target.game_id}"]`;
+    await page.waitForSelector(cancelSelector, { state: "visible", timeout: 10000 });
+    await page.click(cancelSelector);
+    await page.waitForSelector(".modal.danger [data-cancel-game-confirm]",
+      { timeout: 10000 });
+    await page.waitForFunction(() => document.activeElement
+      && document.activeElement.matches(".modal.danger"), null,
+    { timeout: 5000 });
+    const modalText = await page.textContent(".modal.danger .modal-body");
+    if (!/released immediately/i.test(modalText)
+        || !/venue, rink, and scheduled time remain in history/i.test(modalText)) {
+      throw new Error(`[${V}] cancellation modal did not explain release + history: ${modalText}`);
+    }
+    const modalBox = await page.locator(".modal.danger").boundingBox();
+    if (!modalBox || modalBox.x < 0
+        || modalBox.x + modalBox.width > viewport.width + 1) {
+      throw new Error(`[${V}] cancellation modal overflows the ${viewport.width}px viewport`);
+    }
+
+    // Escape is the safe keyboard path: close without a request or mutation.
+    await page.keyboard.press("Escape");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 5000 });
+    await page.waitForFunction((selector) => document.activeElement
+      && document.activeElement.matches(selector), cancelSelector,
+    { timeout: 5000 });
+    const afterEscape = await getJson("/api/demo/overview");
+    const escapedGame = afterEscape.schedule.find((g) => g.game_id === target.game_id);
+    if (!escapedGame || escapedGame.cancelled || escapedGame.ice_slot_id !== target.ice_slot_id) {
+      throw new Error(`[${V}] Escape mutated cancellation state: ${JSON.stringify(escapedGame)}`);
+    }
+
+    // Re-open and activate the focused destructive action with Enter.
+    await page.click(cancelSelector);
+    await page.waitForSelector(".modal.danger [data-cancel-game-confirm]",
+      { timeout: 5000 });
+    await page.focus("[data-cancel-game-confirm]");
+    const cancelResponse = page.waitForResponse((r) =>
+      r.url() === `${base}/api/games/${target.game_id}/cancel`
+      && r.request().method() === "POST");
+    await page.keyboard.press("Enter");
+    const cancellationHttp = await cancelResponse;
+    if (cancellationHttp.status() !== 200) {
+      throw new Error(`[${V}] keyboard cancellation returned non-200`);
+    }
+    const cancellationDto = await cancellationHttp.json();
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    await page.waitForFunction((gid) => {
+      const row = document.querySelector(`[data-games-toggle="${gid}"]`);
+      const detail = row && row.nextElementSibling;
+      return detail && /Ice released/.test(detail.textContent || "");
+    }, target.game_id, { timeout: 10000 });
+    const toastText = await page.textContent("#toast-root .toast-msg").catch(() => "");
+    if (!/ice released and history preserved/i.test(toastText || "")) {
+      throw new Error(`[${V}] cancellation toast omitted release/history: ${toastText}`);
+    }
+
+    const afterCancel = await getJson("/api/demo/overview");
+    const cancelled = afterCancel.schedule.find((g) => g.game_id === target.game_id);
+    const released = afterCancel.ice_slots.find((s) => s.id === target.ice_slot_id);
+    if (!cancelled || !cancelled.cancelled || cancelled.ice_slot_id !== null
+        || cancelled.reserved !== null || !cancelled.historical_ice) {
+      throw new Error(`[${V}] cancelled schedule row did not detach cleanly: ${JSON.stringify(cancelled)}`);
+    }
+    if (cancelled.historical_ice.ice_slot_id !== target.ice_slot_id
+        || cancelled.historical_ice.venue_name !== target.venue_name
+        || cancelled.historical_ice.rink_name !== target.rink_name
+        || cancelled.historical_ice.scheduled_start_time !== target.start_time) {
+      throw new Error(`[${V}] cancellation history drifted: ${JSON.stringify(cancelled.historical_ice)}`);
+    }
+    if (!released || released.status !== "available" || released.game_id !== null
+        || released.reserved !== null) {
+      throw new Error(`[${V}] released slot still looks occupied: ${JSON.stringify(released)}`);
+    }
+
+    // Reuse the released inventory through the real scheduling endpoint. One
+    // replacement succeeds, a second is refused, and the cancelled row's
+    // history remains visible beside the newly-live occupant.
+    // Creating records is context-scoped (#367): the Games read is allowed
+    // before a Program/Season choice, but its write must name the exact live
+    // tuple. Resolve the Program from the real hierarchy and switch through
+    // the shipped client function so this leg exercises the same session and
+    // client state an operator uses instead of bypassing the context gate.
+    const reuseHierarchy = await getJson("/api/v2/setup/hierarchy");
+    const reuseProgram = (reuseHierarchy.programs || []).find((p) =>
+      (p.seasons || []).some((s) => s.id === cancellationDto.season_id));
+    if (!reuseProgram) {
+      throw new Error(`[${V}] cancelled game's Season has no Program in hierarchy`);
+    }
+    await page.evaluate(([programId, seasonId, leagueId]) =>
+      setActiveContext(programId, seasonId, leagueId),
+    [reuseProgram.id, cancellationDto.season_id, cancellationDto.league_id]);
+    const replacement = await postJson("/api/v2/setup/game", {
+      season_id: cancellationDto.season_id,
+      league_id: cancellationDto.league_id,
+      division_id: cancellationDto.division_id,
+      home_team_id: cancellationDto.home_team_id,
+      away_team_id: cancellationDto.away_team_id,
+      ice_slot_id: target.ice_slot_id,
+    });
+    if (replacement.status !== 200 || !replacement.body.id) {
+      throw new Error(`[${V}] released slot could not be reused: ${JSON.stringify(replacement)}`);
+    }
+    // The refusal is intentional. Send it through BrowserContext's request
+    // client, which shares the page's session cookies but does not emit
+    // Chromium's generic "Failed to load resource: 400" into the page console
+    // (this journey correctly treats every real page-console error as fatal).
+    const duplicateHttp = await context.request.post(
+      `${base}/api/v2/setup/game`, { data: {
+        season_id: cancellationDto.season_id,
+        league_id: cancellationDto.league_id,
+        division_id: cancellationDto.division_id,
+        home_team_id: cancellationDto.home_team_id,
+        away_team_id: cancellationDto.away_team_id,
+        ice_slot_id: target.ice_slot_id,
+      } });
+    const duplicate = {
+      status: duplicateHttp.status(), body: await duplicateHttp.json(),
+    };
+    if (duplicate.status < 400 || !duplicate.body.error) {
+      throw new Error(`[${V}] released slot accepted two replacements: ${JSON.stringify(duplicate)}`);
+    }
+    const afterReuse = await getJson("/api/demo/overview");
+    const reused = afterReuse.ice_slots.find((s) => s.id === target.ice_slot_id);
+    const retained = afterReuse.schedule.find((g) => g.game_id === target.game_id);
+    const liveOnSlot = afterReuse.schedule.filter(
+      (g) => !g.cancelled && g.ice_slot_id === target.ice_slot_id);
+    if (!reused || reused.status !== "allocated"
+        || reused.game_id !== replacement.body.id || liveOnSlot.length !== 1) {
+      throw new Error(`[${V}] released slot reuse was not singular: ${JSON.stringify({ reused, liveOnSlot })}`);
+    }
+    if (!retained || !retained.historical_ice
+        || retained.historical_ice.ice_slot_id !== target.ice_slot_id) {
+      throw new Error(`[${V}] reuse erased cancellation history: ${JSON.stringify(retained)}`);
+    }
+    await page.evaluate(() => render());
+    await page.waitForSelector(`[data-games-toggle="${replacement.body.id}"]`,
+      { timeout: 10000 });
+    const cancelledDetail = await page.locator(
+      `[data-games-toggle="${target.game_id}"] + .games-detail`).textContent();
+    if (!/Ice released/.test(cancelledDetail || "")
+        || !cancelled.historical_ice.venue_name
+        || !(cancelledDetail || "").includes(cancelled.historical_ice.venue_name)) {
+      throw new Error(`[${V}] history view disappeared after slot reuse: ${cancelledDetail}`);
+    }
+
     if (errors.length) throw new Error(`[${V}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${V}] OK — blank → load → clear → reset, header state-aware, `
-      + `and a stale render() cannot destroy the confirm modal.`);
+      + `a stale render() cannot destroy the confirm modal, and cancellation `
+      + `releases and reuses ice while retaining fixture history.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

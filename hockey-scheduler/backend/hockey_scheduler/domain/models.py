@@ -136,6 +136,22 @@ class Game:
     # LeagueSeason). Backfilled for existing regular games from their unique
     # (league_id, season_id) pair by migration 037.
     league_season_id: Optional[str] = None
+    # Immutable cancellation-time ice history (#428).  Cancellation detaches
+    # ``ice_slot_id`` so the physical slot becomes reusable/deletable, while
+    # these denormalized facts keep the historical fixture intelligible even
+    # after #429 later removes the original facility subtree.  They are
+    # written once, in the same transaction as cancellation, and never used
+    # as current scheduling authority.
+    cancelled_ice_slot_id: Optional[str] = None
+    cancelled_venue_id: Optional[str] = None
+    cancelled_venue_name: Optional[str] = None
+    cancelled_venue_timezone: Optional[str] = None
+    cancelled_rink_id: Optional[str] = None
+    cancelled_rink_name: Optional[str] = None
+    cancelled_scheduled_start_time: Optional[datetime] = None
+    cancelled_scheduled_end_time: Optional[datetime] = None
+    cancelled_ice_start_time: Optional[datetime] = None
+    cancelled_ice_end_time: Optional[datetime] = None
 
 
 @dataclass
