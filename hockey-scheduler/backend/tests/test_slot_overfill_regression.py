@@ -50,7 +50,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND, FakeClock  # noqa: F401  (sets up sys.path)
+from helpers import BACKEND  # noqa: F401  (sets up sys.path)
 from helpers import end_membership_directly, fresh_sql_store
 
 from test_substitute_membership_cutover import ADMIN, _at, _Fixture
@@ -68,7 +68,7 @@ class _OverfillFixture(_Fixture):
 
     def _build(self, store, target_skaters=1, target_goalies=0):
         api = ApiService(store)
-        api.roster.clock = FakeClock()
+        self._bind_clock(api, store)
         org = api.create_organization("Org", "O", actor_id=ADMIN)
         program = api.create_program(
             "Prog", operator_organization_id=org["id"], actor_id=ADMIN)

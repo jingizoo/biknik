@@ -542,6 +542,20 @@ async function checkViewport(browser, viewport) {
     // Reuse the released inventory through the real scheduling endpoint. One
     // replacement succeeds, a second is refused, and the cancelled row's
     // history remains visible beside the newly-live occupant.
+    // Creating records is context-scoped (#367): the Games read is allowed
+    // before a Program/Season choice, but its write must name the exact live
+    // tuple. Resolve the Program from the real hierarchy and switch through
+    // the shipped client function so this leg exercises the same session and
+    // client state an operator uses instead of bypassing the context gate.
+    const reuseHierarchy = await getJson("/api/v2/setup/hierarchy");
+    const reuseProgram = (reuseHierarchy.programs || []).find((p) =>
+      (p.seasons || []).some((s) => s.id === cancellationDto.season_id));
+    if (!reuseProgram) {
+      throw new Error(`[${V}] cancelled game's Season has no Program in hierarchy`);
+    }
+    await page.evaluate(([programId, seasonId, leagueId]) =>
+      setActiveContext(programId, seasonId, leagueId),
+    [reuseProgram.id, cancellationDto.season_id, cancellationDto.league_id]);
     const replacement = await postJson("/api/v2/setup/game", {
       season_id: cancellationDto.season_id,
       league_id: cancellationDto.league_id,

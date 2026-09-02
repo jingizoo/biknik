@@ -11,7 +11,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from helpers import BACKEND, fresh_sql_store  # noqa: F401
 
@@ -65,6 +65,55 @@ def _seed(store):
     rink = store.get_rink(slot.rink_id)
     venue = store.get_venue(rink.venue_id)
     return ApiService(store), game, slot, rink, venue
+
+
+def _seed_single_game(store):
+    """A private facility subtree with exactly one Game dependency.
+
+    The full demo intentionally shares its primary Venue across many Games,
+    so it is the wrong fixture for proving the *entire* subtree can disappear.
+    This one still uses every supported setup command and every real FK, but
+    gives the cancellation test sole ownership of the Venue/Rink/Slot chain.
+    """
+    api = ApiService(store)
+    api.roster.clock = lambda: SEED_NOW
+    org = api.create_organization("History Org", "H", actor_id="operator")
+    program = api.create_program(
+        "History Program", operator_organization_id=org["id"],
+        actor_id="operator")
+    season = api.create_season(
+        program["id"], "History Season", actor_id="operator")
+    league = api.create_league(
+        season["id"], "History League", actor_id="operator")
+    club = api.create_club("History Club", actor_id="operator")
+    teams = []
+    for name in ("History Home", "History Away"):
+        team = api.create_team(
+            club["id"], None, name, actor_id="operator",
+            league_id=league["id"])
+        registration = api.register_team_for_season(
+            season["id"], team["id"], actor_id="operator",
+            league_id=league["id"])
+        assert "error" not in registration, registration
+        teams.append(team)
+    venue = api.create_venue(
+        "History Venue", organization_id=org["id"],
+        league_id=program["id"], actor_id="operator")
+    access = api.grant_season_venue_access(
+        season["id"], venue["id"], actor_id="operator")
+    rink = api.create_rink(venue["id"], "History Rink", actor_id="operator")
+    start = SEED_NOW + timedelta(days=7)
+    slot = api.create_ice_slot(
+        rink["id"], start.isoformat(),
+        (start + timedelta(hours=1)).isoformat(), "game",
+        actor_id="operator")
+    game = api.create_game(
+        season["id"], None, teams[0]["id"], teams[1]["id"], slot["id"],
+        league_id=league["id"], actor_id="operator")
+    assert "error" not in game, game
+    return (api, store.get_game(game["id"]), store.get_ice_slot(slot["id"]),
+            store.get_rink(rink["id"]), store.get_venue(venue["id"]),
+            store.get_season_venue_access(access["id"]))
 
 
 def _cancel_audits(store, game_id):
@@ -293,10 +342,11 @@ class CancelledGameIceReleaseParityTest(unittest.TestCase):
                 self.assertIsNone(historical.ice_slot_id)
                 self.assertEqual(historical.cancelled_ice_slot_id, slot0.id)
 
-    def test_released_slot_can_be_deleted_without_erasing_history(self):
+    def test_facility_subtree_can_be_deleted_without_erasing_history(self):
         for backend, store, _reopen_url in _store_cases():
             with self.subTest(backend=backend):
-                api, game0, slot0, rink0, venue0 = _seed(store)
+                api, game0, slot0, rink0, venue0, access = (
+                    _seed_single_game(store))
                 historical_rink_name = rink0.name
                 historical_venue_name = venue0.name
                 self.assertNotIn("error", api.cancel_game(game0.id))
@@ -309,6 +359,26 @@ class CancelledGameIceReleaseParityTest(unittest.TestCase):
                 deleted = api.delete_ice_slot(slot0.id, actor_id="operator")
                 self.assertNotIn("error", deleted, deleted)
                 self.assertIsNone(store.get_ice_slot(slot0.id))
+
+                # Remove the remaining live dependency, then delete the
+                # facility subtree through the supported commands. Snapshot
+                # ids deliberately carry no FKs: #429 may later compose these
+                # same explicit steps, but #428 history must already survive
+                # the final Rink and Venue rows disappearing.
+                revoked = api.revoke_season_venue_access(
+                    access.id, actor_id="operator")
+                self.assertNotIn("error", revoked, revoked)
+                access_deleted = api.delete_season_venue_access(
+                    access.id, actor_id="operator")
+                self.assertNotIn("error", access_deleted, access_deleted)
+                rink_deleted = api.delete_rink(rink0.id, actor_id="operator")
+                self.assertNotIn("error", rink_deleted, rink_deleted)
+                venue_deleted = api.delete_venue(
+                    venue0.id, actor_id="operator")
+                self.assertNotIn("error", venue_deleted, venue_deleted)
+                self.assertIsNone(store.get_rink(rink0.id))
+                self.assertIsNone(store.get_venue(venue0.id))
+
                 history = store.get_game(game0.id)
                 self.assertEqual(history.cancelled_ice_slot_id, slot0.id)
                 self.assertEqual(history.cancelled_rink_name,
