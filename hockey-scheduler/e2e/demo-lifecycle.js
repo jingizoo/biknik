@@ -567,14 +567,22 @@ async function checkViewport(browser, viewport) {
     if (replacement.status !== 200 || !replacement.body.id) {
       throw new Error(`[${V}] released slot could not be reused: ${JSON.stringify(replacement)}`);
     }
-    const duplicate = await postJson("/api/v2/setup/game", {
-      season_id: cancellationDto.season_id,
-      league_id: cancellationDto.league_id,
-      division_id: cancellationDto.division_id,
-      home_team_id: cancellationDto.home_team_id,
-      away_team_id: cancellationDto.away_team_id,
-      ice_slot_id: target.ice_slot_id,
-    });
+    // The refusal is intentional. Send it through BrowserContext's request
+    // client, which shares the page's session cookies but does not emit
+    // Chromium's generic "Failed to load resource: 400" into the page console
+    // (this journey correctly treats every real page-console error as fatal).
+    const duplicateHttp = await context.request.post(
+      `${base}/api/v2/setup/game`, { data: {
+        season_id: cancellationDto.season_id,
+        league_id: cancellationDto.league_id,
+        division_id: cancellationDto.division_id,
+        home_team_id: cancellationDto.home_team_id,
+        away_team_id: cancellationDto.away_team_id,
+        ice_slot_id: target.ice_slot_id,
+      } });
+    const duplicate = {
+      status: duplicateHttp.status(), body: await duplicateHttp.json(),
+    };
     if (duplicate.status < 400 || !duplicate.body.error) {
       throw new Error(`[${V}] released slot accepted two replacements: ${JSON.stringify(duplicate)}`);
     }
