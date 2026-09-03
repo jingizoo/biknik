@@ -6,9 +6,11 @@ they differ, treat the newer of the two as correct and reconcile the other.
 
 ## Baselines
 
-- **Current `main`:** `5aa84da` — #404 database-connection recovery and
-  health-status reporting, merged via PR #406.
-- **Previously recorded here:** `bf85403` (Epic #283 competition-hierarchy
+- **Current `main`:** `699d685` — #428 cancellation releases ice while
+  preserving history, merged via PR #447.
+- **Previously recorded here:** `5aa84da` (#404 database-connection recovery,
+  PR #406), 377 commits stale when reconciled on 2026-09-02.
+- **Older recorded hierarchy baseline:** `bf85403` (Epic #283 competition-hierarchy
   reset, Slices A–E, via PR #284). That baseline was **428 commits stale** when
   this file was reconciled on 2026-08-07; the hierarchy sections below still
   describe the model #283 established, which is current.
@@ -313,6 +315,12 @@ only — no schema, persistence, API mutations, notifications, or runtime
 state transitions; see Release 4 above for the exact boundary) → #206
 resumes.
 
+Owner-directed addition (2026-09-02): #428 landed through PR #447. **#429 is
+now active**: first land the complete ownership/dependency inventory and pure
+preview contract; only after that slice is reviewed may a separate bounded
+slice add the high-privilege, token-bound, atomic destructive execution. This
+does not widen any ordinary dependency-gated delete endpoint.
+
 Owner-directed split (2026-07-27): PR #331 may merge as the technically
 clean first slice. #345 is the immediate next critical deliverable and
 retains every unfinished guided Setup/IA/accessibility/responsive/state/
@@ -367,7 +375,7 @@ against GitHub on 2026-08-07, not carried forward from the previous text:
 > not implied by this file.
 
 **Still open and genuinely queued**, for the avoidance of the same drift:
-#202 (Release 0 remainder), #159/#124/#273/#205 (Release 2), #287, #206,
+#202 (Release 0 remainder), #159/#124/#273/#205 (Release 2), #287, #429, #206,
 #146, and the epics #203/#207/#208/#209/#210/#211/#212.
 
 > **Needs an owner ruling — not decided here.** The 2026-08-02 parallel
