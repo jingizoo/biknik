@@ -746,7 +746,7 @@ PRINCIPALS = tuple(PRINCIPAL_ROLES)
 #: THE HOLE THIS REPLACES (#427 round 9, D7). :data:`HINTS` was a hand-written
 #: 4-tuple, and the variant that carried the whole "client input cannot select
 #: a side" claim spelled itself ``?side=<a team id>``. ``side`` IS NOT A
-#: PARAMETER THIS SERVER READS — ``web/server.py`` reads exactly seven names,
+#: PARAMETER THIS SERVER READS — ``web/server.py`` reads the names
 #: enumerated from its own ``parse_qs`` call sites by
 #: :func:`route_extract.query_parameter_names` — so that variant probed a name
 #: the server ignores, carrying a value outside the parameter's real domain.
@@ -777,6 +777,7 @@ PRINCIPALS = tuple(PRINCIPAL_ROLES)
 #: construction and would prove nothing.
 QUERY_PARAMETER_PROBES = {
     "team_id": ("home_team", "away_team"),
+    "target_team_id": ("home_team", "away_team"),
     "season_id": ("season",),
     "scope_type": ("scope_type_team",),
     "scope_id": ("away_team",),
@@ -1307,6 +1308,28 @@ HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR = {
     ("get_notifications_preferences", "recipient_ref"):
         "session+MANAGE_SCHEDULE-or-self",
     ("get_setup_scheduling_policy", "scope_type"): "operator_only",
+}
+
+#: A target-team query on the signed-in player's, or a verified guardian's
+#: junior's, substitute opportunity is the second half of an OWNED COMPOUND
+#: RESOURCE identity, not a claim to read that target side's private state.
+#: The response is restricted to the public fixture plus the subject's own
+#: enrollment; target roster status and identities are deliberately absent.
+#: Keep this separate from the operator exemptions above, and keep the
+#: audiences pair-specific, so widening either audience is a failing
+#: re-classification rather than an accumulating suppression list.
+HINT_MAY_SELECT_FOR_OWN_SUBJECT = {
+    ("get_me_substitute_opportunities_id", "target_team_id"):
+        "session+player-scope",
+    ("get_me_guardian_id_substitute_opportunities_id", "target_team_id"):
+        "session+guardian-scope+verified-link",
+}
+
+OWN_SUBJECT_HINT_CLASSES = {
+    ("get_me_substitute_opportunities_id", "target_team_id"):
+        frozenset({PLAYER_SCOPED_BY_MEMBERSHIP}),
+    ("get_me_guardian_id_substitute_opportunities_id", "target_team_id"):
+        frozenset({GUARDIAN_OF_A_JUNIOR}),
 }
 
 #: The two classes an exemption above may be claimed by, and no others.
@@ -7852,6 +7875,10 @@ class _SweepHarness(_OverviewHarness):
                     and entitlement[principal][0]
                     in UNSCOPED_OPERATOR_CLASSES):
                 continue
+            if ((route, param) in HINT_MAY_SELECT_FOR_OWN_SUBJECT
+                    and entitlement[principal][0]
+                    in OWN_SUBJECT_HINT_CLASSES[(route, param)]):
+                continue
             plain = sweep.rows[(principal, route, path, "none")]
             self.assertEqual(
                 value, plain,
@@ -8348,8 +8375,12 @@ class TheDesignClassificationsAreStillTrue(_SweepHarness, unittest.TestCase):
                 # taken on trust — the rule `get_players` already carried,
                 # now applied to all six pairs.
                 by_name = {spec.name: spec for spec in route_registry.REGISTRY}
+                classified_hints = {
+                    **HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR,
+                    **HINT_MAY_SELECT_FOR_OWN_SUBJECT,
+                }
                 for (name, param), recorded in sorted(
-                        HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR.items()):
+                        classified_hints.items()):
                     self.assertIn(name, by_name, name)
                     self.assertIn(
                         param, QUERY_PARAMETER_PROBES,
@@ -11317,16 +11348,15 @@ class TheHintAxisIsClosedAgainstWhatTheServerReads(_SweepHarness,
 
 class TheHintExemptionsAreNecessaryAndSufficient(_SweepHarness,
                                                  unittest.TestCase):
-    """`HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR` is a MEASUREMENT, not a
-    suppression list: every entry must be needed, and nothing outside it may
-    move.
+    """The two typed hint maps are MEASUREMENTS, not suppression lists:
+    every entry must be needed, and nothing outside them may move.
 
     This is the assertion that stops the exemption map being the
     accumulating-exemption shape the owner banned. An entry that has stopped
     being necessary is dead weight that silently covers whatever arrives on
     that route next."""
 
-    def test_exactly_the_declared_pairs_move_and_only_for_an_operator(self):
+    def test_exactly_the_declared_pairs_move_for_the_declared_audience(self):
         store = InMemoryStore()
         try:
             fx = self._fixture(store)
@@ -11342,8 +11372,11 @@ class TheHintExemptionsAreNecessaryAndSufficient(_SweepHarness,
                     continue
                 movers.setdefault((route, hint.split("=", 1)[0]),
                                   set()).add(principal)
+            declared = (
+                set(HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR)
+                | set(HINT_MAY_SELECT_FOR_OWN_SUBJECT))
             self.assertEqual(
-                set(HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR), set(movers),
+                declared, set(movers),
                 "the set of (route, parameter) pairs where a hint changes "
                 "the answer is not the set this sweep exempts. A pair that "
                 "MOVES and is not exempt is a client-selected read; a pair "
@@ -11353,11 +11386,15 @@ class TheHintExemptionsAreNecessaryAndSufficient(_SweepHarness,
                 f"exempt={sorted(HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR)}")
             for pair, principals in sorted(movers.items()):
                 classes = {entitlement[p][0] for p in principals}
+                allowed = (
+                    UNSCOPED_OPERATOR_CLASSES
+                    if pair in HINT_MAY_SELECT_FOR_AN_UNSCOPED_OPERATOR
+                    else OWN_SUBJECT_HINT_CLASSES[pair])
                 self.assertLessEqual(
-                    classes, UNSCOPED_OPERATOR_CLASSES,
+                    classes, allowed,
                     f"{pair} moves for {sorted(principals)}, whose classes "
-                    f"are {sorted(classes)} — a hint is selecting a read for "
-                    f"a principal that is not an unscoped operator")
+                    f"are {sorted(classes)} — the hint moved outside its "
+                    f"declared audience {sorted(allowed)}")
         finally:
             store.clear_all_data()
 

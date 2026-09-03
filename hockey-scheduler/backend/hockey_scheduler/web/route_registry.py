@@ -1495,7 +1495,10 @@ REGISTRY = (
               "post_games_id_substitutes_id_accept", "do_POST",
               auth="session+RESPOND_AVAILABILITY",
               scope_axis="none",
-              note=("#202: generic gate -> authz.py:325-331 (`substitutes/[^/]+/(offer|accept|decline|add-to-roster)`, op=='accept') -> RESPOND_AVAILABILITY. server.py:3415-3424 -> `accept_substitute(gid, player_id, user_id)` (service.py:3944-3947) -- no P/S/L check.")),
+              note=("#202: generic RESPOND_AVAILABILITY gate plus self-only "
+                    "Player scope. #287 binds a Player cross-team response "
+                    "to the strictly checked target identity; same-team {}, "
+                    "Coach, and unscoped operator behavior stays compatible.")),
     RouteSpec("POST", r"^/api/games/[^/]+/substitutes/[^/]+/add-to-roster$",
               "/api/games/{}/substitutes/{}/add-to-roster",
               "post_games_id_substitutes_id_add_to_roster", "do_POST",

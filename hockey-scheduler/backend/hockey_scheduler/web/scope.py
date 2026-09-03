@@ -48,7 +48,7 @@ from ..services.game_side_scope import (  # noqa: F401
 from ..services.roster_service import RosterService
 
 _SUB_ACTION = re.compile(
-    r"^/api/games/[^/]+/substitutes/([^/]+)/(?:offer|accept|decline|add-to-roster)$")
+    r"^/api/games/[^/]+/substitutes/([^/]+)/(offer|accept|decline|add-to-roster)$")
 _ASSIGN_RESPOND = re.compile(
     r"^/api/officials/assignments/([^/]+)/(?:accept|decline)$")
 _GAME_ACTION = re.compile(r"^/api/games/[^/]+/(.+)$")
@@ -139,12 +139,48 @@ def scope_violation(role, scope, path, body, store, *,
         # moved OFF their team even though the stale pointer still matches.
         gid_match = _GAME_ACTION_GID.match(path)
         game = store.get_game(gid_match.group(1)) if gid_match else None
+        substitute_action = _SUB_ACTION.match(path)
+        game_action = m.group(1) if m else None
+        roster = RosterService(store)
         for pid in _player_ids(path, body):
             player = store.get_player(pid)
             if player is None:
                 continue
-            resolved_team = (RosterService(store).team_for_game(game, player)
-                             if game is not None else player.team_id)
+            if (game is not None
+                    and (substitute_action is not None
+                         or game_action == "substitutes/withdraw")):
+                # A cross-team player is on neither game side by design.  An
+                # existing enrollment is instead owned by its durable target
+                # team; using team_for_game here made that team's coach unable
+                # to offer or seat the volunteer.  The service command still
+                # receives ``scope["team_id"]`` and repeats this check under
+                # its transaction/locks, so this remains a fast-denial only.
+                resolved_team = roster.substitute_action_team_for_coach_scope(
+                    game, player,
+                    durable_owner=(
+                        game_action == "substitutes/withdraw"
+                        or (substitute_action is not None
+                            and substitute_action.group(2) == "decline")),
+                    # A player's proactive cross-team opt-in and their offer
+                    # response stay player/verified-guardian controlled.
+                    # Target coaches may offer or seat the volunteer, but may
+                    # not erase availability or answer an offer for them.
+                    allow_cross_team=not (
+                        game_action == "substitutes/withdraw"
+                        or (substitute_action is not None
+                            and substitute_action.group(2) == "decline")))
+            elif (game is not None
+                  and game_action in {"availability", "roster/remove"}):
+                # These commands respond to/remove an existing roster row;
+                # their service authority is the row's durable team_side.
+                # That keeps the target coach able to manage an accepted
+                # cross-team player without making roster/select (a create or
+                # revive operation) inherit the same shortcut.
+                resolved_team = roster.roster_row_team_for_coach_scope(
+                    game, player)
+            else:
+                resolved_team = (roster.team_for_game(game, player)
+                                 if game is not None else player.team_id)
             if resolved_team != team:
                 return "A coach can only manage their own team's players."
         team_id = body.get("team_id")

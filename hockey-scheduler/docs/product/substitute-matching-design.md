@@ -1,10 +1,13 @@
 # Substitute Matching Design
 
-> **Status:** bounded, non-production design for #287. This document records
-> settled ranking rules, the five owner-approved product rulings, and contracts
-> for future slices. It does **not** add or authorize production
-> code, schema, migrations, persistence, API mutations, notification delivery,
-> service wiring, or runtime state transitions.
+> **Status:** split scope. The deterministic ranking core, policy model and
+> full offer/advance engine remain bounded non-production design for #287. On
+> 2026-09-04 the repository owner separately authorized one narrow runtime
+> slice: proactive cross-team availability inside the exact same
+> `LeagueSeason` and non-null `Division`, using the existing substitute
+> lifecycle. That authorization supersedes the older prototype-only note for
+> this slice only; it does not authorize the full matching engine or
+> cross-Division substitution.
 
 ## Purpose and boundary
 
@@ -24,13 +27,53 @@ The existing #205 eligibility rules remain authoritative. This document does
 not create a temporary eligibility model and does not reinterpret permanent
 `Player.team_id` as seasonal authority.
 
+### Implemented September 4 bounded slice
+
+The bounded runtime slice is an availability and target-ownership bridge into
+the existing substitute lifecycle, not the ranking design below:
+
+- Player Home proactively lists a checkbox for each explicit target Game side;
+  a vacancy is not required to record willingness, and one Game can yield two
+  target choices.
+- The source player's active `SeasonRosterMembership` and the target team's
+  active registration must resolve through the exact same `LeagueSeason` and
+  the same non-null `Division`. The source team must be neither participating
+  Game side. This slice has no cross-Division policy switch.
+- The selected target owns the enrollment, offer, coach action, slot and
+  eventual roster seat. `SubstituteEnrollment.team_id` is that durable target;
+  paired private `source_membership_id` and `source_team_id` fields preserve
+  the exact source proof and are revalidated before forward transitions.
+- A partial unique constraint permits one active (`ENROLLED` or `OFFERED`) row
+  per `(game_id, player_id)`, while terminal rows remain as history.
+- A target coach may offer only against an actual matching vacancy. Cross-team
+  offer time is captured by the server and expires at
+  `min(offered_at + 30 minutes, game_start)`. The interval is half-open:
+  equality records `EXPIRED` and `substitute_expired` audit evidence. Player
+  Home exposes an explicit **Dismiss Expired Offer** response so the stale card
+  and active-row uniqueness hold do not strand the player.
+- Omitting `target_team_id` stays on the legacy same-team path. Its existing
+  eligibility, offer-time live retargeting and deadline/response semantics are
+  unchanged. Guardians may respond to an existing offer, but proactive
+  cross-team opt-in and withdrawal remain player-only.
+- Cross-team detail and response commands bind to the rendered
+  `(game_id, target_team_id)` identity. The comparison happens under the same
+  transaction as the mutation, so an older tab cannot withdraw, accept or
+  decline a later enrollment for another target. A mismatch is a write-free
+  409; same-team requests continue to omit the target.
+
+The slice does not wire the pure ranking core, fairness counters, skill-rating
+ownership, configurable rule order, automatic next-candidate advancement, or
+the owner-approved future cross-Division policy.
+
 ## Decision register
 
 ### Owner-approved #287 product decisions
 
 **Owner-confirmed (2026-08-29):** the repository owner approved all five
-recommended defaults below. They are binding inputs for future authorized
-slices; this approval does not itself authorize production code or merge.
+recommended defaults below. They remain binding inputs for future authorized
+slices; that approval did not itself authorize production code or merge. The
+separate 2026-09-04 authorization covers only the bounded same-Division
+availability slice described above.
 
 | Question | Approved rule | Alternatives | Tradeoff | Status |
 | --- | --- | --- | --- | --- |
@@ -39,6 +82,12 @@ slices; this approval does not itself authorize production code or merge.
 | Skill-rating ownership | A League administrator owns the canonical 1–7 rating for that League context. Coaches may submit a recommendation, but cannot silently replace the canonical value; self-rating is informational only. Changes require an effective time and actor/reason audit. The data model belongs to #273. | Team-coach-owned rating; player self-rating; multi-rater average; global rating shared across Leagues. | League ownership gives one competition-wide scale and stable comparisons. Coach ownership is operationally easy but may be inconsistent across Teams. Self-rating is inclusive but not authoritative. A composite is richer but requires conflict and weighting policy. | **Resolved 2026-08-29** |
 | Cross-boundary substitution | Default to the same `LeagueSeason`. Permit cross-Division candidates inside that LeagueSeason only when an explicit League policy enables it. Keep cross-League substitution off until a separately authorized rule defines allowed relationships and the responsible approver. | Same Division only; any Division in the LeagueSeason; any League in the Program/Season; affiliate/call-up relationships only; unrestricted privileged override. | Same-LeagueSeason preserves the competition boundary and uses the seasonal membership already established by #205. Narrower scope reduces the pool. Wider scope improves fill rate but adds authorization, fairness, standings, and audit consequences. | **Resolved 2026-08-29** |
 | Late-game offer validity | Compute `expires_at = min(offered_at + response_window, game_start)`. Create no offer when `expires_at <= offered_at`. Treat the response interval as half-open: an acceptance must commit before `expires_at`; at the deadline, expiry wins and the workflow may advance. | Always grant the full response window; use `roster_lock_time`; stop offers at a configurable pre-game cutoff; allow post-start emergency offers. | Clamping prevents an offer from remaining live after the Game starts and produces one deterministic deadline. Very late candidates may have no usable response window. A roster-lock anchor may be too early or absent; emergency post-start behavior needs a separate explicit policy. | **Resolved 2026-08-29** |
+
+The September 4 slice takes the narrowest permitted Q4 boundary: same
+`LeagueSeason` **and** same non-null `Division`. It does not implement the
+future League policy that could enable cross-Division candidates. It implements
+Q5 only for cross-team rows, with an explicit 30-minute server-owned response
+window; legacy same-team timing remains untouched.
 
 ### Settled ranking rulings
 
@@ -182,7 +231,7 @@ rank(request, candidates, policy, authorized_override = none):
 
 The function has no I/O, no clock read, no persistence, and no side effect.
 
-## Future eligibility projection
+## Future full-engine eligibility projection
 
 This is a contract for a later authorized integration slice, not production
 wiring delivered by this document.
@@ -459,11 +508,13 @@ and defence.
 | V22 accept after candidate invalidation | Before `expires_at`, the offered candidate accepts after losing a hard or competition-boundary eligibility fact, or after a validated projection/source version drifts; the vacancy remains offerable | Any | The first authenticated `ACCEPT` observation is recorded exactly once; the attempt becomes `INVALIDATED` with one audit, no roster fill, and one idempotent next-attempt intent. A retry returns `INVALIDATED` without duplicating any effect. | Revalidation/concurrency contract |
 
 The vectors above record design contracts, including the five owner-approved
-policy rulings. They do not claim that production integration exists.
+policy rulings. They do not claim that the full ranking/advance production
+integration exists.
 
-## Preconditions for a later implementation slice
+## Preconditions for the remaining matching-engine slices
 
-Before any production integration is proposed:
+Before any production integration beyond the September 4 bounded slice is
+proposed:
 
 1. Later slices must implement the five approved rulings exactly; an
    alternative requires a new explicit owner decision.
@@ -479,4 +530,7 @@ Before any production integration is proposed:
    "why this player" prototype journeys remain a separate non-production
    design deliverable.
 
-Nothing in this document authorizes merge or runtime behavior.
+The 2026-09-04 owner authorization is limited to the implemented bounded
+same-Division availability slice. Nothing here authorizes merging a particular
+PR, wiring the full ranking/advance engine, or permitting cross-Division or
+cross-LeagueSeason substitution.

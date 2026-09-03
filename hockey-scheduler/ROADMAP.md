@@ -171,9 +171,15 @@ Ship as ordered slices; **do not** land #205 as one large migration PR.
    override with authz + audit; (6) operator UI + e2e. **The #205
    LeagueSeason/membership eligibility boundary required by #287 is now on
    `main`, while #205 remains open for its remaining epic work. The repository
-   owner settled #287's five design questions on 2026-08-29 in #435.
-   Production integration remains separately authorized and must reuse that
-   eligibility boundary through the bounded slices above.**
+   owner settled #287's five design questions on 2026-08-29 in #435. On
+   **2026-09-04** the owner separately authorized one bounded runtime slice:
+   proactive availability for an explicit target whose active registration
+   shares the source membership's exact `LeagueSeason` and same non-null
+   `Division`, with the source team outside both Game sides. That slice uses
+   target-owned provenance, one active row per player/Game, and the existing
+   offer lifecycle with a server-owned 30-minute deadline. It does **not**
+   complete ranking, policy configuration, automatic advancement, or
+   cross-Division substitution; those remain in the bounded sequence above.**
 7. **#276** — privacy-minimized Coach Team directory.
 8. **#275** — Guardian invite-by-email, activation and consent acceptance.
 9. **#278** — C/LW/RW/D/G positions, game lines/pairs/goalie designation, and
@@ -237,21 +243,29 @@ publish-gated and privacy-safe.
    milestone. #345 carries the remaining guided Setup, IA, context-filtering,
    state/error, breakpoint, accessibility, and operator-validation acceptance
    work. #345 remains next; Schedule/Facilities UX follows it.
-4. **#287** — substitute matching engine, **bounded pre-#205 deliverable**:
-   **documentation and design artifacts only, plus a non-production UX
-   prototype** (mockups/clickable prototype of the policy-config screen and
-   the offer/accept/decline/timeout flow) — matching Release 2's own bar
-   exactly: "policy and state-machine **design** (slices 1–3) may begin
-   earlier, but **implementation must not land ahead of #205**." This is
-   design/UX work product, not a landed feature: **no schema or migration,
-   no persistence, no API mutations, no notifications, and no runtime state
-   transitions** of any kind — a real, working offer/accept/decline/timeout
-   state machine (even with eligibility resolution stubbed out) is
-   implementation, not design, and stays barred until #205. Any bounded PR
-   delivering this must assert in its own test plan that it touches no
-   `store/`, migration, or persistence-layer path. The full production
-   workflow (all six slices, wired to real `SeasonRosterMembership`
-   eligibility) waits for #205, per Release 2 above.
+4. **#287** — substitute matching engine, **bounded pre-full-#205 work**.
+   **Owner update (2026-09-04):** this authorization supersedes the older
+   prototype-only restriction for one narrow production slice. The authorized
+   slice lets a Player use proactive Home checkboxes to volunteer for an
+   explicit target side before a vacancy exists, only where the player's
+   active source membership and target registration share the exact
+   `LeagueSeason` and same non-null `Division`, and the source team is neither
+   Game side. The selected target durably owns the row and coach actions; the
+   exact source membership/team is retained as private provenance. One active
+   (`ENROLLED`/`OFFERED`) row is allowed per player/Game, terminal history is
+   retained, and a cross-team offer uses the server-owned
+   `min(offered_at + 30 minutes, game_start)` deadline with expiry winning at
+   equality, an expiry audit, and explicit Player dismissal. Omitted-target
+   same-team behavior is unchanged.
+
+   The earlier plan allowed only documentation/design and a non-production UX
+   prototype at this position. That blanket limitation is retired **only for
+   the bounded slice above**. It remains the scope boundary for everything not
+   expressly authorized: no claim that the deterministic ranking engine,
+   fairness or skill rules, configurable policy, automatic next-candidate
+   workflow, notifications, or cross-Division/cross-LeagueSeason borrowing is
+   implemented. Full production integration still proceeds through the six
+   Release 2 slices and their own authorization/evidence.
 5. **#206** — planner scenarios, fairness, locks, repair and explanations
    (realigned: schedule within a `LeagueSeason`/Division; regular Games never
    cross Leagues). Resumes after #204's #330 / PR #331 bounded slice, #345,
@@ -310,10 +324,10 @@ Releases 0–4 above.
 requirements package (#324) → bounded Home/Tasks first slice (#330 /
 PR #331) → guided Setup, seven-area IA, accessibility, and operator
 validation completion (#345) → Schedule/Facilities UX PR → bounded #287
-pre-#205 deliverable (documentation/design + a non-production UX prototype
-only — no schema, persistence, API mutations, notifications, or runtime
-state transitions; see Release 4 above for the exact boundary) → #206
-resumes.
+September 4 runtime slice (same-`LeagueSeason`, same non-null `Division`,
+explicit-target proactive availability only; no full ranking or
+cross-Division policy) → #206 resumes. The broader #287 engine retains the
+Release 2 order and authorization gates.
 
 Owner-directed addition (2026-09-02): #428 landed through PR #447. #429's
 complete ownership/dependency inventory and pure preview contract then landed
@@ -327,7 +341,8 @@ clean first slice. #345 is the immediate next critical deliverable and
 retains every unfinished guided Setup/IA/accessibility/responsive/state/
 role-journey criterion plus the three moderated operator-validation
 sessions. No Schedule/Facilities, #287, or #206 work advances ahead of
-#345.
+#345. The owner-directed 2026-09-04 #287 authorization above supersedes that
+older no-#287 clause only for its named same-Division availability slice.
 
 Owner-directed parallel exception (2026-08-02): while #375 implements only
 configurable regular-season meeting counts and deterministic home/away balance,

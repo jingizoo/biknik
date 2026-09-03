@@ -19,7 +19,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 from datetime import datetime, timedelta
 
@@ -2378,7 +2378,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/setup/scheduling-policy":
             if self._operator_only("/api/setup/scheduling-policy"):
                 return
-            from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
             return self._send_api(api.get_scheduling_policy(
                 scope_type=(qs.get("scope_type") or [None])[0],
@@ -2665,7 +2664,6 @@ class Handler(BaseHTTPRequestHandler):
             # session. Gated the same as creating one (MANAGE_SETUP).
             if self._operator_only("/api/setup/player"):
                 return
-            from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
             team_id = (qs.get("team_id") or [None])[0]
             # #369: pass the caller's identity so the unfiltered (no team_id)
@@ -2743,7 +2741,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/notifications/preferences":
             # A recipient's channel preferences (#81). Operator → any recipient;
             # a signed-in user → only their own. recipient_ref via query string.
-            from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
             recipient_ref = (qs.get("recipient_ref") or [""])[0]
             if self._prefs_guard(recipient_ref):
@@ -2751,7 +2748,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.get_notification_preferences(recipient_ref))
         if path == "/api/calendar-feeds":
             # List an actor's feed tokens (#82). Operator → any; user → own.
-            from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
             actor_type = (qs.get("actor_type") or [""])[0]
             actor_ref = (qs.get("actor_ref") or [""])[0]
@@ -2820,8 +2816,16 @@ class Handler(BaseHTTPRequestHandler):
             pid, _uid, err = self._require_player_scope()
             if err is not None:
                 return self._send_json(err[1], err[0])
+            # A cross-team opportunity is identified by the compound
+            # (game_id, target_team_id) key.  The player id remains entirely
+            # session-derived; the query parameter only selects which side of
+            # the game the signed-in player is volunteering for.  Omission is
+            # the existing same-team detail contract.
+            query = parse_qs(urlparse(self.path).query)
+            target_team_id = (query.get("target_team_id") or [None])[0]
             return self._send_api(
-                api.get_substitute_opportunity(pid, mso.group(1)))
+                api.get_substitute_opportunity(
+                    pid, mso.group(1), target_team_id=target_team_id))
         if path == "/api/me/guardian/home":
             # The signed-in guardian's linked-junior surface (#26): every
             # verified junior's Player Home payload. Identity is the guardian's
@@ -2843,8 +2847,11 @@ class Handler(BaseHTTPRequestHandler):
             jid = mgo.group(1)
             if self._guardian_link_or_403(guid, jid):
                 return
+            query = parse_qs(urlparse(self.path).query)
+            target_team_id = (query.get("target_team_id") or [None])[0]
             return self._send_api(
-                api.get_substitute_opportunity(jid, mgo.group(2)))
+                api.get_substitute_opportunity(
+                    jid, mgo.group(2), target_team_id=target_team_id))
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
             # #367: the Division's Program must be in the caller's
@@ -3166,7 +3173,6 @@ class Handler(BaseHTTPRequestHandler):
                 # one), and an assigned official is refused 403 rather than
                 # handed an empty summary. A side is never trusted from the
                 # query string.
-                from urllib.parse import parse_qs, urlparse
                 qs = parse_qs(urlparse(self.path).query)
                 # BYTE-FOR-BYTE the binding that stood here before, name
                 # included: this is the same client-supplied team the
@@ -3229,7 +3235,6 @@ class Handler(BaseHTTPRequestHandler):
                 # returns None for it), a stray scope value is not an
                 # authority, and their un-hinted default is now the same home
                 # default `/board` and `/roster-status` already give them.
-                from urllib.parse import parse_qs, urlparse
                 if not can(role, Permission.MANAGE_ROSTER):
                     return self._send_json({"error": {
                         "code": "forbidden",
@@ -3249,7 +3254,6 @@ class Handler(BaseHTTPRequestHandler):
                 # capability gate, same trusted `own_team`, same
                 # `route_audience` — see that leaf's comment above for the
                 # whole reasoning.
-                from urllib.parse import parse_qs, urlparse
                 if not can(role, Permission.MANAGE_ROSTER):
                     return self._send_json({"error": {
                         "code": "forbidden",
@@ -3650,10 +3654,9 @@ class Handler(BaseHTTPRequestHandler):
 
         # Player substitute-opportunity response (#110): signed-in-player
         # scoped, so the browser never passes a player_id — both the target
-        # player and the audit actor come from the session. The verbs match the
-        # services they call (enroll_substitute / withdraw_substitute), leaving
-        # accept/decline free for the distinct coach-OFFER transition the rest
-        # of the codebase already means by those words. No parallel workflow.
+        # player and the audit actor come from the session. These four verbs
+        # reuse the established enrollment and coach-offer transitions rather
+        # than creating a parallel workflow.
         mso = re.match(
             r"^/api/me/substitute-opportunities/([^/]+)/"
             r"(enroll|withdraw|accept-offer|decline-offer)$", path)
@@ -3662,20 +3665,55 @@ class Handler(BaseHTTPRequestHandler):
             if err is not None:
                 return self._send_json(err[1], err[0])
             gid, action = mso.group(1), mso.group(2)
+            # A cross-team row is identified by (game, target team), not game
+            # alone. Validate this selector only after session identity is
+            # established, then let the service compare it to the active row
+            # inside the mutation transaction. Omission remains the exact
+            # established same-team request contract.
+            try:
+                check_body(body, allowed={"target_team_id"},
+                           types={"target_team_id": str})
+                if "target_team_id" in body \
+                        and not isinstance(body["target_team_id"], str):
+                    raise BodyError(
+                        "validation_error",
+                        "The field 'target_team_id' has the wrong type.",
+                        400, {"reason": "wrong_type",
+                              "field": "target_team_id"})
+                if isinstance(body.get("target_team_id"), str) \
+                        and not body["target_team_id"].strip():
+                    raise BodyError(
+                        "validation_error",
+                        "The field 'target_team_id' is required.",
+                        400, {"reason": "field_required",
+                              "field": "target_team_id"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             # enroll/withdraw = the #110 self-service pool; accept-offer/
             # decline-offer = responding to a coach OFFER (#112). All four are
             # the same audited services, player identity from the session.
             if action == "enroll":
                 return self._send_api(
-                    api.enroll_substitute(gid, ppid, actor_id=uid))
+                    api.enroll_substitute(
+                        gid, ppid, actor_id=uid,
+                        target_team_id=body.get("target_team_id")))
             if action == "withdraw":
                 return self._send_api(
-                    api.withdraw_substitute(gid, ppid, actor_id=uid))
+                    api.withdraw_substitute(
+                        gid, ppid, actor_id=uid,
+                        expected_target_team_id=body.get("target_team_id"),
+                        require_target_identity=True))
             if action == "accept-offer":
                 return self._send_api(
-                    api.accept_substitute(gid, ppid, actor_id=uid))
+                    api.accept_substitute(
+                        gid, ppid, actor_id=uid,
+                        expected_target_team_id=body.get("target_team_id"),
+                        require_target_identity=True))
             return self._send_api(
-                api.decline_substitute(gid, ppid, actor_id=uid))
+                api.decline_substitute(
+                    gid, ppid, actor_id=uid,
+                    expected_target_team_id=body.get("target_team_id"),
+                    require_target_identity=True))
 
         # Guardian acting for a linked junior (#26): a verified guardian may set
         # the junior's attendance and accept/decline coach offers on their
@@ -3719,11 +3757,36 @@ class Handler(BaseHTTPRequestHandler):
             jid, gid, action = mgs.group(1), mgs.group(2), mgs.group(3)
             if self._guardian_link_or_403(guid, jid):
                 return
+            try:
+                check_body(body, allowed={"target_team_id"},
+                           types={"target_team_id": str})
+                if "target_team_id" in body \
+                        and not isinstance(body["target_team_id"], str):
+                    raise BodyError(
+                        "validation_error",
+                        "The field 'target_team_id' has the wrong type.",
+                        400, {"reason": "wrong_type",
+                              "field": "target_team_id"})
+                if isinstance(body.get("target_team_id"), str) \
+                        and not body["target_team_id"].strip():
+                    raise BodyError(
+                        "validation_error",
+                        "The field 'target_team_id' is required.",
+                        400, {"reason": "field_required",
+                              "field": "target_team_id"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             if action == "accept-offer":
                 return self._send_api(
-                    api.accept_substitute(gid, jid, actor_id=guid))
+                    api.accept_substitute(
+                        gid, jid, actor_id=guid,
+                        expected_target_team_id=body.get("target_team_id"),
+                        require_target_identity=True))
             return self._send_api(
-                api.decline_substitute(gid, jid, actor_id=guid))
+                api.decline_substitute(
+                    gid, jid, actor_id=guid,
+                    expected_target_team_id=body.get("target_team_id"),
+                    require_target_identity=True))
 
         if path == "/api/context":
             # Set the signed-in user's active Program/Season/League (#159, League
@@ -4570,10 +4633,12 @@ class Handler(BaseHTTPRequestHandler):
             # (`/api/me/substitute-opportunities/...`, `_require_player_
             # scope`), Guardian (`/api/me/guardian/...`, `_require_guardian_
             # scope` + `_guardian_link_or_403`) — both of which are handled
-            # EARLIER in do_POST and never reach this block at all — and the
-            # unscoped League Admin/Arena Manager, who by design are "not
-            # resource-scoped here" (web/scope.py) and reach these rows under
-            # their own permissions.
+            # EARLIER in do_POST and never reach this block at all — the
+            # documented generic Player aliases, whose self-only identity is
+            # checked by `scope_violation` above, and the unscoped League
+            # Admin/Arena Manager, who by design are "not resource-scoped
+            # here" (web/scope.py) and reach these rows under their own
+            # permissions.
             #
             # It costs no new lookup: `scope["team_id"]` is the coach's
             # permanently-bound team and is already in hand. The service is
@@ -4666,7 +4731,8 @@ class Handler(BaseHTTPRequestHandler):
                     gid, pid, user_id, authorized_team_id=coach_team))
             if action == "substitutes/withdraw":
                 return self._send_api(api.withdraw_substitute(
-                    gid, pid, user_id, authorized_team_id=coach_team))
+                    gid, pid, user_id, authorized_team_id=coach_team,
+                    allow_cross_team_response=False))
             if action == "substitutes/add-candidate":
                 # Coach/operator adds an arbitrary eligible team player
                 # directly to the substitute pool (#114) — same enroll, a
@@ -4682,6 +4748,47 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send_api(api.offer_substitute(
                         gid, player_id, user_id, expires_at=body.get("expires_at"),
                         authorized_team_id=coach_team))
+                if op == "accept":
+                    if role == Role.PLAYER:
+                        # Keep the established generic self-service alias, but
+                        # bind a cross-team response to the target rendered by
+                        # the client. Otherwise an old Team 4 tab could accept
+                        # a later Team 5 offer because game+player alone is not
+                        # the lifecycle identity. Same-team ``{}`` is
+                        # intentionally unchanged.
+                        try:
+                            # ``actor_id`` is the documented legacy body field
+                            # for this alias. Accept it for compatibility but
+                            # never trust it: the audited actor below remains
+                            # the signed-in session's ``user_id``.
+                            check_body(
+                                body,
+                                allowed={"actor_id", "target_team_id"},
+                                types={"actor_id": str,
+                                       "target_team_id": str})
+                            if "target_team_id" in body \
+                                    and not isinstance(
+                                        body["target_team_id"], str):
+                                raise BodyError(
+                                    "validation_error",
+                                    "The field 'target_team_id' has the wrong "
+                                    "type.",
+                                    400, {"reason": "wrong_type",
+                                          "field": "target_team_id"})
+                            if isinstance(body.get("target_team_id"), str) \
+                                    and not body["target_team_id"].strip():
+                                raise BodyError(
+                                    "validation_error",
+                                    "The field 'target_team_id' is required.",
+                                    400, {"reason": "field_required",
+                                          "field": "target_team_id"})
+                        except BodyError as exc:
+                            return self._send_json(exc.payload, exc.status)
+                        return self._send_api(api.accept_substitute(
+                            gid, player_id, user_id,
+                            expected_target_team_id=body.get(
+                                "target_team_id"),
+                            require_target_identity=True))
                 fn = {"accept": api.accept_substitute,
                       "decline": api.decline_substitute,
                       "add-to-roster": api.add_substitute_to_roster}[op]
@@ -4689,8 +4796,14 @@ class Handler(BaseHTTPRequestHandler):
                 # never bound into the dict above: three different methods are
                 # reached as VALUES there, so binding it per-value would be
                 # three call sites to keep in step instead of one.
-                return self._send_api(fn(gid, player_id, user_id,
-                                         authorized_team_id=coach_team))
+                if op == "decline":
+                    return self._send_api(fn(
+                        gid, player_id, user_id,
+                        authorized_team_id=coach_team,
+                        allow_cross_team_response=False))
+                return self._send_api(fn(
+                    gid, player_id, user_id,
+                    authorized_team_id=coach_team))
             coach = {"roster/lock": api.lock_roster,
                      "roster/unlock": api.unlock_roster,
                      "cancel": api.cancel_game}.get(action)

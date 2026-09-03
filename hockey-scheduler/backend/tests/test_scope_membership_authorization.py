@@ -273,6 +273,48 @@ class CoachSubstituteActionsResolveThroughMembership(_CutoverContract,
                     "/api/games/unbound_g/substitutes/add-candidate",
                     {"player_id": "p_home"}, store), label)
 
+    def test_decline_and_withdraw_follow_durable_owner_after_transfer(self):
+        """Response/removal rows do not change coach ownership with a stint."""
+        for label, api, season, league, teams, game, ls_id in self._each():
+            with self.subTest(backend=label):
+                home_scope = {"team_id": teams["home"]["id"]}
+                away_scope = {"team_id": teams["away"]["id"]}
+
+                enrolled = self._player(
+                    api, teams["home"]["id"], "Transferred enrollment")
+                self.assertNotIn(
+                    "error", api.enroll_substitute(game["id"], enrolled["id"]))
+                self._transfer(
+                    api, enrolled["id"], ls_id, ls_id,
+                    teams["away"]["id"])
+                withdraw_path = f"/api/games/{game['id']}/substitutes/withdraw"
+                withdraw_body = {"player_id": enrolled["id"]}
+                self.assertIsNone(scope_violation(
+                    Role.COACH, home_scope, withdraw_path, withdraw_body,
+                    api.store), label)
+                self.assertIsNotNone(scope_violation(
+                    Role.COACH, away_scope, withdraw_path, withdraw_body,
+                    api.store), label)
+
+                offered = self._player(
+                    api, teams["home"]["id"], "Transferred offer")
+                self.assertNotIn(
+                    "error", api.enroll_substitute(game["id"], offered["id"]))
+                self.assertNotIn(
+                    "error", api.offer_substitute(game["id"], offered["id"]))
+                self._transfer(
+                    api, offered["id"], ls_id, ls_id,
+                    teams["away"]["id"])
+                decline_path = (
+                    f"/api/games/{game['id']}/substitutes/"
+                    f"{offered['id']}/decline")
+                self.assertIsNone(scope_violation(
+                    Role.COACH, home_scope, decline_path, {}, api.store),
+                    label)
+                self.assertIsNotNone(scope_violation(
+                    Role.COACH, away_scope, decline_path, {}, api.store),
+                    label)
+
 
 _PG_SKIP = ("PostgreSQL not configured (TEST_DATABASE_URL) or psycopg "
             "missing -- the #205 blocker 1 (web/scope.py authorization) fix "

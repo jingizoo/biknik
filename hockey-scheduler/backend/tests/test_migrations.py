@@ -203,16 +203,14 @@ class MigrationApplyTest(unittest.TestCase):
             # (its UNIQUE index goes with it) so adoption's re-run of 053
             # lands on a table that genuinely does not exist yet.
             cur.execute("DROP TABLE IF EXISTS season_copy_forward_commits")
-            # #205 blocker 3, migration 060: substitute_enrollments.team_id
-            # is a brand-new additive column, same shape as the seasons.status
-            # column above — drop it so adoption's re-run of 060 lands on a
-            # column that genuinely does not exist yet, rather than
-            # "duplicate column name". (Unlike the players.* columns 058
-            # adds, nothing between 040 and 060 rebuilds substitute_
-            # enrollments on SQLite, so there is no earlier table-rebuild
-            # migration to strip this one implicitly on replay the way
-            # migration 040's players_new rebuild happens to strip 058's
-            # columns — this one needs an explicit drop.)
+            # #287 migration 063 and #205 migration 060 add these columns.
+            # Strip newest first so adoption replays their ALTERs over the
+            # legacy table shape rather than failing on duplicate columns.
+            cur.execute(
+                "ALTER TABLE substitute_enrollments "
+                "DROP COLUMN source_membership_id")
+            cur.execute(
+                "ALTER TABLE substitute_enrollments DROP COLUMN source_team_id")
             cur.execute(
                 "ALTER TABLE substitute_enrollments DROP COLUMN team_id")
             cur.execute("DELETE FROM schema_migrations")
@@ -227,8 +225,9 @@ class MigrationApplyTest(unittest.TestCase):
             self.assertIn("external_ref", _table_columns(adopted, "teams"))
             self.assertTrue(  # #159 season lifecycle re-added on adoption
                 {"status", "archived_at"} <= _table_columns(adopted, "seasons"))
-            self.assertIn(  # #205 blocker 3, migration 060
-                "team_id", _table_columns(adopted, "substitute_enrollments"))
+            self.assertTrue(
+                {"team_id", "source_membership_id", "source_team_id"}
+                <= _table_columns(adopted, "substitute_enrollments"))
             self.assertIn("external_ref", _table_columns(adopted, "players"))
             self.assertIn("external_ref", _table_columns(adopted, "officials"))
             self.assertIn("external_ref", _table_columns(adopted, "rinks"))

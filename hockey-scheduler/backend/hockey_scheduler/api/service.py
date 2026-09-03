@@ -41,6 +41,7 @@ from ..domain import (
     SeasonStatus,
     SensitiveFieldCategory,
     SubstituteStatus,
+    SubstituteEnrollment,
     can,
     intervals_overlap,
 )
@@ -49,6 +50,7 @@ from ..domain.errors import (
     ConcurrencyConflictError,
     DomainError,
     IntegrityConflictError,
+    InvalidTransitionError,
     NotAuthorizedError,
     NotFoundError,
     ScheduleConflictError,
@@ -4706,6 +4708,19 @@ class ApiService:
         return _serialize(av)
 
     # -- substitutes -------------------------------------------------------
+    @staticmethod
+    def _substitute_row(sub) -> dict:
+        """Public enrollment shape; internal source provenance stays private."""
+        row = _serialize(sub)
+        row.pop("source_membership_id", None)
+        row.pop("source_team_id", None)
+        row["target_team_id"] = sub.team_id
+        row["slot_type"] = sub.slot_type.value
+        row["cross_team"] = (
+            sub.source_membership_id is not None
+            and sub.source_team_id is not None)
+        return row
+
     @catch
     def get_substitutes(self, game_id: str, viewer_role=None,
                         viewer_team_id: Optional[str] = None) -> List[dict]:
@@ -4742,10 +4757,10 @@ class ApiService:
         audience = lineup_visibility.route_audience(
             viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
         if audience == lineup_visibility.FULL:
-            return [_serialize(s)
+            return [self._substitute_row(s)
                     for s in self.store.substitutes_for_game(game_id)]
         if audience == lineup_visibility.OWN_SIDE:
-            return [_serialize(s)
+            return [self._substitute_row(s)
                     for s in self.store.substitutes_for_game(game_id)
                     if s.team_id is not None and s.team_id == viewer_team_id]
         raise NotAuthorizedError(_SUBSTITUTE_REFUSAL)
@@ -4753,25 +4768,33 @@ class ApiService:
     @catch
     def enroll_substitute(self, game_id: str, player_id: str,
                           actor_id: Optional[str] = None,
-                          authorized_team_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.enroll_substitute(
+                          authorized_team_id: Optional[str] = None,
+                          target_team_id: Optional[str] = None) -> dict:
+        return self._substitute_row(self.roster.enroll_substitute(
             game_id, player_id, actor_id,
-            authorized_team_id=authorized_team_id))
+            authorized_team_id=authorized_team_id,
+            target_team_id=target_team_id))
 
     @catch
     def withdraw_substitute(self, game_id: str, player_id: str,
                             actor_id: Optional[str] = None,
-                            authorized_team_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.withdraw_substitute(
+                            authorized_team_id: Optional[str] = None,
+                            expected_target_team_id: Optional[str] = None,
+                            require_target_identity: bool = False,
+                            allow_cross_team_response: bool = True) -> dict:
+        return self._substitute_row(self.roster.withdraw_substitute(
             game_id, player_id, actor_id,
-            authorized_team_id=authorized_team_id))
+            authorized_team_id=authorized_team_id,
+            expected_target_team_id=expected_target_team_id,
+            require_target_identity=require_target_identity,
+            allow_cross_team_response=allow_cross_team_response))
 
     @catch
     def offer_substitute(self, game_id: str, player_id: str,
                          actor_id: Optional[str] = None,
                          expires_at: Optional[str] = None,
                          authorized_team_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.offer_substitute(
+        return self._substitute_row(self.roster.offer_substitute(
             game_id, player_id, actor_id,
             offer_expires_at=_parse_dt(expires_at, "expires_at"),
             authorized_team_id=authorized_team_id,
@@ -4780,28 +4803,47 @@ class ApiService:
     @catch
     def accept_substitute(self, game_id: str, player_id: str,
                           actor_id: Optional[str] = None,
-                          authorized_team_id: Optional[str] = None) -> dict:
+                          authorized_team_id: Optional[str] = None,
+                          expected_target_team_id: Optional[str] = None,
+                          require_target_identity: bool = False) -> dict:
         return _serialize(self.roster.accept_substitute(
             game_id, player_id, actor_id,
-            authorized_team_id=authorized_team_id))
+            authorized_team_id=authorized_team_id,
+            expected_target_team_id=expected_target_team_id,
+            require_target_identity=require_target_identity))
 
     @catch
     def decline_substitute(self, game_id: str, player_id: str,
                            actor_id: Optional[str] = None,
-                           authorized_team_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.decline_substitute(
+                           authorized_team_id: Optional[str] = None,
+                           expected_target_team_id: Optional[str] = None,
+                           require_target_identity: bool = False,
+                           allow_cross_team_response: bool = True) -> dict:
+        sub = self.roster.decline_substitute(
             game_id, player_id, actor_id,
-            authorized_team_id=authorized_team_id))
+            authorized_team_id=authorized_team_id,
+            expected_target_team_id=expected_target_team_id,
+            require_target_identity=require_target_identity,
+            allow_cross_team_response=allow_cross_team_response)
+        # Cross-team decline doubles as the explicit UI dismissal path for an
+        # offer whose trusted deadline has elapsed. The service records
+        # EXPIRED (never DECLINED) and returning that durable outcome lets the
+        # player clear the stale offer instead of leaving an active row that
+        # blocks the next lifecycle.
+        return self._substitute_row(sub)
 
     @catch
     def add_substitute_to_roster(self, game_id: str, player_id: str,
                                  actor_id: Optional[str] = None,
                                  authorized_team_id: Optional[str] = None) -> dict:
-        return _serialize(
-            self.roster.add_substitute_to_roster(
-                game_id, player_id, actor_id,
-                authorized_team_id=authorized_team_id)
-        )
+        result = self.roster.add_substitute_to_roster(
+            game_id, player_id, actor_id,
+            authorized_team_id=authorized_team_id)
+        if (isinstance(result, SubstituteEnrollment)
+                and result.status == SubstituteStatus.EXPIRED):
+            raise InvalidTransitionError(
+                "This substitute offer has expired.")
+        return _serialize(result)
 
     # -- roster status -----------------------------------------------------
     @catch
@@ -7293,18 +7335,20 @@ class ApiService:
         """The other side of a game from ``team_id``'s point of view."""
         return g.away_team_id if g.home_team_id == team_id else g.home_team_id
 
-    @staticmethod
-    def _mutable_block(game) -> Optional[str]:
-        """The reason a game's roster can't be mutated (cancelled/locked), or
-        None — mirrors the service's _guard_mutable so a withdraw/decline
-        button isn't offered when it would dead-end (#110/#112)."""
-        if game.cancelled:
-            return "This game has been cancelled."
-        if game.locked:
-            return "The roster for this game is locked."
-        return None
+    def _mutable_block(self, game) -> Optional[str]:
+        """The canonical reason a game's roster cannot be mutated.
 
-    def _opportunity_base_dict(self, g, player, ctx=None) -> dict:
+        The advisory payload and coach queue share the roster service's
+        read-only mirror of ``_guard_mutable``.  In particular, an archived
+        Season is resolved through the Game's LeagueSeason authority rather
+        than the denormalized ``game.season_id``.
+        """
+        return self.roster.game_mutation_block_reason(game)
+
+    def _opportunity_base_dict(
+        self, g, player, ctx=None, target_team_id: Optional[str] = None,
+        target_ctx=None,
+    ) -> dict:
         """The fields a substitute opportunity carries in both the Home list
         (#107) and the detail view (#110) — kept in one place so the two
         surfaces can't drift on the shared shape.
@@ -7324,16 +7368,35 @@ class ApiService:
         an eligible game (the Home lists are pre-filtered;
         ``get_substitute_opportunity`` resolves the context itself and 404s
         first), so the raise is the guard, not a new user-visible state."""
-        if ctx is None:
-            ctx = self.roster.resolve_membership_context(g, player)
-        if ctx is None:
-            raise NotFoundError("Opportunity not found.")
-        team_id = ctx.team_id
+        if target_ctx is not None:
+            if (target_team_id is not None
+                    and target_team_id != target_ctx.target_team_id):
+                raise NotFoundError("Opportunity not found.")
+            if ctx is not None and ctx != target_ctx.source:
+                raise NotFoundError("Opportunity not found.")
+            ctx = target_ctx.source
+            team_id = target_ctx.target_team_id
+        elif target_team_id is not None:
+            target_ctx = self.roster.resolve_substitute_target_context(
+                g, player, target_team_id)
+            if target_ctx is None:
+                raise NotFoundError("Opportunity not found.")
+            if ctx is None:
+                ctx = target_ctx.source
+            team_id = target_ctx.target_team_id
+        else:
+            if ctx is None:
+                ctx = self.roster.resolve_membership_context(g, player)
+            if ctx is None:
+                raise NotFoundError("Opportunity not found.")
+            team_id = ctx.team_id
         team = self.store.get_team(team_id) if team_id else None
         opp_id = self._opponent_team_id(g, team_id)
         opp_team = self.store.get_team(opp_id) if opp_id else None
         return {
             "game_id": g.id,
+            "target_team_id": team_id,
+            "cross_team": ctx.team_id != team_id,
             "team_name": team.name if team else team_id,
             "opponent_name": opp_team.name if opp_team else None,
             "start_time": g.start_time.isoformat() if g.start_time else None,
@@ -7342,6 +7405,36 @@ class ApiService:
             # #205 review blocker 2: the season-scoped position for THIS
             # game, off the SAME context that named the team above.
             "position_needed": ctx.slot_type.value,
+        }
+
+    def _cross_team_enrollment_opportunity_dict(
+        self, game, enrollment,
+    ) -> dict:
+        """Public fixture plus this player's durable cross-team snapshot.
+
+        An ENROLLED/OFFERED row remains the player's own actionable record
+        after its source membership or target registration stops validating.
+        Rendering that row must not re-authorize it, publish source
+        provenance, or read the target side's private roster state.
+        """
+        team_id = enrollment.team_id
+        team = self.store.get_team(team_id) if team_id else None
+        sides = {game.home_team_id, game.away_team_id}
+        opponent_id = (
+            self._opponent_team_id(game, team_id)
+            if team_id in sides else None)
+        opponent = self.store.get_team(opponent_id) if opponent_id else None
+        return {
+            "game_id": game.id,
+            "target_team_id": team_id,
+            "cross_team": True,
+            "team_name": team.name if team else team_id,
+            "opponent_name": opponent.name if opponent else None,
+            "start_time": (
+                game.start_time.isoformat() if game.start_time else None),
+            "venue_name": self._venue_name_for_game(game),
+            "rink_name": game.rink,
+            "position_needed": enrollment.slot_type.value,
         }
 
     @catch
@@ -7458,13 +7551,82 @@ class ApiService:
                         rstatus.status.value, "not_responded"),
                 }
 
+        active_substitutes = self.roster.active_substitute_snapshot(player_id)
         opportunities = [self._opportunity_base_dict(g, player)
-                         for g in self.roster.list_substitute_opportunities(player_id)]
+                         for g in self.roster.list_substitute_opportunities(
+                             player_id, active_substitutes)]
+        for choice in self.roster.list_cross_team_substitute_opportunities(
+                player_id, active_substitutes):
+            if choice.target is None:
+                row = self._cross_team_enrollment_opportunity_dict(
+                    choice.game, choice.enrollment)
+            else:
+                row = self._opportunity_base_dict(
+                    choice.game, player, ctx=choice.target.source,
+                    target_team_id=choice.target.target_team_id,
+                    target_ctx=choice.target)
+            row["enrollment_status"] = (
+                choice.enrollment.status.value
+                if choice.enrollment is not None else None)
+            row["can_enroll"] = choice.enrollment is None
+            mutation_block = self._mutable_block(choice.game)
+            row["can_withdraw"] = (
+                choice.enrollment is not None and mutation_block is None)
+            eligibility_stale = (
+                choice.enrollment is not None
+                and (choice.target is None or not player.is_active))
+            game_block = (
+                self.roster.cross_team_game_block_reason(choice.game)
+                if choice.enrollment is not None else None)
+            row["needs_cleanup"] = bool(
+                choice.enrollment is not None
+                and (eligibility_stale or game_block is not None))
+            if row["needs_cleanup"]:
+                cleanup_reason = (
+                    "Your eligibility changed; remove this saved "
+                    "availability."
+                    if eligibility_stale else game_block)
+                row["blocked_reason"] = mutation_block or cleanup_reason
+            opportunities.append(row)
+        opportunities.sort(key=lambda row: (
+            row.get("start_time") or "", row["game_id"],
+            row.get("target_team_id") or ""))
         # Slots a coach has OFFERED this player (#112): shown separately so
         # they can accept/decline — the self-enrol opportunities list excludes
         # already-offered games.
-        offers = [self._opportunity_base_dict(g, player)
-                  for g in self.roster.list_player_offers(player_id)]
+        offers = []
+        for offer_choice in self.roster.list_player_offer_choices(
+                player_id, active_substitutes):
+            game = offer_choice.game
+            enrollment = offer_choice.enrollment
+            if (enrollment is not None
+                    and self.roster._is_cross_team_enrollment(enrollment)):
+                row = self._cross_team_enrollment_opportunity_dict(
+                    game, enrollment)
+                target_ctx = self.roster._cross_team_enrollment_context(
+                    game, player, enrollment)
+                offer_ctx = (
+                    target_ctx.source if target_ctx is not None else None)
+                rstatus = None
+            else:
+                offer_ctx = self.roster.resolve_membership_context(
+                    game, player)
+                row = self._opportunity_base_dict(
+                    game, player, ctx=offer_ctx)
+                rstatus = self.roster.compute_roster_status(
+                    game.id, offer_ctx.team_id)
+            offer_block = self.roster.substitute_offer_block_reason(
+                player_id, game.id, enrollment, rstatus, ctx=offer_ctx)
+            row.update({
+                "can_accept_offer": offer_block is None,
+                "can_decline_offer": self._mutable_block(game) is None,
+                "offer_expired": (
+                    self.roster._is_cross_team_enrollment(enrollment)
+                    and self.roster.cross_team_offer_deadline_passed(
+                        game, enrollment)),
+                "blocked_reason": offer_block,
+            })
+            offers.append(row)
 
         notif = self.get_notifications("player", {"player_id": player_id},
                                        user_id=user_id)
@@ -7491,6 +7653,16 @@ class ApiService:
         for jid in self.guardians.verified_junior_ids(guardian_user_id):
             home = self.get_player_home(jid)
             if isinstance(home, dict) and "error" not in home:
+                # Guardian offer response remains supported, including a
+                # cross-team offer already sent to the junior.  Proactive
+                # cross-team opt-in/withdrawal is explicitly player-only in
+                # this slice, so omit those compound target choices rather
+                # than rendering a View link that lacks target_team_id and
+                # necessarily 404s.
+                home = dict(home)
+                home["substitute_opportunities"] = [
+                    row for row in home.get("substitute_opportunities", [])
+                    if not row.get("cross_team")]
                 juniors.append(home)
         juniors.sort(key=lambda h: (h.get("player_name") or "").lower())
         return {"guardian_user_id": guardian_user_id, "juniors": juniors}
@@ -7537,7 +7709,10 @@ class ApiService:
         return [_serialize(l) for l in self.guardians.all_links()]
 
     @catch
-    def get_substitute_opportunity(self, player_id: str, game_id: str) -> dict:
+    def get_substitute_opportunity(
+        self, player_id: str, game_id: str,
+        target_team_id: Optional[str] = None,
+    ) -> dict:
         """Detail for one substitute opportunity, scoped to the signed-in
         player (#110): the game context, this player's current relationship to
         it (can accept / can withdraw), and a plain-language reason when they
@@ -7546,20 +7721,71 @@ class ApiService:
         if player is None:
             raise NotFoundError("Player not found.")
         game = self.store.get_game(game_id)
-        # Only a player who RESOLVES to one of the participating teams may
-        # view the opportunity — don't confirm another team's game to a
-        # non-participant. Resolution is membership-based for a
-        # LeagueSeason-bound game and permanent-pointer for an unbound one
-        # (#205 cutover, RosterService.team_for_game).
-        ctx = (self.roster.resolve_membership_context(game, player)
-               if game is not None else None)
-        if game is None or ctx is None:
+        if game is None:
             raise NotFoundError("Opportunity not found.")
-        team_id = ctx.team_id
-        rstatus = self.roster.compute_roster_status(game_id, team_id)
-        enrollment = self.store.substitute_for_player(game_id, player_id)
+        enrollment = self.roster._active_substitute_for_player(
+            game_id, player_id)
+        if enrollment is not None:
+            if (target_team_id is not None
+                    and enrollment.team_id != target_team_id):
+                raise NotFoundError("Opportunity not found.")
+            marked_cross = self.roster._has_cross_team_provenance(enrollment)
+            exact_cross = self.roster._is_cross_team_enrollment(enrollment)
+            # ``game_id`` alone is not the identity of a cross-team choice:
+            # one game can expose two target sides, and terminal history for
+            # one can precede a new active row for the other. Never infer the
+            # current target for a caller that omitted the selector it saw.
+            # A partial provenance pair is corrupt and takes the same hidden,
+            # fail-closed path instead of falling through as a fresh choice.
+            if marked_cross and (not exact_cross
+                                 or target_team_id is None):
+                raise NotFoundError("Opportunity not found.")
+
+        persisted_cross = (
+            enrollment is not None
+            and self.roster._is_cross_team_enrollment(enrollment))
+        target_ctx = (
+            self.roster._cross_team_enrollment_context(
+                game, player, enrollment)
+            if persisted_cross else
+            self.roster.resolve_substitute_target_context(
+                game, player, target_team_id))
+        if target_ctx is None and not persisted_cross:
+            raise NotFoundError("Opportunity not found.")
+        ctx = target_ctx.source if target_ctx is not None else None
+        team_id = (
+            target_ctx.target_team_id
+            if target_ctx is not None else enrollment.team_id)
+        cross_team = persisted_cross or target_ctx.cross_team
+        # A player has no private relationship to another team's game merely
+        # because they share a Division.  A fresh cross-team detail therefore
+        # exists only while the exact choice is currently advertised.  Return
+        # the same 404 as an unknown compound key instead of confirming an
+        # unpublished, cancelled, past, or locked fixture through a guessed
+        # game/team pair.  An existing enrollment is the player's own record
+        # and remains reachable for withdrawal/offer response.
+        fresh_cross_reason = None
+        if cross_team and enrollment is None:
+            fresh_cross_reason = (
+                self.roster.cross_team_substitute_block_reason(
+                    player_id, game_id, team_id, target_ctx=target_ctx,
+                    observed_enrollment=enrollment))
+            if fresh_cross_reason is not None:
+                raise NotFoundError("Opportunity not found.")
+        rstatus = None
+        if not cross_team:
+            # Private roster state is read only from the signed-in subject's
+            # ordinary game-membership context.  The caller-selectable target
+            # is useful for the public cross-team fixture, but never becomes
+            # authority for a private side read.
+            ctx = self.roster.resolve_membership_context(game, player)
+            if ctx is None or ctx.team_id != team_id:
+                raise NotFoundError("Opportunity not found.")
+            rstatus = self.roster.compute_roster_status(
+                game_id, ctx.team_id)
         status = enrollment.status if enrollment else None
         can_accept = can_withdraw = can_accept_offer = can_decline_offer = False
+        offer_expired = False
         blocked = None
         if status == SubstituteStatus.OFFERED:
             # A coach has offered this player the slot (#112): respond with
@@ -7571,30 +7797,63 @@ class ApiService:
                 player_id, game_id, enrollment, rstatus, ctx=ctx)
             can_accept_offer = offer_block is None
             can_decline_offer = self._mutable_block(game) is None
+            offer_expired = (
+                persisted_cross
+                and self.roster.cross_team_offer_deadline_passed(
+                    game, enrollment))
             blocked = offer_block
         elif status == SubstituteStatus.ENROLLED:
-            # Withdrawal routes through _guard_mutable, so only a locked or
-            # cancelled game blocks it — not the enrol-eligibility reasons.
+            # Withdrawal routes through _guard_mutable.  A stale or no-longer
+            # advertised cross-team opt-in remains visible so the player can
+            # clean it up whenever the canonical game guard permits.
             withdraw_block = self._mutable_block(game)
-            can_withdraw, blocked = withdraw_block is None, withdraw_block
+            can_withdraw = withdraw_block is None
+            eligibility_stale = (
+                persisted_cross
+                and (target_ctx is None or not player.is_active))
+            game_block = (
+                self.roster.cross_team_game_block_reason(game)
+                if persisted_cross else None)
+            cleanup_reason = (
+                "Your eligibility changed; remove this saved availability."
+                if eligibility_stale else game_block)
+            blocked = withdraw_block or cleanup_reason
         else:
-            reason = self.roster.substitute_block_reason(
-                player_id, game_id, rstatus, ctx=ctx)
+            if cross_team:
+                reason = fresh_cross_reason
+            else:
+                reason = self.roster.substitute_block_reason(
+                    player_id, game_id, rstatus, ctx=ctx)
             can_accept, blocked = reason is None, reason
-        return {
-            **self._opportunity_base_dict(game, player, ctx=ctx),
-            "roster_status": rstatus.status.value,
-            "team_status": self._PLAYER_TEAM_STATUS.get(
-                rstatus.status.value, "not_responded"),
-            "open_goalie_slots": rstatus.open_goalie_slots,
-            "open_skater_slots": rstatus.open_skater_slots,
+        base = (
+            self._cross_team_enrollment_opportunity_dict(game, enrollment)
+            if persisted_cross else
+            self._opportunity_base_dict(
+                game, player, ctx=ctx, target_team_id=team_id,
+                target_ctx=target_ctx))
+        result = {
+            **base,
             "enrollment_status": status.value if status else None,
             "can_accept": can_accept,
             "can_withdraw": can_withdraw,
             "can_accept_offer": can_accept_offer,
             "can_decline_offer": can_decline_offer,
+            "offer_expired": offer_expired,
             "blocked_reason": blocked,
+            "needs_cleanup": bool(
+                status == SubstituteStatus.ENROLLED
+                and persisted_cross
+                and (eligibility_stale or game_block is not None)),
         }
+        if not cross_team:
+            result.update({
+                "roster_status": rstatus.status.value,
+                "team_status": self._PLAYER_TEAM_STATUS.get(
+                    rstatus.status.value, "not_responded"),
+                "open_goalie_slots": rstatus.open_goalie_slots,
+                "open_skater_slots": rstatus.open_skater_slots,
+            })
+        return result
 
     def _workflow_side(self, game, team_id, viewer_role, viewer_team_id,
                        refusal: str) -> str:
@@ -7717,7 +7976,7 @@ class ApiService:
     def add_substitute_candidate(self, game_id: str, player_id: str,
                                  actor_id: Optional[str] = None,
                                  authorized_team_id: Optional[str] = None) -> dict:
-        return _serialize(self.roster.add_substitute_candidate(
+        return self._substitute_row(self.roster.add_substitute_candidate(
             game_id, player_id, actor_id,
             authorized_team_id=authorized_team_id))
 

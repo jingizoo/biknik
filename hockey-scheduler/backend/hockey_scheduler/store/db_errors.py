@@ -73,6 +73,7 @@ _ICE_SLOT_TIME_CONSTRAINT = "ux_ice_slots_rink_time"
 _COPY_FORWARD_FINGERPRINT_CONSTRAINT = \
     "ux_season_copy_forward_commits_fingerprint"
 _TEAM_REGISTRATION_NUMBER_CONSTRAINT = "ux_players_team_registration_number"
+_SUBSTITUTE_ACTIVE_CONSTRAINT = "ux_substitute_active_game_player"
 
 
 def translate_player_jersey_exception(
@@ -170,6 +171,22 @@ def translate_membership_conflict_exception(
                      "player_id": membership.player_id,
                      "league_season_id": membership.league_season_id})
     return None
+
+
+def translate_substitute_active_conflict_exception(
+        exc: BaseException, sub) -> Optional[DomainError]:
+    """Translate migration 063's active ``(game, player)`` race backstop."""
+    if isinstance(exc, DomainError):
+        return None
+    if not _is_unique_violation_on(
+            exc, _SUBSTITUTE_ACTIVE_CONSTRAINT,
+            ("substitute_enrollments.game_id",
+             "substitute_enrollments.player_id")):
+        return None
+    return IntegrityConflictError(
+        "Player already has an active substitute enrollment for this game.",
+        details={"reason": "active_substitute_conflict",
+                 "game_id": sub.game_id, "player_id": sub.player_id})
 
 
 def translate_reassignment_fk_exception(

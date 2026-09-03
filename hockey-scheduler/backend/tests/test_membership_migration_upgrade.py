@@ -181,6 +181,7 @@ class Migration059SortsAfterEveryMainMigrationTest(unittest.TestCase):
         "060_substitute_team_id",
         "061_roster_entry_durable_attribution",
         "062_cancelled_game_ice_history",
+        "063_cross_team_substitute_provenance",
         "063_subtree_deletion_challenges",
     })
 

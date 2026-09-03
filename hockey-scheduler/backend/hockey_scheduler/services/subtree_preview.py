@@ -313,6 +313,14 @@ REFERENCE_INVENTORY: tuple[ReferenceSpec, ...] = (
        ReferenceRole.ASSOCIATION, TargetRemoval.DELETE_SOURCE),
     _r(EntityType.SUBSTITUTE_ENROLLMENT, "team_id", (EntityType.TEAM,),
        ReferenceRole.ASSOCIATION, TargetRemoval.DELETE_SOURCE),
+    # Cross-team opt-in provenance is frozen history, deliberately without
+    # foreign keys (migration 063). Deleting a former source membership or
+    # team must not rewrite or cascade the substitute record.
+    _r(EntityType.SUBSTITUTE_ENROLLMENT, "source_membership_id",
+       (EntityType.SEASON_ROSTER_MEMBERSHIP,), ReferenceRole.HISTORICAL,
+       TargetRemoval.RETAIN),
+    _r(EntityType.SUBSTITUTE_ENROLLMENT, "source_team_id", (EntityType.TEAM,),
+       ReferenceRole.HISTORICAL, TargetRemoval.RETAIN),
     _r(EntityType.AUDIT_LOG, "game_id", (EntityType.GAME,),
        ReferenceRole.OWNERSHIP, TargetRemoval.DELETE_SOURCE),
     _r(EntityType.AUDIT_LOG, "actor_id", (), ReferenceRole.PRINCIPAL,

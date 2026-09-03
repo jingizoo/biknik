@@ -166,7 +166,10 @@ Tracks a player's response.
 
 ## SubstituteEnrollment
 
-Non-selected players willing to play.
+Non-selected players willing to play. The legacy form is availability for the
+player's own Game side. The bounded #287 cross-team form is a proactive opt-in
+for one explicit target side of another team's Game in the same competition
+boundary; it does not require an open vacancy at enrollment time.
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -178,12 +181,33 @@ Non-selected players willing to play.
 | priority_rank | int? | coach-controlled ordering |
 | enrolled_at | datetime | |
 | offered_at | datetime? | |
-| offer_expires_at | datetime? | |
+| offer_expires_at | datetime? | server-owned for cross-team rows: `min(offered_at + 30 minutes, game.start_time)`; equality is expired |
 | accepted_at | datetime? | |
 | declined_at | datetime? | |
+| team_id | str? | durable owning Game side; for a cross-team row this is the explicit target, not the source team; null only on honest legacy rows |
+| source_membership_id | str? | cross-team-only exact source stint; paired with `source_team_id`, deliberately no foreign key so history survives cleanup |
+| source_team_id | str? | cross-team-only source team; paired with `source_membership_id`, deliberately no foreign key |
 
-A substitute is **available for a slot** when status is `ENROLLED` and the
-substitute's slot type matches the open slot type.
+A fresh cross-team row is valid only when source and target resolve through the
+exact same `LeagueSeason`, both registrations share the same non-null
+`Division`, and the source team is neither participating side in the target
+Game. `team_id` owns the row and eventual roster seat; the source pair proves
+where eligibility came from and is revalidated before offer or acceptance.
+The public API never returns the source pair.
+
+The partial unique index `ux_substitute_active_game_player` permits at most one
+`ENROLLED` or `OFFERED` row per `(game_id, player_id)`. Terminal rows remain as
+history and do not prevent a later lifecycle. A substitute becomes offerable
+for a slot only when status is `ENROLLED`, its snapshotted slot type matches an
+open target-side slot, and its eligibility/provenance still validates. For a
+cross-team `OFFERED` row, accept or decline at the server-owned deadline records
+`EXPIRED`; that transition emits `substitute_expired` audit evidence and the
+overdue offer remains explicitly dismissible from Player Home so that action
+can persist the terminal outcome.
+
+Same-team rows keep both source columns null. Omitted-target enrollment,
+offer-time live retargeting, client deadline handling, and the established
+same-team response boundary are unchanged by migration 063.
 
 ## RosterStatus (computed)
 
@@ -217,7 +241,8 @@ GameStatus          : DRAFT, SELECTED, AWAITING_RESPONSES, ROSTER_CONFIRMED,
                       NEEDS_SUBSTITUTE, OPEN_SLOT, LOCKED, FINAL
 AuditAction         : roster_selected, availability_set, player_backed_out,
                       substitute_enrolled, substitute_withdrawn, substitute_offered,
-                      substitute_accepted, substitute_declined, substitute_added_to_roster,
+                      substitute_accepted, substitute_declined, substitute_expired,
+                      substitute_added_to_roster,
                       player_removed, roster_locked, roster_unlocked, game_cancelled
 ```
 
