@@ -24,26 +24,119 @@ from hockey_scheduler.services.subtree_preview import (
 from hockey_scheduler.store.sql_store import SPECS, SqlStore
 
 
-_REFERENCE_LOOKING_FIELDS = {
-    "scope", "detail", "request_input", "proposal", "generation_snapshot",
-    "response_snapshot", "request_identity", "counts", "pre_reset_counts",
-    "audience", "team_side", "actor_key",
+# Closed complement to REFERENCE_INVENTORY.  This is intentionally explicit:
+# every persisted field must be classified as either a relationship/reference
+# or a non-reference value.  A new field therefore fails the partition test no
+# matter what it is named; there is no suffix convention or silent default.
+_NON_REFERENCE_FIELD_MANIFEST = """
+season_roster_membership_events id action at reason seq
+season_roster_memberships id status position jersey_number shoots effective_from effective_to
+schedule_scenarios id name planner_version input_fingerprint proposal_fingerprint created_at
+programs id name country timezone
+seasons id name start_date end_date status archived_at
+leagues id name sort_order
+league_seasons id
+divisions id name age_group
+age_eligibility_rules id version cutoff_month cutoff_day tiers enforcement created_at
+season_team_registrations id active
+season_copy_forward_commits id copy_forward_fingerprint rolled_forward skipped committed_at
+team_league_migration_decisions id note
+season_venue_access id active
+clubs id name country
+teams id name division
+players id name position shoots jersey_number is_active first_name last_name preferred_name birthdate registration_number skill_rating
+organizations id name short_name
+venues id name address timezone
+rinks id name
+ice_slots id start_time end_time slot_type status
+scheduling_policies id scope_type warmup_minutes resurfacing_minutes min_playable_minutes curfew_local
+games id start_time target_goalies target_skaters max_skaters rink end_time roster_lock_time locked cancelled published is_draft game_type cancelled_venue_name cancelled_venue_timezone cancelled_rink_name cancelled_scheduled_start_time cancelled_scheduled_end_time cancelled_ice_start_time cancelled_ice_end_time
+game_roster_entries id roster_role selection_source status selected_at updated_at seated_position
+game_availability id availability_status response_source responded_at notes
+substitute_enrollments id position status enrolled_at priority_rank offered_at offer_expires_at accepted_at declined_at
+audit_logs id action at
+notification_events id type message at
+setup_audit_logs id action entity_type at
+data_access_logs category subject_type purpose at actor_role outcome id seq
+factory_reset_events id environment started_at result completed_at failure_reason
+factory_reset_challenges id token_hash expires_at created_at
+factory_reset_locks id token acquired_at expires_at
+officials id name is_active
+official_assignments id role status assigned_at responded_at note
+game_results id home_score away_score status recorded_at approved_at
+notifications_feed id kind title message at
+notification_recipients id read_at
+notification_deliveries id channel status attempts last_error sent_at destination last_attempt_at next_attempt_at dead_lettered_at
+contact_destinations id channel destination label active
+device_tokens id provider token label active
+notification_preferences id channel enabled digest active
+installation_state id claimed_at claim_method
+user_accounts id username password_hash role created_at active
+sessions id token_hash issued_at expires_at revoked_at user_agent
+user_active_context updated_at generation
+guardian_links id created_at verified consent_method consented_at
+reschedule_requests id reason status created_at opponent_responded_at league_decided_at decision_note
+calendar_feed_tokens id token_hash actor_type created_at revoked_at label last_used_at
+official_availability id start_time end_time status note
+""".strip()
+
+_NON_REFERENCE_FIELDS = {
+    f"{parts[0]}.{name}"
+    for line in _NON_REFERENCE_FIELD_MANIFEST.splitlines()
+    for parts in (line.split(),)
+    for name in parts[1:]
 }
 
-_REFERENCE_PRIMARY_KEYS = {("user_active_context", "id")}
+
+def _persisted_fields():
+    return {
+        f"{spec.table}.{field.name}"
+        for model, spec in SPECS.items()
+        for field in fields(model)
+    }
 
 
-def _is_reference_looking(table: str, name: str) -> bool:
-    return (
-        (table, name) in _REFERENCE_PRIMARY_KEYS
-        or (
-            name != "id"
-            and (
-                name.endswith(("_id", "_ids", "_ref", "_by"))
-                or name in _REFERENCE_LOOKING_FIELDS
-            )
+def _partition_gaps(persisted):
+    references = set(REFERENCE_BY_KEY)
+    overlap = references & _NON_REFERENCE_FIELDS
+    classified = references | _NON_REFERENCE_FIELDS
+    return persisted - classified, classified - persisted, overlap
+
+
+def _declared_foreign_keys(store):
+    cur = store.conn.cursor()
+    if store.backend == "sqlite":
+        actual = set()
+        cur.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         )
+        for row in cur.fetchall():
+            table = row[0] if not hasattr(row, "keys") else row["name"]
+            cur.execute(f"PRAGMA foreign_key_list('{table}')")
+            for fk in cur.fetchall():
+                actual.add((table, fk[3], fk[2]))
+        return actual
+
+    cur.execute(
+        "SELECT src.relname AS source_table, source_col.attname AS source_col, "
+        "       target.relname AS target_table "
+        "FROM pg_constraint constraint_row "
+        "JOIN pg_class src ON src.oid = constraint_row.conrelid "
+        "JOIN pg_namespace source_ns ON source_ns.oid = src.relnamespace "
+        "JOIN pg_class target ON target.oid = constraint_row.confrelid "
+        "JOIN LATERAL generate_subscripts(constraint_row.conkey, 1) pos(i) "
+        "  ON TRUE "
+        "JOIN pg_attribute source_col "
+        "  ON source_col.attrelid = constraint_row.conrelid "
+        " AND source_col.attnum = constraint_row.conkey[pos.i] "
+        "WHERE constraint_row.contype = 'f' "
+        "  AND source_ns.nspname = current_schema()"
     )
+    return {
+        (row["source_table"], row["source_col"], row["target_table"])
+        for row in cur.fetchall()
+    }
 
 
 def _state(kind: EntityType, record_id: str, version: str = "1") -> str:
@@ -63,15 +156,19 @@ class TestReferenceInventory(unittest.TestCase):
             {spec.table for spec in SPECS.values()},
         )
 
-    def test_every_reference_looking_field_is_classified_exactly_once(self):
-        derived = {
-            f"{spec.table}.{field.name}"
-            for model, spec in SPECS.items()
-            for field in fields(model)
-            if _is_reference_looking(spec.table, field.name)
-        }
-        self.assertEqual(set(REFERENCE_BY_KEY), derived)
+    def test_every_persisted_field_has_exactly_one_explicit_classification(self):
+        missing, unknown, overlap = _partition_gaps(_persisted_fields())
+        self.assertEqual(missing, set(), "unclassified persisted fields")
+        self.assertEqual(unknown, set(), "declarations for absent fields")
+        self.assertEqual(overlap, set(), "fields classified both ways")
         self.assertEqual(len(REFERENCE_INVENTORY), len(REFERENCE_BY_KEY))
+
+    def test_unconventionally_named_new_field_cannot_evade_the_partition(self):
+        mutated = _persisted_fields() | {"games.shadow_parent"}
+        missing, unknown, overlap = _partition_gaps(mutated)
+        self.assertEqual(missing, {"games.shadow_parent"})
+        self.assertEqual(unknown, set())
+        self.assertEqual(overlap, set())
 
     def test_every_inventory_field_exists_on_its_persisted_model(self):
         model_by_table = {spec.table: model for model, spec in SPECS.items()}
@@ -106,27 +203,34 @@ class TestReferenceInventory(unittest.TestCase):
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         os.unlink(path)
-        store = SqlStore(path)
+        stores = [("sqlite", SqlStore(path))]
+        postgres_url = os.environ.get("TEST_DATABASE_URL")
+        if postgres_url:
+            stores.append(("postgres", SqlStore(postgres_url)))
         try:
-            actual = set()
-            for (table,) in store.conn.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            ):
-                for row in store.conn.execute(f"PRAGMA foreign_key_list({table})"):
-                    actual.add((table, row[3], row[2]))
-
-            for table, field, target_table in sorted(actual):
-                with self.subTest(table=table, field=field):
-                    relation = REFERENCE_BY_KEY[f"{table}.{field}"]
-                    self.assertIn(relation.on_target_delete, {
-                        TargetRemoval.DELETE_SOURCE,
-                        TargetRemoval.DETACH,
-                    })
-                    self.assertIn(target_table,
-                                  {target.value for target in relation.targets})
+            constraints = {}
+            for backend, store in stores:
+                actual = _declared_foreign_keys(store)
+                constraints[backend] = actual
+                for table, field, target_table in sorted(actual):
+                    with self.subTest(backend=backend, table=table, field=field):
+                        relation = REFERENCE_BY_KEY[f"{table}.{field}"]
+                        self.assertIn(relation.on_target_delete, {
+                            TargetRemoval.DELETE_SOURCE,
+                            TargetRemoval.DETACH,
+                        })
+                        self.assertIn(
+                            target_table,
+                            {target.value for target in relation.targets},
+                        )
+            if "postgres" in constraints:
+                self.assertEqual(
+                    constraints["postgres"], constraints["sqlite"],
+                    "SQLite and PostgreSQL declare different foreign keys",
+                )
         finally:
-            store.conn.close()
+            for _, store in stores:
+                store.close()
             if os.path.exists(path):
                 os.unlink(path)
 
