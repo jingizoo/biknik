@@ -1,6 +1,10 @@
 from .account_service import AccountService
 from .context_service import ContextService
 from .factory_reset_service import CONFIRMATION_PHRASE, FactoryResetService
+from .subtree_deletion_service import (
+    ALLOWED_ROOT_TYPES,
+    SubtreeDeletionService,
+)
 from .guardian_service import GuardianService
 from .calendar import (
     ACTOR_TYPES,
@@ -76,4 +80,5 @@ __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "SCENARIO_PLANNER_VERSION", "canonical_fingerprint",
            "changed_snapshot_sections", "material_input_snapshot",
            "resolve_scenario_scope",
-           "FactoryResetService", "CONFIRMATION_PHRASE"]
+           "FactoryResetService", "CONFIRMATION_PHRASE",
+           "SubtreeDeletionService", "ALLOWED_ROOT_TYPES"]

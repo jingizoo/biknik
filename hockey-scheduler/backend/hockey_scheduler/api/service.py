@@ -69,6 +69,7 @@ from ..services import (
     AccountService,
     ContextService,
     FactoryResetService,
+    SubtreeDeletionService,
     GuardianService,
     DeliveryLoop,
     DeliveryWorker,
@@ -360,6 +361,8 @@ class ApiService:
         self.accounts = AccountService(self.store, self.roster.clock)
         self.factory_reset = FactoryResetService(
             self.store, self.accounts, self.roster.clock)
+        self.subtree_deletion = SubtreeDeletionService(
+            self.store, self.roster.clock)
         self.guardians = GuardianService(self.store, self.roster.clock)
         self.context = ContextService(self.store, self.roster.clock)
 
@@ -6971,6 +6974,19 @@ class ApiService:
         return self.factory_reset.execute(
             actor_id, password, typed_phrase, challenge_token,
             backup_acknowledged, environment=environment)
+
+    # -- explicit destructive subtree deletion (#429) ----------------------
+    @catch
+    def subtree_deletion_preview(self, root_type: str, root_id: str,
+                                 actor_id: str = None) -> dict:
+        return self.subtree_deletion.preview(actor_id, root_type, root_id)
+
+    @catch
+    def subtree_deletion_execute(self, challenge_token: str,
+                                 typed_name: str, reason: str,
+                                 actor_id: str = None) -> dict:
+        return self.subtree_deletion.execute(
+            actor_id, challenge_token, typed_name, reason)
 
     # -- account sessions (#78) --------------------------------------------
     @staticmethod

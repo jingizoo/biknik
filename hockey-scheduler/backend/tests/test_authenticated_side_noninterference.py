@@ -628,7 +628,7 @@ become another set of stale numbers.
 **2. THE INVENTORY IS GET-ONLY.** :meth:`_SweepHarness
 ._authenticated_get_specs` filters ``method == "GET"``, so the fail-closed
 property covers exactly the authenticated GET surface — 51 routes on this
-tree. Counted off ``route_registry.REGISTRY`` rather than estimated: 161
+tree. Counted off ``route_registry.REGISTRY`` rather than estimated: 163
 authenticated POST specs return response bodies and enter NO oracle, and a
 newly added one is NOT reported by :meth:`_SweepHarness
 ._assert_inventory_is_closed`; a further 16 ``auth="none"`` GET routes are
@@ -18885,7 +18885,7 @@ class TheMethodAxisIsADisclosedLimitWithLiveNumbers(unittest.TestCase):
 
         self.assertEqual(51, count("GET", True), "authenticated GET (SWEPT)")
         self.assertEqual(16, count("GET", False), "auth=none GET (unswept)")
-        self.assertEqual(161, count("POST", True),
+        self.assertEqual(163, count("POST", True),
                          "authenticated POST (unswept, and NOT reported by "
                          "_assert_inventory_is_closed)")
         self.assertEqual(

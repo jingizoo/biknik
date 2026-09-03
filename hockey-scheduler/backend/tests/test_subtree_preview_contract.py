@@ -61,6 +61,7 @@ data_access_logs category subject_type purpose at actor_role outcome id seq
 factory_reset_events id environment started_at result completed_at failure_reason
 factory_reset_challenges id token_hash expires_at created_at
 factory_reset_locks id token acquired_at expires_at
+subtree_deletion_challenges id token_hash fingerprint root_type confirmation_name expires_at created_at
 officials id name is_active
 official_assignments id role status assigned_at responded_at note
 game_results id home_score away_score status recorded_at approved_at

@@ -6,8 +6,8 @@ they differ, treat the newer of the two as correct and reconcile the other.
 
 ## Baselines
 
-- **Current `main`:** `699d685` — #428 cancellation releases ice while
-  preserving history, merged via PR #447.
+- **Current `main`:** `1e9171c` — #429 ownership/dependency inventory and pure
+  preview contract, merged via PR #448 (after #428 via PR #447).
 - **Previously recorded here:** `5aa84da` (#404 database-connection recovery,
   PR #406), 377 commits stale when reconciled on 2026-09-02.
 - **Older recorded hierarchy baseline:** `bf85403` (Epic #283 competition-hierarchy
@@ -315,11 +315,12 @@ only — no schema, persistence, API mutations, notifications, or runtime
 state transitions; see Release 4 above for the exact boundary) → #206
 resumes.
 
-Owner-directed addition (2026-09-02): #428 landed through PR #447. **#429 is
-now active**: first land the complete ownership/dependency inventory and pure
-preview contract; only after that slice is reviewed may a separate bounded
-slice add the high-privilege, token-bound, atomic destructive execution. This
-does not widen any ordinary dependency-gated delete endpoint.
+Owner-directed addition (2026-09-02): #428 landed through PR #447. #429's
+complete ownership/dependency inventory and pure preview contract then landed
+through PR #448. **#429's separate execution slice is now active**: add the
+high-privilege, token-bound, atomic destructive command, survivor audit, and
+desktop/390px confirmation flow. This does not widen any ordinary
+dependency-gated delete endpoint.
 
 Owner-directed split (2026-07-27): PR #331 may merge as the technically
 clean first slice. #345 is the immediate next critical deliverable and

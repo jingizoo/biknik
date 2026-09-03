@@ -963,3 +963,25 @@ class FactoryResetLock:
     token: str
     acquired_at: datetime
     expires_at: datetime
+
+
+@dataclass
+class SubtreeDeletionChallenge:
+    """One actor's outstanding destructive-subtree preview challenge (#429).
+
+    Only a SHA-256 token digest is durable.  The row binds that token to the
+    authenticated actor, selected root, exact graph fingerprint and typed
+    confirmation name.  ``id`` is the actor id, so a newer preview atomically
+    supersedes that actor's older one without disturbing another operator's
+    challenge.
+    """
+
+    id: str
+    token_hash: str
+    actor_id: str
+    fingerprint: str
+    root_type: str
+    root_id: str
+    confirmation_name: str
+    expires_at: datetime
+    created_at: datetime

@@ -247,6 +247,12 @@ def required_permission(path: str):
     if path in ("/api/admin/factory-reset/preview",
                 "/api/admin/factory-reset/execute"):
         return Permission.MANAGE_USERS
+    # Explicit #429 subtree deletion uses a separate preview/execute contract;
+    # ordinary delete routes remain dependency-gated.  The service re-checks
+    # exact League Admin + both setup/users permissions as defense in depth.
+    if path in ("/api/admin/subtree-deletion/preview",
+                "/api/admin/subtree-deletion/execute"):
+        return Permission.MANAGE_USERS
     # Officials: an official accepts/declines their own assignment (#54);
     # unassigning is an operator/scheduling action (#30).
     m = re.match(r"^/api/officials/assignments/[^/]+/(accept|decline|unassign)$", path)

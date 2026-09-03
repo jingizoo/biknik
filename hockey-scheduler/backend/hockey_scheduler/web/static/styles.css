@@ -1137,6 +1137,24 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .fr-inline-error { color: var(--red); font-size: 13px; font-weight: 600;
   margin: 12px 0 0; }
 
+/* ----- Explicit destructive subtree preview (#429) ----- */
+.sd-warning { border-left: 3px solid var(--red); background: #fff5f5;
+  padding: 9px 11px; border-radius: 6px; line-height: 1.4; }
+.sd-groups { border: 1px solid var(--sep); border-radius: 9px; overflow: hidden;
+  margin: 7px 0 12px; max-height: 190px; overflow-y: auto; }
+.sd-group { border-bottom: 1px solid var(--sep); padding: 7px 10px; }
+.sd-group:last-child { border-bottom: 0; }
+.sd-group-head { display: flex; justify-content: space-between; gap: 12px;
+  padding: 5px 10px; font-size: 13px; }
+.sd-group .sd-group-head { padding: 0; }
+.sd-group-head strong { font-variant-numeric: tabular-nums; }
+.sd-ids { margin-top: 4px; color: var(--muted); font-size: 12px;
+  overflow-wrap: anywhere; line-height: 1.55; }
+.sd-retained { margin: 8px 0 12px; font-size: 13px; }
+.sd-retained summary { cursor: pointer; font-weight: 600; }
+.modal-confirm-input.sd-input { text-transform: none; letter-spacing: normal;
+  resize: vertical; font-family: inherit; }
+
 /* ----- Pilot onboarding import wizard (#96/#99) ----- */
 .import-form { padding: 0 16px 16px; }
 .import-form label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 4px; }
@@ -1294,6 +1312,9 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
      focus at phone width. It keeps its 12px monospace base ABOVE the token,
      where auto-zoom does not apply and the denser text fits more CSV. */
   .import-form textarea { font-size: 16px; }
+  .modal-confirm-input { font-size: 16px; }
+  .modal-foot { flex-wrap: wrap; }
+  .modal-foot .act { flex: 1 1 auto; }
   /* Touch-first tap targets (#118 Phase 6): these were sized for a mouse
      pointer (~21px tall) — grow them toward the ~44px minimum recommended
      for touch on the viewport width where touch is the only input. */

@@ -1,12 +1,12 @@
 # Destructive Subtree Inventory and Preview Contract
 
-> **Status:** bounded, non-production design/code slice for issue #429. It
-> inventories the current persisted ownership graph and defines a pure preview.
-> It does **not** add a destructive command, route, token store, migration, UI,
-> authorization rule, audit write, or deletion. Ordinary delete endpoints remain
-> dependency-gated and acquire no cascade.
+> **Status:** the reviewed ownership inventory and pure preview landed through
+> PR #448. This follow-up branch adds the separate high-privilege execution
+> slice required by issue #429: durable single-use challenges, atomic execution,
+> survivor audit, authenticated routes, and the preview/confirmation UI.
+> Ordinary delete endpoints remain dependency-gated and acquire no cascade.
 
-## Why this lands before execution
+## Why the inventory landed before execution
 
 `Delete subtree` is an intentional exception to the application's normal
 delete-one-record contract. The exception is safe only if the product can first
@@ -59,13 +59,15 @@ and have no database FK on all three stores.
 - SeasonVenueAccess is an association row. Removing a Season or Venue removes
   the access row while preserving the other endpoint.
 - `Game.ice_slot_id` is shared inventory. Removing a Game removes its ice edge
-  and preserves the slot. Removing a facility subtree preserves an outside Game
-  and detaches its live ice edge. The future execution slice must define the
-  resulting Game state and release semantics under the same transaction before
-  it wires that path.
+  and preserves the slot. Removing a facility subtree preserves an outside Game,
+  detaches its live ice edge, clears the stale rink display, and returns it to an
+  unpublished draft. A retained allocated slot is released only when no
+  surviving active Game still occupies it; all of this happens in the deletion
+  transaction.
 - `Venue.league_id` is legacy compatibility state, but it is still a live,
   nullable FK in the current schema. A Program subtree must therefore detach it;
-  calling it historical and retaining it would make the future delete fail.
+  calling it historical and retaining it would make the destructive transaction
+  fail.
 - A cancelled Game's `cancelled_ice_slot_id`, `cancelled_venue_id`, and
   `cancelled_rink_id` are display snapshots created by #428, deliberately
   without foreign keys. They remain part of the Game state digest and never
@@ -85,16 +87,17 @@ and have no database FK on all three stores.
   availability rows, substitute rows, guardian links, player-addressed feeds,
   and integration destinations. The guardian UserAccount remains.
 - User accounts are principals, not descendants of a Team/Player/Official.
-  Their scope edge is detached by a subject subtree; the future execution slice
-  must deactivate or safely rebind the account in the same transaction. Sessions
-  remain owned by the UserAccount.
+  Their scope edge is detached by a subject subtree and the now-unbound account
+  is deactivated in the same transaction. Sessions remain owned by the
+  UserAccount and become unusable because session resolution re-reads that live
+  account state.
 - ActiveContext is a view preference, not authority. Program/Season/League
   selections are detached when their targets disappear; its primary key is also
   inventoried as the owning UserAccount link.
 - SetupAuditLog and DataAccessLog references are historical evidence and do not
   pull their subjects into or follow them out of a subtree. Detailed roster
   AuditLog rows, by contrast, are Game-owned and leave with the Game.
-- The future destructive command must append a separate aggregate,
+- The destructive command appends a separate aggregate,
   server-attributed event outside the removed subtree. It must not copy protected
   child payloads into that survivor merely to preserve deleted detail.
 - External import refs, generation/response snapshots, audit detail, and trace
@@ -104,7 +107,7 @@ and have no database FK on all three stores.
 
 ## Pure preview contract
 
-The future authenticated store projector supplies:
+The authenticated store projector supplies:
 
 - one selected root record;
 - the root's operator-visible confirmation name;
@@ -149,29 +152,32 @@ The preview fingerprint is SHA-256 over canonical JSON containing:
 
 Input ordering has no effect. A material row change, relationship change, new
 owned child, changed actor, changed root, or changed confirmation name changes
-the fingerprint. The future execution command must re-project under its
-deterministic transaction locks and require byte equality before the first
-write. A mismatch returns a stable `preview_stale` refusal and consumes no
-partial work.
+the fingerprint. Execution re-projects under deterministic transaction locks
+and requires byte equality before the first write. A mismatch returns a stable
+`preview_stale` refusal and consumes no partial work.
 
-The fingerprint is not yet a capability token. The execution slice must store a
-short-lived hash of a cryptographically random, single-use token bound to this
-fingerprint and actor, consume it atomically, and reject expiry/replay. It must
-also require high-privilege server authorization and exact typed confirmation;
-none of those guarantees can be inferred from calling this pure function.
+The fingerprint becomes usable only through a short-lived cryptographically
+random challenge. Only its SHA-256 digest is stored, one active challenge per
+actor. Preview replacement is atomic; a guessed or older token cannot consume a
+newer legitimate preview. Execute consumes the matching challenge once, rejects
+expiry/replay, re-projects under the graph locks, and requires byte equality
+before the first destructive write. It also re-checks the exact League Admin
+role plus `manage_setup` and `manage_users`, the exact parent name, and a bounded
+non-empty audit reason.
 
-## Required next slice before production
+## Execution slice added by this branch
 
-After this inventory is reviewed, destructive execution still needs all of the
-following in one bounded feature slice:
+The separate execution path now provides:
 
-1. An authenticated store projector for every allowed root type, with
+1. An authenticated store projector for every named allowed root type, with
    privacy-filtered identifiers and material row digests.
 2. A durable preview challenge and aggregate survivor audit record, with a
    forward-only Memory/SQLite/PostgreSQL-compatible migration.
-3. One deterministic lock order and a single atomic transaction covering graph
-   revalidation, edge detachment, slot-state updates, child-first deletion,
-   audit append, token consumption, and rollback.
+3. One deterministic table-lock order and a single atomic destructive
+   transaction covering graph revalidation, edge detachment, slot-state
+   updates, child-first deletion, audit append, and rollback. Challenge
+   consumption precedes that transaction intentionally, so an uncertain or
+   failed attempt is never replayable and always requires a fresh preview.
 4. A route/permission contract which does not widen ordinary delete endpoints.
 5. Memory/SQLite/PostgreSQL failure injection and concurrent child creation,
    reassignment, cancellation, slot allocation, and competing-delete coverage.
@@ -179,5 +185,6 @@ following in one bounded feature slice:
    accessible warnings, typed confirmation, loading/error/retry states, and no
    console errors.
 
-Until those land and pass review, this slice is neither deployable nor a partial
-implementation of `Delete subtree`.
+The feature remains unmerged and therefore not deployable until exact-head
+review and required CI finish. The operation is reachable only as a separately
+named action after an ordinary delete returns its dependency breakdown.

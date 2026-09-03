@@ -3907,6 +3907,20 @@ class Handler(BaseHTTPRequestHandler):
                           self._session_cookie(token, SESSION_MAX_AGE))]
             return self._send_json({"ok": True}, extra_headers=extra)
 
+        if path in ("/api/admin/subtree-deletion/preview",
+                    "/api/admin/subtree-deletion/execute"):
+            if self._rate_limited(
+                    "subtree_deletion", limit=10, window_seconds=300):
+                return
+            if path == "/api/admin/subtree-deletion/preview":
+                return self._send_api(api.subtree_deletion_preview(
+                    root_type=body.get("root_type"),
+                    root_id=body.get("root_id"), actor_id=user_id))
+            return self._send_api(api.subtree_deletion_execute(
+                challenge_token=body.get("challenge_token"),
+                typed_name=body.get("typed_name"),
+                reason=body.get("reason"), actor_id=user_id))
+
         if path in ("/api/admin/factory-reset/preview",
                     "/api/admin/factory-reset/execute"):
             # Guarded production factory reset (#256): a whole-installation

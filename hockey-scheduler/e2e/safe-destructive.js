@@ -1,6 +1,6 @@
 // Safe destructive actions browser journey (#215).
 //
-// At desktop and phone widths, a League Admin exercises the four destructive
+// At desktop and phone widths, a League Admin exercises five destructive
 // surfaces end to end:
 //   1. Blocked deletion — deleting a league that still has a season/team is
 //      refused with a themed dependency modal listing what's in the way, and
@@ -8,7 +8,10 @@
 //   2. Successful deletion — a bare team is deleted through the confirm modal.
 //   3. Remove from season — the redesigned "Remove from season" action
 //      deactivates a registration.
-//   4. Reset demo — the header "Reset demo" button opens a confirm modal that
+//   4. Delete subtree — a blocked ordinary delete can open an exact privacy-
+//      safe preview; cancel writes nothing, graph drift refuses, and a fresh
+//      typed-confirmed preview removes the owned tree atomically.
+//   5. Reset demo — the header "Reset demo" button opens a confirm modal that
 //      requires typing RESET, then atomically reseeds the demo.
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -149,6 +152,8 @@ async function checkViewport(browser, viewport) {
             + `season=${read.season_id || null}`);
         }
       };
+      const keep = await create("unrelated Program", "/api/setup/league",
+        { name: "Keep Program" });
       const league = await create("Program", "/api/setup/league", { name: "Del League" });
       // BOUNDARY 1 — the Program-only bootstrap selection. The Season below is
       // a Program-axis create.
@@ -174,7 +179,7 @@ async function checkViewport(browser, viewport) {
         { team_id: team.id, division_id: div.id });
       const bare = await create("Bare Team", "/api/setup/team",
         { club_id: club.id, league_id: league.id, name: "Bare Team" });
-      return { league: league.id, season: season.id, div: div.id,
+      return { keep: keep.id, league: league.id, season: season.id, div: div.id,
         club: club.id, team: team.id, bare: bare.id };
     });
 
@@ -289,7 +294,151 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] the team is still active after Remove from season`);
     }
 
-    // (4) Reset demo: the header database-icon control is visible in demo, and
+    // (4) Explicit Delete subtree.  Reach it only through a fresh ordinary
+    // dependency refusal: no existing delete route silently cascades.  First
+    // cancel a real preview and prove execute was never called.
+    const privatePlayer = await page.evaluate(async (teamId) => {
+      const r = await fetch("/api/setup/player", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ team_id: teamId, name: "Protected Child Name",
+          position: "forward" }),
+      });
+      return { status: r.status, body: await r.json() };
+    }, ids.team);
+    if (privatePlayer.status !== 200 || privatePlayer.body.error
+        || !privatePlayer.body.id) {
+      throw new Error(`[${viewport.label}] could not add the protected preview child: `
+        + JSON.stringify(privatePlayer));
+    }
+    await page.click(
+      `#competition-structure [data-del="league"][data-del-id="${ids.league}"]`);
+    await page.fill("#del-confirm", "Del League");
+    await page.click("[data-del-confirm]");
+    await page.waitForSelector(".modal.blocked [data-subtree-start]", { timeout: 10000 });
+    let subtreeExecRequests = 0;
+    const countSubtreeExec = (r) => {
+      if (r.url() === `${base}/api/admin/subtree-deletion/execute`) subtreeExecRequests += 1;
+    };
+    page.on("request", countSubtreeExec);
+    let releaseHeldPreview;
+    await page.route("**/api/admin/subtree-deletion/preview", async (route) => {
+      await new Promise((resolve) => { releaseHeldPreview = resolve; });
+      await route.continue();
+    }, { times: 1 });
+    await page.focus("[data-subtree-start]");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector('.modal.danger [role="status"]', { timeout: 5000 });
+    if (!releaseHeldPreview) {
+      throw new Error(`[${viewport.label}] preview request was not dispatched from loading state`);
+    }
+    releaseHeldPreview();
+    await page.waitForSelector("[data-subtree-confirm]", { timeout: 10000 });
+    const previewText = await page.textContent(".modal.danger .modal-body");
+    if (!/programs/.test(previewText) || !/teams/.test(previewText)
+        || !/players/.test(previewText)) {
+      throw new Error(`[${viewport.label}] subtree preview omitted owned record groups: ${previewText}`);
+    }
+    if (/Protected Child Name/.test(previewText)) {
+      throw new Error(`[${viewport.label}] subtree preview exposed a protected child label`);
+    }
+    if (!(await page.$eval("[data-subtree-confirm]", (b) => b.disabled))) {
+      throw new Error(`[${viewport.label}] subtree execute enabled without reason/name`);
+    }
+    await page.focus('.modal.danger [data-modal-close]');
+    await page.keyboard.press("Enter");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    if (subtreeExecRequests !== 0) {
+      throw new Error(`[${viewport.label}] cancelling a subtree preview sent execute`);
+    }
+
+    // Re-preview, mutate the affected graph while the preview is open, and
+    // prove the now-stale capability refuses with no partial delete.  The UI
+    // must offer a fresh preview rather than retrying the consumed token.
+    await page.click(
+      `#competition-structure [data-del="league"][data-del-id="${ids.league}"]`);
+    await page.fill("#del-confirm", "Del League");
+    await page.click("[data-del-confirm]");
+    await page.waitForSelector(".modal.blocked [data-subtree-start]", { timeout: 10000 });
+    await page.focus("[data-subtree-start]");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector("[data-subtree-confirm]", { timeout: 10000 });
+    const late = await page.evaluate(async ([clubId, programId]) => {
+      const r = await fetch("/api/setup/team", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ club_id: clubId, league_id: programId,
+          name: "Late Graph Child" }),
+      });
+      return { status: r.status, body: await r.json() };
+    }, [ids.club, ids.league]);
+    if (late.status !== 200 || late.body.error || !late.body.id) {
+      throw new Error(`[${viewport.label}] could not mutate the previewed graph: ${JSON.stringify(late)}`);
+    }
+    await page.fill("#sd-reason", "Retire duplicate competition");
+    await page.fill("#sd-confirm", "wrong case");
+    if (!(await page.$eval("[data-subtree-confirm]", (b) => b.disabled))) {
+      throw new Error(`[${viewport.label}] subtree execute accepted the wrong parent name`);
+    }
+    await page.fill("#sd-confirm", "Del League");
+    await page.waitForFunction(
+      () => !document.querySelector("[data-subtree-confirm]").disabled,
+      null, { timeout: 5000 });
+    const staleResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/admin/subtree-deletion/execute`
+      && r.request().method() === "POST");
+    await page.focus("[data-subtree-confirm]");
+    await page.keyboard.press("Enter");
+    if ((await staleResp).status() === 200) {
+      throw new Error(`[${viewport.label}] stale subtree preview executed`);
+    }
+    await page.waitForSelector("[data-subtree-restart]", { timeout: 10000 });
+    if (!(await getJson(`/api/setup/hierarchy`)).leagues.some((l) => l.id === ids.league)) {
+      throw new Error(`[${viewport.label}] stale refusal partially deleted the Program`);
+    }
+
+    // A fresh preview includes the late child and succeeds once, producing a
+    // success modal and leaving the unrelated demo competition intact.
+    await page.focus("[data-subtree-restart]");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector("[data-subtree-confirm]", { timeout: 10000 });
+    const freshText = await page.textContent(".modal.danger .modal-body");
+    if (!freshText.includes(late.body.id)) {
+      throw new Error(`[${viewport.label}] fresh preview did not include the late child id`);
+    }
+    await page.fill("#sd-reason", "Retire duplicate competition");
+    await page.fill("#sd-confirm", "Del League");
+    const execResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/admin/subtree-deletion/execute`
+      && r.request().method() === "POST");
+    await page.focus("[data-subtree-confirm]");
+    await page.keyboard.press("Enter");
+    const executionResponse = await execResp;
+    if (executionResponse.status() !== 200) {
+      throw new Error(`[${viewport.label}] fresh subtree execution returned `
+        + `${executionResponse.status()}: ${await executionResponse.text()}`);
+    }
+    await page.waitForSelector(".modal.danger [data-modal-close]", { timeout: 10000 });
+    const successText = await page.textContent(".modal.danger .modal-body");
+    if (!/deleted atomically/i.test(successText) || !/Audit event/.test(successText)) {
+      throw new Error(`[${viewport.label}] subtree success did not report atomic/audit outcome`);
+    }
+    await page.click(".modal.danger [data-modal-close]");
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    page.off("request", countSubtreeExec);
+    // The deleted Program was the SAVED active context, so a scoped hierarchy
+    // correctly returns no inferred replacement.  Use context/options' global
+    // League-Admin selector inventory to prove both absence and preservation.
+    const afterSubtree = await getJson("/api/context/options");
+    if ((afterSubtree.programs || []).some((p) => p.id === ids.league)) {
+      throw new Error(`[${viewport.label}] subtree execution left its Program behind`);
+    }
+    if (!(afterSubtree.programs || []).some((p) => p.id === ids.keep)) {
+      throw new Error(`[${viewport.label}] subtree execution removed unrelated Programs: `
+        + JSON.stringify(afterSubtree));
+    }
+
+    // (5) Reset demo: the header database-icon control is visible in demo, and
     // because data exists its dropdown offers "Reset demo data", which opens a
     // confirm modal requiring RESET and atomically reseeds — our Del League is
     // gone afterward.
@@ -332,7 +481,8 @@ async function checkViewport(browser, viewport) {
     const stored = await page.evaluate(() => JSON.stringify({
       local: { ...localStorage }, session: { ...sessionStorage },
     }));
-    for (const marker of ["RESET", "Del League", "Bare Team"]) {
+    for (const marker of ["RESET", "Del League", "Bare Team",
+                          "Retire duplicate competition", "Protected Child Name"]) {
       if (stored.includes(marker)) {
         throw new Error(`[${viewport.label}] destructive form data leaked into browser storage: ${marker}`);
       }
@@ -341,7 +491,7 @@ async function checkViewport(browser, viewport) {
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — blocked delete, clean delete, remove-from-season, reset.`);
+    console.log(`[${viewport.label}] OK — blocked delete, clean delete, remove-from-season, subtree, reset.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

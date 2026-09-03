@@ -265,7 +265,7 @@ class RegistryCoversTheDispatchTests(unittest.TestCase):
         """
         self.assertEqual(len(REGISTRY), len(LIVE))
         self.assertEqual(sum(1 for s in REGISTRY if s.method == "GET"), 75)
-        self.assertEqual(sum(1 for s in REGISTRY if s.method == "POST"), 166)
+        self.assertEqual(sum(1 for s in REGISTRY if s.method == "POST"), 168)
 
 
 class RegistryInternalConsistencyTests(unittest.TestCase):
@@ -596,6 +596,8 @@ _EXPECTED_CLASSIFICATION = {
     ("POST", '/api/accounts/{}/sessions/{}/revoke'): ('session+MANAGE_USERS', 'none'),  # post_accounts_id_sessions_id_revoke
     ("POST", '/api/admin/factory-reset/execute'): ('session+MANAGE_USERS', 'none'),  # post_admin_factory_reset_execute
     ("POST", '/api/admin/factory-reset/preview'): ('session+MANAGE_USERS', 'none'),  # post_admin_factory_reset_preview
+    ("POST", '/api/admin/subtree-deletion/execute'): ('session+MANAGE_USERS', 'none'),  # post_admin_subtree_deletion_execute
+    ("POST", '/api/admin/subtree-deletion/preview'): ('session+MANAGE_USERS', 'none'),  # post_admin_subtree_deletion_preview
     ("POST", '/api/auth/login'): ('none', 'none'),  # post_auth_login
     ("POST", '/api/auth/logout'): ('none', 'none'),  # post_auth_logout
     ("POST", '/api/bootstrap/claim'): ('none', 'none'),  # post_bootstrap_claim
