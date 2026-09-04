@@ -2361,6 +2361,10 @@ class SqlStore:
         with self.transaction():
             self._delete(FactoryResetChallenge, self._FACTORY_RESET_CHALLENGE_ID)
 
+    def get_subtree_deletion_challenge(self, actor_id):
+        """Return this actor's outstanding #429 preview challenge."""
+        return self._get(SubtreeDeletionChallenge, actor_id)
+
     def set_subtree_deletion_challenge(self, challenge):
         """Replace this actor's outstanding #429 challenge atomically."""
         with self.transaction():
@@ -2391,13 +2395,24 @@ class SqlStore:
         self._delete(type(row), row.id)
 
     def lock_subtree_graph(self) -> None:
-        """Exclude graph writers in deterministic table-name order (#429).
+        """Try to exclude every graph writer without joining its lock order.
 
         PostgreSQL's EXCLUSIVE mode conflicts with both ordinary writes and
         ``SELECT ... FOR UPDATE``.  The latter matters for allocation flows:
         they must observe a retained slot *after* this transaction releases it,
         not read its pre-deletion ALLOCATED state and fail before attempting a
-        write.  Plain ACCESS SHARE readers remain allowed.  SQLite's outer
+        write.  Plain ACCESS SHARE readers remain allowed.
+
+        ``NOWAIT`` is load-bearing.  Ordinary writers deliberately use more
+        than one relation order (for example Team -> League when transferring
+        a Team, but League -> Team when creating one).  A graph operation that
+        blocked after acquiring only a prefix of either table order could form
+        an ABBA deadlock with the other writer.  Taking the complete,
+        deterministic SPECS-derived set as a non-blocking try-lock instead
+        either succeeds before any competing writer can enter the graph or
+        fails immediately with PostgreSQL ``55P03``; the transaction boundary
+        translates that into the existing retryable ``lock_not_available``
+        conflict and releases every prefix lock on rollback.  SQLite's outer
         write transaction has already issued BEGIN IMMEDIATE before this method
         is entered, and Memory uses its process-wide RLock.
         """
@@ -2405,7 +2420,7 @@ class SqlStore:
             tables = sorted(spec.table for spec in SPECS.values())
             if tables:
                 self._exec(
-                    f"LOCK TABLE {', '.join(tables)} IN EXCLUSIVE MODE")
+                    f"LOCK TABLE {', '.join(tables)} IN EXCLUSIVE MODE NOWAIT")
 
     def acquire_factory_reset_lock(self, lock) -> bool:
         """Try to become the sole in-progress factory reset installation-

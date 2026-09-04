@@ -4100,6 +4100,29 @@ function subtreeRelationshipGroups(groups) {
   </div>`).join("");
 }
 
+// Retained does not mean byte-for-byte unchanged.  These stable effect codes
+// are produced by the same server plan the challenge fingerprint binds; render
+// them explicitly so the operator consents to every survivor state transition,
+// without exposing a username, account scope, child label, or other payload.
+const SUBTREE_RETAINED_CHANGE_LABEL = {
+  draft_game_unplaced: "Draft games unplaced (they remain drafts)",
+  user_account_deactivated: "User accounts deactivated (active sessions stop working)",
+  ice_slot_released: "Ice slots released (allocated → available)",
+};
+
+function subtreeRetainedChangeGroups(groups) {
+  return (groups || []).map((group) => {
+    const effect = group.effect || "retained_record_changed";
+    const label = SUBTREE_RETAINED_CHANGE_LABEL[effect]
+      || `Other retained change (${effect})`;
+    const ids = (group.record_ids || []).map((id) => `<code>${esc(id)}</code>`).join(", ");
+    return `<div class="sd-group" data-subtree-retained-change="${esc(effect)}">
+      <div class="sd-group-head"><span>${esc(label)}</span>
+        <strong>${esc(String(group.count))}</strong></div>
+      ${ids ? `<div class="sd-ids">${ids}</div>` : ""}</div>`;
+  }).join("");
+}
+
 function subtreeDeleteModalHtml(m) {
   const title = "Delete subtree";
   if (m.step === "loading") {
@@ -4108,18 +4131,42 @@ function subtreeDeleteModalHtml(m) {
       `<button class="act ghost" data-modal-close>Cancel</button>`);
   }
   if (m.step === "error") {
+    const previewFailed = m.errorPhase === "preview";
+    // Only stable domain refusals issued before commit justify a definite
+    // no-write statement.  Transport/proxy failures, internal_error, a missing
+    // code, and every future error default to UNKNOWN: execute may have
+    // committed before response serialization or delivery failed.
+    const confirmedRefusal = ["validation_error", "forbidden", "unauthorized",
+      "not_found", "concurrency_conflict"].includes(m.errorCode);
+    const outcomeUncertain = !confirmedRefusal;
+    let consequence;
+    if (previewFailed && outcomeUncertain) {
+      consequence = "No deletion was requested, but the preview and challenge outcome "
+        + "could not be confirmed. Build a fresh preview before continuing.";
+    } else if (previewFailed) {
+      consequence = "No deletion was requested. Build a fresh preview before continuing.";
+    } else if (outcomeUncertain) {
+      consequence = "The deletion outcome could not be confirmed. Refresh and verify the "
+        + "current records before attempting another deletion.";
+    } else {
+      consequence = "The server refused the deletion, so no deletion was committed. "
+        + "Build a fresh preview before trying again.";
+    }
+    const restartLabel = outcomeUncertain && !previewFailed
+      ? "Refresh and verify"
+      : "Build a fresh preview";
     return modalShell("danger", title,
       `<p class="fr-inline-error" role="alert">${esc(m.error || "The subtree could not be deleted.")}</p>
-       <p class="muted">Nothing was partially deleted. The preview token cannot be reused.</p>`,
+       <p class="muted">${consequence}</p>`,
       `<button class="act ghost" data-modal-close>Close</button>
-       <button class="act danger" data-subtree-restart>Build a fresh preview</button>`);
+       <button class="act danger" data-subtree-restart>${restartLabel}</button>`);
   }
   if (m.step === "success") {
     const total = Object.values(m.deletedCounts || {}).reduce((sum, n) => sum + Number(n || 0), 0);
     return modalShell("danger", title,
       `<p><strong>The subtree was deleted atomically.</strong></p>
-       <p>${esc(String(total))} record${total === 1 ? "" : "s"} removed. Shared and historical
-          records marked as retained were preserved.</p>
+       <p>${esc(String(total))} record${total === 1 ? "" : "s"} removed. Retained rows were
+          not deleted; the link and state changes disclosed in the preview were applied.</p>
        <p class="muted">Audit event <code>${esc(m.auditId || "")}</code> records the actor,
           reason, root, fingerprint and aggregate counts.</p>`,
       `<button class="act primary" data-modal-close>Done</button>`);
@@ -4130,15 +4177,19 @@ function subtreeDeleteModalHtml(m) {
   const deleteRows = subtreePreviewGroups(p.delete_groups);
   const retainedRows = subtreePreviewGroups(p.retained_groups);
   const detachRows = subtreeRelationshipGroups(p.detached_relationship_groups);
+  const retainedChangeRows = subtreeRetainedChangeGroups(p.retained_change_groups);
   return modalShell("danger", title,
     `<p class="sd-warning" role="alert"><strong>This permanently deletes the selected
        ${esc(DEL_NOUN[m.kind] || "record")} and every exclusively owned descendant.</strong>
        Ordinary Delete never does this. This operation cannot be undone.</p>
      <div class="section-title" style="margin-top:0">Will be deleted</div>
      <div class="sd-groups" data-subtree-delete-groups>${deleteRows}</div>
+     ${retainedChangeRows ? `<div class="section-title">Retained records that will change</div>
+       <p class="muted">These records will not be deleted, but their state will change as shown.</p>
+       <div class="sd-groups" data-subtree-retained-change-groups>${retainedChangeRows}</div>` : ""}
      ${detachRows ? `<div class="section-title">Shared links cleared</div>
        <div class="sd-groups" data-subtree-detach-groups>${detachRows}</div>` : ""}
-     ${retainedRows ? `<details class="sd-retained"><summary>Retained shared/history records</summary>
+     ${retainedRows ? `<details class="sd-retained"><summary>Records retained (not deleted)</summary>
        <div class="sd-groups">${retainedRows}</div></details>` : ""}
      <p class="muted">This preview expires at ${esc(p.expires_at || "")} and becomes stale
        if any affected record or relationship changes.</p>
@@ -4287,7 +4338,9 @@ function wireModal(c) {
   }
   // Explicit subtree deletion (#429): a fresh server-projected preview owns
   // the entire confirmation screen.  Exact parent name plus a non-empty reason
-  // unlock execute; any refusal requires a new single-use preview.
+  // unlock execute.  A confirmed refusal preserves the exact challenge, but
+  // this UI rebuilds the preview so the operator re-consents to the live graph;
+  // an uncertain transport outcome must be verified rather than blindly replayed.
   if (modal && modal.type === "subtree-delete") {
     const restartBtn = c.querySelector("[data-subtree-restart]");
     if (restartBtn) restartBtn.onclick = () => startSubtreeDeletion(
@@ -4314,7 +4367,8 @@ function wireModal(c) {
         });
         toast = "";
         if (res && res.error) {
-          modal = { ...m, step: "error", error: res.error.message };
+          modal = { ...m, step: "error", errorPhase: "execute",
+                    errorCode: res.error.code, error: res.error.message };
           return repaintModalOnly();
         }
         modal = { ...m, step: "success", deletedCounts: res.deleted_counts,
@@ -4427,7 +4481,8 @@ async function startFactoryReset() {
 
 // Open #429 from an ordinary dependency refusal.  Preview is always fetched
 // live; reopening/retrying mints a new actor-bound capability rather than
-// trusting browser state or reusing a token whose outcome may be uncertain.
+// trusting browser state.  A transport failure can hide a completed preview,
+// so the operator starts over instead of assuming whether a token was minted.
 async function startSubtreeDeletion(kind, id, name, rootType) {
   if (!canDeleteSubtree() || !SUBTREE_ROOT_BY_DEL_KIND[kind]
       || SUBTREE_ROOT_BY_DEL_KIND[kind] !== rootType) return;
@@ -4443,6 +4498,7 @@ async function startSubtreeDeletion(kind, id, name, rootType) {
   toast = "";
   if (res && res.error) {
     modal = { type: "subtree-delete", step: "error", kind, id, name, rootType,
+              errorPhase: "preview", errorCode: res.error.code,
               error: res.error.message };
   } else {
     modal = { type: "subtree-delete", step: "confirm", kind, id, name, rootType,

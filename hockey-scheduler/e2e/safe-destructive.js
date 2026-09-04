@@ -311,11 +311,52 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] could not add the protected preview child: `
         + JSON.stringify(privatePlayer));
     }
+    const boundPlayerAccount = await page.evaluate(async (playerId) => {
+      const r = await fetch("/api/accounts", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "subtree-bound-player",
+          password: "SubtreeBoundPlayer9!", role: "player",
+          scope: { player_id: playerId } }),
+      });
+      return { status: r.status, body: await r.json() };
+    }, privatePlayer.body.id);
+    if (boundPlayerAccount.status !== 200 || boundPlayerAccount.body.error
+        || !boundPlayerAccount.body.id) {
+      throw new Error(`[${viewport.label}] could not create the retained account effect: `
+        + JSON.stringify(boundPlayerAccount));
+    }
     await page.click(
       `#competition-structure [data-del="league"][data-del-id="${ids.league}"]`);
     await page.fill("#del-confirm", "Del League");
     await page.click("[data-del-confirm]");
     await page.waitForSelector(".modal.blocked [data-subtree-start]", { timeout: 10000 });
+
+    // A lost preview response can happen after the server committed the new
+    // challenge.  Drive that exact boundary (fetch fully, then abort delivery)
+    // and ensure the UI never claims that no challenge was created.
+    let lostPreview;
+    await page.route("**/api/admin/subtree-deletion/preview", async (route) => {
+      const response = await route.fetch();
+      lostPreview = { status: response.status(), body: await response.json() };
+      await route.abort("failed");
+    }, { times: 1 });
+    await page.focus("[data-subtree-start]");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector("[data-subtree-restart]", { timeout: 10000 });
+    if (!lostPreview || lostPreview.status !== 200
+        || !lostPreview.body.challenge_token) {
+      throw new Error(`[${viewport.label}] preview-loss probe did not first create a challenge: `
+        + JSON.stringify(lostPreview));
+    }
+    const lostPreviewText = await page.textContent(".modal.danger .modal-body");
+    if (!/No deletion was requested/.test(lostPreviewText)
+        || !/could not be confirmed/.test(lostPreviewText)
+        || /created no new deletion preview or challenge token/.test(lostPreviewText)) {
+      throw new Error(`[${viewport.label}] preview-loss outcome was stated as certain: `
+        + lostPreviewText);
+    }
+
     let subtreeExecRequests = 0;
     const countSubtreeExec = (r) => {
       if (r.url() === `${base}/api/admin/subtree-deletion/execute`) subtreeExecRequests += 1;
@@ -326,7 +367,7 @@ async function checkViewport(browser, viewport) {
       await new Promise((resolve) => { releaseHeldPreview = resolve; });
       await route.continue();
     }, { times: 1 });
-    await page.focus("[data-subtree-start]");
+    await page.focus("[data-subtree-restart]");
     await page.keyboard.press("Enter");
     await page.waitForSelector('.modal.danger [role="status"]', { timeout: 5000 });
     if (!releaseHeldPreview) {
@@ -342,6 +383,11 @@ async function checkViewport(browser, viewport) {
     if (/Protected Child Name/.test(previewText)) {
       throw new Error(`[${viewport.label}] subtree preview exposed a protected child label`);
     }
+    if (!/User accounts deactivated/.test(previewText)
+        || !previewText.includes(boundPlayerAccount.body.id)) {
+      throw new Error(`[${viewport.label}] subtree preview did not disclose the retained account change: `
+        + previewText);
+    }
     if (!(await page.$eval("[data-subtree-confirm]", (b) => b.disabled))) {
       throw new Error(`[${viewport.label}] subtree execute enabled without reason/name`);
     }
@@ -353,8 +399,9 @@ async function checkViewport(browser, viewport) {
     }
 
     // Re-preview, mutate the affected graph while the preview is open, and
-    // prove the now-stale capability refuses with no partial delete.  The UI
-    // must offer a fresh preview rather than retrying the consumed token.
+    // prove the now-stale capability refuses with no partial delete.  The exact
+    // challenge is preserved, but its fingerprint stays stale; the UI must
+    // offer a fresh preview rather than blindly replaying the same refusal.
     await page.click(
       `#competition-structure [data-del="league"][data-del-id="${ids.league}"]`);
     await page.fill("#del-confirm", "Del League");
@@ -406,24 +453,65 @@ async function checkViewport(browser, viewport) {
     if (!freshText.includes(late.body.id)) {
       throw new Error(`[${viewport.label}] fresh preview did not include the late child id`);
     }
+    if (!/User accounts deactivated/.test(freshText)
+        || !freshText.includes(boundPlayerAccount.body.id)) {
+      throw new Error(`[${viewport.label}] fresh preview lost its retained account disclosure`);
+    }
     await page.fill("#sd-reason", "Retire duplicate competition");
     await page.fill("#sd-confirm", "Del League");
-    const execResp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/admin/subtree-deletion/execute`
-      && r.request().method() === "POST");
-    await page.focus("[data-subtree-confirm]");
-    await page.keyboard.press("Enter");
-    const executionResponse = await execResp;
-    if (executionResponse.status() !== 200) {
-      throw new Error(`[${viewport.label}] fresh subtree execution returned `
-        + `${executionResponse.status()}: ${await executionResponse.text()}`);
+    if (viewport.label === "desktop") {
+      // The destructive transaction may commit before a later response-layer
+      // failure. Fetch the real response (and therefore commit), replace only
+      // browser delivery with the server's generic structured 500, then prove
+      // the operator sees UNKNOWN rather than the dangerously false "nothing
+      // was deleted" assurance.
+      let lostExecution;
+      await page.route("**/api/admin/subtree-deletion/execute", async (route) => {
+        const response = await route.fetch();
+        lostExecution = { status: response.status(), body: await response.json() };
+        await route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ error: { code: "internal_error",
+            message: "The server could not complete this request." } }),
+        });
+      }, { times: 1 });
+      await page.focus("[data-subtree-confirm]");
+      await page.keyboard.press("Enter");
+      await page.waitForSelector("[data-subtree-restart]", { timeout: 10000 });
+      if (!lostExecution || lostExecution.status !== 200
+          || !lostExecution.body.audit_id) {
+        throw new Error(`[${viewport.label}] execute-loss probe did not first commit: `
+          + JSON.stringify(lostExecution));
+      }
+      const lostExecutionText = await page.textContent(".modal.danger .modal-body");
+      const lostExecutionAction = await page.textContent("[data-subtree-restart]");
+      if (!/outcome could not be confirmed/.test(lostExecutionText)
+          || !/Refresh and verify/.test(lostExecutionAction)
+          || /Nothing was deleted/.test(lostExecutionText)
+          || /no deletion was committed/.test(lostExecutionText)) {
+        throw new Error(`[${viewport.label}] execute-loss outcome was stated as certain: `
+          + lostExecutionText);
+      }
+      await page.click('.modal.danger [data-modal-close]');
+    } else {
+      const execResp = page.waitForResponse((r) =>
+        r.url() === `${base}/api/admin/subtree-deletion/execute`
+        && r.request().method() === "POST");
+      await page.focus("[data-subtree-confirm]");
+      await page.keyboard.press("Enter");
+      const executionResponse = await execResp;
+      if (executionResponse.status() !== 200) {
+        throw new Error(`[${viewport.label}] fresh subtree execution returned `
+          + `${executionResponse.status()}: ${await executionResponse.text()}`);
+      }
+      await page.waitForSelector(".modal.danger [data-modal-close]", { timeout: 10000 });
+      const successText = await page.textContent(".modal.danger .modal-body");
+      if (!/deleted atomically/i.test(successText) || !/Audit event/.test(successText)) {
+        throw new Error(`[${viewport.label}] subtree success did not report atomic/audit outcome`);
+      }
+      await page.click(".modal.danger [data-modal-close]");
     }
-    await page.waitForSelector(".modal.danger [data-modal-close]", { timeout: 10000 });
-    const successText = await page.textContent(".modal.danger .modal-body");
-    if (!/deleted atomically/i.test(successText) || !/Audit event/.test(successText)) {
-      throw new Error(`[${viewport.label}] subtree success did not report atomic/audit outcome`);
-    }
-    await page.click(".modal.danger [data-modal-close]");
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
     page.off("request", countSubtreeExec);
     // The deleted Program was the SAVED active context, so a scoped hierarchy
@@ -436,6 +524,14 @@ async function checkViewport(browser, viewport) {
     if (!(afterSubtree.programs || []).some((p) => p.id === ids.keep)) {
       throw new Error(`[${viewport.label}] subtree execution removed unrelated Programs: `
         + JSON.stringify(afterSubtree));
+    }
+    const accountsAfter = await getJson("/api/accounts");
+    const retainedAccount = (accountsAfter.user_accounts || []).find(
+      (a) => a.id === boundPlayerAccount.body.id);
+    if (!retainedAccount || retainedAccount.active !== false
+        || retainedAccount.scope.player_id) {
+      throw new Error(`[${viewport.label}] disclosed retained account change was not applied: `
+        + JSON.stringify(retainedAccount));
     }
 
     // (5) Reset demo: the header database-icon control is visible in demo, and

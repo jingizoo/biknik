@@ -1726,6 +1726,13 @@ class InMemoryStore:
         with self._lock:
             self._factory_reset_challenge = None
 
+    def get_subtree_deletion_challenge(
+            self, actor_id: str
+    ) -> Optional[SubtreeDeletionChallenge]:
+        """Return this actor's outstanding #429 preview challenge."""
+        with self._lock:
+            return self.subtree_deletion_challenges.get(actor_id)
+
     def set_subtree_deletion_challenge(
             self, challenge: SubtreeDeletionChallenge
     ) -> SubtreeDeletionChallenge:
