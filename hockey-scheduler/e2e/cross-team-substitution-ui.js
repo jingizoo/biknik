@@ -21,8 +21,9 @@
 //     legacy same-team detail is opened;
 //   * cross-team detail ignores private team/roster fields even when a stale
 //     or over-broad response contains them;
-//   * an accepted borrowed game renders as a confirmed Substitute on player
-//     and guardian Home without target team status or a roster link;
+//   * an accepted borrowed game renders from the player's real attendance
+//     response (not merely its roster seat), remains actionable after Can't
+//     Play, and never exposes target team status or a roster link;
 //   * the existing same-team "View Opportunity" interaction remains; and
 //   * scoped text meets 4.5:1 contrast, the row has a >=44px target, and the
 //     complete list has no horizontal overflow at 390px.
@@ -278,7 +279,7 @@ const guardianDetailOffer = () => focusedCrossTeamOffer({
   startTime: "2026-09-27T19:30:00+00:00",
 });
 
-const borrowedNextGame = () => ({
+const borrowedNextGame = (attendanceStatus = "confirmed") => ({
   game_id: "borrowed-game",
   cross_team: true,
   team_name: "Bronze Team 4",
@@ -286,7 +287,7 @@ const borrowedNextGame = () => ({
   start_time: "2026-09-11T19:30:00+00:00",
   venue_name: "Twin Rinks",
   rink_name: "Blue Rink",
-  attendance_status: "confirmed",
+  attendance_status: attendanceStatus,
   // Deliberately over-broad private state: every borrowed-card surface,
   // including the status feed, must ignore it rather than relying on null.
   team_status: "sub_search",
@@ -330,6 +331,8 @@ async function checkViewport(browser, viewport) {
   const guardianSameDeclineBodies = [];
   const guardianDetailDeclineBodies = [];
   const guardianDetailReads = [];
+  const borrowedAvailabilityBodies = [];
+  const borrowedGuardianAvailabilityBodies = [];
   let enrolled = false;
   let crossVisible = true;
   let raceEnrolledTarget = null;
@@ -342,6 +345,8 @@ async function checkViewport(browser, viewport) {
   let guardianInlineResolved = false;
   let guardianSameResolved = false;
   let guardianDetailResolved = false;
+  let borrowedPlayerAttendance = "confirmed";
+  let borrowedGuardianAttendance = "not_responded";
   let notificationReads = 0;
   let expectedConflictInFlight = false;
   let holdNextPlayerHomeRead = false;
@@ -467,7 +472,9 @@ async function checkViewport(browser, viewport) {
         return json(route, { juniors: [{
           player_id: "junior-1",
           player_name: "Junior One",
-          next_game: borrowedNextGame(),
+          // Models an exact borrowed seat created by a coach override: the
+          // seat exists, but no player/guardian attendance response does.
+          next_game: borrowedNextGame(borrowedGuardianAttendance),
           substitute_offers: [
             ...(guardianInlineResolved ? [] : [guardianInlineOffer()]),
             ...(guardianSameResolved ? [] : [guardianSameTeamOffer()]),
@@ -519,7 +526,7 @@ async function checkViewport(browser, viewport) {
         }
         return json(route, {
           player_id: "player-1", player_name: "Bronze One Player",
-          next_game: borrowedNextGame(), today_count: 1,
+          next_game: borrowedNextGame(borrowedPlayerAttendance), today_count: 1,
           substitute_offers: [
             ...(offerResolved ? [] : [crossTeamOffer()]),
             ...(sameViewOfferResolved ? [] : [sameViewOffer()]),
@@ -531,6 +538,22 @@ async function checkViewport(browser, viewport) {
           substitute_opportunities: opportunities(),
           unread_notifications: 0,
         });
+      }
+      if (p === "/api/games/borrowed-game/availability"
+          && request.method() === "POST") {
+        const body = request.postDataJSON();
+        borrowedAvailabilityBodies.push(body);
+        borrowedPlayerAttendance = body.availability_status === "unavailable"
+          ? "checked_out" : "confirmed";
+        return json(route, { availability_status: body.availability_status });
+      }
+      if (p === "/api/me/guardian/junior-1/games/borrowed-game/availability"
+          && request.method() === "POST") {
+        const body = request.postDataJSON();
+        borrowedGuardianAvailabilityBodies.push(body);
+        borrowedGuardianAttendance = body.availability_status === "unavailable"
+          ? "checked_out" : "confirmed";
+        return json(route, { availability_status: body.availability_status });
       }
       if (p === "/api/me/substitute-opportunities/game-cross"
           && request.method() === "GET") {
@@ -726,6 +749,32 @@ async function checkViewport(browser, viewport) {
         || await page.locator('[data-open-roster="borrowed-game"]').count()
         || await page.locator("[data-ph-backout]").count() !== 1) {
       fail("borrowed next game exposed the wrong confirmed/backout/roster actions");
+    }
+    // Can't Play must not strand the accepted borrowed enrollment. The same
+    // public card stays visible as Checked Out, exposes an enabled I'm In,
+    // and re-confirming returns it to the disabled confirmed state. Run this
+    // through the shipped event handlers at desktop and 390px.
+    await page.locator("[data-ph-backout]").click();
+    await page.getByRole("button", { name: "Confirm Can't Play" }).click();
+    await page.waitForFunction(
+      () => /Checked Out/.test(document.getElementById("content")?.textContent || "")
+        && !document.querySelector("[data-ph-confirm]")?.disabled,
+      null, { timeout: 10000 });
+    if (JSON.stringify(borrowedAvailabilityBodies) !== JSON.stringify([
+      { player_id: "player-1", availability_status: "unavailable" },
+    ]) || await page.locator('[data-open-roster="borrowed-game"]').count()) {
+      fail(`borrowed Can't Play lost its self-only/private contract: ${JSON.stringify(borrowedAvailabilityBodies)}`);
+    }
+    await page.getByRole("button", { name: "I'm In", exact: true }).click();
+    await page.waitForFunction(
+      () => /You're In ✓/.test(document.getElementById("content")?.textContent || "")
+        && !!document.querySelector("[data-ph-confirm]")?.disabled,
+      null, { timeout: 10000 });
+    if (JSON.stringify(borrowedAvailabilityBodies) !== JSON.stringify([
+      { player_id: "player-1", availability_status: "unavailable" },
+      { player_id: "player-1", availability_status: "available" },
+    ])) {
+      fail(`borrowed re-confirm lost its player response: ${JSON.stringify(borrowedAvailabilityBodies)}`);
     }
     const headingTags = await page.evaluate(() => ({
       offers: document.getElementById("ph-sub-offers-title")?.tagName,
@@ -1737,10 +1786,23 @@ async function checkViewport(browser, viewport) {
       null, { timeout: 10000 });
     const guardianHomeText = (await page.textContent("#content")) || "";
     if (!/Bronze Team 4 vs Bronze Team 5/.test(guardianHomeText)
-        || !/Confirmed\s*Substitute/.test(guardianHomeText)
+        || !/Not Responded\s*Substitute/.test(guardianHomeText)
         || /Team Status/.test(guardianHomeText)
         || /Sub Search/.test(guardianHomeText)) {
       fail(`guardian borrowed game exposed private team state or lost its role: ${guardianHomeText}`);
+    }
+    const guardianConfirm = page.locator('[data-g-confirm="junior-1"]');
+    if (await guardianConfirm.isDisabled()
+        || (await guardianConfirm.textContent() || "").trim() !== "I'm In") {
+      fail("coach-seated borrowed junior was falsely rendered player-confirmed");
+    }
+    await guardianConfirm.click();
+    await page.waitForFunction(
+      () => !!document.querySelector('[data-g-confirm="junior-1"]')?.disabled,
+      null, { timeout: 10000 });
+    if (JSON.stringify(borrowedGuardianAvailabilityBodies)
+        !== JSON.stringify([{ availability_status: "available" }])) {
+      fail(`guardian borrowed confirmation sent the wrong response: ${JSON.stringify(borrowedGuardianAvailabilityBodies)}`);
     }
     const guardianInlineAccept = page.locator(
       '[data-g-accept-offer="junior-1|guardian-inline-offer"]');

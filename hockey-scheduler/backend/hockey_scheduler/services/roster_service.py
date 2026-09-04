@@ -1279,8 +1279,10 @@ class RosterService:
         * an ordinary seated player must still have a LIVE membership
           context for the row's side; or
         * an ACCEPTED cross-team substitute must still have the one matched
-          accepted enrollment + occupying substitute-pool row that
-          :meth:`accepted_cross_team_roster_entry` validates.
+          accepted enrollment + substitute-pool row that
+          :meth:`accepted_cross_team_roster_entry` validates.  A backed-out
+          UNAVAILABLE row may use that authority only after the original
+          cross-team relationship is revalidated from live, locked state.
 
         The second authority is deliberately narrow. Accepting a borrowed
         seat makes that game a current player commitment; choosing MAYBE
@@ -1298,7 +1300,8 @@ class RosterService:
         comparison is reached.
 
         NO OPEN-SLOT CHECK IS ADDED by either step — the ruling forbids
-        one here, and the re-confirm caller keeps running its own.
+        one here, and the re-confirm caller keeps running its own after this
+        authorization gate.
 
         Returns the row's ``(team_side, slot_type)`` attribution, never
         ``None``: the re-confirm caller needs the pair for its slot gate,
@@ -1315,14 +1318,47 @@ class RosterService:
 
         # A cross-team acceptance is its own narrow seat authority. Reuse the
         # paired-row oracle that exposes this commitment on Player Home so
-        # rendering and the Home attendance action cannot disagree. Restrict
-        # the exception to ACCEPTED: a backed-out UNAVAILABLE row cannot be
-        # resurrected through it.
-        borrowed = self.accepted_cross_team_roster_entry(game, player)
-        if (entry.status == RosterEntryStatus.ACCEPTED
+        # rendering and the Home attendance action cannot disagree. ACCEPTED
+        # handles first confirmation; UNAVAILABLE is the exact paired row's
+        # recovery path after the player backs out. REMOVED and every
+        # unmatched/corrupt row remain outside this exception.
+        borrowed = self.accepted_cross_team_roster_entry(
+            game, player, include_unavailable=True)
+        if (entry.status in {
+                    RosterEntryStatus.ACCEPTED,
+                    RosterEntryStatus.UNAVAILABLE,
+                }
                 and borrowed is not None
                 and borrowed.id == entry.id
                 and borrowed.attribution == attribution):
+            # ACCEPTED is durable history, not standing permission.  The
+            # paired-row oracle above proves which historical relationship
+            # created this seat; before a player can confirm/re-confirm it,
+            # lock and revalidate every live fact which originally made that
+            # cross-team relationship eligible.  This deliberately leaves a
+            # post-subtree-deletion row visible on Home for honest history,
+            # while refusing to turn its frozen source ids into authorization.
+            accepted = [
+                sub for sub in
+                self.store.substitute_enrollments_for_player(player.id)
+                if (sub.game_id == game.id
+                    and sub.status == SubstituteStatus.ACCEPTED
+                    and self._is_cross_team_enrollment(sub)
+                    and sub.team_id == attribution[0]
+                    and sub.slot_type == attribution[1])
+            ]
+            if len(accepted) != 1:
+                raise NotEligibleError(
+                    f"{player.name} cannot {action}: the accepted "
+                    "cross-team seat could not be verified.")
+            locked_player = self.store.get_player_for_update(player.id)
+            decision_at = self.clock()
+            player = self._require_locked_active_player(
+                player.id, locked_player)
+            self._require_cross_team_game_actionable(
+                game, as_of=decision_at)
+            self._require_cross_team_enrollment_context(
+                game, player, accepted[0])
             return attribution
 
         ctx = self._require_membership_context(game, player)
@@ -1882,6 +1918,7 @@ class RosterService:
         expected_target_team_id: Optional[str] = None,
         require_target_identity: bool = False,
         allow_cross_team_response: bool = True,
+        response_source: str = "player",
     ) -> GameRosterEntry:
         # The whole read → validate → decide → write path runs inside ONE
         # transaction, so no concurrent request can cancel/lock the game or
@@ -1979,7 +2016,8 @@ class RosterService:
                         game, player, sub)
                     entry = self._accept_offered_substitute(
                         game, sub, player_id, actor_id,
-                        accepted_at=decision_at)
+                        accepted_at=decision_at,
+                        response_source=response_source)
             else:
                 # Preserve the established same-team contract exactly: game
                 # start and explicit expiry remain independent legacy checks.
@@ -2002,6 +2040,7 @@ class RosterService:
     def _accept_offered_substitute(
         self, game, sub, player_id: str, actor_id: Optional[str],
         accepted_at: Optional[datetime] = None,
+        response_source: Optional[str] = None,
     ) -> GameRosterEntry:
         # Runs inside accept_substitute's transaction (the game/sub were fetched
         # and validated within that same unit, so no interleaving is possible).
@@ -2027,6 +2066,23 @@ class RosterService:
         entry = self._add_to_roster_entry(
             game, player_id, team_id, sub.position,
             seated_at=accepted_at)
+        if response_source is not None:
+            # Cross-team offers are accepted only through the signed-in
+            # Player/verified-Guardian routes. Persist that consent as the
+            # same GameAvailability fact the Home attendance control writes,
+            # inside this acceptance transaction. The explicit coach
+            # add-to-roster override never reaches this branch, so seating a
+            # player cannot manufacture an answer on their behalf.
+            existing = self.store.availability_for_player(game_id, player_id)
+            self.store.upsert_availability(GameAvailability(
+                id=(existing.id if existing is not None
+                    else self.store.next_id("avail")),
+                game_id=game_id,
+                player_id=player_id,
+                availability_status=AvailabilityStatus.AVAILABLE,
+                response_source=response_source,
+                responded_at=sub.accepted_at,
+            ))
         self._audit(
             game_id,
             AuditAction.SUBSTITUTE_ACCEPTED,
@@ -3334,7 +3390,7 @@ class RosterService:
         return ctx.team_id if ctx is not None else None
 
     def accepted_cross_team_roster_entry(
-        self, game, player,
+        self, game, player, *, include_unavailable: bool = False,
     ) -> Optional[GameRosterEntry]:
         """The player's one current accepted borrowed seat, or ``None``.
 
@@ -3343,7 +3399,10 @@ class RosterService:
         It exists for the player's own schedule projection: once a player has
         accepted a cross-team offer, Player Home must count and render the
         game so they can back out, without granting access to the borrowing
-        side's private roster workflow.
+        side's private roster workflow. ``include_unavailable`` admits only
+        that same exact paired seat after the player backs out, so Home can
+        offer the ordinary re-confirm action. A coach-REMOVED row and every
+        other non-occupying state remain terminal from player self-service.
 
         The roster row and enrollment must independently agree on the exact
         game side and slot.  While the source Team/Membership rows still
@@ -3352,8 +3411,11 @@ class RosterService:
         provenance columns deliberately have no foreign keys so that history
         survives), but one missing row or a contradictory survivor is corrupt
         and fails closed.  A bare seat, an enrollment without a seat,
-        terminal/non-occupying history, half-written provenance, conflicting
-        rows, or a player who is no longer active all fail closed.
+        unsupported history, half-written provenance, conflicting rows, or a
+        player who is no longer active all fail closed.  Paired source-row
+        deletion remains displayable history, but this read helper does not
+        authorize re-seating; :meth:`_authorize_seated_side` revalidates the
+        live relationship before that mutation.
         """
         if game is None or player is None or not player.is_active:
             return None
@@ -3361,7 +3423,9 @@ class RosterService:
         if (entry is None
                 or entry.roster_role != RosterRole.SUBSTITUTE_ADDED
                 or entry.selection_source != SelectionSource.SUBSTITUTE_POOL
-                or not entry.status.is_confirmed_body
+                or not (entry.status.is_confirmed_body
+                        or (include_unavailable
+                            and entry.status == RosterEntryStatus.UNAVAILABLE))
                 or entry.attribution is None):
             return None
         side, slot_type = entry.attribution
@@ -3411,14 +3475,16 @@ class RosterService:
     def player_home_team_for_game(self, game, player) -> Optional[str]:
         """The side used only to select a player's own schedule games.
 
-        Seasonal membership remains the ordinary answer.  A fully matched,
-        still-occupying accepted cross-team seat is also a real commitment
-        and therefore belongs on Player Home.  If both authorities exist and
+        Seasonal membership remains the ordinary answer. A fully matched
+        accepted cross-team seat is also a real commitment and therefore
+        belongs on Player Home while occupying and after a player back-out,
+        when the card is the recovery path. If both authorities exist and
         disagree, the state is ambiguous and the schedule projection exposes
         neither side.
         """
         member_side = self.team_for_game(game, player)
-        borrowed = self.accepted_cross_team_roster_entry(game, player)
+        borrowed = self.accepted_cross_team_roster_entry(
+            game, player, include_unavailable=True)
         borrowed_side = borrowed.team_side if borrowed is not None else None
         if (member_side is not None and borrowed_side is not None
                 and member_side != borrowed_side):
@@ -4592,8 +4658,9 @@ class RosterService:
         Every Player Home scan pairs it with
         :meth:`player_home_team_for_game` (see :meth:`_plays_in`). Ordinary
         participation is still decided by the one membership authority; the
-        only additional selector is a fully matched, still-occupying accepted
-        cross-team seat used solely for the player's own schedule."""
+        only additional selector is a fully matched accepted cross-team seat
+        used solely for the player's own schedule. A player-backed-out seat
+        remains visible as the route to re-confirm it."""
         return (not g.cancelled and g.published and not g.is_draft
                 and g.start_time is not None)
 
@@ -4626,9 +4693,10 @@ class RosterService:
         ``player_home_team_for_game`` keeps that membership rule, including
         ``team_for_game``'s permanent-pointer fallback for a game with NO
         LeagueSeason binding. It additionally recognizes only a fully
-        matched, occupying accepted cross-team seat. That exception does not
-        feed private-game authorization and disappears when the player backs
-        out or the seat otherwise stops occupying a slot.
+        matched accepted cross-team seat. That exception does not feed
+        private-game authorization. A player-backed-out UNAVAILABLE row stays
+        visible only as the ordinary re-confirm route; coach-REMOVED and
+        malformed rows disappear.
 
         Same predicate, same order and the same authority
         :meth:`list_player_offers` has used since the cutover, so the Player

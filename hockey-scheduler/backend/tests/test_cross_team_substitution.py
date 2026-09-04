@@ -788,14 +788,15 @@ class CrossTeamAvailabilityContract(_CrossTeamContract):
                     "cross_team": True,
                 }, (label, events[0]))
 
-    def test_accepted_borrowed_game_is_home_visible_until_player_backs_out(self):
+    def test_accepted_borrowed_game_stays_home_visible_for_reconfirm(self):
         """An accepted Team 4 seat is a schedule fact, not private Team 4 data.
 
         The borrowing player must see the earlier game on Home and be able to
         use the ordinary ``Can't Play`` path, but the payload must not publish
-        Team 4's aggregate roster status.  Once the durable seat stops
-        occupying a slot, the borrowed game no longer belongs in their
-        personal schedule or today's count.
+        Team 4's aggregate roster status. Once the durable seat stops
+        occupying a slot, the same public-fixture card is the only reachable
+        re-confirm path; it stays checked out until the exact paired accepted
+        enrollment reclaims its still-open slot.
         """
         for label, fx in self._each():
             with self.subTest(backend=label):
@@ -811,6 +812,18 @@ class CrossTeamAvailabilityContract(_CrossTeamContract):
                 accepted = fx["api"].accept_substitute(
                     fx["game"]["id"], fx["player"]["id"])
                 self.assertEqual(accepted.get("status"), "accepted", accepted)
+                consent = fx["store"].availability_for_player(
+                    fx["game"]["id"], fx["player"]["id"])
+                accepted_enrollment = fx["store"].substitute_for_player(
+                    fx["game"]["id"], fx["player"]["id"])
+                self.assertEqual(
+                    consent.availability_status.value, "available",
+                    (label, consent))
+                self.assertEqual(consent.response_source, "player",
+                                 (label, consent))
+                self.assertEqual(consent.responded_at,
+                                 accepted_enrollment.accepted_at,
+                                 (label, consent, accepted_enrollment))
 
                 # Both fixtures are on 2026-02-01; the borrowed 18:00 game is
                 # earlier than the player's own 20:00 game.
@@ -873,8 +886,176 @@ class CrossTeamAvailabilityContract(_CrossTeamContract):
 
                 after = fx["api"].get_player_home(fx["player"]["id"])
                 self.assertEqual(
-                    after["next_game"]["game_id"], fx["own_game"]["id"], after)
-                self.assertEqual(after["today_count"], 1, after)
+                    after["next_game"]["game_id"], fx["game"]["id"], after)
+                self.assertTrue(after["next_game"]["cross_team"], after)
+                self.assertIsNone(after["next_game"]["team_status"], after)
+                self.assertEqual(
+                    after["next_game"]["attendance_status"], "checked_out",
+                    after)
+                self.assertEqual(after["today_count"], 2, after)
+
+                recovered = fx["api"].set_availability(
+                    fx["game"]["id"], fx["player"]["id"], "available",
+                    actor_id=fx["player"]["id"])
+                self.assertNotIn("error", recovered, (label, recovered))
+                recovered_entry = fx["store"].roster_entry_for_player(
+                    fx["game"]["id"], fx["player"]["id"])
+                self.assertEqual(
+                    recovered_entry.status.value, "confirmed",
+                    (label, recovered_entry))
+                histories = [
+                    row for row in
+                    fx["store"].substitute_enrollments_for_player(
+                        fx["player"]["id"])
+                    if row.game_id == fx["game"]["id"]]
+                self.assertEqual(len(histories), 1, (label, histories))
+                self.assertEqual(histories[0].status.value, "accepted",
+                                 (label, histories))
+                accepted_audits = [
+                    row for row in fx["store"].audit_for_game(
+                        fx["game"]["id"])
+                    if (row.action == AuditAction.SUBSTITUTE_ACCEPTED
+                        and row.subject_player_id == fx["player"]["id"])]
+                self.assertEqual(len(accepted_audits), 1,
+                                 (label, accepted_audits))
+                recovered_home = fx["api"].get_player_home(
+                    fx["player"]["id"])
+                self.assertEqual(
+                    recovered_home["next_game"]["attendance_status"],
+                    "confirmed", (label, recovered_home))
+
+    def test_coach_override_does_not_claim_player_confirmation(self):
+        """Seating and player consent remain separate facts on both paths.
+
+        Same-team is the compatibility control: before #450 a coach's
+        add-to-roster override left Player Home at Not Responded. Cross-team
+        uses the same rule while keeping only public fixture labels visible.
+        In either case the player's own I'm In action remains enabled and is
+        what creates the AVAILABLE response.
+        """
+        for label, fx in self._each():
+            with self.subTest(backend=label):
+                cases = (
+                    ("same", fx["own_game"]["id"], fx["team1"]["id"], None),
+                    ("cross", fx["game"]["id"], fx["team4"]["id"],
+                     fx["team4"]["id"]),
+                )
+                for kind, game_id, team_id, target_team_id in cases:
+                    with self.subTest(backend=label, kind=kind):
+                        enrolled = fx["api"].enroll_substitute(
+                            game_id, fx["player"]["id"],
+                            target_team_id=target_team_id)
+                        self.assertEqual(enrolled.get("status"), "enrolled",
+                                         (label, kind, enrolled))
+                        if kind == "cross":
+                            _Fixture.open_team4_slot(fx)
+                        seated = fx["api"].add_substitute_to_roster(
+                            game_id, fx["player"]["id"], actor_id="coach",
+                            authorized_team_id=team_id)
+                        self.assertEqual(seated.get("status"), "accepted",
+                                         (label, kind, seated))
+                        self.assertIsNone(
+                            fx["store"].availability_for_player(
+                                game_id, fx["player"]["id"]),
+                            (label, kind))
+
+                        fx["api"].roster.clock = lambda: datetime(
+                            2026, 2, 1, 17, tzinfo=UTC)
+                        home = fx["api"].get_player_home(
+                            fx["player"]["id"])
+                        self.assertEqual(home["next_game"]["game_id"], game_id,
+                                         (label, kind, home))
+                        self.assertEqual(
+                            home["next_game"]["attendance_status"],
+                            "not_responded", (label, kind, home))
+                        if kind == "cross":
+                            self.assertTrue(home["next_game"]["cross_team"],
+                                            (label, home))
+                            self.assertIsNone(home["next_game"]["team_status"],
+                                              (label, home))
+
+                        confirmed = fx["api"].set_availability(
+                            game_id, fx["player"]["id"], "available",
+                            actor_id=fx["player"]["id"])
+                        self.assertNotIn("error", confirmed,
+                                         (label, kind, confirmed))
+                        answer = fx["store"].availability_for_player(
+                            game_id, fx["player"]["id"])
+                        self.assertEqual(answer.availability_status.value,
+                                         "available", (label, kind, answer))
+                        confirmed_home = fx["api"].get_player_home(
+                            fx["player"]["id"])
+                        self.assertEqual(
+                            confirmed_home["next_game"]["attendance_status"],
+                            "confirmed", (label, kind, confirmed_home))
+
+    def test_legacy_same_team_offer_accept_keeps_attendance_separate(self):
+        """The #450 consent write is cross-team-only compatibility glue.
+
+        The established same-team accept command still seats the substitute
+        without manufacturing a GameAvailability row. Player Home therefore
+        keeps its pre-#450 Not Responded state until the player uses I'm In.
+        """
+        for label, fx in self._each():
+            with self.subTest(backend=label):
+                gid = fx["own_game"]["id"]
+                pid = fx["player"]["id"]
+                enrolled = fx["api"].enroll_substitute(gid, pid)
+                self.assertEqual(enrolled.get("status"), "enrolled", enrolled)
+                offered = fx["api"].offer_substitute(
+                    gid, pid, authorized_team_id=fx["team1"]["id"])
+                self.assertEqual(offered.get("status"), "offered", offered)
+                accepted = fx["api"].accept_substitute(
+                    gid, pid, authorized_team_id=fx["team1"]["id"])
+                self.assertEqual(accepted.get("status"), "accepted", accepted)
+                self.assertIsNone(
+                    fx["store"].availability_for_player(gid, pid), label)
+
+                fx["api"].roster.clock = lambda: datetime(
+                    2026, 2, 1, 17, tzinfo=UTC)
+                home = fx["api"].get_player_home(pid)
+                self.assertEqual(home["next_game"]["game_id"], gid, home)
+                self.assertEqual(
+                    home["next_game"]["attendance_status"], "not_responded",
+                    (label, home))
+
+                response = fx["api"].set_availability(
+                    gid, pid, "available", actor_id=pid)
+                self.assertNotIn("error", response, (label, response))
+                self.assertEqual(
+                    fx["api"].get_player_home(pid)["next_game"][
+                        "attendance_status"],
+                    "confirmed", label)
+
+    def test_cross_team_acceptance_consent_is_in_the_same_transaction(self):
+        """A failed consent write cannot leave ACCEPTED/roster half-state."""
+        for label, fx in self._each():
+            with self.subTest(backend=label):
+                gid = fx["game"]["id"]
+                pid = fx["player"]["id"]
+                enrolled = fx["api"].enroll_substitute(
+                    gid, pid, target_team_id=fx["team4"]["id"])
+                self.assertEqual(enrolled.get("status"), "enrolled", enrolled)
+                _Fixture.open_team4_slot(fx)
+                offered = fx["api"].offer_substitute(
+                    gid, pid, authorized_team_id=fx["team4"]["id"])
+                self.assertEqual(offered.get("status"), "offered", offered)
+                before = self._game_write_state(fx["store"], gid)
+
+                with mock.patch.object(
+                        fx["store"], "upsert_availability",
+                        side_effect=RuntimeError("injected consent failure")):
+                    with self.assertRaisesRegex(
+                            RuntimeError, "injected consent failure"):
+                        fx["api"].roster.accept_substitute(gid, pid)
+
+                self.assertEqual(
+                    self._game_write_state(fx["store"], gid), before,
+                    (label, fx["store"].substitutes_for_game(gid)))
+                self.assertIsNone(
+                    fx["store"].roster_entry_for_player(gid, pid), label)
+                self.assertIsNone(
+                    fx["store"].availability_for_player(gid, pid), label)
 
     def test_available_refuses_mismatched_borrowed_row_without_writes(self):
         """Corrupt enrollment identity cannot authorize its paired row.
@@ -904,9 +1085,9 @@ class CrossTeamAvailabilityContract(_CrossTeamContract):
                 self.assertEqual(offered.get("status"), "offered", offered)
                 accepted = fx["api"].accept_substitute(gid, pid)
                 self.assertEqual(accepted.get("status"), "accepted", accepted)
-                maybe = fx["api"].set_availability(
-                    gid, pid, "maybe", actor_id=pid)
-                self.assertNotIn("error", maybe, maybe)
+                unavailable = fx["api"].set_availability(
+                    gid, pid, "unavailable", actor_id=pid)
+                self.assertNotIn("error", unavailable, unavailable)
 
                 enrollment = fx["store"].substitute_for_player(gid, pid)
                 enrollment.team_id = fx["team5"]["id"]
@@ -967,14 +1148,38 @@ class CrossTeamAvailabilityContract(_CrossTeamContract):
                 enrollment.source_membership_id = "deleted-source-membership"
                 _save_substitute(fx["store"], enrollment)
 
+                historical_home = fx["api"].get_player_home(pid)
+                self.assertEqual(
+                    historical_home["next_game"]["game_id"], gid,
+                    (label, historical_home))
+                self.assertEqual(
+                    historical_home["next_game"]["attendance_status"],
+                    "checked_out", (label, historical_home))
+                self.assertTrue(
+                    historical_home["next_game"]["cross_team"],
+                    (label, historical_home))
+                self.assertIsNone(
+                    historical_home["next_game"]["team_status"],
+                    (label, historical_home))
+                historical_before = {
+                    "game": self._game_write_state(fx["store"], gid),
+                    "availability": copy.deepcopy(
+                        fx["store"].availability_for_player(gid, pid)),
+                }
                 historical = fx["api"].set_availability(
                     gid, pid, "available", actor_id=pid)
-                self.assertNotIn("error", historical, (label, historical))
-                historical_entry = fx["store"].roster_entry_for_player(
-                    gid, pid)
                 self.assertEqual(
-                    historical_entry.status.value, "confirmed",
-                    (label, historical_entry))
+                    historical.get("error", {}).get("code"), "not_eligible",
+                    (label, historical))
+                self.assertEqual(
+                    {
+                        "game": self._game_write_state(fx["store"], gid),
+                        "availability": copy.deepcopy(
+                            fx["store"].availability_for_player(gid, pid)),
+                    },
+                    historical_before,
+                    (label, historical),
+                )
 
     def test_terminal_team4_then_accepted_team5_keeps_each_activity_on_its_side(self):
         """Historical and current side claims must not erase each other.
@@ -2678,6 +2883,7 @@ class CrossTeamExpiredOfferOverHttp(unittest.TestCase):
             "cross_team_guardian", self.PASSWORD, "guardian",
             actor_id=ADMIN)
         self.assertNotIn("error", guardian, guardian)
+        self.guardian_user_id = guardian["id"]
         link = self.fx["api"].create_guardian_link(
             guardian["id"], self.fx["player"]["id"], actor_id=ADMIN)
         self.assertNotIn("error", link, link)
@@ -2821,8 +3027,90 @@ class CrossTeamExpiredOfferOverHttp(unittest.TestCase):
         status, after = self._request("GET", "/api/me/player-home")
         self.assertEqual(status, 200, after)
         self.assertEqual(
-            after["next_game"]["game_id"], self.fx["own_game"]["id"], after)
-        self.assertEqual(after["today_count"], 1, after)
+            after["next_game"]["game_id"], gid, after)
+        self.assertTrue(after["next_game"]["cross_team"], after)
+        self.assertIsNone(after["next_game"]["team_status"], after)
+        self.assertEqual(
+            after["next_game"]["attendance_status"], "checked_out", after)
+        self.assertEqual(after["today_count"], 2, after)
+
+        # The same public-fixture card is the only discoverable recovery
+        # control. It re-confirms the exact paired borrowed row without
+        # granting any of the target-side private reads above.
+        status, available = self._request(
+            "POST", f"/api/games/{gid}/availability",
+            {"player_id": pid, "availability_status": "available"})
+        self.assertEqual(status, 200, available)
+        status, recovered = self._request("GET", "/api/me/player-home")
+        self.assertEqual(status, 200, recovered)
+        self.assertEqual(recovered["next_game"]["game_id"], gid, recovered)
+        self.assertEqual(
+            recovered["next_game"]["attendance_status"], "confirmed",
+            recovered)
+        self.assertTrue(recovered["next_game"]["cross_team"], recovered)
+        self.assertIsNone(recovered["next_game"]["team_status"], recovered)
+
+    def test_guardian_accept_records_verified_guardian_consent(self):
+        """The route, not request JSON, owns response-source attribution."""
+        gid = self.fx["game"]["id"]
+        pid = self.fx["player"]["id"]
+        target = self.fx["team4"]["id"]
+        path = (
+            f"/api/me/guardian/{pid}/substitute-opportunities/{gid}/"
+            "accept-offer")
+        status, accepted = self._request(
+            "POST", path, {"target_team_id": target},
+            opener=self.guardian_opener)
+        self.assertEqual(status, 200, accepted)
+        self.assertEqual(accepted.get("status"), "accepted", accepted)
+
+        consent = self.fx["store"].availability_for_player(gid, pid)
+        enrollment = self.fx["store"].substitute_for_player(gid, pid)
+        self.assertEqual(consent.availability_status.value, "available")
+        self.assertEqual(consent.response_source, "guardian")
+        self.assertEqual(consent.responded_at, enrollment.accepted_at)
+        accepted_audits = [
+            row for row in self.fx["store"].audit_for_game(gid)
+            if row.action == AuditAction.SUBSTITUTE_ACCEPTED]
+        self.assertEqual(len(accepted_audits), 1, accepted_audits)
+        self.assertEqual(
+            accepted_audits[0].actor_id, self.guardian_user_id,
+            accepted_audits)
+
+        srv.STATE.api.roster.clock = lambda: datetime(
+            2026, 2, 1, 17, tzinfo=UTC)
+        availability_path = (
+            f"/api/me/guardian/{pid}/games/{gid}/availability")
+        status, unavailable = self._request(
+            "POST", availability_path,
+            {"availability_status": "unavailable"},
+            opener=self.guardian_opener)
+        self.assertEqual(status, 200, unavailable)
+        status, home = self._request(
+            "GET", "/api/me/guardian/home", opener=self.guardian_opener)
+        self.assertEqual(status, 200, home)
+        (junior,) = home["juniors"]
+        self.assertEqual(junior["next_game"]["game_id"], gid, junior)
+        self.assertEqual(
+            junior["next_game"]["attendance_status"], "checked_out",
+            junior)
+        self.assertTrue(junior["next_game"]["cross_team"], junior)
+        self.assertIsNone(junior["next_game"]["team_status"], junior)
+
+        status, available = self._request(
+            "POST", availability_path,
+            {"availability_status": "available"},
+            opener=self.guardian_opener)
+        self.assertEqual(status, 200, available)
+        recovered = self.fx["store"].availability_for_player(gid, pid)
+        self.assertEqual(recovered.availability_status.value, "available")
+        self.assertEqual(recovered.response_source, "guardian")
+        histories = [
+            row for row in
+            self.fx["store"].substitute_enrollments_for_player(pid)
+            if row.game_id == gid]
+        self.assertEqual(len(histories), 1, histories)
+        self.assertEqual(histories[0].status.value, "accepted", histories)
 
     def test_stale_team4_actions_cannot_mutate_new_team5_offer(self):
         gid = self.fx["game"]["id"]

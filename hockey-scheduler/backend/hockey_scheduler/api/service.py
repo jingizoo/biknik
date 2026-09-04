@@ -4806,13 +4806,15 @@ class ApiService:
                           authorized_team_id: Optional[str] = None,
                           expected_target_team_id: Optional[str] = None,
                           require_target_identity: bool = False,
-                          allow_cross_team_response: bool = True) -> dict:
+                          allow_cross_team_response: bool = True,
+                          response_source: str = "player") -> dict:
         return _serialize(self.roster.accept_substitute(
             game_id, player_id, actor_id,
             authorized_team_id=authorized_team_id,
             expected_target_team_id=expected_target_team_id,
             require_target_identity=require_target_identity,
-            allow_cross_team_response=allow_cross_team_response))
+            allow_cross_team_response=allow_cross_team_response,
+            response_source=response_source))
 
     @catch
     def decline_substitute(self, game_id: str, player_id: str,
@@ -7358,11 +7360,6 @@ class ApiService:
             return "checked_out"
         if avail == "maybe":
             return "pending"
-        # Accepting a substitute offer commits the player even when they have
-        # no separate availability response. An explicit AVAILABLE,
-        # UNAVAILABLE or MAYBE answer above remains authoritative.
-        if row.get("roster_status") in {"accepted", "confirmed"}:
-            return "confirmed"
         return "not_responded"
 
     def _venue_name_for_game(self, g) -> Optional[str]:
@@ -7540,11 +7537,13 @@ class ApiService:
         legacy rows are byte-for-byte unchanged.
 
         ACCEPTED BORROWING IS THE NARROW EXCEPTION. A fully matched accepted
-        cross-team enrollment plus its still-occupying attributed roster row
-        makes that game part of this player's own schedule. It renders as a
-        confirmed substitute with ``cross_team: true`` and ``team_status:
-        null``. It never flows into ``game_scoped_own_team_id`` or the private
-        roster family, and it disappears as soon as the player backs out."""
+        cross-team enrollment plus its attributed roster row makes that game
+        part of this player's own schedule. It renders with ``cross_team:
+        true`` and ``team_status: null``. A player/guardian acceptance carries
+        an explicit AVAILABLE response; a coach override does not claim one.
+        After a player back-out the same public-fixture card remains as the
+        checked-out recovery path. It never flows into
+        ``game_scoped_own_team_id`` or the private roster family."""
         player = self.store.get_player(player_id)
         if player is None:
             raise NotFoundError("Player not found.")
@@ -7563,7 +7562,7 @@ class ApiService:
             borrowed_entry = (
                 None if membership_team_id is not None
                 else self.roster.accepted_cross_team_roster_entry(
-                    next_game, player))
+                    next_game, player, include_unavailable=True))
             my_team_id = (membership_team_id if membership_team_id is not None
                           else (borrowed_entry.team_side
                                 if borrowed_entry is not None else None))

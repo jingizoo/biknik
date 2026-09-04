@@ -1579,7 +1579,7 @@ REGISTRY = (
               "do_POST",
               auth="session+guardian-scope+verified-link",
               scope_axis="none",
-              note=("#202: same `_require_guardian_scope` + `_guardian_link_or_403` gate as post_me_guardian_id_games_id_availability (server.py:2586-2590). server.py:2592-2594 -> `accept_substitute(gid, jid, actor_id=guid)`.")),
+              note=("#202: same `_require_guardian_scope` + `_guardian_link_or_403` gate as post_me_guardian_id_games_id_availability (server.py:2586-2590). The server-owned `response_source='guardian'` records the verified guardian's acceptance without reading it from the request body.")),
     RouteSpec("POST",
               r"^/api/me/guardian/[^/]+/substitute-opportunities/[^/]+/decline-offer$",
               "/api/me/guardian/{}/substitute-opportunities/{}/decline-offer",

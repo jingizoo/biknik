@@ -3904,7 +3904,8 @@ _AUDIT_WAIVERS = {
     ('do_POST',
      "api.accept_substitute(gid, jid, actor_id=guid, "
      "expected_target_team_id=body.get('target_team_id'), "
-     "require_target_identity=True)", 'call_argument', "action == 'accept-offer'"):
+     "require_target_identity=True, response_source='guardian')", 'call_argument',
+     "action == 'accept-offer'"):
         "jid/gid/action captured off the SAME mgs match; `action == "
         "'accept-offer'` already selects this leaf; target_team_id is the "
         "strictly checked compound-resource selector",

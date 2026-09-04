@@ -3781,7 +3781,8 @@ class Handler(BaseHTTPRequestHandler):
                     api.accept_substitute(
                         gid, jid, actor_id=guid,
                         expected_target_team_id=body.get("target_team_id"),
-                        require_target_identity=True))
+                        require_target_identity=True,
+                        response_source="guardian"))
             return self._send_api(
                 api.decline_substitute(
                     gid, jid, actor_id=guid,
