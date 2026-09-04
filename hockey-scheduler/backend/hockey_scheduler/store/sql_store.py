@@ -506,7 +506,7 @@ _PRE_MIGRATION_CHECKS = {
 _ATOMIC_PRE_MIGRATION_CHECKS = {
     "057_device_token_unique_key":
         (assert_no_duplicate_device_tokens, "device_tokens"),
-    "063_cross_team_substitute_provenance":
+    "064_cross_team_substitute_provenance":
         (assert_no_duplicate_active_substitute_players,
          "substitute_enrollments"),
 }

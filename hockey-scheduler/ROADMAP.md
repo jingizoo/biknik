@@ -250,8 +250,10 @@ publish-gated and privacy-safe.
    explicit target side before a vacancy exists, only where the player's
    active source membership and target registration share the exact
    `LeagueSeason` and same non-null `Division`, and the source team is neither
-   Game side. The selected target durably owns the row and coach actions; the
-   exact source membership/team is retained as private provenance. One active
+   Game side. The selected target durably owns the row and Coach offer/seating
+   actions; the Player or verified Guardian owns accept/decline, while a Coach
+   seats only through the explicit audited override. The exact source
+   membership/team is retained as private provenance. One active
    (`ENROLLED`/`OFFERED`) row is allowed per player/Game, terminal history is
    retained, and a cross-team offer uses the server-owned
    `min(offered_at + 30 minutes, game_start)` deadline with expiry winning at

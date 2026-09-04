@@ -8858,9 +8858,12 @@ function phStatusFeed(ng, oppCount) {
       rows.push(["orange", "You have not responded to your next game."]);
     if (ng.attendance_status === "checked_out")
       rows.push(["red", "You checked out of your next game."]);
-    if (ng.team_status === "full")
+    // A borrowed seat is the player's commitment, not a grant to the target
+    // side's private roster state. Fail closed even if a stale/over-broad
+    // Player Home response still carries team_status.
+    if (!ng.cross_team && ng.team_status === "full")
       rows.push(["green", "Your team's roster is full."]);
-    if (ng.team_status === "sub_search")
+    if (!ng.cross_team && ng.team_status === "sub_search")
       rows.push(["orange", "Substitute search is active for your next game."]);
   }
   if (oppCount) rows.push(["blue", "New substitute opportunity available."]);
@@ -8889,9 +8892,9 @@ function renderOppDetail(detail) {
   ].map(([k, v]) => `<div class="li"><div class="li-main">
       <div class="li-sub">${esc(k)}</div><div class="li-title">${esc(v)}</div></div></div>`).join("");
   // A cross-team volunteer may see the public fixture and their own opt-in,
-  // but not the target side's private roster state/shortage counts. The API
-  // deliberately omits those fields, so the browser must not synthesize an
-  // "undefined" status or depend on private data to render the detail.
+  // but not the target side's private roster state/shortage counts. Ignore
+  // those fields even if a stale or over-broad response includes them; the
+  // browser must neither render nor depend on private side data here.
   if (!detail.cross_team && detail.team_status) {
     rows += `<div class="li"><div class="li-main"><div class="li-sub">Team status</div></div>
         ${phBadge(PH_TEAM_STATUS, detail.team_status)}</div>`;
@@ -8948,15 +8951,23 @@ function renderPlayerHome(playerHome) {
   const ng = playerHome.next_game;
   const welcome = `<div class="section-title" style="margin-top:0">Hi, ${esc(playerHome.player_name || "there")}</div>
     <p class="muted">Ready for your next game?</p>`;
-  // "Tonight" + "Team Status" summary cards (#107 doc §6.3), reusing the
-  // dashboard's stat-tile classes (responsive stacking comes with them).
+  // A borrowed cross-team seat is part of the player's schedule, but it does
+  // not grant access to the target side's private roster state. Name the
+  // player's role instead of inventing a Team Status value for that card.
+  const nextGameContextLabel = ng && ng.cross_team ? "Game Role" : "Team Status";
+  const nextGameContextBadge = ng
+    ? (ng.cross_team
+      ? '<span class="badge blue">Substitute</span>'
+      : phBadge(PH_TEAM_STATUS, ng.team_status))
+    : '<span class="badge gray">No game</span>';
+  // "Tonight" + next-game context summary cards (#107 doc §6.3), reusing
+  // the dashboard's stat-tile classes (responsive stacking comes with them).
   const summary = `<div class="dash-stats">
       <div class="dash-stat"><div class="ds-label">Tonight</div>
         <div class="ds-n">${playerHome.today_count || 0}</div>
         <div class="ds-sub">game${playerHome.today_count === 1 ? "" : "s"} today</div></div>
-      <div class="dash-stat"><div class="ds-label">Team Status</div>
-        <div class="ds-n">${ng ? phBadge(PH_TEAM_STATUS, ng.team_status)
-          : `<span class="badge gray">No game</span>`}</div></div>
+      <div class="dash-stat"><div class="ds-label">${nextGameContextLabel}</div>
+        <div class="ds-n">${nextGameContextBadge}</div></div>
     </div>`;
   let nextGameBlock;
   if (!ng) {
@@ -8977,11 +8988,13 @@ function renderPlayerHome(playerHome) {
           <div class="li-sub">${esc(fmtDateTime(ng.start_time))}
             ${ng.venue_name ? " · " + esc(ng.venue_name) : ""}${ng.rink_name ? " · " + esc(ng.rink_name) : ""}</div></div>
       </div>
-      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
+      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${ng.cross_team
+        ? '<span class="badge blue">Substitute</span>'
+        : phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
       <div class="actions">
         <button class="act success" data-ph-confirm ${confirmed ? "disabled" : ""}>${confirmed ? "You're In ✓" : "I'm In"}</button>
         <button class="act danger" data-ph-backout>Can't Play</button>
-        <button class="act ghost" data-open-roster="${esc(ng.game_id)}">View Roster</button>
+        ${ng.cross_team ? "" : `<button class="act ghost" data-open-roster="${esc(ng.game_id)}">View Roster</button>`}
       </div>`;
   }
   // A row for a substitute opportunity/offer, with its call-to-action button.
@@ -9031,6 +9044,10 @@ function renderPlayerHome(playerHome) {
     const checked = isPendingTarget ? pending.enrolling : canonicalChecked;
     const canToggle = !!target && !pending
       && (checked ? o.can_withdraw !== false : o.can_enroll !== false);
+    // Pending copy mutates an existing node and is therefore a useful live
+    // update. A settled notice arrives in a newly rendered node, so keep it as
+    // visible row context and let the persistent #toast-root announce it.
+    const liveStatus = pending ? ' aria-live="polite" role="status"' : "";
     const statusText = pending
       ? (isPendingTarget
         ? (pending.enrolling
@@ -9052,8 +9069,7 @@ function renderPlayerHome(playerHome) {
           <span class="li-title">Sub for ${esc(o.team_name)}</span>
           <span class="li-sub">vs ${esc(o.opponent_name || "TBD")} · ${esc(fmtDateTime(o.start_time))}
             ${o.rink_name ? " · " + esc(o.rink_name) : ""} · available as ${esc(o.position_needed)}</span>
-          <span class="ph-sub-optin-text" aria-live="polite"
-            role="${isNoticeTarget && notice.isError ? "alert" : "status"}">${esc(statusText)}</span>
+          <span class="ph-sub-optin-text"${liveStatus}>${esc(statusText)}</span>
         </span>
       </label>
       <button class="act ghost" data-ph-view-opp="${esc(o.game_id)}"
@@ -9157,7 +9173,9 @@ function renderJuniorCard(j) {
           <div class="li-sub">${esc(fmtDateTime(ng.start_time))}
             ${ng.venue_name ? " · " + esc(ng.venue_name) : ""}${ng.rink_name ? " · " + esc(ng.rink_name) : ""}</div></div>
       </div>
-      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
+      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${ng.cross_team
+        ? '<span class="badge blue">Substitute</span>'
+        : phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
       <div class="actions">
         <button class="act success" data-g-confirm="${esc(jid)}" ${confirmed ? "disabled" : ""}>${confirmed ? "In ✓" : "I'm In"}</button>
         <button class="act danger" data-g-backout="${esc(jid)}">Can't Play</button>
@@ -12837,17 +12855,21 @@ async function render() {
       candidate.disabled = true;
       row.setAttribute("aria-busy", "true");
       const candidateStatus = row.querySelector(".ph-sub-optin-text");
-      if (candidateStatus) candidateStatus.textContent =
-        candidate.dataset.phSubTarget === target
+      if (candidateStatus) {
+        candidateStatus.setAttribute("role", "status");
+        candidateStatus.setAttribute("aria-live", "polite");
+        candidateStatus.textContent = candidate.dataset.phSubTarget === target
           ? (enrolling
             ? "Saving availability…" : "Removing availability…")
           : "Another team choice for this game is being saved…";
+      }
     });
     c.querySelectorAll("[data-ph-view-opp]").forEach((candidate) => {
       if (candidate.dataset.phViewOpp === gid) candidate.disabled = true;
     });
     const verb = enrolling ? "enroll" : "withdraw";
     const body = { target_team_id: target };
+    let outcome = null;
     try {
       let identityCurrent = false;
       try {
@@ -12879,6 +12901,7 @@ async function render() {
             expectedChecked: isError ? !enrolling : enrolling,
             playerId: operation.playerId, epoch: operation.epoch,
           });
+          outcome = { message, isError };
         }
       } finally {
         settleSubstituteOptInWrite(operation);
@@ -12888,6 +12911,17 @@ async function render() {
       if (operation.epoch !== uiIdentityEpoch
           || operation.playerId !== ownPlayerId()
           || view !== "player_home") return;
+      // Canonical rendering replaces the row-local status node, so inserting
+      // the completed sentence there is not a reliable screen-reader
+      // announcement. Publish it only after that render, through the one
+      // persistent sitewide live region, and only while the issuing player and
+      // view still own the result. The row-local notice remains as durable
+      // visible context beside its compound choice.
+      if (outcome) {
+        toast = outcome.message;
+        toastIsError = outcome.isError;
+        updateToast();
+      }
       const replacement = Array.from(document.querySelectorAll(
         "[data-ph-sub-optin]")).find((candidate) =>
           candidate.dataset.phSubGame === gid

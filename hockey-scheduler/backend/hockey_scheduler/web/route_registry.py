@@ -1497,8 +1497,9 @@ REGISTRY = (
               scope_axis="none",
               note=("#202: generic RESPOND_AVAILABILITY gate plus self-only "
                     "Player scope. #287 binds a Player cross-team response "
-                    "to the strictly checked target identity; same-team {}, "
-                    "Coach, and unscoped operator behavior stays compatible.")),
+                    "to the strictly checked target identity. A cross-team "
+                    "Coach is refused here and seats only through the explicit "
+                    "add-to-roster override; same-team behavior is unchanged.")),
     RouteSpec("POST", r"^/api/games/[^/]+/substitutes/[^/]+/add-to-roster$",
               "/api/games/{}/substitutes/{}/add-to-roster",
               "post_games_id_substitutes_id_add_to_roster", "do_POST",
@@ -1510,7 +1511,10 @@ REGISTRY = (
               "post_games_id_substitutes_id_decline", "do_POST",
               auth="session+RESPOND_AVAILABILITY",
               scope_axis="none",
-              note=("#202: generic gate -> authz.py:325-331, op=='decline' -> RESPOND_AVAILABILITY. server.py:3415-3424 -> `decline_substitute(gid, player_id, user_id)` (service.py:3949-3952) -- no P/S/L check.")),
+              note=("#202 generic RESPOND_AVAILABILITY gate plus self-only "
+                    "Player scope. #287 binds a Player cross-team decline to "
+                    "the strictly checked target identity; a cross-team Coach "
+                    "may not answer the offer.")),
     RouteSpec("POST", r"^/api/games/[^/]+/substitutes/[^/]+/offer$",
               "/api/games/{}/substitutes/{}/offer",
               "post_games_id_substitutes_id_offer", "do_POST",

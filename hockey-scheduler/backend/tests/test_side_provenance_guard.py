@@ -1115,10 +1115,10 @@ class TheGuardCatchesEveryLeakThisBlockerFixed(_GuardHarness,
         of this gate BLESSED, under the ``SUBJECT_OWN_SIDE`` exemption whose
         only condition was "takes no caller-supplied side". It takes none;
         it derived the OPPONENT's side from ``Player.team_id``."""
-        leaked = _replace(_sources(), FACADE, """            my_team_id = game_scoped_own_team_id(
+        leaked = _replace(_sources(), FACADE, """            membership_team_id = game_scoped_own_team_id(
                 Role.PLAYER, None, player_id,
                 GameAuthorization.of(next_game), self.store)""",
-                          """            my_team_id = player.team_id""")
+                          """            membership_team_id = player.team_id""")
         violations, _errors = self._audit(leaked)
         self.assertTrue(
             self._caught(violations, "untrusted_side", "get_player_home"),

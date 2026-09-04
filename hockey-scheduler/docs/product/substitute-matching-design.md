@@ -39,10 +39,12 @@ the existing substitute lifecycle, not the ranking design below:
   active registration must resolve through the exact same `LeagueSeason` and
   the same non-null `Division`. The source team must be neither participating
   Game side. This slice has no cross-Division policy switch.
-- The selected target owns the enrollment, offer, coach action, slot and
-  eventual roster seat. `SubstituteEnrollment.team_id` is that durable target;
-  paired private `source_membership_id` and `source_team_id` fields preserve
-  the exact source proof and are revalidated before forward transitions.
+- The selected target owns the enrollment, Coach offer/seating actions, slot
+  and eventual roster seat. `SubstituteEnrollment.team_id` is that durable
+  target; paired private `source_membership_id` and `source_team_id` fields
+  preserve the exact source proof and are revalidated before forward
+  transitions. The player or verified guardian owns accept/decline; a Coach
+  seats only through the explicit audited override.
 - A partial unique constraint permits one active (`ENROLLED` or `OFFERED`) row
   per `(game_id, player_id)`, while terminal rows remain as history.
 - A target coach may offer only against an actual matching vacancy. Cross-team
@@ -60,6 +62,10 @@ the existing substitute lifecycle, not the ranking design below:
   transaction as the mutation, so an older tab cannot withdraw, accept or
   decline a later enrollment for another target. A mismatch is a write-free
   409; same-team requests continue to omit the target.
+- A fully matched, occupying accepted seat appears in Player/Guardian Home as
+  a confirmed Substitute and counts toward today's games. This personal
+  schedule projection exposes no target-side team status and grants no access
+  to the borrowing team's private roster surfaces; backing out removes it.
 
 The slice does not wire the pure ranking core, fairness counters, skill-rating
 ownership, configurable rule order, automatic next-candidate advancement, or

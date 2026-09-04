@@ -123,7 +123,7 @@ def find_duplicate_active_substitute_players(conn):
     """Active ``(game, player)`` keys with more than one substitute row.
 
     Terminal declined/withdrawn/expired rows are historical evidence and are
-    intentionally outside migration 063's partial unique index.
+    intentionally outside migration 064's partial unique index.
     """
     cur = conn.cursor()
     cur.execute(
@@ -136,7 +136,7 @@ def find_duplicate_active_substitute_players(conn):
 
 
 def assert_no_duplicate_active_substitute_players(conn):
-    """Abort migration 063 before its active-enrollment index would fail."""
+    """Abort migration 064 before its active-enrollment index would fail."""
     duplicates = find_duplicate_active_substitute_players(conn)
     if duplicates:
         raise MigrationDataError(

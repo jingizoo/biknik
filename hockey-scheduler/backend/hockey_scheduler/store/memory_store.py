@@ -438,7 +438,7 @@ class InMemoryStore:
     def _write_substitute(
         self, sub: SubstituteEnrollment
     ) -> SubstituteEnrollment:
-        """Mirror migration 063's active ``(game, player)`` uniqueness.
+        """Mirror migration 064's active ``(game, player)`` uniqueness.
 
         SQL has a partial unique index covering ENROLLED/OFFERED rows.  The
         in-memory backend has no engine constraint, so enforce the identical

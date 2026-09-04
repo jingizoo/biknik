@@ -3573,11 +3573,11 @@ _AUDIT_WAIVERS = {
     ("do_POST",
      "fn(gid, player_id, user_id, authorized_team_id=coach_team, "
      "allow_cross_team_response=False)",
-     "call_argument", "op == 'decline'"):
-        "the explicit decline-only sibling of the shared fn call above. The "
-        "captured op has already selected decline; the constant false keeps "
-        "cross-team offer response player/guardian-owned and cannot choose a "
-        "different route",
+     "call_argument", "op in {'accept', 'decline'}"):
+        "the explicit response-only sibling of the shared fn call above. The "
+        "captured op has already selected accept/decline; the constant false "
+        "keeps cross-team offer response player/guardian-owned and cannot "
+        "choose a different route",
     ("do_POST", "coach(gid, user_id)", "call_argument", "coach"):
         "#202 repair round 5, finding 2b -- `coach` is one of "
         "`api.{lock_roster,unlock_roster,cancel_game}`, selected by "
@@ -3985,14 +3985,15 @@ _AUDIT_WAIVERS = {
         "'substitutes/<player_id>/<op>'` shape; `op == 'offer'` already "
         "selects this leaf",
     ('do_POST',
-     "api.accept_substitute(gid, player_id, user_id, "
+     "fn(gid, player_id, user_id, "
      "expected_target_team_id=body.get('target_team_id'), "
      "require_target_identity=True)",
-     'call_argument', 'role == Role.PLAYER'):
-        "the player-only arm of the already-selected generic accept route; "
+     'call_argument', "op in {'accept', 'decline'}"):
+        "the player-only arm of the already-selected generic response route; "
         "gid/player_id/op came from the outer and nested route matches, while "
-        "role is session-derived. The strictly checked target binds the "
-        "already-selected cross-team enrollment and cannot select a route",
+        "role is session-derived. `fn` is selected from the closed literal "
+        "map waived below, and the strictly checked target binds the active "
+        "cross-team enrollment rather than selecting a route",
     ('do_POST', "{'accept': api.accept_substitute, 'decline': api.decline_substitute, 'add-to-roster': api.add_substitute_to_roster}[op]", 'assign_rhs', 'sub'):
         "the terminal else of sub's own three-way alternation (offer "
         "already returned above); a dict LITERAL of api.X values keyed on "

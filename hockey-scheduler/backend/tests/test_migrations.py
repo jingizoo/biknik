@@ -45,6 +45,25 @@ class MigrationDiscoveryTest(unittest.TestCase):
         for version, statements in _load_migrations():
             self.assertTrue(statements, f"{version} parsed to zero statements")
 
+    def test_numeric_migration_prefixes_are_unique(self):
+        """One sequence number cannot describe two different histories.
+
+        If ``063_alpha`` already ran and ``063_beta`` ships later, an upgrade
+        applies beta after every newer migration while a fresh database sorts
+        alpha/beta together.  Both ledgers look complete but the DDL order is
+        different, so reject the collision before either path can exist.
+        """
+        by_prefix = {}
+        for version, _statements in _load_migrations():
+            by_prefix.setdefault(version.split("_", 1)[0], []).append(version)
+        duplicates = {prefix: versions
+                      for prefix, versions in by_prefix.items()
+                      if len(versions) != 1}
+        self.assertEqual(
+            duplicates, {},
+            "migration sequence numbers must be unique; duplicate prefixes "
+            "make fresh-install and upgrade application order diverge")
+
 
 class MigrationApplyTest(unittest.TestCase):
     def test_fresh_database_records_all_versions(self):
@@ -203,7 +222,7 @@ class MigrationApplyTest(unittest.TestCase):
             # (its UNIQUE index goes with it) so adoption's re-run of 053
             # lands on a table that genuinely does not exist yet.
             cur.execute("DROP TABLE IF EXISTS season_copy_forward_commits")
-            # #287 migration 063 and #205 migration 060 add these columns.
+            # #287 migration 064 and #205 migration 060 add these columns.
             # Strip newest first so adoption replays their ALTERs over the
             # legacy table shape rather than failing on duplicate columns.
             cur.execute(
@@ -213,6 +232,8 @@ class MigrationApplyTest(unittest.TestCase):
                 "ALTER TABLE substitute_enrollments DROP COLUMN source_team_id")
             cur.execute(
                 "ALTER TABLE substitute_enrollments DROP COLUMN team_id")
+            cur.execute("ALTER TABLE audit_logs DROP COLUMN team_id")
+            cur.execute("ALTER TABLE notification_events DROP COLUMN team_id")
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -228,6 +249,9 @@ class MigrationApplyTest(unittest.TestCase):
             self.assertTrue(
                 {"team_id", "source_membership_id", "source_team_id"}
                 <= _table_columns(adopted, "substitute_enrollments"))
+            self.assertIn("team_id", _table_columns(adopted, "audit_logs"))
+            self.assertIn(
+                "team_id", _table_columns(adopted, "notification_events"))
             self.assertIn("external_ref", _table_columns(adopted, "players"))
             self.assertIn("external_ref", _table_columns(adopted, "officials"))
             self.assertIn("external_ref", _table_columns(adopted, "rinks"))

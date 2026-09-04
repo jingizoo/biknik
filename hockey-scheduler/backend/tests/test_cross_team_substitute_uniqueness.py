@@ -1,7 +1,7 @@
-"""Migration 063's one-active-substitute-row database backstop (#287).
+"""Migration 064's one-active-substitute-row database backstop (#287).
 
 The service rejects a second active enrollment for the same ``(game, player)``
-before writing, but two processes can race that check.  Migration 063 therefore
+before writing, but two processes can race that check.  Migration 064 therefore
 adds a partial unique index covering exactly ENROLLED/OFFERED rows, independent
 of target team.  These tests exercise that last-line constraint through the
 real store write sites, including their stable error translation and rollback.
@@ -33,7 +33,7 @@ from hockey_scheduler.store.sql_store import _ATOMIC_PRE_MIGRATION_CHECKS
 
 
 UTC = timezone.utc
-_VERSION = "063_cross_team_substitute_provenance"
+_VERSION = "064_cross_team_substitute_provenance"
 _INDEX = "ux_substitute_active_game_player"
 _MESSAGE = "Player already has an active substitute enrollment for this game."
 _ACTIVE = frozenset({SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED})
@@ -235,7 +235,7 @@ class SQLiteActiveSubstituteConstraintTest(
 
 
 class InMemoryActiveSubstituteConstraintTest(unittest.TestCase):
-    """Memory mirrors migration 063 rather than accepting impossible state."""
+    """Memory mirrors migration 064 rather than accepting impossible state."""
 
     def setUp(self):
         self.store = InMemoryStore()
@@ -312,7 +312,7 @@ class InMemoryActiveSubstituteConstraintTest(unittest.TestCase):
 
 @unittest.skipUnless(
     os.environ.get("TEST_DATABASE_URL"),
-    "PostgreSQL not configured: migration 063's active substitute constraint "
+    "PostgreSQL not configured: migration 064's active substitute constraint "
     "was NOT exercised on PostgreSQL; a skip is not a pass.")
 class PostgreSQLActiveSubstituteConstraintTest(
         _ActiveSubstituteConstraintContract, unittest.TestCase):
@@ -321,12 +321,12 @@ class PostgreSQLActiveSubstituteConstraintTest(
 
 
 class ActiveSubstitutePreMigrationTest(unittest.TestCase):
-    def test_migration_063_check_is_registered_behind_the_right_writer_lock(self):
+    def test_migration_064_check_is_registered_behind_the_right_writer_lock(self):
         check_fn, lock_table = _ATOMIC_PRE_MIGRATION_CHECKS[_VERSION]
         self.assertIs(check_fn, assert_no_duplicate_active_substitute_players)
         self.assertEqual(lock_table, "substitute_enrollments")
 
-    def test_dirty_active_duplicates_abort_before_migration_063_ddl(self):
+    def test_dirty_active_duplicates_abort_before_migration_064_ddl(self):
         # This schema surgery is safe only on the private in-memory database.
         store = SqlStore(":memory:")
         prefix = f"t063-preflight-{uuid.uuid4().hex}"

@@ -11,14 +11,18 @@
 //     identity while the legacy same-team action keeps its empty body;
 //   * a held write disables both same-game target choices and both Details
 //     controls across a navigation-driven rerender, with no second request;
-//   * pending Saving/Removing state is announced, canonical errors recover,
-//     per-game outcomes cannot overwrite one another, and stale responses do
-//     not cross a no-reload player identity switch;
+//   * pending Saving/Removing state is announced, completed outcomes use the
+//     persistent sitewide live region, canonical errors recover, per-game row
+//     outcomes cannot overwrite one another, and stale responses do not cross
+//     a no-reload player identity switch;
 //   * focus is restored only while the initiating intent is still current,
 //     with a section-heading fallback when withdrawal removes the row;
 //   * detail GETs retain target_team_id, and going Back clears it before a
 //     legacy same-team detail is opened;
-//   * a privacy-minimal cross-team detail (no team/roster/slot fields) renders;
+//   * cross-team detail ignores private team/roster fields even when a stale
+//     or over-broad response contains them;
+//   * an accepted borrowed game renders as a confirmed Substitute on player
+//     and guardian Home without target team status or a roster link;
 //   * the existing same-team "View Opportunity" interaction remains; and
 //   * scoped text meets 4.5:1 contrast, the row has a >=44px target, and the
 //     complete list has no horizontal overflow at 390px.
@@ -34,6 +38,8 @@ const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8997 },
   { label: "phone", width: 390, height: 844, port: 8998 },
 ];
+const PRIVATE_TEAM_STATUS = "PRIVATE_TARGET_TEAM_STATUS";
+const PRIVATE_ROSTER_STATUS = "PRIVATE_TARGET_ROSTER_STATUS";
 
 function waitForServer(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -272,6 +278,20 @@ const guardianDetailOffer = () => focusedCrossTeamOffer({
   startTime: "2026-09-27T19:30:00+00:00",
 });
 
+const borrowedNextGame = () => ({
+  game_id: "borrowed-game",
+  cross_team: true,
+  team_name: "Bronze Team 4",
+  opponent_name: "Bronze Team 5",
+  start_time: "2026-09-11T19:30:00+00:00",
+  venue_name: "Twin Rinks",
+  rink_name: "Blue Rink",
+  attendance_status: "confirmed",
+  // Deliberately over-broad private state: every borrowed-card surface,
+  // including the status feed, must ignore it rather than relying on null.
+  team_status: "sub_search",
+});
+
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
   const server = spawn(
@@ -447,7 +467,7 @@ async function checkViewport(browser, viewport) {
         return json(route, { juniors: [{
           player_id: "junior-1",
           player_name: "Junior One",
-          next_game: null,
+          next_game: borrowedNextGame(),
           substitute_offers: [
             ...(guardianInlineResolved ? [] : [guardianInlineOffer()]),
             ...(guardianSameResolved ? [] : [guardianSameTeamOffer()]),
@@ -459,7 +479,11 @@ async function checkViewport(browser, viewport) {
       if (p === "/api/me/guardian/junior-1/substitute-opportunities/guardian-detail-offer"
           && request.method() === "GET") {
         guardianDetailReads.push(url.search);
-        return json(route, guardianDetailOffer());
+        return json(route, {
+          ...guardianDetailOffer(),
+          team_status: PRIVATE_TEAM_STATUS,
+          roster_status: PRIVATE_ROSTER_STATUS,
+        });
       }
       if (p === "/api/me/guardian/junior-1/substitute-opportunities/guardian-inline-offer/accept-offer"
           && request.method() === "POST") {
@@ -495,7 +519,7 @@ async function checkViewport(browser, viewport) {
         }
         return json(route, {
           player_id: "player-1", player_name: "Bronze One Player",
-          next_game: null, today_count: 0,
+          next_game: borrowedNextGame(), today_count: 1,
           substitute_offers: [
             ...(offerResolved ? [] : [crossTeamOffer()]),
             ...(sameViewOfferResolved ? [] : [sameViewOffer()]),
@@ -517,7 +541,10 @@ async function checkViewport(browser, viewport) {
           can_accept_offer: false,
           can_decline_offer: false,
           blocked_reason: null,
-          // Deliberately NO roster_status, team_status or open-slot counts.
+          // Deliberately over-broad sentinels: the cross-team browser surface
+          // must ignore private target-side state even if it arrives.
+          roster_status: PRIVATE_ROSTER_STATUS,
+          team_status: PRIVATE_TEAM_STATUS,
         });
       }
       if (p === "/api/me/substitute-opportunities/game-same"
@@ -687,6 +714,19 @@ async function checkViewport(browser, viewport) {
     if (!/Games you can sub in \(7\)/.test(heading || "")) {
       fail("cleanup-only game was counted as a current substitute choice");
     }
+    if (!/Game Role\s*Substitute/.test(heading || "")
+        || !/Bronze Team 4 vs Bronze Team 5/.test(heading || "")
+        || !/You're In ✓/.test(heading || "")
+        || /Team Status/.test(heading || "")
+        || /Sub Search/.test(heading || "")
+        || /Substitute search is active for your next game/.test(heading || "")) {
+      fail(`accepted borrowed game did not render as a private confirmed Substitute: ${heading}`);
+    }
+    if (!await page.locator("[data-ph-confirm]").isDisabled()
+        || await page.locator('[data-open-roster="borrowed-game"]').count()
+        || await page.locator("[data-ph-backout]").count() !== 1) {
+      fail("borrowed next game exposed the wrong confirmed/backout/roster actions");
+    }
     const headingTags = await page.evaluate(() => ({
       offers: document.getElementById("ph-sub-offers-title")?.tagName,
       opportunities: document.getElementById("ph-sub-opportunities-title")?.tagName,
@@ -836,6 +876,30 @@ async function checkViewport(browser, viewport) {
     if (!await crossBox.evaluate((element) => document.activeElement === element)) {
       fail("same-view enroll did not restore focus to its replacement checkbox");
     }
+    const enrollToast = await page.evaluate(() => {
+      const root = document.getElementById("toast-root");
+      return {
+        count: document.querySelectorAll("#toast-root").length,
+        insideContent: !!document.querySelector("#content #toast-root"),
+        hidden: root ? root.hidden : true,
+        role: root ? root.getAttribute("role") : null,
+        live: root ? root.getAttribute("aria-live") : null,
+        text: root ? root.textContent : "",
+      };
+    });
+    if (enrollToast.count !== 1 || enrollToast.insideContent
+        || enrollToast.hidden || enrollToast.role !== "status"
+        || enrollToast.live !== "polite"
+        || !/You're available to substitute for this team/.test(enrollToast.text)) {
+      fail(`checkbox success did not use the persistent toast live region: ${JSON.stringify(enrollToast)}`);
+    }
+    const enrollRowNotice = optInRow(crossBox).locator(".ph-sub-optin-text");
+    if (!/You're available to substitute for this team/.test(
+      (await enrollRowNotice.textContent()) || "")
+        || await enrollRowNotice.getAttribute("role") !== null
+        || await enrollRowNotice.getAttribute("aria-live") !== null) {
+      fail("settled success did not remain visible as non-live row context");
+    }
 
     const crossDetailsButton = details("game-cross", "bronze-team-4");
     await crossDetailsButton.focus();
@@ -852,8 +916,10 @@ async function checkViewport(browser, viewport) {
     if (!/Bronze Team 4/.test(crossDetail) || !/Bronze Team 5/.test(crossDetail)) {
       fail("cross-team detail does not clearly name target and opponent");
     }
-    if (/Team status|undefined/.test(crossDetail)) {
-      fail(`privacy-minimal cross-team detail depended on omitted private fields: ${crossDetail}`);
+    if (/Team status|undefined/.test(crossDetail)
+        || crossDetail.includes(PRIVATE_TEAM_STATUS)
+        || crossDetail.includes(PRIVATE_ROSTER_STATUS)) {
+      fail(`cross-team detail exposed or depended on private target fields: ${crossDetail}`);
     }
     if (detailReads.at(-1) !== "?target_team_id=bronze-team-4") {
       fail(`cross-team detail lost target query: ${JSON.stringify(detailReads)}`);
@@ -978,9 +1044,25 @@ async function checkViewport(browser, viewport) {
     }
     const errorResult = optInRow(optIn("game-error", "bronze-team-6"))
       .locator(".ph-sub-optin-text");
-    if (await errorResult.getAttribute("role") !== "alert"
+    if (await errorResult.getAttribute("role") !== null
+        || await errorResult.getAttribute("aria-live") !== null
         || !/Roster changed; try again/.test((await errorResult.textContent()) || "")) {
-      fail("server refusal was not announced on its compound choice");
+      fail("server refusal did not remain visible as non-live compound-choice context");
+    }
+    const refusalToast = await page.evaluate(() => {
+      const root = document.getElementById("toast-root");
+      return {
+        count: document.querySelectorAll("#toast-root").length,
+        insideContent: !!document.querySelector("#content #toast-root"),
+        hidden: root ? root.hidden : true,
+        isError: !!(root && root.classList.contains("error")),
+        text: root ? root.textContent : "",
+      };
+    });
+    if (refusalToast.count !== 1 || refusalToast.insideContent
+        || refusalToast.hidden || !refusalToast.isError
+        || !/Roster changed; try again/.test(refusalToast.text)) {
+      fail(`checkbox refusal did not use the persistent toast live region: ${JSON.stringify(refusalToast)}`);
     }
     errorBox = optIn("game-error", "bronze-team-6");
     if (!await errorBox.evaluate((element) => document.activeElement === element)) {
@@ -1653,6 +1735,13 @@ async function checkViewport(browser, viewport) {
         && !!document.querySelector(
           '[data-g-accept-offer="junior-1|guardian-inline-offer"]'),
       null, { timeout: 10000 });
+    const guardianHomeText = (await page.textContent("#content")) || "";
+    if (!/Bronze Team 4 vs Bronze Team 5/.test(guardianHomeText)
+        || !/Confirmed\s*Substitute/.test(guardianHomeText)
+        || /Team Status/.test(guardianHomeText)
+        || /Sub Search/.test(guardianHomeText)) {
+      fail(`guardian borrowed game exposed private team state or lost its role: ${guardianHomeText}`);
+    }
     const guardianInlineAccept = page.locator(
       '[data-g-accept-offer="junior-1|guardian-inline-offer"]');
     const guardianInlineDecline = page.locator(
@@ -1703,6 +1792,12 @@ async function checkViewport(browser, viewport) {
       "?target_team_id=bronze-team-32",
     ])) {
       fail(`guardian detail GET lost target query: ${JSON.stringify(guardianDetailReads)}`);
+    }
+    const guardianDetailText = (await page.textContent("#content")) || "";
+    if (/Team status/.test(guardianDetailText)
+        || guardianDetailText.includes(PRIVATE_TEAM_STATUS)
+        || guardianDetailText.includes(PRIVATE_ROSTER_STATUS)) {
+      fail(`guardian cross-team detail exposed private target fields: ${guardianDetailText}`);
     }
     const guardianDetailAccept = page.locator(
       '[data-g-accept-offer="junior-1|guardian-detail-offer"]');

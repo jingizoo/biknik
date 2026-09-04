@@ -4805,12 +4805,14 @@ class ApiService:
                           actor_id: Optional[str] = None,
                           authorized_team_id: Optional[str] = None,
                           expected_target_team_id: Optional[str] = None,
-                          require_target_identity: bool = False) -> dict:
+                          require_target_identity: bool = False,
+                          allow_cross_team_response: bool = True) -> dict:
         return _serialize(self.roster.accept_substitute(
             game_id, player_id, actor_id,
             authorized_team_id=authorized_team_id,
             expected_target_team_id=expected_target_team_id,
-            require_target_identity=require_target_identity))
+            require_target_identity=require_target_identity,
+            allow_cross_team_response=allow_cross_team_response))
 
     @catch
     def decline_substitute(self, game_id: str, player_id: str,
@@ -5059,13 +5061,16 @@ class ApiService:
 
         notifications = [
             {"type": n.type.value, "audience": n.audience, "message": n.message,
-             "at": n.at.isoformat(), "subject_player_id": n.subject_player_id}
+             "at": n.at.isoformat(), "subject_player_id": n.subject_player_id,
+             # Internal authorization metadata.  _activity_projection strips
+             # it before every caller-visible return.
+             "_team_id": n.team_id}
             for n in self.store.notifications_for_game(game_id)
         ]
         audit = [
             {"action": a.action.value, "actor_id": a.actor_id,
              "subject_player_id": a.subject_player_id, "at": a.at.isoformat(),
-             "detail": a.detail}
+             "detail": a.detail, "_team_id": a.team_id}
             for a in self.store.audit_for_game(game_id)
         ]
         audience = lineup_visibility.route_audience(
@@ -5119,30 +5124,39 @@ class ApiService:
         ``notifications`` and the HOME ``roster_selected`` /
         ``availability_set`` entries in ``audit``.
 
-        THE ATTRIBUTION RULE, in one sentence: an event is RETAINED for side
-        ``S`` only when every player identity it discloses is durably
-        attributed to ``S``, and it discloses at least one.
+        THE ATTRIBUTION RULE. New lifecycle events carry the validated game
+        side frozen at the write. An event is retained only when it discloses
+        at least one player identity and that snapshot names both the caller's
+        side and a current participant in this exact game. The internal
+        snapshot is stripped before every response, including FULL operator
+        responses.
 
-        Both halves are load-bearing.
+        A pre-064 event has a NULL snapshot. Only for those legacy rows, the
+        conservative fallback retains the event when every identity it
+        discloses has one unambiguous durable side equal to the caller's.
 
-        * EVERY identity, not just the subject. ``subject_player_id`` is not
-          the only identity an event carries: ``roster_selected`` has no
+        Both fallback conditions are load-bearing.
+
+        * For a legacy row, EVERY identity, not just the subject.
+          ``subject_player_id`` is not the only identity an event carries:
+          ``roster_selected`` has no
           subject at all and names its players in ``detail.player_ids``, and
           ``roster_batch_seated`` names four more lists of them. Attributing
           on the subject alone would have retained the exact
           ``{"action":"roster_selected","detail":{"player_ids":["player_1"]}}``
           entry the reviewer measured leaking. See :func:`_player_ids_in` for
           how identities are recovered from the free-form ``detail``.
-        * AT LEAST ONE, so an event that names nobody is withheld rather than
-          shown to both sides. A game-wide event genuinely cannot be
-          attributed to a side, and the ruling's rule for that case is
-          omission — "never guess a side".
+        * For every row, AT LEAST ONE, so an event that names nobody is
+          withheld rather than shown to both sides. A game-wide event
+          genuinely cannot be attributed to a side, and the ruling's rule for
+          that case is omission — "never guess a side".
 
-        DURABLY means :meth:`RosterService.durable_game_sides`: the seat's
-        stored ``attribution`` and the enrollment's stored ``team_id``, never
-        live membership and never the permanent pointer. A legacy NULL row,
-        and a player whose durable records disagree, name no side — so every
-        event about them is withheld from BOTH sides.
+        DURABLY in that legacy fallback means
+        :meth:`RosterService.durable_game_sides`: the seat's stored
+        ``attribution`` and the enrollment's stored ``team_id``, never live
+        membership and never the permanent pointer. A player whose durable
+        records disagree names no fallback side, so the legacy event is
+        withheld from BOTH sides.
 
         WHY THE FILTER CANNOT UNDER-COUNT ITSELF INTO A LEAK: because the
         retained set contains only events all of whose identities are the
@@ -5155,20 +5169,46 @@ class ApiService:
         anyone's roster"), so all three fields are withheld outright. An
         UNSCOPED OPERATOR keeps the full game-wide collections, unchanged.
         """
+        def public(events):
+            return [{k: v for k, v in event.items() if k != "_team_id"}
+                    for event in events]
+
         if audience == lineup_visibility.FULL:
-            return lineup_visibility.FULL, notifications, audit
+            return (lineup_visibility.FULL, public(notifications),
+                    public(audit))
         if audience != lineup_visibility.OWN_SIDE:
             return self.ACTIVITY_WITHHELD, None, None
         sides = self.roster.durable_game_sides(game_id)
         known = self._game_player_universe(game_id, sides)
+        game = self.store.get_game(game_id)
+        valid_event_sides = (
+            {game.home_team_id, game.away_team_id}
+            if game is not None else set())
 
         def own(events):
             kept = []
             for event in events:
                 disclosed = _player_ids_in(event, known)
-                if disclosed and all(sides.get(pid) == team_id
-                                     for pid in disclosed):
-                    kept.append(event)
+                event_team_id = event.get("_team_id")
+                if not disclosed:
+                    continue
+                if event_team_id is not None:
+                    # A new event-side snapshot is authoritative only when it
+                    # still names a participant in this exact game.  It was
+                    # recorded from the same validated side as the lifecycle
+                    # write, so a player's later terminal row on another side
+                    # cannot erase or reattribute this historical event.
+                    keep = (event_team_id in valid_event_sides
+                            and event_team_id == team_id)
+                else:
+                    # Pre-064 rows have no event snapshot.  Preserve the
+                    # existing conservative rule: every disclosed identity
+                    # must have one unambiguous durable game side.
+                    keep = all(sides.get(pid) == team_id
+                               for pid in disclosed)
+                if keep:
+                    kept.append({k: v for k, v in event.items()
+                                 if k != "_team_id"})
             return kept
 
         return lineup_visibility.OWN_SIDE, own(notifications), own(audit)
@@ -7305,7 +7345,7 @@ class ApiService:
 
     @staticmethod
     def _player_attendance_status(row: Optional[dict]) -> str:
-        """Collapse a lineup row's availability/backed_out fields into the
+        """Collapse a player's roster commitment and availability into the
         Player Home Page's four attendance labels (#107)."""
         if row is None:
             return "not_responded"
@@ -7318,6 +7358,11 @@ class ApiService:
             return "checked_out"
         if avail == "maybe":
             return "pending"
+        # Accepting a substitute offer commits the player even when they have
+        # no separate availability response. An explicit AVAILABLE,
+        # UNAVAILABLE or MAYBE answer above remains authoritative.
+        if row.get("roster_status") in {"accepted", "confirmed"}:
+            return "confirmed"
         return "not_responded"
 
     def _venue_name_for_game(self, g) -> Optional[str]:
@@ -7468,7 +7513,7 @@ class ApiService:
         Identical on all three backends, and identical inside
         ``/api/me/guardian/home`` for a guardian verified for that junior.
 
-        THE ENTITLEMENT RULE, and it is decided by MEMBERSHIP, never by the
+        THE ORDINARY ENTITLEMENT RULE is decided by MEMBERSHIP, never by the
         pointer: the side is ``game_scoped_own_team_id`` against THIS game —
         the one resolution ``web/scope.can_read_private_game_data``, the
         private-game dispatch and the Dashboard schedule row all use, and the
@@ -7487,44 +7532,64 @@ class ApiService:
         chose.
 
         GAME SELECTION MOVED TO THE SAME AUTHORITY. ``next_game`` and
-        ``today_count`` now choose WHICH games this page is about through
+        ``today_count`` choose ordinary games through
         :meth:`RosterService._plays_in` (``team_for_game``), because a Mover
         handed the wrong game cannot be rescued by resolving the side
         correctly within it. Both halves fall back to the permanent pointer
         for a game with NO LeagueSeason binding, so exhibitions and unbound
-        legacy rows are byte-for-byte unchanged."""
+        legacy rows are byte-for-byte unchanged.
+
+        ACCEPTED BORROWING IS THE NARROW EXCEPTION. A fully matched accepted
+        cross-team enrollment plus its still-occupying attributed roster row
+        makes that game part of this player's own schedule. It renders as a
+        confirmed substitute with ``cross_team: true`` and ``team_status:
+        null``. It never flows into ``game_scoped_own_team_id`` or the private
+        roster family, and it disappears as soon as the player backs out."""
         player = self.store.get_player(player_id)
         if player is None:
             raise NotFoundError("Player not found.")
 
         next_game = self.roster.find_next_game_for_player(player_id)
         next_game_dto = None
-        # The SERVER's per-game resolution for the SIGNED-IN subject — the
-        # same function every other private per-side read of this game goes
-        # through. The subject comes from `player_id`, which `web/server.py`
-        # takes from the SESSION scope and never from a query parameter, so
-        # no caller can name a side here.
+        # Resolve ordinary membership through the same function every private
+        # per-side read uses. The subject comes from the SESSION scope. Only
+        # when membership names no side may Player Home recognize a fully
+        # matched accepted borrowed seat; that narrow schedule authority is
+        # never passed to a private per-side read.
         if next_game is not None:
-            my_team_id = game_scoped_own_team_id(
+            membership_team_id = game_scoped_own_team_id(
                 Role.PLAYER, None, player_id,
                 GameAuthorization.of(next_game), self.store)
-            # FAIL-CLOSED, and unreachable by construction rather than a new
-            # user-visible state: `find_next_game_for_player` selected this
-            # game through the SAME membership authority (`_plays_in` ->
-            # `team_for_game`), so a game it returned always resolves a side.
-            # The guard is what stops a future caller reintroducing the
-            # fallback — the same reasoning `position_for_game` gives for its
-            # own unreachable raise. It matters because an unresolved side
-            # here would reach `_opponent_team_id(g, None)` -> `home_team_id`
-            # and `compute_roster_status(gid, None)` -> the producer's home
-            # default: this very leak, by the back door.
+            borrowed_entry = (
+                None if membership_team_id is not None
+                else self.roster.accepted_cross_team_roster_entry(
+                    next_game, player))
+            my_team_id = (membership_team_id if membership_team_id is not None
+                          else (borrowed_entry.team_side
+                                if borrowed_entry is not None else None))
+            # FAIL-CLOSED: `_plays_in` admitted either the membership side or
+            # this exact fully matched borrowed row. Re-resolve both here so a
+            # stale/half-written row cannot fall through to a home-side
+            # default. The borrowed side is used only for public fixture
+            # labels and this player's own attendance controls.
             if my_team_id is not None:
                 team = self.store.get_team(my_team_id)
                 opponent_id = self._opponent_team_id(next_game, my_team_id)
                 opponent = (self.store.get_team(opponent_id)
                             if opponent_id else None)
-                rstatus = self.roster.compute_roster_status(
-                    next_game.id, my_team_id)
+                # Borrowed participation is enough to show this player's own
+                # schedule and attendance controls, but it does not disclose
+                # the target side's private shortage/roster status.
+                cross_team = borrowed_entry is not None
+                if cross_team:
+                    rstatus = None
+                else:
+                    # Keep the private per-side read on the membership side
+                    # produced by the canonical resolver.  A borrowed entry
+                    # is sufficient for this player's own schedule card, but
+                    # must never become authority to read target-team state.
+                    rstatus = self.roster.compute_roster_status(
+                        next_game.id, membership_team_id)
                 # Only this player's own roster entry + availability are
                 # needed — single-player lookups, not a full _lineup_rows
                 # pass over the team.
@@ -7537,9 +7602,12 @@ class ApiService:
                                    and not entry.status.occupies_slot),
                     "availability": (avail.availability_status.value
                                      if avail else "pending"),
+                    "roster_status": (entry.status.value
+                                      if entry is not None else None),
                 }
                 next_game_dto = {
                     "game_id": next_game.id, "team_id": my_team_id,
+                    "cross_team": cross_team,
                     "team_name": team.name if team else my_team_id,
                     "opponent_name": opponent.name if opponent else None,
                     "start_time": next_game.start_time.isoformat()
@@ -7547,8 +7615,10 @@ class ApiService:
                     "venue_name": self._venue_name_for_game(next_game),
                     "rink_name": next_game.rink,
                     "attendance_status": self._player_attendance_status(my_row),
-                    "team_status": self._PLAYER_TEAM_STATUS.get(
-                        rstatus.status.value, "not_responded"),
+                    "team_status": (None if rstatus is None else
+                                    self._PLAYER_TEAM_STATUS.get(
+                                        rstatus.status.value,
+                                        "not_responded")),
                 }
 
         active_substitutes = self.roster.active_substitute_snapshot(player_id)

@@ -314,6 +314,11 @@ class AuditLog:
     actor_id: Optional[str] = None
     subject_player_id: Optional[str] = None
     detail: dict = field(default_factory=dict)
+    # Durable event-side attribution for side-scoped activity projection.
+    # It is a frozen snapshot, deliberately without a foreign key: audit
+    # history must survive later Team/subtree deletion.  Legacy rows remain
+    # NULL and continue through the conservative player-attribution fallback.
+    team_id: Optional[str] = None
 
 
 @dataclass
@@ -325,6 +330,9 @@ class NotificationEvent:
     message: str
     at: datetime
     subject_player_id: Optional[str] = None
+    # Same frozen event-side snapshot as AuditLog.team_id.  This is internal
+    # authorization metadata and is never serialized in the board response.
+    team_id: Optional[str] = None
 
 
 @dataclass

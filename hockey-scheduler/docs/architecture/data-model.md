@@ -207,7 +207,7 @@ can persist the terminal outcome.
 
 Same-team rows keep both source columns null. Omitted-target enrollment,
 offer-time live retargeting, client deadline handling, and the established
-same-team response boundary are unchanged by migration 063.
+same-team response boundary are unchanged by migration 064.
 
 ## RosterStatus (computed)
 
@@ -257,3 +257,27 @@ AuditAction         : roster_selected, availability_set, player_backed_out,
 | subject_player_id | str? | who it was about |
 | detail | dict | structured before/after where useful |
 | at | datetime | |
+| team_id | str? | internal frozen Game-side attribution; historical snapshot, no FK |
+
+`team_id` is captured from the validated side of a side-owned lifecycle write.
+It is deliberately not backfilled and carries no foreign key, so audit history
+survives later Team/subtree deletion. A legacy NULL uses the conservative
+durable-player-attribution fallback. The field is authorization metadata and
+is stripped from every board response.
+
+## NotificationEvent
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | str | |
+| game_id | str | |
+| type | NotificationType | |
+| audience | str | intended audience class |
+| message | str | |
+| subject_player_id | str? | who it was about |
+| at | datetime | |
+| team_id | str? | internal frozen Game-side attribution; historical snapshot, no FK |
+
+`NotificationEvent.team_id` follows the same no-backfill, no-FK and
+never-serialized rules as `AuditLog.team_id`. It prevents later terminal
+history for another side from erasing or reattributing the original event.

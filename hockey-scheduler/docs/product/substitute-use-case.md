@@ -66,18 +66,24 @@ cross-Division policy:
    are stored privately as provenance. At most one active enrollment exists
    for that player and Game, so checking one side excludes the other even under
    concurrent requests.
-5. An enrolled row does not promise a seat. The target coach can offer or seat
-   it only when that target has an open slot matching the source membership's
-   snapshotted goalie/skater type, and the exact source provenance still
-   validates.
+5. An enrolled row does not promise a seat. The target coach can offer it, or
+   seat it through the explicit audited override, only when that target has an
+   open slot matching the source membership's snapshotted goalie/skater type,
+   and the exact source provenance still validates. The coach cannot accept or
+   decline on the player's behalf.
 6. A cross-team offer gets a server-owned deadline of
    `min(offered_at + 30 minutes, game.start_time)`. The response window is
    half-open: accept or decline must commit before the deadline; at equality
    `EXPIRED` wins. The transition records `substitute_expired` audit evidence.
    The stale card presents **Dismiss Expired Offer**, which uses the decline
    response path to persist expiry and release the unique active lifecycle.
-7. A verified guardian may accept or decline an offer for a junior. Proactive
+7. The player or a verified guardian may accept or decline an offer. Proactive
    cross-team opt-in and withdrawal are player-only in this slice.
+8. After acceptance, the borrowed Game appears in the player's (and verified
+   guardian's) Home schedule and today's count as a confirmed Substitute.
+   **Can't Play** backs out the occupying seat. The card never exposes the
+   target's private team status or grants access to its roster, lineups,
+   substitutes or availability summary.
 
 The established same-team workflow is unchanged: it omits `target_team_id`,
 uses its existing live side resolution and deadline semantics, and does not

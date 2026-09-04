@@ -4748,19 +4748,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send_api(api.offer_substitute(
                         gid, player_id, user_id, expires_at=body.get("expires_at"),
                         authorized_team_id=coach_team))
-                if op == "accept":
-                    if role == Role.PLAYER:
-                        # Keep the established generic self-service alias, but
-                        # bind a cross-team response to the target rendered by
-                        # the client. Otherwise an old Team 4 tab could accept
-                        # a later Team 5 offer because game+player alone is not
-                        # the lifecycle identity. Same-team ``{}`` is
-                        # intentionally unchanged.
+                fn = {"accept": api.accept_substitute,
+                      "decline": api.decline_substitute,
+                      "add-to-roster": api.add_substitute_to_roster}[op]
+                if role == Role.PLAYER:
+                    if op in {"accept", "decline"}:
+                        # Keep the established generic self-service aliases,
+                        # but bind a cross-team response to the target rendered
+                        # by the client. Otherwise an old Team 4 tab could
+                        # answer a later Team 5 offer because game+player alone
+                        # is not the lifecycle identity. Same-team ``{}`` is
+                        # unchanged.
                         try:
                             # ``actor_id`` is the documented legacy body field
                             # for this alias. Accept it for compatibility but
-                            # never trust it: the audited actor below remains
-                            # the signed-in session's ``user_id``.
+                            # never trust it: the audited actor remains the
+                            # session user.
                             check_body(
                                 body,
                                 allowed={"actor_id", "target_team_id"},
@@ -4784,19 +4787,16 @@ class Handler(BaseHTTPRequestHandler):
                                           "field": "target_team_id"})
                         except BodyError as exc:
                             return self._send_json(exc.payload, exc.status)
-                        return self._send_api(api.accept_substitute(
+                        return self._send_api(fn(
                             gid, player_id, user_id,
                             expected_target_team_id=body.get(
                                 "target_team_id"),
                             require_target_identity=True))
-                fn = {"accept": api.accept_substitute,
-                      "decline": api.decline_substitute,
-                      "add-to-roster": api.add_substitute_to_roster}[op]
                 # Threaded through the SHARED `fn(...)` call, deliberately,
                 # never bound into the dict above: three different methods are
                 # reached as VALUES there, so binding it per-value would be
                 # three call sites to keep in step instead of one.
-                if op == "decline":
+                if op in {"accept", "decline"}:
                     return self._send_api(fn(
                         gid, player_id, user_id,
                         authorized_team_id=coach_team,

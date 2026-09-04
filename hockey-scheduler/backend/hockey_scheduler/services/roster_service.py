@@ -294,7 +294,9 @@ class SubstituteTargetContext(NamedTuple):
     ``target_team_id`` is the game side they volunteered to help.  Keeping
     those values separate is essential for cross-team substitution: the
     source supplies eligibility and position, while the target owns the
-    enrollment, coach actions, slot and eventual roster seat.
+    enrollment, coach offer/seating actions, slot and eventual roster seat.
+    The player or verified guardian owns accept/decline; a Coach can seat the
+    player only through the explicit audited override.
     """
     source: GameMembershipContext
     target_team_id: str
@@ -659,6 +661,7 @@ class RosterService:
         actor_id: Optional[str] = None,
         subject_player_id: Optional[str] = None,
         detail: Optional[dict] = None,
+        team_id: Optional[str] = None,
     ) -> AuditLog:
         entry = AuditLog(
             id=self.store.next_id("audit"),
@@ -668,6 +671,7 @@ class RosterService:
             actor_id=actor_id,
             subject_player_id=subject_player_id,
             detail=detail or {},
+            team_id=team_id,
         )
         return self.store.add_audit(entry)
 
@@ -678,6 +682,7 @@ class RosterService:
         audience: str,
         message: str,
         subject_player_id: Optional[str] = None,
+        team_id: Optional[str] = None,
     ) -> NotificationEvent:
         event = NotificationEvent(
             id=self.store.next_id("notif"),
@@ -687,6 +692,7 @@ class RosterService:
             message=message,
             at=self.clock(),
             subject_player_id=subject_player_id,
+            team_id=team_id,
         )
         return self.store.add_notification(event)
 
@@ -1191,6 +1197,13 @@ class RosterService:
             subject_player_id=player_id,
             detail={"availability_status": availability_status.value,
                     "response_source": response_source},
+            # A seated row is the durable authority for the side this answer
+            # affects.  In particular, an accepted cross-team substitute has
+            # no membership on the borrowing side, so live resolution cannot
+            # recover this attribution later.
+            team_id=(entry.attribution[0]
+                     if entry is not None and entry.attribution is not None
+                     else None),
         )
 
         # Keep the roster entry in sync so the status engine reacts.
@@ -1260,16 +1273,29 @@ class RosterService:
         resolution — which also keeps it before every attempted write,
         since the resolution itself is the first thing this gate did.
 
-        STEP 2 — MAY THIS PLAYER HOLD THAT SIDE? Only now, and from the
-        LIVE context and nothing else. Durable attribution records what the
-        row HOLDS; it says nothing about who is still entitled to hold it.
-        If the stored value could authorize its own re-use, the row would
-        be a standing permission that outlives the participation that
-        granted it. Resolution fails CLOSED
+        STEP 2 — MAY THIS PLAYER HOLD THAT SIDE? There are exactly two
+        authorities, and both fail closed:
+
+        * an ordinary seated player must still have a LIVE membership
+          context for the row's side; or
+        * an ACCEPTED cross-team substitute must still have the one matched
+          accepted enrollment + occupying substitute-pool row that
+          :meth:`accepted_cross_team_roster_entry` validates.
+
+        The second authority is deliberately narrow. Accepting a borrowed
+        seat makes that game a current player commitment; choosing MAYBE
+        afterwards must not strand the player in a state where the same Home
+        card's ``I'm In`` action can never confirm that seat. A bare row, a
+        bare enrollment, a terminal row, half provenance, or a target/slot
+        mismatch does not pass. This does not make the borrower a member of
+        the target side or authorize any private game read.
+
+        Everyone else is resolved from live membership exactly as before.
+        Durable attribution records what the row HOLDS; it says nothing by
+        itself about who is entitled to hold it. Resolution fails CLOSED
         (``_require_membership_context`` — the #270 deactivation gate), so
-        a player with no live context at all is still refused before any
-        comparison is reached; what changed is only that an unattributed
-        row no longer reaches this step to be diagnosed by it.
+        a player with no live context at all is refused before any
+        comparison is reached.
 
         NO OPEN-SLOT CHECK IS ADDED by either step — the ruling forbids
         one here, and the re-confirm caller keeps running its own.
@@ -1286,6 +1312,19 @@ class RosterService:
         attribution = entry.attribution
         if attribution is None:
             self._refuse_unattributed(player, action)
+
+        # A cross-team acceptance is its own narrow seat authority. Reuse the
+        # paired-row oracle that exposes this commitment on Player Home so
+        # rendering and the Home attendance action cannot disagree. Restrict
+        # the exception to ACCEPTED: a backed-out UNAVAILABLE row cannot be
+        # resurrected through it.
+        borrowed = self.accepted_cross_team_roster_entry(game, player)
+        if (entry.status == RosterEntryStatus.ACCEPTED
+                and borrowed is not None
+                and borrowed.id == entry.id
+                and borrowed.attribution == attribution):
+            return attribution
+
         ctx = self._require_membership_context(game, player)
         if ctx.team_id != attribution[0]:
             # AUTHORIZATION, not occupancy — deliberately raised BEFORE any
@@ -1399,6 +1438,8 @@ class RosterService:
         actor_id: Optional[str],
         removed: bool = False,
     ) -> None:
+        event_team_id = (entry.attribution[0]
+                         if entry.attribution is not None else None)
         new_status = (
             RosterEntryStatus.REMOVED if removed else RosterEntryStatus.UNAVAILABLE
         )
@@ -1409,6 +1450,7 @@ class RosterService:
             action,
             actor_id=actor_id,
             subject_player_id=entry.player_id,
+            team_id=event_team_id,
         )
         if not removed:
             self._notify(
@@ -1417,6 +1459,7 @@ class RosterService:
                 audience="coach",
                 message="A selected player is unavailable.",
                 subject_player_id=entry.player_id,
+                team_id=event_team_id,
             )
         # Recalculate and, if a slot is now open with no substitutes, alert.
         # #205 blocker 5 round 2: the side that just LOST a player is the
@@ -1442,6 +1485,7 @@ class RosterService:
                 NotificationType.SLOT_OPEN,
                 audience="coach",
                 message=status.message,
+                team_id=event_team_id,
             )
             # Feed notification to that team's coach (#32).
             # #205 blocker 3 (sibling): unlike decline_substitute's offer,
@@ -1628,6 +1672,7 @@ class RosterService:
             subject_player_id=player_id,
             detail={"target_team_id": target_ctx.target_team_id,
                     "cross_team": target_ctx.cross_team},
+            team_id=target_ctx.target_team_id,
         )
         self._notify(
             game_id,
@@ -1635,6 +1680,7 @@ class RosterService:
             audience="coach",
             message="A player enrolled as substitute.",
             subject_player_id=player_id,
+            team_id=target_ctx.target_team_id,
         )
         return sub
 
@@ -1706,6 +1752,7 @@ class RosterService:
             AuditAction.SUBSTITUTE_WITHDRAWN,
             actor_id=actor_id,
             subject_player_id=player_id,
+            team_id=sub.team_id,
         )
         if was_offered:
             # An offered substitute backing out: notify the coach.
@@ -1715,6 +1762,7 @@ class RosterService:
                 audience="coach",
                 message="An offered substitute withdrew. The slot is open again.",
                 subject_player_id=player_id,
+                team_id=sub.team_id,
             )
         return sub
 
@@ -1808,6 +1856,7 @@ class RosterService:
             AuditAction.SUBSTITUTE_OFFERED,
             actor_id=actor_id,
             subject_player_id=player_id,
+            team_id=team_id,
         )
         self._notify(
             game_id,
@@ -1815,6 +1864,7 @@ class RosterService:
             audience="player",
             message="A game slot is available. Accept?",
             subject_player_id=player_id,
+            team_id=team_id,
         )
         # Deliver to the offered player's feed + delivery queue (#112) so it
         # drives their Player Home unread count and any push/email channel.
@@ -1831,6 +1881,7 @@ class RosterService:
         authorized_team_id: Optional[str] = None,
         expected_target_team_id: Optional[str] = None,
         require_target_identity: bool = False,
+        allow_cross_team_response: bool = True,
     ) -> GameRosterEntry:
         # The whole read → validate → decide → write path runs inside ONE
         # transaction, so no concurrent request can cancel/lock the game or
@@ -1854,13 +1905,19 @@ class RosterService:
                 sub, expected_target_team_id,
                 require_target_identity=require_target_identity)
             is_cross_team = self._has_cross_team_provenance(sub)
+            if is_cross_team and not allow_cross_team_response:
+                raise NotAuthorizedError(
+                    "Cross-team substitute offers are answered by the player "
+                    "or their verified guardian. A coach can use the explicit "
+                    "add-to-roster override instead.")
             # COMPARAND: THE LOCKED LIVE CONTEXT. Accepting CREATES NEW STATE
             # — it seats a roster row — and `_accept_offered_substitute`
             # below deliberately re-resolves live for exactly that reason
             # (see its comment, and decline_substitute's on why the two
-            # transitions differ). Authorizing against the same live side
-            # keeps the coach who may accept and the side the seat is
-            # counted on identical by construction.
+            # transitions differ). For the legacy same-team Coach path, the
+            # authorized live side and the side the seat counts on remain
+            # identical. Cross-team accept/decline is player/guardian-owned;
+            # its target Coach uses the explicit add-to-roster override.
             #
             # RESOLVED HERE, NOT INSIDE THE SEATING HELPER, because the
             # EXPIRED transition below is itself a WRITE and the ruling
@@ -1975,6 +2032,7 @@ class RosterService:
             AuditAction.SUBSTITUTE_ACCEPTED,
             actor_id=actor_id,
             subject_player_id=player_id,
+            team_id=team_id,
         )
         self._notify(
             game_id,
@@ -1982,6 +2040,7 @@ class RosterService:
             audience="coach",
             message="Substitute accepted and was added to roster.",
             subject_player_id=player_id,
+            team_id=team_id,
         )
         # Notify the team's coach via the feed + delivery queue (#112).
         _push_notification(
@@ -2049,6 +2108,7 @@ class RosterService:
             AuditAction.SUBSTITUTE_DECLINED,
             actor_id=actor_id,
             subject_player_id=player_id,
+            team_id=sub.team_id,
         )
         # Notify the team's coach so they can advance to the next candidate
         # (#112) — the pre-#112 decline path emitted no notification at all.
@@ -2136,7 +2196,7 @@ class RosterService:
         is_cross_team = self._has_cross_team_provenance(sub)
         decision_at = None
         if is_cross_team:
-            # As on offer/coach-accept, authorize the stored target before
+            # As on offer/coach-override, authorize the stored target before
             # inspecting the source player's active/provenance state.
             self._require_authorized_team(
                 authorized_team_id, sub.team_id, "player")
@@ -2178,6 +2238,7 @@ class RosterService:
             actor_id=actor_id,
             subject_player_id=player_id,
             detail={"override": True},
+            team_id=team_id,
         )
         self._notify(
             game_id,
@@ -2185,6 +2246,7 @@ class RosterService:
             audience="coach",
             message="Substitute accepted and was added to roster.",
             subject_player_id=player_id,
+            team_id=team_id,
         )
         return entry
 
@@ -2207,6 +2269,7 @@ class RosterService:
             actor_id=actor_id,
             subject_player_id=sub.player_id,
             detail={"reason": reason, "target_team_id": sub.team_id},
+            team_id=sub.team_id,
         )
         return sub
 
@@ -3269,6 +3332,98 @@ class RosterService:
         keep pre-#205 behavior exactly."""
         ctx = self.resolve_membership_context(game, player)
         return ctx.team_id if ctx is not None else None
+
+    def accepted_cross_team_roster_entry(
+        self, game, player,
+    ) -> Optional[GameRosterEntry]:
+        """The player's one current accepted borrowed seat, or ``None``.
+
+        This is deliberately *not* membership and therefore is not folded
+        into :meth:`team_for_game` or the private-game authorization family.
+        It exists for the player's own schedule projection: once a player has
+        accepted a cross-team offer, Player Home must count and render the
+        game so they can back out, without granting access to the borrowing
+        side's private roster workflow.
+
+        The roster row and enrollment must independently agree on the exact
+        game side and slot.  While the source Team/Membership rows still
+        exist, they must also agree with the frozen source provenance.  Both
+        may be absent after an explicitly authorised subtree deletion (the
+        provenance columns deliberately have no foreign keys so that history
+        survives), but one missing row or a contradictory survivor is corrupt
+        and fails closed.  A bare seat, an enrollment without a seat,
+        terminal/non-occupying history, half-written provenance, conflicting
+        rows, or a player who is no longer active all fail closed.
+        """
+        if game is None or player is None or not player.is_active:
+            return None
+        entry = self.store.roster_entry_for_player(game.id, player.id)
+        if (entry is None
+                or entry.roster_role != RosterRole.SUBSTITUTE_ADDED
+                or entry.selection_source != SelectionSource.SUBSTITUTE_POOL
+                or not entry.status.is_confirmed_body
+                or entry.attribution is None):
+            return None
+        side, slot_type = entry.attribution
+        if side not in {game.home_team_id, game.away_team_id}:
+            return None
+        accepted = [
+            sub for sub in self.store.substitute_enrollments_for_player(
+                player.id)
+            if (sub.game_id == game.id
+                and sub.status == SubstituteStatus.ACCEPTED
+                and self._is_cross_team_enrollment(sub))
+        ]
+        if len(accepted) != 1:
+            return None
+        sub = accepted[0]
+        if sub.team_id != side or sub.slot_type != slot_type:
+            return None
+
+        # Source provenance is historical after acceptance, but it is not an
+        # unchecked marker.  Cross-team enrollment can never originate from
+        # either participating side, and any surviving source Team and
+        # Membership must describe the exact frozen source stint.  #429's
+        # explicit subtree deletion may remove both rows; accepting that
+        # paired absence is why this is not a foreign-key/existence gate.
+        game_sides = {game.home_team_id, game.away_team_id}
+        if (sub.source_team_id in game_sides
+                or sub.source_team_id == sub.team_id):
+            return None
+        source_team = self.store.get_team(sub.source_team_id)
+        source_membership = self.store.get_season_roster_membership(
+            sub.source_membership_id)
+        if (source_team is None) != (source_membership is None):
+            return None
+        if source_membership is not None:
+            league_season = self.store.get_league_season(
+                game.league_season_id)
+            if (league_season is None
+                    or source_team.league_id != league_season.league_id
+                    or source_membership.player_id != player.id
+                    or source_membership.team_id != sub.source_team_id
+                    or source_membership.league_season_id
+                    != game.league_season_id
+                    or source_membership.season_id != game.season_id):
+                return None
+        return entry
+
+    def player_home_team_for_game(self, game, player) -> Optional[str]:
+        """The side used only to select a player's own schedule games.
+
+        Seasonal membership remains the ordinary answer.  A fully matched,
+        still-occupying accepted cross-team seat is also a real commitment
+        and therefore belongs on Player Home.  If both authorities exist and
+        disagree, the state is ambiguous and the schedule projection exposes
+        neither side.
+        """
+        member_side = self.team_for_game(game, player)
+        borrowed = self.accepted_cross_team_roster_entry(game, player)
+        borrowed_side = borrowed.team_side if borrowed is not None else None
+        if (member_side is not None and borrowed_side is not None
+                and member_side != borrowed_side):
+            return None
+        return member_side or borrowed_side
 
     def position_for_game(self, game, player) -> Position:
         """The position ``player`` plays FOR ``game`` — the resolved
@@ -4434,16 +4589,16 @@ class RosterService:
         GAME-SHAPE half of "counts for the Player Home Page" (#107), with no
         team in it at all.
 
-        Every Player Home scan pairs it with :meth:`team_for_game` (see
-        :meth:`_plays_in`), so WHICH GAMES a player sees and WHICH SIDE they
-        see them from are decided by the one membership authority instead of
-        by two tests that could disagree."""
+        Every Player Home scan pairs it with
+        :meth:`player_home_team_for_game` (see :meth:`_plays_in`). Ordinary
+        participation is still decided by the one membership authority; the
+        only additional selector is a fully matched, still-occupying accepted
+        cross-team seat used solely for the player's own schedule."""
         return (not g.cancelled and g.published and not g.is_draft
                 and g.start_time is not None)
 
     def _plays_in(self, g, player) -> bool:
-        """Is ``g`` a game ``player`` is IN, resolved by the game-scoped
-        membership authority (#205, round 6)?
+        """Is ``g`` a game ``player`` is committed to on Player Home?
 
         THE SELECTION HALF OF THE SIDE RULE. This used to be
         ``_is_visible_team_game(g, player.team_id)`` — the permanent pointer
@@ -4468,22 +4623,25 @@ class RosterService:
         correctly within it, and the availability POST the Player Home screen
         offers is addressed to ``next_game.game_id``.
 
-        ``team_for_game`` falls back to the permanent pointer for a game with
-        NO LeagueSeason binding, so exhibitions and unbound legacy rows keep
-        pre-#205 behavior exactly — there the pointer is the only authority
-        there has ever been and it is correct by design.
+        ``player_home_team_for_game`` keeps that membership rule, including
+        ``team_for_game``'s permanent-pointer fallback for a game with NO
+        LeagueSeason binding. It additionally recognizes only a fully
+        matched, occupying accepted cross-team seat. That exception does not
+        feed private-game authorization and disappears when the player backs
+        out or the seat otherwise stops occupying a slot.
 
         Same predicate, same order and the same authority
         :meth:`list_player_offers` has used since the cutover, so the Player
         Home scans cannot drift on what a player-visible game is."""
         return (self._is_visible_game(g)
-                and self.team_for_game(g, player) is not None)
+                and self.player_home_team_for_game(g, player) is not None)
 
     def find_next_game_for_player(self, player_id: str) -> Optional[Game]:
         """The player's next published, non-cancelled game in chronological
         order — the Player Home Page's "next game" card (#107).
-        Membership-resolved: see :meth:`_plays_in`. A pure read helper — must
-        NOT be @_transactional."""
+        Membership- or accepted-borrowed-seat-resolved: see
+        :meth:`_plays_in`. A pure read helper — must NOT be
+        @_transactional."""
         player = self.store.get_player(player_id)
         if player is None or not player.is_active:
             return None
@@ -4498,8 +4656,9 @@ class RosterService:
 
     def count_games_today_for_player(self, player_id: str) -> int:
         """How many of THIS PLAYER's games fall on today's date — the Player
-        Home Page's "Tonight" summary card (#107). Membership-resolved: see
-        :meth:`_plays_in`. A pure read helper — must NOT be
+        Home Page's "Tonight" summary card (#107). Membership- or
+        accepted-borrowed-seat-resolved: see :meth:`_plays_in`. A pure read
+        helper — must NOT be
         @_transactional."""
         player = self.store.get_player(player_id)
         if player is None or not player.is_active:

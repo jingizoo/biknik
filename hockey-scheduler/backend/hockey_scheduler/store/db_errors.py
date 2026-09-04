@@ -175,7 +175,7 @@ def translate_membership_conflict_exception(
 
 def translate_substitute_active_conflict_exception(
         exc: BaseException, sub) -> Optional[DomainError]:
-    """Translate migration 063's active ``(game, player)`` race backstop."""
+    """Translate migration 064's active ``(game, player)`` race backstop."""
     if isinstance(exc, DomainError):
         return None
     if not _is_unique_violation_on(

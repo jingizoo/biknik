@@ -62,9 +62,10 @@ POST /games/{gameId}/substitutes/{playerId}/add-to-roster
   cross-team enrollment rejects a client-supplied deadline and uses the
   server-owned deadline described below.
 - Legacy same-team `accept` / `decline` body:
-  `{ "actor_id": "..." }`. The signed-in Player form of generic `accept`
-  also accepts `target_team_id` for a cross-team offer; `actor_id` remains a
-  compatibility field and never overrides the session-derived audit actor.
+  `{ "actor_id": "..." }`. The signed-in Player forms of generic `accept`
+  and `decline` require `target_team_id` for a cross-team offer; `actor_id`
+  remains a compatibility field and never overrides the session-derived
+  audit actor.
 - `add-to-roster` body: `{ "actor_id": "..." }` (coach override; offers + accepts in one step)
 
 The signed-in Player Home surface also exposes substitute availability and
@@ -97,24 +98,26 @@ POST /api/me/guardian/{juniorId}/substitute-opportunities/{gameId}/decline-offer
   and `cross_team` instead.
 - Only one active (`enrolled` or `offered`) row may exist for one
   `(game_id, player_id)`, including concurrent requests for opposite sides.
-- A target-side coach may offer or seat the row only after a matching target
-  slot exists. Cross-team offer time is captured by the server and the
+- A target-side coach may offer the row, or seat it through the explicit
+  audited `add-to-roster` override, only after a matching target slot exists.
+  The coach may not accept or decline on the player's behalf. Cross-team
+  offer time is captured by the server and the
   deadline is `min(offered_at + 30 minutes, game.start_time)`. The interval is
   half-open: at equality the durable outcome is `expired`, not accepted or
   declined. Expiry appends `substitute_expired` audit evidence; the player's
   `decline-offer` action is also the explicit **Dismiss Expired Offer** path
   that clears the stale card and releases the active-row uniqueness key.
-- A verified guardian may accept or decline an existing offer for their
-  junior, but proactive cross-team enrollment and withdrawal remain
-  player-only in this slice.
+- The player or a verified guardian may accept or decline an existing offer;
+  proactive cross-team enrollment and withdrawal remain player-only in this
+  slice.
 - Every player/guardian cross-team detail or response request carries the
   rendered `target_team_id`: as the detail query parameter above and as
   `{ "target_team_id": "..." }` for player withdraw/accept/decline bodies,
   including guardian responses. The service compares it to the active
   enrollment under the mutation transaction. A stale tab aimed at an earlier
   target receives **409** and performs no state, roster, notification or audit
-  write. Coach actions instead bind through the row's durable target and the
-  coach's server-resolved team scope.
+  write. Coach offer and explicit add-to-roster actions instead bind through
+  the row's durable target and the coach's server-resolved team scope.
 - Omitting `target_team_id` preserves the established same-team eligibility,
   live retargeting, request-deadline and response-boundary behavior.
 
@@ -285,12 +288,14 @@ statement about the reader:
   `null` when `withheld`, and `audit_count` otherwise counts the rows actually
   returned, so it cannot report the size of what was omitted.
 
-An event is retained for a side only when **every player identity it discloses
-is durably attributed to that side, and it discloses at least one**.
-Attribution comes from the stored `GameRosterEntry.team_side` and
-`SubstituteEnrollment.team_id` — never live membership and never
-`Player.team_id`. A legacy row with NULL attribution names no side, so it is
-withheld from **both** rather than guessed onto one.
+New lifecycle events carry an internal frozen `team_id` from the validated
+side of the write. An event is retained only when it discloses at least one
+player and that snapshot names the caller's side and a current side of the
+same Game. The snapshot is never serialized. Only a legacy event whose
+snapshot is NULL uses the conservative fallback: **every player identity it
+discloses must have one unambiguous durable side equal to the caller's**.
+That fallback comes from stored `GameRosterEntry.team_side` and
+`SubstituteEnrollment.team_id` — never live membership or `Player.team_id`.
 
 ### Per-side private state outside the `/games/{id}/…` family (#205)
 
@@ -358,8 +363,8 @@ no audience to classify and no client hint to ignore. The only question is
 `Player.team_id`, the permanent pointer, which a mid-season transfer leaves
 stale for a particular game in either direction.
 
-Entitlement therefore comes from **authoritative game-scoped membership**, and
-a pointer that has outlived the membership grants nothing:
+Ordinary entitlement therefore comes from **authoritative game-scoped
+membership**, and a pointer that has outlived the membership grants nothing:
 
 | pointer / membership for this game | `next_game` |
 |---|---|
@@ -368,13 +373,19 @@ a pointer that has outlived the membership grants nothing:
 | pointer HOME, membership moved to another team | **no BOUND game, neither side** (an unbound exhibition the pointer still names is unaffected) |
 | pointer HOME, membership ended or absent | **no BOUND game, neither side** (an unbound exhibition the pointer still names is unaffected) |
 | pointer and membership agree | that side, unchanged |
+| no Game-side membership, but a fully matched accepted cross-team seat still occupies its slot | the borrowed Game appears as `cross_team: true`, `attendance_status: "confirmed"`, and `team_status: null` |
 | no player binding on the session (including an unscoped operator) | the empty stub |
 
-**Game selection follows the same authority.** `next_game` and `today_count`
-choose *which games* the page is about through the game-scoped membership
-resolution as well, because a player handed the wrong game cannot be rescued
-by resolving the side correctly within it — and the availability POST the
-screen offers is addressed to `next_game.game_id`. For a **mover** this
+**Game selection follows the same authority, with one narrow personal-schedule
+exception.** `next_game` and `today_count` ordinarily choose *which games* the
+page is about through game-scoped membership. A fully matched accepted
+cross-team enrollment plus its still-occupying attributed roster row also
+counts as this player's own commitment. That borrowed card exposes public
+fixture labels and this player's own attendance control, but no target-side
+team status and no `/roster`, `/lineups`, `/substitutes`, or
+`/availability-summary` access. Using **Can't Play** backs the player out and
+removes the borrowed Game from `next_game` and `today_count`. For a **mover**
+the membership correction
 changed three things at once, and only the first is a privacy fix:
 
 | | before | now |
@@ -428,15 +439,18 @@ and liveness are different questions asked of the same row:
   membership and make the guess durable. An unscoped operator claims no side
   and is unaffected — they remain the path by which a legacy row is repaired.
 
-Migration 063 adds the cross-team half of that ownership rule. `team_id` is
+Migration 064 adds the cross-team half of that ownership rule. `team_id` is
 still the durable **target** Game side. The paired, nullable
 `source_membership_id` and `source_team_id` columns record the exact source
 stint that admitted a cross-team row; they carry no foreign keys so terminal
 history survives later membership or organization cleanup. A partial unique
 index on `(game_id, player_id)` for `enrolled` and `offered` rows prevents a
 player from holding both Game sides at once without deleting terminal history.
-Same-team rows leave both source columns null and retain their pre-063
-behavior.
+The migration also adds nullable, non-FK `team_id` snapshots to `audit_logs`
+and `notification_events`; new side-owned lifecycle writes freeze their
+validated side while legacy NULL events retain the conservative projection
+above. Same-team enrollment rows leave both source columns null and retain
+their pre-064 behavior.
 
 ### Which side a roster selection may act on
 

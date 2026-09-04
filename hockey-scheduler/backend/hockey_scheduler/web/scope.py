@@ -168,7 +168,8 @@ def scope_violation(role, scope, path, body, store, *,
                     allow_cross_team=not (
                         game_action == "substitutes/withdraw"
                         or (substitute_action is not None
-                            and substitute_action.group(2) == "decline")))
+                            and substitute_action.group(2)
+                                in {"accept", "decline"})))
             elif (game is not None
                   and game_action in {"availability", "roster/remove"}):
                 # These commands respond to/remove an existing roster row;
