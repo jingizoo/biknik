@@ -1552,6 +1552,58 @@ class SubtreeDeletionContract:
         self.assertEqual(cancellation.exception.details["reason"],
                          "game_cancellation_required")
 
+    def test_archived_season_guard_is_linear_in_the_projected_graph(self):
+        """Unrelated archived Seasons cannot multiply full edge scans."""
+        fingerprint = "0" * 64
+
+        def ref(kind, record_id):
+            return RecordRef(kind, record_id, fingerprint)
+
+        rows = {}
+        projected_edges = []
+        affected_index = 37
+        for index in range(64):
+            season_id = f"archived_{index}"
+            season = Season(
+                season_id, f"program_{index}", f"Archived {index}",
+                status=SeasonStatus.ARCHIVED)
+            rows[(EntityType.SEASON.value, season_id)] = season
+            projected_edges.append(ProjectedEdge(
+                "league_seasons.season_id",
+                ref(EntityType.LEAGUE_SEASON, f"league_season_{index}"),
+                ref(EntityType.SEASON, season_id)))
+
+        # Only this Division belongs to one archived Season. The other 63
+        # Seasons make a whole-installation rescan visible without relying on
+        # timing: the edge iterable counts each concrete visit.
+        division = ref(EntityType.DIVISION, "division_mutated")
+        projected_edges.append(ProjectedEdge(
+            "divisions.league_season_id", division,
+            ref(EntityType.LEAGUE_SEASON,
+                f"league_season_{affected_index}")))
+
+        class CountingEdges:
+            def __init__(self, values):
+                self.values = values
+                self.passes = 0
+                self.visits = 0
+
+            def __iter__(self):
+                self.passes += 1
+                for value in self.values:
+                    self.visits += 1
+                    yield value
+
+        edges = CountingEdges(projected_edges)
+        with self.assertRaises(ValidationError) as blocked:
+            self.service._assert_no_archived_season_impact(
+                rows, edges, {division.key})
+
+        self.assertEqual(blocked.exception.details["season_ids"],
+                         [f"archived_{affected_index}"])
+        self.assertLessEqual(edges.passes, 2)
+        self.assertLessEqual(edges.visits, 2 * len(projected_edges))
+
     def test_concurrent_cancellation_waits_then_cannot_resurrect_game(self):
         def build(peer):
             roster = RosterService(peer, clock=lambda: NOW)

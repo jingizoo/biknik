@@ -629,20 +629,39 @@ class SubtreeDeletionService:
     def _assert_no_archived_season_impact(self, rows, edges,
                                           deleting) -> None:
         mutation_keys = set(deleting)
-        mutation_keys.update(
-            edge.source.key for edge in edges
-            if (edge.target.key in deleting
-                and edge.source.key not in deleting
-                and REFERENCE_BY_KEY[edge.inventory_key].on_target_delete
-                is TargetRemoval.DETACH))
-        affected = []
-        for key, row in rows.items():
-            if not isinstance(row, Season) \
-                    or not season_guard.season_is_read_only(row):
-                continue
-            governed = self._deletion_closure(key, edges)
-            if governed & mutation_keys:
-                affected.append(row.id)
+        delete_parents_by_source = {}
+        for edge in edges:
+            removal = REFERENCE_BY_KEY[
+                edge.inventory_key].on_target_delete
+            if removal is TargetRemoval.DELETE_SOURCE:
+                # Deletion closure flows target -> source.  The archived-
+                # Season question is the inverse: which possible owners can
+                # reach a row we plan to mutate?  Index source -> target once
+                # so that answer is linear in this projection rather than one
+                # full closure scan per archived Season.
+                delete_parents_by_source.setdefault(
+                    edge.source.key, set()).add(edge.target.key)
+            elif (removal is TargetRemoval.DETACH
+                  and edge.target.key in deleting
+                  and edge.source.key not in deleting):
+                mutation_keys.add(edge.source.key)
+
+        governing_keys = set(mutation_keys)
+        pending = list(mutation_keys)
+        while pending:
+            source_key = pending.pop()
+            for target_key in delete_parents_by_source.get(source_key, ()):
+                if target_key in governing_keys:
+                    continue
+                governing_keys.add(target_key)
+                pending.append(target_key)
+
+        affected = [
+            row.id for key, row in rows.items()
+            if (key in governing_keys
+                and isinstance(row, Season)
+                and season_guard.season_is_read_only(row))
+        ]
         if affected:
             raise ValidationError(
                 "Archived Seasons are read-only. Reopen the affected Season "
