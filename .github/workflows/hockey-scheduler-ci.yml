@@ -280,7 +280,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.browser_smoke == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Four bounded shards now run 14-17 real journeys each. On a slow hosted
+    # runner dependency setup alone can consume 7+ minutes; retain a hard cap
+    # while leaving enough time for the journeys to execute.
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: hockey-scheduler/e2e
