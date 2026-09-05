@@ -40,6 +40,8 @@ from hockey_scheduler.domain import (
     SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
+    SubstituteEnrollment,
+    SubstituteStatus,
     Team,
     UserAccount,
     Venue,
@@ -733,6 +735,7 @@ class SubtreeDeletionContract:
             EPOCH_FENCE_GLOBAL_KEY)
         original_fence = self.store.epoch_fence_acquire_exclusive
         original_authorizer = self.service._root_authorizer
+        original_context_lock = self.store.get_active_context_for_update
         original_graph_lock = self.store.lock_subtree_graph
         original_account_lock = self.store.get_user_account_for_update
 
@@ -745,6 +748,10 @@ class SubtreeDeletionContract:
             return original_authorizer(
                 kind, record_id, account, phase)
 
+        def context_lock(account_id):
+            events.append(("active_context", account_id))
+            return original_context_lock(account_id)
+
         def graph_lock():
             events.append(("graph", None))
             return original_graph_lock()
@@ -755,6 +762,7 @@ class SubtreeDeletionContract:
 
         self.store.epoch_fence_acquire_exclusive = fence
         self.service._root_authorizer = authorize
+        self.store.get_active_context_for_update = context_lock
         self.store.lock_subtree_graph = graph_lock
         self.store.get_user_account_for_update = account_lock
 
@@ -762,6 +770,7 @@ class SubtreeDeletionContract:
         self.assertEqual(events, [
             ("fence", EPOCH_FENCE_GLOBAL_KEY),
             ("authorize", "context"),
+            ("active_context", "admin"),
             ("graph", None),
             ("account", "admin"),
             ("authorize", "target"),
@@ -1740,6 +1749,98 @@ class TestSubtreeDeletionPostgres(SubtreeDeletionContract, unittest.TestCase):
             "IN EXCLUSIVE MODE NOWAIT"
         ])
 
+    def test_writer_committed_before_graph_lock_cannot_survive_successful_delete(self):
+        """A pre-lock commit makes the presented preview stale.
+
+        The former SERIALIZABLE execution established its snapshot at the
+        first statement. Park the deleter immediately before its graph lock,
+        commit a row through a second real connection, and then let deletion
+        continue. ``substitute_enrollments`` deliberately has no foreign keys,
+        so that stale snapshot reported success while the new row survived
+        with missing Game, Player, and Team parents.
+        """
+        preview = self.preview()
+        challenge_before = copy.deepcopy(
+            self.store.get_subtree_deletion_challenge("admin"))
+        peer = self.make_peer_store()
+        before_graph_lock = threading.Event()
+        writer_committed = threading.Event()
+        release_graph_lock = threading.Event()
+        outcome = {}
+        ordering = []
+        original_graph_lock = self.store.lock_subtree_graph
+
+        def graph_lock():
+            ordering.append("before_graph_lock")
+            before_graph_lock.set()
+            if not release_graph_lock.wait(10):
+                raise RuntimeError("writer did not release the graph lock")
+            if not writer_committed.is_set():
+                raise RuntimeError("graph lock resumed before writer commit")
+            ordering.append("graph_lock")
+            return original_graph_lock()
+
+        def run_delete():
+            try:
+                outcome["result"] = self.execute(preview)
+            except Exception as exc:  # exact safe refusal is checked below
+                outcome["error"] = exc
+
+        self.store.lock_subtree_graph = graph_lock
+        thread = threading.Thread(target=run_delete)
+        try:
+            thread.start()
+            self.assertTrue(
+                before_graph_lock.wait(10),
+                "delete never reached its graph lock")
+            with peer.transaction():
+                peer.add_substitute(SubstituteEnrollment(
+                    id="sub_committed_before_graph_lock",
+                    game_id="game_program",
+                    player_id="player_private",
+                    position=Position.FORWARD,
+                    status=SubstituteStatus.ENROLLED,
+                    enrolled_at=NOW,
+                    team_id="team_home",
+                ))
+            ordering.append("writer_committed")
+            writer_committed.set()
+        finally:
+            release_graph_lock.set()
+            thread.join(20)
+            self.store.lock_subtree_graph = original_graph_lock
+            peer.close()
+
+        self.assertFalse(thread.is_alive(), "subtree deletion thread hung")
+        self.assertEqual(
+            ordering[:3],
+            ["before_graph_lock", "writer_committed", "graph_lock"],
+            ordering)
+
+        self.assertNotIn("result", outcome, outcome)
+        self.assertIsInstance(outcome.get("error"), ValidationError, outcome)
+        self.assertEqual(
+            outcome["error"].details.get("reason"), "preview_stale")
+        self.assertEqual(
+            self.store.get_subtree_deletion_challenge("admin"),
+            challenge_before,
+            "stale refusal must roll challenge consumption back")
+        self.assertIsNotNone(self.store.get_game("game_program"))
+        self.assertIsNotNone(self.store.get_player("player_private"))
+        self.assertIsNotNone(self.store.get_team("team_home"))
+        self.assertIsNotNone(self.store.substitute_for_player(
+            "game_program", "player_private"))
+
+        fresh = self.preview()
+        self.assertEqual(self.execute(fresh)["result"], "success")
+        self.assertIsNone(
+            self.store.get_subtree_deletion_challenge("admin"))
+        self.assertIsNone(self.store.get_game("game_program"))
+        self.assertIsNone(self.store.get_player("player_private"))
+        self.assertIsNone(self.store.get_team("team_home"))
+        self.assertIsNone(self.store.substitute_for_player(
+            "game_program", "player_private"))
+
     def test_account_deactivation_after_context_check_aborts_locked_recheck(self):
         preview = self.preview()
         context_checked = threading.Event()
@@ -1788,10 +1889,9 @@ class TestSubtreeDeletionPostgres(SubtreeDeletionContract, unittest.TestCase):
 
         self.assertFalse(thread.is_alive(), "subtree deletion thread hung")
         self.assertNotIn("result", outcome, outcome)
-        self.assertIsInstance(
-            outcome.get("error"), ConcurrencyConflictError, outcome)
+        self.assertIsInstance(outcome.get("error"), NotAuthorizedError, outcome)
         self.assertEqual(
-            outcome["error"].details["reason"], "serialization_failure")
+            outcome["error"].details["reason"], "not_authorized")
         self.assertIsNotNone(self.store.get_program("program_delete"))
         self.assertIsNotNone(
             self.store.get_subtree_deletion_challenge("admin"),
