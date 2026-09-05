@@ -425,6 +425,26 @@ class ContextService:
         # this round's regression traced to) genuinely does not.
         return self._snapshot(work, read_only=not lock)
 
+    def _resolve_saved_with_league_in_transaction(
+            self, user_id: Optional[str], role, scope, lock=False):
+        """Resolve the persisted tuple inside a transaction the caller owns.
+
+        This is the transaction-bound form used by subtree deletion (#452).
+        It deliberately opens no nested snapshot and performs no retry: that
+        caller must keep the ActiveContext row lock and its graph-wide lock
+        around this read and the mutation it authorizes.  Ordinary callers use
+        :meth:`resolve_saved_with_league`, whose SERIALIZABLE snapshot contract
+        remains unchanged.
+        """
+        if getattr(self.store, "_txn_depth", 0) < 1:
+            raise RuntimeError(
+                "transaction-bound context resolution requires an active "
+                "store transaction")
+        saved, program, season, league = self._saved_locked(
+            user_id, role, scope, lock=lock)
+        return (_detached(saved), _detached(program), _detached(season),
+                _detached(league))
+
     def _saved_locked(self, user_id, role, scope, lock=False):
         """The persisted row and the axes it still validly names, as LIVE rows —
         MUST run inside the transaction; every caller detaches its result before

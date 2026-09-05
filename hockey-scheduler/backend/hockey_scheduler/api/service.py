@@ -1866,31 +1866,47 @@ class ApiService:
         # the row locks and the transaction across the mutation, is.
         with self.store.transaction(
                 isolation="REPEATABLE READ", read_only=True):
-            # -- rule 3: existence (indistinguishable from inaccessible) ---
-            record = self._setup_target_record(normalized, record_id)
-            if record is None:
-                return False
+            return self._setup_target_accessible_from_tuple(
+                normalized, record_id, user_id, program, season, league)
 
-            # -- rule 4: the record's chain, as WHOLE link triples ----------
-            edges, saw_link = self._setup_target_edges(normalized, record)
+    def _setup_target_accessible_from_tuple(
+            self, normalized, record_id, user_id, program, season, league):
+        """Apply #369 to a validated tuple inside the caller's transaction.
 
-            # -- rule 5: LINKED → the chain decides, creator is irrelevant --
-            # ONE whole link must place the record inside the caller's whole
-            # persisted context. Judging edge by edge (rather than testing each
-            # axis against a union of components taken from DIFFERENT links) is
-            # what stops a (Season S, League B) caller from being authorized by
-            # a record whose only links are (S, League A) and (S', League B).
-            if edges:
-                return any(
-                    self._setup_target_edge_allows(edge, program, season,
-                                                   league)
-                    for edge in edges)
-            if saw_link:
-                return False                 # linked but unresolvable → closed
+        The ordinary predicate above obtains its own coherent snapshot first.
+        Subtree execution calls this policy core only after it owns the graph
+        lock, so every row the chain walk can read is stable without a nested
+        REPEATABLE READ transaction (#452).
+        """
+        if (normalized not in self._SETUP_TARGET_KINDS
+                or program is None):
+            return False
 
-            # -- rule 6: genuinely UNLINKED → creator only -----------------
-            return self._setup_target_created_by(
-                normalized, record_id, user_id)
+        # -- rule 3: existence (indistinguishable from inaccessible) -------
+        record = self._setup_target_record(normalized, record_id)
+        if record is None:
+            return False
+
+        # -- rule 4: the record's chain, as WHOLE link triples --------------
+        edges, saw_link = self._setup_target_edges(normalized, record)
+
+        # -- rule 5: LINKED -> the chain decides, creator is irrelevant -----
+        # ONE whole link must place the record inside the caller's whole
+        # persisted context. Judging edge by edge (rather than testing each
+        # axis against a union of components taken from DIFFERENT links) is
+        # what stops a (Season S, League B) caller from being authorized by a
+        # record whose only links are (S, League A) and (S', League B).
+        if edges:
+            return any(
+                self._setup_target_edge_allows(
+                    edge, program, season, league)
+                for edge in edges)
+        if saw_link:
+            return False                     # linked but unresolvable -> closed
+
+        # -- rule 6: genuinely UNLINKED -> creator only ---------------------
+        return self._setup_target_created_by(
+            normalized, record_id, user_id)
 
     def setup_target_allowed(self, kind, record_id, user_id, role, scope,
                              rule="scope"):
@@ -1965,18 +1981,45 @@ class ApiService:
         lock inversion.
         """
         if phase == "context":
-            error = self._mutation_context_error(
-                [(kind, record_id)], account.id, account.role, account.scope,
-                lock=True)
+            _saved, program, season, _league = (
+                self.context._resolve_saved_with_league_in_transaction(
+                    account.id, account.role, account.scope, lock=True))
+            axis_targets = self._mutation_axis_targets([(kind, record_id)])
+            error = self._mutation_context_error_from_selection(
+                axis_targets, program, season)
             if error is not None:
                 raise error
             return True
         if phase == "target":
-            refused = self._authorize_setup_targets(
-                [(0, kind, record_id, "scope")], account.id, account.role,
-                account.scope)
+            # READ COMMITTED makes the pre-graph decision intentionally
+            # non-authoritative. Re-read the still-locked ActiveContext after
+            # the graph lock and re-apply both #409 and #369 before mutation.
+            _saved, program, season, league = (
+                self.context._resolve_saved_with_league_in_transaction(
+                    account.id, account.role, account.scope))
+            axis_targets = self._mutation_axis_targets([(kind, record_id)])
+            error = self._mutation_context_error_from_selection(
+                axis_targets, program, season)
+            if error is not None:
+                raise error
+            refused = self._authorize_subtree_scope_targets(
+                [(0, kind, record_id, "scope")], account,
+                (program, season, league))
             return refused is None
         raise ValueError(f"unknown subtree authorization phase: {phase!r}")
+
+    def _authorize_subtree_scope_targets(self, checks, account, selection):
+        """Apply the ordinary scope rule under subtree's graph lock (#452)."""
+        program, season, league = selection
+        resolved = self._lock_and_resolve_setup_targets(checks)
+        for index, kind, record_id, rule in sorted(resolved):
+            if rule != "scope":
+                return index                       # unknown rule -> fail closed
+            if self._setup_target_accessible_from_tuple(
+                    kind, record_id, account.id,
+                    program, season, league) is not True:
+                return index
+        return None
 
     def _authorize_subtree_boundary(self, checks, account, phase):
         """Authorize every cross-boundary row/effect #429 would touch.
@@ -1988,9 +2031,16 @@ class ApiService:
         cover shared facility/Official identities and reservation cleanup
         without tying a whole-Program cascade to one selected Season.
         """
-        def descendant_venue_allowed(venue_id):
-            program = self._explicit_program(
+        unresolved = object()
+
+        def selected_program(value):
+            if value is not unresolved:
+                return value
+            return self._explicit_program(
                 account.id, account.role, account.scope)
+
+        def descendant_venue_allowed(venue_id, program=unresolved):
+            program = selected_program(program)
             venue = self.store.get_venue(venue_id) if venue_id else None
             if program is None or venue is None:
                 return False
@@ -2016,9 +2066,8 @@ class ApiService:
                 return bool(program_ids) and program_ids == {program.id}
             return True
 
-        def deleted_game_reservation_allowed(game_id):
-            program = self._explicit_program(
-                account.id, account.role, account.scope)
+        def deleted_game_reservation_allowed(game_id, program=unresolved):
+            program = selected_program(program)
             game = self.store.get_game(game_id) if game_id else None
             if program is None or game is None:
                 return False
@@ -2041,9 +2090,8 @@ class ApiService:
             # null. A reservation with no resolvable owner remains refused.
             return program_ids == {program.id}
 
-        def shared_official_allowed(official_id):
-            program = self._explicit_program(
-                account.id, account.role, account.scope)
+        def shared_official_allowed(official_id, program=unresolved):
+            program = selected_program(program)
             official = (self.store.get_official(official_id)
                         if official_id else None)
             if program is None or official is None:
@@ -2076,13 +2124,13 @@ class ApiService:
         reservation_rule = DELETED_GAME_RESERVATION_RULE
         official_rule = SHARED_OFFICIAL_PROGRAM_RULE
 
-        def special_allowed(rule, record_id):
+        def special_allowed(rule, record_id, program=unresolved):
             if rule == venue_rule:
-                return descendant_venue_allowed(record_id)
+                return descendant_venue_allowed(record_id, program)
             if rule == reservation_rule:
-                return deleted_game_reservation_allowed(record_id)
+                return deleted_game_reservation_allowed(record_id, program)
             if rule == official_rule:
-                return shared_official_allowed(record_id)
+                return shared_official_allowed(record_id, program)
             return None
 
         special_rules = {venue_rule, reservation_rule, official_rule}
@@ -2099,6 +2147,9 @@ class ApiService:
                     return False
             return True
         if phase == "target":
+            _saved, program, season, league = (
+                self.context._resolve_saved_with_league_in_transaction(
+                    account.id, account.role, account.scope))
             ordinary = tuple(
                 (index, kind, record_id, rule)
                 for index, (kind, record_id, rule) in enumerate(checks)
@@ -2107,10 +2158,9 @@ class ApiService:
                 (rule, record_id) for kind, record_id, rule in checks
                 if rule in special_rules)
             return (
-                self._authorize_setup_targets(
-                    ordinary, account.id, account.role,
-                    account.scope) is None
-                and all(special_allowed(rule, record_id) is True
+                self._authorize_subtree_scope_targets(
+                    ordinary, account, (program, season, league)) is None
+                and all(special_allowed(rule, record_id, program) is True
                         for rule, record_id in special))
         raise ValueError(
             f"unknown subtree boundary authorization phase: {phase!r}")
@@ -2386,12 +2436,23 @@ class ApiService:
         axis_targets = self._mutation_axis_targets(targets)
         if not axis_targets:
             return None
+        program, season = self._explicit_selection(
+            user_id, role, scope, lock=lock)
+        return self._mutation_context_error_from_selection(
+            axis_targets, program, season)
+
+    def _mutation_context_error_from_selection(
+            self, axis_targets, program, season):
+        """Apply #409 to an already-validated persisted selection.
+
+        Subtree execution uses this pure policy core inside its own transaction
+        so it can keep ActiveContext -> graph lock order without asking a
+        nested context resolver to raise the transaction's isolation (#452).
+        """
         # The KINDS decide which rule applies, and they are read off the route
         # shape alone — no store row, so this branch (and therefore the refusal
         # WORDING) cannot vary with which target id was supplied.
         kinds = {kind for kind, _record_id in axis_targets}
-        program, season = self._explicit_selection(
-            user_id, role, scope, lock=lock)
         if (kinds - self._PROGRAM_AXIS_TARGET_KINDS):
             if program is None or season is None:
                 return ActiveContextRequiredError(
@@ -2516,6 +2577,42 @@ class ApiService:
         None when all pass. Must run inside ``setup_guarded_mutation``'s
         transaction — the locks are meaningless outside one.
         """
+        resolved = self._lock_and_resolve_setup_targets(checks)
+
+        # Decide under the locks, on the post-lock snapshot. In the CALLER's
+        # order, so the target reported back is the first one the caller
+        # listed, never whichever happened to sort first.
+        for index, kind, record_id, rule in sorted(resolved):
+            if rule == "grantable":
+                # The facility-tree exception: a shared arena stays grantable
+                # across Programs (#369 owner ruling). One argument, one route.
+                allowed = self.setup_venue_grantable(
+                    record_id, user_id, role, scope)
+            elif rule == "active_program_league":
+                allowed = self.setup_league_in_active_program(
+                    record_id, user_id, role, scope)
+            elif rule == "active_season":
+                # Re-decided HERE, under the Season's lock and inside the same
+                # transaction as the commit it guards. The preflight's answer
+                # is already stale: between it and the write the active context
+                # can change, or the Season's Program can move.
+                allowed = self.setup_season_is_active(
+                    record_id, user_id, role, scope)
+            elif rule == "writable_parent":
+                # #369 review's write-side parent rule, re-decided HERE under
+                # the destination row's lock so a reassign's parent check is
+                # atomic with the move and its audit.
+                allowed = self.setup_parent_writable(
+                    kind, record_id, user_id, role, scope)
+            else:
+                allowed = self.setup_target_accessible(
+                    kind, record_id, user_id, role, scope)
+            if allowed is False:
+                return index
+        return None
+
+    def _lock_and_resolve_setup_targets(self, checks):
+        """Lock named setup rows and return their canonical target tuples."""
         # -- phase 1: lock the NAMED rows, resolving each bridge row's parent
         # FROM THE LOCKED ROW (one statement reads and locks it, so the parent
         # cannot be re-pointed between the two). This runs first so the
@@ -2550,38 +2647,7 @@ class ApiService:
         # name the Program a bridge row is judged by).
         for kind, record_id in sorted(set(parents)):
             self._lock_setup_row(kind, record_id)
-
-        # -- phase 3: decide, under the locks, on the post-lock snapshot. In the
-        # CALLER's order, so the target reported back is the first one the
-        # caller listed, never whichever happened to sort first.
-        for index, kind, record_id, rule in sorted(resolved):
-            if rule == "grantable":
-                # The facility-tree exception: a shared arena stays grantable
-                # across Programs (#369 owner ruling). One argument, one route.
-                allowed = self.setup_venue_grantable(
-                    record_id, user_id, role, scope)
-            elif rule == "active_program_league":
-                allowed = self.setup_league_in_active_program(
-                    record_id, user_id, role, scope)
-            elif rule == "active_season":
-                # Re-decided HERE, under the Season's lock and inside the same
-                # transaction as the commit it guards. The preflight's answer
-                # is already stale: between it and the write the active context
-                # can change, or the Season's Program can move.
-                allowed = self.setup_season_is_active(
-                    record_id, user_id, role, scope)
-            elif rule == "writable_parent":
-                # #369 review's write-side parent rule, re-decided HERE under
-                # the destination row's lock so a reassign's parent check is
-                # atomic with the move it authorizes — not merely preflighted.
-                allowed = self.setup_parent_writable(
-                    kind, record_id, user_id, role, scope)
-            else:
-                allowed = self.setup_target_accessible(
-                    kind, record_id, user_id, role, scope)
-            if allowed is False:
-                return index
-        return None
+        return resolved
 
     def _lock_setup_row(self, kind, record_id):
         """Take the write lock on one setup row (a no-op read on Memory/SQLite,
