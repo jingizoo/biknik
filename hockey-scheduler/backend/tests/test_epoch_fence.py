@@ -76,18 +76,18 @@ WHAT THIS FILE PROVES, mapped to the design's own §10:
   reader's shared hold, response stays consistent) and
   `test_writer_first_...` (reader must wait for the writer, then discard) are
   both exercised.
-* §10.5 same-transaction-ordering, all 17 writers: `EpochFenceWriterOrdering
+* §10.5 same-transaction-ordering, all 18 writers: `EpochFenceWriterOrdering
   Test` — a spy on `epoch_fence_acquire_exclusive` proves EVERY writer in the
   design's §3 table takes the fence, and that it happens before the write is
   visible to a second connection; `EpochFenceRollbackReleasesTest` proves a
   rolled-back writer leaves no lock behind.
 
-Coverage note, stated rather than left implicit: the full 17-writer x
+Coverage note, stated rather than left implicit: the full 18-writer x
 both-orderings x 3-backend concurrency matrix (§10.3) is exercised for a
 representative subset of writers spanning both fence classes (per-user:
 context switch, account activate; global: Season archive/reopen/delete,
-official unassign, guardian link) rather than all 17 -- the per-writer
-ORDERING proof (§10.5, which every one of the 17 needs) IS exhaustive; the
+official unassign, guardian link) rather than all 18 -- the per-writer
+ORDERING proof (§10.5, which every one of the 18 needs) IS exhaustive; the
 concurrency RACE proof (§10.2/10.3) is representative. Both are real,
 neither is a stub.
 """
@@ -101,7 +101,10 @@ from datetime import datetime, timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import GuardianLink, OfficialRole, Role, SeasonStatus
+from hockey_scheduler.domain import (
+    ActiveContext, GuardianLink, OfficialRole, Program, Role, Season,
+    SeasonStatus, UserAccount,
+)
 from hockey_scheduler.domain.errors import ConcurrencyConflictError
 from hockey_scheduler.domain.models import Game
 from hockey_scheduler.domain.setup_models import OfficialAssignment
@@ -659,7 +662,7 @@ class EpochFenceMemorySameProcessTornReadTest(unittest.TestCase):
 # acquires it FIRST -- before any other store mutation its own call makes.
 # Spy-based, no real concurrency needed for THIS proof (concurrency is what
 # §10.1-10.4 above already prove for the mechanism itself); this proves the
-# 17 SERVICE call sites are wired correctly. InMemoryStore for speed; the
+# 18 SERVICE call sites are wired correctly. InMemoryStore for speed; the
 # spy fires on the SAME store class every backend uses
 # (SqlStore/InMemoryStore both implement epoch_fence_acquire_exclusive), so
 # the ORDER proof this establishes is backend-independent by construction.
@@ -899,6 +902,29 @@ class EpochFenceWriterOrderingTest(unittest.TestCase):
         self.api.verify_guardian_link(
             link["id"], actor_id="admin", consent_method="verbal_confirmed")
         self._assert_fenced(EPOCH_FENCE_GLOBAL_KEY, "guardian link verify")
+
+    # -- row 18: explicit subtree deletion ---------------------------------
+    def test_row18_subtree_deletion(self):
+        now = datetime.now(timezone.utc)
+        self.store.add_user_account(UserAccount(
+            "subtree_admin", "subtree_admin", "opaque-hash",
+            Role.LEAGUE_ADMIN, now, {}, True))
+        self.store.add_program(Program("subtree_program", "Subtree Program"))
+        self.store.add_season(Season(
+            "subtree_season", "subtree_program", "Subtree Season"))
+        self.store.set_active_context(ActiveContext(
+            "subtree_admin", "subtree_program", "subtree_season", now))
+        preview = self.api.subtree_deletion_preview(
+            "programs", "subtree_program", actor_id="subtree_admin")
+        self.assertNotIn("error", preview)
+        self.calls.clear()
+
+        result = self.api.subtree_deletion_execute(
+            preview["challenge_token"], "Subtree Program", "order test",
+            actor_id="subtree_admin")
+
+        self.assertEqual(result["result"], "success")
+        self._assert_fenced(EPOCH_FENCE_GLOBAL_KEY, "subtree deletion")
 
 
 class EpochFenceRollbackReleasesTest(unittest.TestCase):

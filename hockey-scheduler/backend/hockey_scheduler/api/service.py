@@ -64,11 +64,17 @@ from ..services import visibility_policy
 # being copied.
 from ..services.game_side_scope import (GameAuthorization,
                                         game_scoped_own_team_id)
+from ..services.subtree_deletion_service import (
+    DELETED_GAME_RESERVATION_RULE,
+    DESCENDANT_VENUE_PROGRAM_RULE,
+    SHARED_OFFICIAL_PROGRAM_RULE,
+)
 from ..services import (
     ACTOR_TYPES,
     AccountService,
     ContextService,
     FactoryResetService,
+    SubtreeDeletionService,
     GuardianService,
     DeliveryLoop,
     DeliveryWorker,
@@ -360,8 +366,15 @@ class ApiService:
         self.accounts = AccountService(self.store, self.roster.clock)
         self.factory_reset = FactoryResetService(
             self.store, self.accounts, self.roster.clock)
-        self.guardians = GuardianService(self.store, self.roster.clock)
+        # Context must exist before the subtree service is constructed: its
+        # injected authorizer reuses the canonical #409/#369 context + target
+        # gates instead of inventing a second destructive-delete policy.
         self.context = ContextService(self.store, self.roster.clock)
+        self.subtree_deletion = SubtreeDeletionService(
+            self.store, self.roster.clock,
+            root_authorizer=self._authorize_subtree_root,
+            boundary_authorizer=self._authorize_subtree_boundary)
+        self.guardians = GuardianService(self.store, self.roster.clock)
 
     # -- active Program/Season/League context (#159, League axis #345) ------
     def _context_view(self, program, season, league=None) -> dict:
@@ -1938,6 +1951,167 @@ class ApiService:
                 record_id, user_id, role, scope)
         return self.setup_target_accessible(
             normalized, record_id, user_id, role, scope)
+
+    def _authorize_subtree_root(self, kind, record_id, account, phase):
+        """Reuse the ordinary #409/#369 setup gates for #429's root.
+
+        The destructive service deliberately receives the live persisted
+        account rather than request-supplied role/scope values.  Its two-phase
+        call keeps the ActiveContext lock first, then lets the service acquire
+        its graph-wide PostgreSQL lock, then locks and authorizes the target.
+        This avoids both an existence oracle and a target-row -> graph-table
+        lock inversion.
+        """
+        if phase == "context":
+            error = self._mutation_context_error(
+                [(kind, record_id)], account.id, account.role, account.scope,
+                lock=True)
+            if error is not None:
+                raise error
+            return True
+        if phase == "target":
+            refused = self._authorize_setup_targets(
+                [(0, kind, record_id, "scope")], account.id, account.role,
+                account.scope)
+            return refused is None
+        raise ValueError(f"unknown subtree authorization phase: {phase!r}")
+
+    def _authorize_subtree_boundary(self, checks, account, phase):
+        """Authorize every cross-boundary row/effect #429 would touch.
+
+        Preview uses the ordinary lock-free preflight inside its SERIALIZABLE
+        snapshot.  Execution calls the canonical batch target gate only after
+        the global graph lock, so all named rows are judged together without a
+        target-row -> graph-table lock inversion.  Special Program-only folds
+        cover shared facility/Official identities and reservation cleanup
+        without tying a whole-Program cascade to one selected Season.
+        """
+        def descendant_venue_allowed(venue_id):
+            program = self._explicit_program(
+                account.id, account.role, account.scope)
+            venue = self.store.get_venue(venue_id) if venue_id else None
+            if program is None or venue is None:
+                return False
+            edges, saw_link = self._venue_edges(venue)
+            resolved_season_ids = {
+                season_id for _, season_id, _ in edges
+                if season_id is not None}
+            grants = self.store.season_venue_access_for_venue(venue.id)
+            if any(not grant.season_id
+                   or grant.season_id not in resolved_season_ids
+                   for grant in grants):
+                # ``_venue_edges`` intentionally preserves ``saw_link`` when
+                # a grant's Season cannot resolve, but a valid sibling edge
+                # could otherwise hide that partial corruption.  Deletion is
+                # stricter: every persisted grant must resolve before an
+                # Organization root may carry this Venue across the boundary.
+                return False
+            program_ids = {program_id for program_id, _, _ in edges}
+            if saw_link:
+                # The Organization-owned Venue may serve any number of Seasons
+                # in this Program, but a foreign or dangling Program link is a
+                # cross-context descendant and fails closed.
+                return bool(program_ids) and program_ids == {program.id}
+            return True
+
+        def deleted_game_reservation_allowed(game_id):
+            program = self._explicit_program(
+                account.id, account.role, account.scope)
+            game = self.store.get_game(game_id) if game_id else None
+            if program is None or game is None:
+                return False
+            constraints, broken = self._game_parent_constraints(game)
+            if broken:
+                return False
+            program_ids = {axes[0] for axes in constraints}
+            for team_id in (game.home_team_id, game.away_team_id):
+                if not team_id:
+                    continue
+                team = self.store.get_team(team_id)
+                if team is None:
+                    return False
+                edges, saw_link = self._team_edges(team)
+                if saw_link and not edges:
+                    return False
+                program_ids.update(edge[0] for edge in edges)
+            # Season-less exhibitions are explicitly supported: their Teams
+            # supply the Program axis even when every competition parent is
+            # null. A reservation with no resolvable owner remains refused.
+            return program_ids == {program.id}
+
+        def shared_official_allowed(official_id):
+            program = self._explicit_program(
+                account.id, account.role, account.scope)
+            official = (self.store.get_official(official_id)
+                        if official_id else None)
+            if program is None or official is None:
+                return False
+            program_ids = set()
+            if official.home_club_id:
+                club = self.store.get_club(official.home_club_id)
+                if club is None:
+                    return False
+                for team in self.store.all_teams():
+                    if team.club_id != club.id:
+                        continue
+                    edges, saw_link = self._team_edges(team)
+                    if saw_link and not edges:
+                        return False
+                    program_ids.update(edge[0] for edge in edges)
+            for assignment in self.store.assignments_for_official(official.id):
+                game = self.store.get_game(assignment.game_id)
+                if game is None:
+                    return False
+                edges, saw_link = self._setup_target_edges("game", game)
+                if not saw_link or not edges:
+                    return False
+                program_ids.update(edge[0] for edge in edges)
+            # An unlinked Official has already passed the ordinary root gate;
+            # otherwise every concrete Club/Game Program must be this one.
+            return not program_ids or program_ids == {program.id}
+
+        venue_rule = DESCENDANT_VENUE_PROGRAM_RULE
+        reservation_rule = DELETED_GAME_RESERVATION_RULE
+        official_rule = SHARED_OFFICIAL_PROGRAM_RULE
+
+        def special_allowed(rule, record_id):
+            if rule == venue_rule:
+                return descendant_venue_allowed(record_id)
+            if rule == reservation_rule:
+                return deleted_game_reservation_allowed(record_id)
+            if rule == official_rule:
+                return shared_official_allowed(record_id)
+            return None
+
+        special_rules = {venue_rule, reservation_rule, official_rule}
+
+        if phase == "preview":
+            for kind, record_id, rule in checks:
+                special = special_allowed(rule, record_id)
+                if special is not None:
+                    if special is not True:
+                        return False
+                elif self.setup_target_allowed(
+                        kind, record_id, account.id, account.role,
+                        account.scope, rule=rule) is not True:
+                    return False
+            return True
+        if phase == "target":
+            ordinary = tuple(
+                (index, kind, record_id, rule)
+                for index, (kind, record_id, rule) in enumerate(checks)
+                if rule not in special_rules)
+            special = tuple(
+                (rule, record_id) for kind, record_id, rule in checks
+                if rule in special_rules)
+            return (
+                self._authorize_setup_targets(
+                    ordinary, account.id, account.role,
+                    account.scope) is None
+                and all(special_allowed(rule, record_id) is True
+                        for rule, record_id in special))
+        raise ValueError(
+            f"unknown subtree boundary authorization phase: {phase!r}")
 
     # -- the ATOMIC guard: authorize + lock + mutate + audit, one txn (#369) --
     #
@@ -6971,6 +7145,24 @@ class ApiService:
         return self.factory_reset.execute(
             actor_id, password, typed_phrase, challenge_token,
             backup_acknowledged, environment=environment)
+
+    # -- explicit destructive subtree deletion (#429) ----------------------
+    @catch
+    def subtree_deletion_preview(self, root_type: str, root_id: str,
+                                 actor_id: str = None) -> dict:
+        return self.subtree_deletion.preview(actor_id, root_type, root_id)
+
+    @catch
+    def subtree_deletion_execute(self, challenge_token: str,
+                                 typed_name: str, reason: str,
+                                 actor_id: str = None) -> dict:
+        # Subtree deletion can remove Program/Season/League context rows, so
+        # it is a global lifecycle writer.  The in-process exclusive hold is
+        # intentionally outside the service's transaction; the service adds
+        # the matching cross-replica epoch fence as its first store operation.
+        with LIFECYCLE_GATE.exclusive(EPOCH_FENCE_GLOBAL_KEY):
+            return self.subtree_deletion.execute(
+                actor_id, challenge_token, typed_name, reason)
 
     # -- account sessions (#78) --------------------------------------------
     @staticmethod

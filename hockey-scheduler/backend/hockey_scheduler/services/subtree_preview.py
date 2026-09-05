@@ -19,10 +19,10 @@ The inventory answers two different questions which must not be conflated:
   ``*_id``/``*_ref``/JSON carrier fail the completeness test until somebody
   classifies it.
 
-The future store adapter is responsible for resolving polymorphic fields and
-for projecting only records the authenticated operator may name.  The pure
-planner validates that every projected edge agrees with this inventory; a
-caller cannot smuggle a friendlier cascade rule into the preview.
+The authenticated store adapter resolves polymorphic fields and projects only
+records the operator may name.  The pure planner validates that every projected
+edge agrees with this inventory; a caller cannot smuggle a friendlier cascade
+rule into the preview.
 """
 
 from __future__ import annotations
@@ -77,6 +77,7 @@ class EntityType(str, Enum):
     FACTORY_RESET_EVENT = "factory_reset_events"
     FACTORY_RESET_CHALLENGE = "factory_reset_challenges"
     FACTORY_RESET_LOCK = "factory_reset_locks"
+    SUBTREE_DELETION_CHALLENGE = "subtree_deletion_challenges"
     OFFICIAL = "officials"
     OFFICIAL_ASSIGNMENT = "official_assignments"
     GAME_RESULT = "game_results"
@@ -145,7 +146,7 @@ def _r(
 
 # This is the current ownership/dependency inventory, not a proposed database
 # cascade.  Ordinary deletes remain dependency-gated.  ``DELETE_SOURCE`` is
-# consulted only by the future explicit #429 subtree projection.
+# consulted only by the explicit #429 subtree projection.
 REFERENCE_INVENTORY: tuple[ReferenceSpec, ...] = (
     _r(EntityType.SEASON_ROSTER_MEMBERSHIP_EVENT, "membership_id",
        (EntityType.SEASON_ROSTER_MEMBERSHIP,), ReferenceRole.OWNERSHIP,
@@ -362,6 +363,10 @@ REFERENCE_INVENTORY: tuple[ReferenceSpec, ...] = (
        ReferenceRole.OPAQUE_SNAPSHOT, TargetRemoval.NOT_GRAPH),
     _r(EntityType.FACTORY_RESET_LOCK, "actor_id", (),
        ReferenceRole.PRINCIPAL, TargetRemoval.NOT_GRAPH),
+    _r(EntityType.SUBTREE_DELETION_CHALLENGE, "actor_id", (),
+       ReferenceRole.PRINCIPAL, TargetRemoval.NOT_GRAPH),
+    _r(EntityType.SUBTREE_DELETION_CHALLENGE, "root_id", (),
+       ReferenceRole.TRACE, TargetRemoval.NOT_GRAPH),
 
     _r(EntityType.OFFICIAL, "home_club_id", (EntityType.CLUB,),
        ReferenceRole.SHARED, TargetRemoval.DETACH),
@@ -496,8 +501,8 @@ class RecordRef:
     """One privacy-filtered record in the projected graph.
 
     ``state_fingerprint`` is a lowercase SHA-256 digest of every material field
-    the future projector read.  The digest, rather than a child payload, lets a
-    later execution detect row changes without returning private data.
+    the projector read.  The digest, rather than a child payload, lets execution
+    detect row changes without returning private data.
     """
 
     entity_type: EntityType
@@ -691,8 +696,8 @@ def build_subtree_preview(
 ) -> SubtreePreview:
     """Build a deterministic, actor-bound preview from a complete graph.
 
-    This is a planning operation only.  The future command must re-project the
-    graph under its transaction locks and compare the resulting fingerprint
+    This is a planning operation only.  The execution boundary re-projects the
+    graph under its transaction locks and compares the resulting fingerprint
     before performing any write; this function does not make a token single-use
     and does not authorize its caller.
     """

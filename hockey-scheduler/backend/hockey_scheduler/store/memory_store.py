@@ -7,6 +7,7 @@ later without touching domain logic.
 
 import copy
 from contextlib import contextmanager
+from dataclasses import is_dataclass
 from datetime import datetime
 import threading
 from typing import Dict, List, Optional
@@ -32,6 +33,7 @@ from ..domain import (
     FactoryResetChallenge,
     FactoryResetEvent,
     FactoryResetLock,
+    SubtreeDeletionChallenge,
     League,
     LeagueSeason,
     MembershipStatus,
@@ -136,6 +138,11 @@ class InMemoryStore:
         # begins, and the lock is held for the wipe's whole duration.
         self._factory_reset_challenge: Optional[FactoryResetChallenge] = None
         self._factory_reset_lock: Optional[FactoryResetLock] = None
+        # One short-lived #429 subtree challenge per authenticated actor.
+        # Kept in a normal persisted collection so transaction rollback and
+        # production factory reset cover it automatically.
+        self.subtree_deletion_challenges: Dict[
+            str, SubtreeDeletionChallenge] = {}
         # Plain int counters (not itertools.count): a count object is not
         # copyable on Python 3.14 (copy.copy raises "cannot pickle
         # 'itertools.count'"), which would break the transaction snapshot; an
@@ -1718,6 +1725,91 @@ class InMemoryStore:
     def clear_factory_reset_challenge(self) -> None:
         with self._lock:
             self._factory_reset_challenge = None
+
+    def get_subtree_deletion_challenge(
+            self, actor_id: str
+    ) -> Optional[SubtreeDeletionChallenge]:
+        """Return this actor's outstanding #429 preview challenge."""
+        with self._lock:
+            return self.subtree_deletion_challenges.get(actor_id)
+
+    def set_subtree_deletion_challenge(
+            self, challenge: SubtreeDeletionChallenge
+    ) -> SubtreeDeletionChallenge:
+        """Replace this actor's outstanding #429 challenge atomically."""
+        with self._lock:
+            self.subtree_deletion_challenges[challenge.actor_id] = challenge
+        return challenge
+
+    def consume_subtree_deletion_challenge(
+            self, actor_id: str,
+            token_hash: str) -> Optional[SubtreeDeletionChallenge]:
+        """Take-and-delete the matching challenge in one serialized step.
+
+        A stale/guessed token must not consume a newer legitimate preview for
+        the same actor.
+        """
+        with self._lock:
+            challenge = self.subtree_deletion_challenges.get(actor_id)
+            if challenge is None or challenge.token_hash != token_hash:
+                return None
+            return self.subtree_deletion_challenges.pop(actor_id)
+
+    def subtree_all_rows(self):
+        """Every persisted dataclass row, for the inventory-driven projector.
+
+        This deliberately derives the collection set from this store's live
+        state rather than restating its 50 model types.  Empty collections add
+        no rows; populated dict/list collections are already the store's source
+        of truth and the #448 inventory pins their row types to ``SqlStore``.
+        """
+        rows = []
+        for name, value in self.__dict__.items():
+            if name in self._NON_SNAPSHOT:
+                continue
+            candidates = (value.values() if isinstance(value, dict)
+                          else value if isinstance(value, list) else ())
+            rows.extend(row for row in candidates if is_dataclass(row))
+        return rows
+
+    def subtree_save_row(self, row):
+        """Persist a projected retained row after one or more edge detaches."""
+        for value in self.__dict__.values():
+            if isinstance(value, dict):
+                current = value.get(getattr(row, "id", None))
+                if current is not None and type(current) is type(row):
+                    value[row.id] = row
+                    return row
+            elif isinstance(value, list):
+                for index, current in enumerate(value):
+                    if (type(current) is type(row)
+                            and getattr(current, "id", None) == row.id):
+                        value[index] = row
+                        return row
+        raise ValidationError(
+            "The subtree row changed during execution.",
+            {"reason": "preview_stale"})
+
+    def subtree_delete_row(self, row) -> None:
+        """Delete one exact projected row; callers supply child-first order."""
+        for value in self.__dict__.values():
+            if isinstance(value, dict):
+                current = value.get(getattr(row, "id", None))
+                if current is not None and type(current) is type(row):
+                    del value[row.id]
+                    return
+            elif isinstance(value, list):
+                for index, current in enumerate(value):
+                    if (type(current) is type(row)
+                            and getattr(current, "id", None) == row.id):
+                        del value[index]
+                        return
+        raise ValidationError(
+            "The subtree row changed during execution.",
+            {"reason": "preview_stale"})
+
+    def lock_subtree_graph(self) -> None:
+        """Memory transactions already hold the one process-wide store lock."""
 
     def acquire_factory_reset_lock(self, lock: FactoryResetLock) -> bool:
         """Try to become the sole in-progress factory reset (#256 review

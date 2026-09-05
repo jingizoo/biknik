@@ -43,6 +43,7 @@ from ..domain import (
     FactoryResetChallenge,
     FactoryResetEvent,
     FactoryResetLock,
+    SubtreeDeletionChallenge,
     Notification,
     NotificationAudience,
     NotificationChannel,
@@ -298,6 +299,9 @@ SPECS = {
     FactoryResetLock: Spec(
         FactoryResetLock, "factory_reset_locks",
         {"acquired_at": _dt(), "expires_at": _dt()}),
+    SubtreeDeletionChallenge: Spec(
+        SubtreeDeletionChallenge, "subtree_deletion_challenges",
+        {"expires_at": _dt(), "created_at": _dt()}),
     Official: Spec(Official, "officials", {"is_active": _bool()}),
     OfficialAssignment: Spec(OfficialAssignment, "official_assignments",
                              {"role": _enum(OfficialRole),
@@ -2356,6 +2360,67 @@ class SqlStore:
     def clear_factory_reset_challenge(self) -> None:
         with self.transaction():
             self._delete(FactoryResetChallenge, self._FACTORY_RESET_CHALLENGE_ID)
+
+    def get_subtree_deletion_challenge(self, actor_id):
+        """Return this actor's outstanding #429 preview challenge."""
+        return self._get(SubtreeDeletionChallenge, actor_id)
+
+    def set_subtree_deletion_challenge(self, challenge):
+        """Replace this actor's outstanding #429 challenge atomically."""
+        with self.transaction():
+            self._upsert(challenge)
+        return challenge
+
+    def consume_subtree_deletion_challenge(self, actor_id, token_hash):
+        """Lock/read/delete the matching actor challenge in one transaction.
+
+        Comparing under the row lock prevents a stale/guessed token from
+        consuming a newer legitimate preview for the same actor.
+        """
+        with self.transaction():
+            challenge = self._get_for_update(SubtreeDeletionChallenge, actor_id)
+            if challenge is None or challenge.token_hash != token_hash:
+                return None
+            self._delete(SubtreeDeletionChallenge, actor_id)
+            return challenge
+
+    def subtree_all_rows(self):
+        """Every persisted row, derived from the one authoritative spec map."""
+        return [row for model in SPECS for row in self._query(model)]
+
+    def subtree_save_row(self, row):
+        return self._update(row)
+
+    def subtree_delete_row(self, row) -> None:
+        self._delete(type(row), row.id)
+
+    def lock_subtree_graph(self) -> None:
+        """Try to exclude every graph writer without joining its lock order.
+
+        PostgreSQL's EXCLUSIVE mode conflicts with both ordinary writes and
+        ``SELECT ... FOR UPDATE``.  The latter matters for allocation flows:
+        they must observe a retained slot *after* this transaction releases it,
+        not read its pre-deletion ALLOCATED state and fail before attempting a
+        write.  Plain ACCESS SHARE readers remain allowed.
+
+        ``NOWAIT`` is load-bearing.  Ordinary writers deliberately use more
+        than one relation order (for example Team -> League when transferring
+        a Team, but League -> Team when creating one).  A graph operation that
+        blocked after acquiring only a prefix of either table order could form
+        an ABBA deadlock with the other writer.  Taking the complete,
+        deterministic SPECS-derived set as a non-blocking try-lock instead
+        either succeeds before any competing writer can enter the graph or
+        fails immediately with PostgreSQL ``55P03``; the transaction boundary
+        translates that into the existing retryable ``lock_not_available``
+        conflict and releases every prefix lock on rollback.  SQLite's outer
+        write transaction has already issued BEGIN IMMEDIATE before this method
+        is entered, and Memory uses its process-wide RLock.
+        """
+        if self.backend == "postgres":
+            tables = sorted(spec.table for spec in SPECS.values())
+            if tables:
+                self._exec(
+                    f"LOCK TABLE {', '.join(tables)} IN EXCLUSIVE MODE NOWAIT")
 
     def acquire_factory_reset_lock(self, lock) -> bool:
         """Try to become the sole in-progress factory reset installation-

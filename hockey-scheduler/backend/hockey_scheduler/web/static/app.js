@@ -441,6 +441,13 @@ const canFactoryReset = () =>
   && currentRole === "league_admin"
   && hasPerm("manage_setup") && hasPerm("manage_users");
 
+// #429's explicit subtree operation is narrower than ordinary Setup access:
+// only the exact League Admin role holding both administrative permissions may
+// even see the entry point.  The service repeats this check against the live
+// account on preview AND execute; this client check is presentation only.
+const canDeleteSubtree = () => currentRole === "league_admin"
+  && hasPerm("manage_setup") && hasPerm("manage_users");
+
 // Theme-aligned inline SVG icons (#215): 20×20, stroke=currentColor so a button
 // class controls colour (neutral at rest, red on destructive hover/focus). Kept
 // tiny and dependency-free — no icon font, no external asset.
@@ -3799,6 +3806,15 @@ const DEL_ROUTE_V2 = {
   official: "official", player: "player",
 };
 
+// Only named hierarchy roots accepted by SubtreeDeletionService are exposed.
+// Relationship/history rows and ice slots keep their ordinary dependency-gated
+// delete only; their ids are not promoted into a destructive root surface.
+const SUBTREE_ROOT_BY_DEL_KIND = {
+  organization: "organizations", league: "programs", season: "seasons",
+  level: "leagues", division: "divisions", club: "clubs", team: "teams",
+  venue: "venues", rink: "rinks", official: "officials", player: "players",
+};
+
 // Structural deletes use v2 (#233 B2a review r1, extended B2c); frozen
 // frontend kind tokens map to canonical v2 route segments (league→program,
 // level→league), others 1:1. Shared by the initial confirm and the blocked
@@ -3817,8 +3833,24 @@ function renderModal() {
   if (modal.type === "player-active") return playerActiveModalHtml(modal);
   if (modal.type === "cancel-game") return cancelGameModalHtml(modal);
   if (modal.type === "blocked") return blockedModalHtml(modal);
+  if (modal.type === "subtree-delete") return subtreeDeleteModalHtml(modal);
   if (modal.type === "factory-reset") return factoryResetModalHtml(modal);
   return "";
+}
+
+// Repaint only the active dialog after a preview capability has been minted.
+// A normal render() refetches the current view; some views correctly append a
+// durable sensitive-read audit.  Doing that between #429 preview and execute
+// would mutate the reviewed graph and make the UI invalidate its OWN preview.
+// Dialog-only transitions need no business-data read, and still reuse the
+// shared wiring plus focus lifecycle.
+function repaintModalOnly() {
+  const c = document.getElementById("content");
+  if (!c) return;
+  c.querySelectorAll(".modal-scrim, .modal").forEach((el) => el.remove());
+  c.insertAdjacentHTML("beforeend", renderModal());
+  wireModal(c);
+  syncOverlayFocus();
 }
 
 // Cancel game (#215): a committed/published fixture is never hard-deleted — it
@@ -4038,11 +4070,138 @@ function blockedModalHtml(m) {
          can't be purged while any game — including cancelled ones — still
          references it in this season.</p>`
     : `<p class="muted">Remove or reassign these first, then delete the ${esc(noun)}.</p>`;
+  const subtreeRoot = SUBTREE_ROOT_BY_DEL_KIND[m.kind];
+  const subtreeAction = canDeleteSubtree() && subtreeRoot
+    ? `<button class="act danger" data-subtree-start
+         data-root-type="${esc(subtreeRoot)}">Delete subtree…</button>` : "";
   return modalShell("blocked", `Can't delete this ${noun}`,
     `<p>${esc((m.error && m.error.message) || "This record still has dependents.")}</p>
      <div class="card">${rows || `<div class="li"><div class="li-sub">Dependent records exist.</div></div>`}</div>
      ${footer}`,
-    `<button class="act primary" data-modal-close>Close</button>`);
+    `<button class="act ghost" data-modal-close>Close</button>${subtreeAction}`);
+}
+
+// #429 preview rows expose only stable ids and derived counts.  No child name,
+// contact value, registration number, account scope, or row digest enters the
+// browser payload.  Showing ids makes the blast radius inspectable without
+// turning the destructive endpoint into a protected-data read surface.
+function subtreePreviewGroups(groups) {
+  return (groups || []).map((group) => {
+    const ids = (group.record_ids || []).map((id) => `<code>${esc(id)}</code>`).join(", ");
+    return `<div class="sd-group"><div class="sd-group-head">
+      <span>${esc(group.entity_type)}</span><strong>${esc(String(group.count))}</strong>
+    </div>${ids ? `<div class="sd-ids">${ids}</div>` : ""}</div>`;
+  }).join("");
+}
+
+function subtreeRelationshipGroups(groups) {
+  return (groups || []).map((group) => `<div class="sd-group-head">
+    <span>${esc(group.inventory_key)}</span><strong>${esc(String(group.count))}</strong>
+  </div>`).join("");
+}
+
+// Retained does not mean byte-for-byte unchanged.  These stable effect codes
+// are produced by the same server plan the challenge fingerprint binds; render
+// them explicitly so the operator consents to every survivor state transition,
+// without exposing a username, account scope, child label, or other payload.
+const SUBTREE_RETAINED_CHANGE_LABEL = {
+  draft_game_unplaced: "Draft games unplaced (they remain drafts)",
+  user_account_deactivated: "User accounts deactivated (active sessions stop working)",
+  ice_slot_released: "Ice slots released (allocated → available)",
+};
+
+function subtreeRetainedChangeGroups(groups) {
+  return (groups || []).map((group) => {
+    const effect = group.effect || "retained_record_changed";
+    const label = SUBTREE_RETAINED_CHANGE_LABEL[effect]
+      || `Other retained change (${effect})`;
+    const ids = (group.record_ids || []).map((id) => `<code>${esc(id)}</code>`).join(", ");
+    return `<div class="sd-group" data-subtree-retained-change="${esc(effect)}">
+      <div class="sd-group-head"><span>${esc(label)}</span>
+        <strong>${esc(String(group.count))}</strong></div>
+      ${ids ? `<div class="sd-ids">${ids}</div>` : ""}</div>`;
+  }).join("");
+}
+
+function subtreeDeleteModalHtml(m) {
+  const title = "Delete subtree";
+  if (m.step === "loading") {
+    return modalShell("danger", title,
+      `<p class="muted" role="status">Building an exact deletion preview…</p>`,
+      `<button class="act ghost" data-modal-close>Cancel</button>`);
+  }
+  if (m.step === "error") {
+    const previewFailed = m.errorPhase === "preview";
+    // Only stable domain refusals issued before commit justify a definite
+    // no-write statement.  Transport/proxy failures, internal_error, a missing
+    // code, and every future error default to UNKNOWN: execute may have
+    // committed before response serialization or delivery failed.
+    const confirmedRefusal = ["validation_error", "forbidden", "unauthorized",
+      "not_found", "concurrency_conflict"].includes(m.errorCode);
+    const outcomeUncertain = !confirmedRefusal;
+    let consequence;
+    if (previewFailed && outcomeUncertain) {
+      consequence = "No deletion was requested, but the preview and challenge outcome "
+        + "could not be confirmed. Build a fresh preview before continuing.";
+    } else if (previewFailed) {
+      consequence = "No deletion was requested. Build a fresh preview before continuing.";
+    } else if (outcomeUncertain) {
+      consequence = "The deletion outcome could not be confirmed. Refresh and verify the "
+        + "current records before attempting another deletion.";
+    } else {
+      consequence = "The server refused the deletion, so no deletion was committed. "
+        + "Build a fresh preview before trying again.";
+    }
+    const restartLabel = outcomeUncertain && !previewFailed
+      ? "Refresh and verify"
+      : "Build a fresh preview";
+    return modalShell("danger", title,
+      `<p class="fr-inline-error" role="alert">${esc(m.error || "The subtree could not be deleted.")}</p>
+       <p class="muted">${consequence}</p>`,
+      `<button class="act ghost" data-modal-close>Close</button>
+       <button class="act danger" data-subtree-restart>${restartLabel}</button>`);
+  }
+  if (m.step === "success") {
+    const total = Object.values(m.deletedCounts || {}).reduce((sum, n) => sum + Number(n || 0), 0);
+    return modalShell("danger", title,
+      `<p><strong>The subtree was deleted atomically.</strong></p>
+       <p>${esc(String(total))} record${total === 1 ? "" : "s"} removed. Retained rows were
+          not deleted; the link and state changes disclosed in the preview were applied.</p>
+       <p class="muted">Audit event <code>${esc(m.auditId || "")}</code> records the actor,
+          reason, root, fingerprint and aggregate counts.</p>`,
+      `<button class="act primary" data-modal-close>Done</button>`);
+  }
+
+  const p = m.preview || {};
+  const root = p.root || {};
+  const deleteRows = subtreePreviewGroups(p.delete_groups);
+  const retainedRows = subtreePreviewGroups(p.retained_groups);
+  const detachRows = subtreeRelationshipGroups(p.detached_relationship_groups);
+  const retainedChangeRows = subtreeRetainedChangeGroups(p.retained_change_groups);
+  return modalShell("danger", title,
+    `<p class="sd-warning" role="alert"><strong>This permanently deletes the selected
+       ${esc(DEL_NOUN[m.kind] || "record")} and every exclusively owned descendant.</strong>
+       Ordinary Delete never does this. This operation cannot be undone.</p>
+     <div class="section-title" style="margin-top:0">Will be deleted</div>
+     <div class="sd-groups" data-subtree-delete-groups>${deleteRows}</div>
+     ${retainedChangeRows ? `<div class="section-title">Retained records that will change</div>
+       <p class="muted">These records will not be deleted, but their state will change as shown.</p>
+       <div class="sd-groups" data-subtree-retained-change-groups>${retainedChangeRows}</div>` : ""}
+     ${detachRows ? `<div class="section-title">Shared links cleared</div>
+       <div class="sd-groups" data-subtree-detach-groups>${detachRows}</div>` : ""}
+     ${retainedRows ? `<details class="sd-retained"><summary>Records retained (not deleted)</summary>
+       <div class="sd-groups">${retainedRows}</div></details>` : ""}
+     <p class="muted">This preview expires at ${esc(p.expires_at || "")} and becomes stale
+       if any affected record or relationship changes.</p>
+     <label class="modal-confirm-label" for="sd-reason">Reason (required; saved in the audit)</label>
+     <textarea id="sd-reason" class="modal-confirm-input sd-input" maxlength="500"
+       rows="3" placeholder="Why is this subtree being removed?"></textarea>
+     <label class="modal-confirm-label" for="sd-confirm">Type the parent name exactly:
+       <strong>${esc(root.confirmation_name || m.name)}</strong></label>
+     <input id="sd-confirm" class="modal-confirm-input sd-input" autocomplete="off"
+       spellcheck="false" placeholder="${esc(root.confirmation_name || m.name)}">`,
+    `<button class="act ghost" data-modal-close>Cancel</button>
+     <button class="act danger" data-subtree-confirm disabled>Delete subtree</button>`);
 }
 
 // Clear per-view interaction state after a demo reset rebuilds the store, so no
@@ -4156,6 +4315,9 @@ function wireModal(c) {
   // it now succeeds, or the (shorter) remaining blocker list.
   if (modal && modal.type === "blocked") {
     const m = modal;
+    const subtreeStart = c.querySelector("[data-subtree-start]");
+    if (subtreeStart) subtreeStart.onclick = () => startSubtreeDeletion(
+      m.kind, m.id, m.name, subtreeStart.dataset.rootType);
     c.querySelectorAll("[data-retire-route]").forEach((b) => b.onclick = async () => {
       toast = "";
       b.disabled = true;
@@ -4173,6 +4335,47 @@ function wireModal(c) {
       toast = `Deleted ${DEL_NOUN[m.kind] || "record"} “${m.name}”.`;
       await render();
     });
+  }
+  // Explicit subtree deletion (#429): a fresh server-projected preview owns
+  // the entire confirmation screen.  Exact parent name plus a non-empty reason
+  // unlock execute.  A confirmed refusal preserves the exact challenge, but
+  // this UI rebuilds the preview so the operator re-consents to the live graph;
+  // an uncertain transport outcome must be verified rather than blindly replayed.
+  if (modal && modal.type === "subtree-delete") {
+    const restartBtn = c.querySelector("[data-subtree-restart]");
+    if (restartBtn) restartBtn.onclick = () => startSubtreeDeletion(
+      modal.kind, modal.id, modal.name, modal.rootType);
+    const confirmBtn = c.querySelector("[data-subtree-confirm]");
+    const typed = c.querySelector("#sd-confirm");
+    const reason = c.querySelector("#sd-reason");
+    if (confirmBtn && typed && reason && modal.step === "confirm") {
+      const m = modal;
+      const expected = (m.preview.root || {}).confirmation_name || m.name;
+      const ready = () => typed.value === expected && reason.value.trim().length > 0;
+      const sync = () => { confirmBtn.disabled = !ready(); };
+      typed.oninput = reason.oninput = sync;
+      sync();
+      confirmBtn.onclick = async () => {
+        if (!ready()) return;
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Deleting…";
+        typed.disabled = reason.disabled = true;
+        const res = await post("/api/admin/subtree-deletion/execute", {
+          challenge_token: m.preview.challenge_token,
+          typed_name: typed.value,
+          reason: reason.value.trim(),
+        });
+        toast = "";
+        if (res && res.error) {
+          modal = { ...m, step: "error", errorPhase: "execute",
+                    errorCode: res.error.code, error: res.error.message };
+          return repaintModalOnly();
+        }
+        modal = { ...m, step: "success", deletedCounts: res.deleted_counts,
+                  auditId: res.audit_id };
+        await render();
+      };
+    }
   }
   // Cancel-game confirm: posts to the roster cancel route (history preserved).
   const cancelGameBtn = c.querySelector("[data-cancel-game-confirm]");
@@ -4274,6 +4477,34 @@ async function startFactoryReset() {
   }
   toast = "";
   render();
+}
+
+// Open #429 from an ordinary dependency refusal.  Preview is always fetched
+// live; reopening/retrying mints a new actor-bound capability rather than
+// trusting browser state.  A transport failure can hide a completed preview,
+// so the operator starts over instead of assuming whether a token was minted.
+async function startSubtreeDeletion(kind, id, name, rootType) {
+  if (!canDeleteSubtree() || !SUBTREE_ROOT_BY_DEL_KIND[kind]
+      || SUBTREE_ROOT_BY_DEL_KIND[kind] !== rootType) return;
+  modal = { type: "subtree-delete", step: "loading", kind, id, name, rootType };
+  // Settle the loading render (including any view read/audit) BEFORE the
+  // server projects the graph.  After projection, repaintModalOnly is the only
+  // permitted transition until execute/cancel.
+  await render();
+  const res = await post("/api/admin/subtree-deletion/preview", {
+    root_type: rootType, root_id: id,
+  });
+  if (!modal || modal.type !== "subtree-delete" || modal.id !== id) return;
+  toast = "";
+  if (res && res.error) {
+    modal = { type: "subtree-delete", step: "error", kind, id, name, rootType,
+              errorPhase: "preview", errorCode: res.error.code,
+              error: res.error.message };
+  } else {
+    modal = { type: "subtree-delete", step: "confirm", kind, id, name, rootType,
+              preview: res };
+  }
+  repaintModalOnly();
 }
 
 // Complete the post-reset sign-out (#256): the server already revoked every

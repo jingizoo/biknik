@@ -1142,6 +1142,27 @@ REGISTRY = (
                     "reports what a whole-installation wipe would remove -- no single "
                     "Program/Season/League to ceiling against."
               )),
+    RouteSpec("POST", r"^/api/admin/subtree-deletion/execute$",
+              "/api/admin/subtree-deletion/execute",
+              "post_admin_subtree_deletion_execute", "do_POST",
+              auth="session+MANAGE_USERS", scope_axis="cross",
+              note=(
+                    "#429: exceptional subtree execution. The generic gate "
+                    "requires MANAGE_USERS; SubtreeDeletionService also "
+                    "requires exact League Admin and re-applies canonical "
+                    "context plus target authorization to the challenge-bound "
+                    "root before destructive work."
+              )),
+    RouteSpec("POST", r"^/api/admin/subtree-deletion/preview$",
+              "/api/admin/subtree-deletion/preview",
+              "post_admin_subtree_deletion_preview", "do_POST",
+              auth="session+MANAGE_USERS", scope_axis="cross",
+              note=(
+                    "#429: exceptional inventory-derived preview. The service "
+                    "applies canonical context plus target authorization before "
+                    "projecting or reading the root confirmation name; ordinary "
+                    "dependency-gated delete policy is unchanged."
+              )),
     RouteSpec("POST", r"^/api/auth/login$", "/api/auth/login",
               "post_auth_login", "do_POST",
               auth="none", scope_axis="none",
