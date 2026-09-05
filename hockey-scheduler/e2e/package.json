@@ -23,6 +23,7 @@
     "setup-workflow-hub": "node setup-workflow-hub.js",
     "setup-accessibility-axe-gate": "node setup-accessibility-axe-gate.js",
     "role-home-journeys": "node role-home-journeys.js",
+    "cross-team-substitution-ui": "node cross-team-substitution-ui.js",
     "role-authorization-matrix": "node role-authorization-matrix.js",
     "seven-area-navigation": "node seven-area-navigation.js",
     "hierarchy-import": "node hierarchy-import.js",

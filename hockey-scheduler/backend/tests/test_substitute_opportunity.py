@@ -16,6 +16,8 @@ import urllib.request
 from datetime import timedelta, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
+from unittest import mock
+from urllib.parse import quote
 
 from helpers import BACKEND, FakeClock  # noqa: F401  (BACKEND sets up sys.path)
 
@@ -156,6 +158,19 @@ class SubstituteOpportunityDetailTest(unittest.TestCase):
                for o in self.api.get_player_home("goalie1")["substitute_opportunities"]]
         self.assertNotIn("g1", ids)
 
+    def test_same_team_offer_read_and_accept_stay_open_at_exact_start(self):
+        """#287's half-open boundary must not rewrite legacy same-team UX."""
+        self.api.enroll_substitute("g1", "skater2")
+        self.api.offer_substitute("g1", "skater2")
+        drop = self.store.get_game("g1").start_time
+        self.api.roster.clock = lambda: drop
+
+        offers = self.api.get_player_home("skater2")["substitute_offers"]
+        self.assertEqual([row["game_id"] for row in offers], ["g1"])
+        self.assertTrue(offers[0]["can_accept_offer"])
+        accepted = self.api.accept_substitute("g1", "skater2")
+        self.assertNotIn("error", accepted)
+
 
 class SubstituteOpportunityHttpTest(unittest.TestCase):
     """Signed-in-player scoping for the /api/me/substitute-opportunities
@@ -259,6 +274,100 @@ class SubstituteOpportunityHttpTest(unittest.TestCase):
         status, _ = self._get(
             c, f"/api/me/substitute-opportunities/{self.other_gid}")
         self.assertEqual(status, 404)
+
+    def test_detail_forwards_compound_target_identity(self):
+        """The target side is explicit; player identity remains session-only."""
+        c = self._login("player")
+        target = "bronze team/4"
+        with mock.patch.object(
+                srv.STATE.api, "get_substitute_opportunity",
+                return_value={"game_id": self.gid,
+                              "target_team_id": target}) as get_detail:
+            status, body = self._get(
+                c,
+                f"/api/me/substitute-opportunities/{self.gid}"
+                f"?target_team_id={quote(target, safe='')}")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["target_team_id"], target)
+        get_detail.assert_called_once_with(
+            self.pid, self.gid, target_team_id=target)
+
+    def test_detail_without_target_preserves_same_team_contract(self):
+        c = self._login("player")
+        with mock.patch.object(
+                srv.STATE.api, "get_substitute_opportunity",
+                return_value={"game_id": self.gid}) as get_detail:
+            status, _body = self._get(
+                c, f"/api/me/substitute-opportunities/{self.gid}")
+        self.assertEqual(status, 200)
+        get_detail.assert_called_once_with(
+            self.pid, self.gid, target_team_id=None)
+
+    def test_enroll_forwards_target_but_never_accepts_player_identity(self):
+        c = self._login("player")
+        target = "bronze-team-4"
+        with mock.patch.object(
+                srv.STATE.api, "enroll_substitute",
+                return_value={"game_id": self.gid,
+                              "player_id": self.pid,
+                              "target_team_id": target}) as enroll:
+            status, body = self._post(
+                c, f"/api/me/substitute-opportunities/{self.gid}/enroll",
+                {"target_team_id": target})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["target_team_id"], target)
+        enroll.assert_called_once()
+        args, kwargs = enroll.call_args
+        self.assertEqual(args, (self.gid, self.pid))
+        self.assertEqual(kwargs["target_team_id"], target)
+        self.assertIsNotNone(kwargs["actor_id"])
+
+        with mock.patch.object(
+                srv.STATE.api, "enroll_substitute") as enroll:
+            status, body = self._post(
+                c, f"/api/me/substitute-opportunities/{self.gid}/enroll",
+                {"target_team_id": target, "player_id": "someone-else"})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+        self.assertEqual(body["error"]["details"]["fields"], ["player_id"])
+        enroll.assert_not_called()
+
+    def test_enroll_target_is_optional_but_when_present_must_be_string(self):
+        c = self._login("player")
+        with mock.patch.object(
+                srv.STATE.api, "enroll_substitute",
+                return_value={"game_id": self.gid}) as enroll:
+            status, _body = self._post(
+                c, f"/api/me/substitute-opportunities/{self.gid}/enroll", {})
+        self.assertEqual(status, 200)
+        args, kwargs = enroll.call_args
+        self.assertEqual(args, (self.gid, self.pid))
+        self.assertIsNone(kwargs["target_team_id"])
+
+        non_strings = (None, True, 4, ["team-4"], {"id": "team-4"})
+        for value in non_strings:
+            with self.subTest(value=value), mock.patch.object(
+                    srv.STATE.api, "enroll_substitute") as enroll:
+                status, body = self._post(
+                    c,
+                    f"/api/me/substitute-opportunities/{self.gid}/enroll",
+                    {"target_team_id": value})
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"]["details"], {
+                    "reason": "wrong_type", "field": "target_team_id"})
+                enroll.assert_not_called()
+
+        for value in ("", " ", "\t\n"):
+            with self.subTest(value=value), mock.patch.object(
+                    srv.STATE.api, "enroll_substitute") as enroll:
+                status, body = self._post(
+                    c,
+                    f"/api/me/substitute-opportunities/{self.gid}/enroll",
+                    {"target_team_id": value})
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"]["details"], {
+                    "reason": "field_required", "field": "target_team_id"})
+                enroll.assert_not_called()
 
     def test_legacy_enroll_route_still_enforces_player_scope(self):
         # #110 keeps the existing /api/games/{gid}/substitutes/enroll route.

@@ -199,6 +199,7 @@ class AuditAction(str, Enum):
     SUBSTITUTE_OFFERED = "substitute_offered"
     SUBSTITUTE_ACCEPTED = "substitute_accepted"
     SUBSTITUTE_DECLINED = "substitute_declined"
+    SUBSTITUTE_EXPIRED = "substitute_expired"
     SUBSTITUTE_ADDED_TO_ROSTER = "substitute_added_to_roster"
     PLAYER_REMOVED = "player_removed"
     ROSTER_LOCKED = "roster_locked"

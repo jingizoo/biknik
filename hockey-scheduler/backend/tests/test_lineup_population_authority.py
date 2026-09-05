@@ -346,13 +346,36 @@ class _LineupAuthority(_Authority):
 
     @staticmethod
     def _strip_sub_owner(api, game_id, player_id):
-        """Make an enrollment look pre-060: ``team_id`` NULL."""
+        """Make an enrollment and its activity look genuinely pre-060/064.
+
+        Migration 064 adds the frozen ``team_id`` to activity rows.  A
+        pre-060 enrollment cannot have been created by a post-064 writer, so
+        leaving its enrollment owner NULL while retaining a side snapshot on
+        the accompanying audit/notification rows constructs an impossible
+        mixed-era fixture.  Clear both authorities together: the board then
+        exercises the intended conservative legacy fallback instead of the
+        new snapshot path.
+        """
         with api.store.transaction():
             s = api.store.substitute_for_player(game_id, player_id)
             s.team_id = None
             api.store.save_substitute(s)
+            for event in (api.store.audit_for_game(game_id)
+                          + api.store.notifications_for_game(game_id)):
+                if event.subject_player_id != player_id:
+                    continue
+                event.team_id = None
+                # InMemoryStore returns its resident objects; SQL stores
+                # materialise rows and therefore need an explicit update.
+                if hasattr(api.store, "_update"):
+                    api.store._update(event)
         assert api.store.substitute_for_player(
             game_id, player_id).team_id is None
+        assert all(
+            event.team_id is None
+            for event in (api.store.audit_for_game(game_id)
+                          + api.store.notifications_for_game(game_id))
+            if event.subject_player_id == player_id)
 
 
 # ---------------------------------------------------------------------------

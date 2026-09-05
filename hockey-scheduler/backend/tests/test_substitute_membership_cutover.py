@@ -671,6 +671,23 @@ class _DeclineAudienceContract(_Fixture):
                                      store.get_player(sam["id"])),
             teams["away"]["id"], label)
 
+        # The offer remains reachable after an ordinary unbound-game team
+        # reassignment.  Same-team legacy rows deliberately follow the live
+        # side for player-facing acceptance; cross-team rows use their
+        # durable target instead.  A cross-team-specific serializer must not
+        # make this established path 404 or disappear from Player Home.
+        home = api.get_player_home(sam["id"])
+        self.assertNotIn("error", home, (label, home))
+        (visible_offer,) = [
+            item for item in home["substitute_offers"]
+            if item["game_id"] == exhibition["id"]]
+        self.assertEqual(
+            visible_offer["target_team_id"], teams["away"]["id"],
+            (label, visible_offer))
+        self.assertEqual(
+            visible_offer["team_name"], teams["away"]["name"],
+            (label, visible_offer))
+
         before = {n.id for n in store.all_notifications_feed()}
         res = (decline or api.decline_substitute)(
             exhibition["id"], sam["id"])

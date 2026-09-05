@@ -273,13 +273,57 @@ let drawerError = "";       // validation/API error shown inside the open drawer
 let drawerValues = {};      // {fieldId: value} preserved across re-render on error
 let checkoutConfirm = null;  // {game_id} while the Player Home "Can't Play" confirmation is open (#107)
 let oppDetailGame = null;    // game_id of the substitute opportunity whose detail is open (#110)
+let oppDetailTeam = null;    // target_team_id half of a cross-team opportunity identity (#287)
 let oppDetail = null;        // fetched detail payload for oppDetailGame (#110)
+// At most one cross-team opt-in write per game and signed-in player.  A game
+// can expose two target sides; this module-level ledger survives rerenders and
+// navigation, so the sibling cannot race a held request merely by recreating
+// the DOM.  Entries carry the identity epoch and are ignored after a persona
+// change; resetTransientUiState clears them at that boundary.
+const substituteOptInWrites = new Map();  // game_id -> operation identity
+const substituteOptInNotices = new Map(); // game_id -> player-visible outcome
+function currentSubstituteOptInWrite(gameId) {
+  const operation = substituteOptInWrites.get(gameId);
+  const playerId = currentUser && currentUser.scope
+    ? currentUser.scope.player_id : null;
+  return operation && operation.epoch === uiIdentityEpoch
+    && operation.playerId === playerId ? operation : null;
+}
+function beginSubstituteOptInWrite(
+  gameId, target, enrolling, playerId, action = enrolling ? "enroll" : "withdraw",
+) {
+  if (!gameId || !target || !playerId
+      || currentSubstituteOptInWrite(gameId)) return null;
+  const operation = {
+    gameId, target, enrolling, action, playerId, epoch: uiIdentityEpoch,
+  };
+  substituteOptInNotices.delete(gameId);
+  substituteOptInWrites.set(gameId, operation);
+  return operation;
+}
+function substituteOptInWriteIsCurrent(operation) {
+  const playerId = currentUser && currentUser.scope
+    ? currentUser.scope.player_id : null;
+  return !!operation && operation.epoch === uiIdentityEpoch
+    && operation.playerId === playerId;
+}
+function settleSubstituteOptInWrite(operation) {
+  if (operation && substituteOptInWrites.get(operation.gameId) === operation)
+    substituteOptInWrites.delete(operation.gameId);
+}
+function currentSubstituteOptInNotice(gameId) {
+  const notice = substituteOptInNotices.get(gameId);
+  const playerId = currentUser && currentUser.scope
+    ? currentUser.scope.player_id : null;
+  return notice && notice.epoch === uiIdentityEpoch
+    && notice.playerId === playerId ? notice : null;
+}
 // Guardian linked-junior surface (#26). A guardian acts FOR a junior, so every
 // piece of open UI state is keyed by the junior's player_id, never a global
 // "current player" — a guardian may have several linked juniors on screen.
 let guardianHome = null;     // fetched /api/me/guardian/home payload
 let gCheckout = null;        // {jid, game_id} while a junior's "Can't Play" confirm is open
-let gOpp = null;             // {jid, game_id} of the junior's opportunity detail open
+let gOpp = null;             // {jid, game_id, target_team_id} of the junior's open opportunity
 let gOppDetail = null;       // fetched detail payload for gOpp
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
 // Home/Tasks and Setup card state lives in the per-card store (#365 —
@@ -8814,9 +8858,12 @@ function phStatusFeed(ng, oppCount) {
       rows.push(["orange", "You have not responded to your next game."]);
     if (ng.attendance_status === "checked_out")
       rows.push(["red", "You checked out of your next game."]);
-    if (ng.team_status === "full")
+    // A borrowed seat is the player's commitment, not a grant to the target
+    // side's private roster state. Fail closed even if a stale/over-broad
+    // Player Home response still carries team_status.
+    if (!ng.cross_team && ng.team_status === "full")
       rows.push(["green", "Your team's roster is full."]);
-    if (ng.team_status === "sub_search")
+    if (!ng.cross_team && ng.team_status === "sub_search")
       rows.push(["orange", "Substitute search is active for your next game."]);
   }
   if (oppCount) rows.push(["blue", "New substitute opportunity available."]);
@@ -8831,38 +8878,61 @@ function phStatusFeed(ng, oppCount) {
 // respond; the response reuses the existing enroll/withdraw workflow.
 function renderOppDetail(detail) {
   if (!detail || detail.error) {
-    return `<div class="banner alert"><h2>Opportunity unavailable</h2>
+    return `<div class="banner alert"><h2 id="opp-detail-title" tabindex="-1">Opportunity unavailable</h2>
       <p>${esc((detail && detail.error && detail.error.message) || "This opportunity could not be loaded.")}</p></div>
       <div class="actions"><button class="act ghost" data-opp-back>Back to Home</button></div>`;
   }
-  const rows = [
+  let rows = [
     ["Team", detail.team_name],
     ["Opponent", detail.opponent_name || "TBD"],
     ["When", fmtDateTime(detail.start_time)],
     ["Venue", [detail.venue_name, detail.rink_name].filter(Boolean).join(" · ") || "—"],
-    ["Position needed", detail.position_needed],
+    [detail.cross_team ? "Your substitute position" : "Position needed",
+      detail.position_needed],
   ].map(([k, v]) => `<div class="li"><div class="li-main">
-      <div class="li-sub">${esc(k)}</div><div class="li-title">${esc(v)}</div></div></div>`).join("")
-    + `<div class="li"><div class="li-main"><div class="li-sub">Team status</div></div>
+      <div class="li-sub">${esc(k)}</div><div class="li-title">${esc(v)}</div></div></div>`).join("");
+  // A cross-team volunteer may see the public fixture and their own opt-in,
+  // but not the target side's private roster state/shortage counts. Ignore
+  // those fields even if a stale or over-broad response includes them; the
+  // browser must neither render nor depend on private side data here.
+  if (!detail.cross_team && detail.team_status) {
+    rows += `<div class="li"><div class="li-main"><div class="li-sub">Team status</div></div>
         ${phBadge(PH_TEAM_STATUS, detail.team_status)}</div>`;
+  }
   const offered = detail.enrollment_status === "offered";
+  const targetAttr = detail.cross_team && detail.target_team_id
+    ? ` data-opp-target="${esc(detail.target_team_id)}"` : "";
+  const pending = detail.cross_team
+    ? currentSubstituteOptInWrite(detail.game_id) : null;
+  const pendingAttr = pending ? " disabled aria-busy=\"true\"" : "";
   let note = "", actions = "";
   if (offered) {
     // A coach has offered this player the slot (#112) — respond to the offer.
     const btns = [];
-    if (detail.can_accept_offer) btns.push(`<button class="act success" data-opp-accept-offer="${esc(detail.game_id)}">Accept Offer</button>`);
-    if (detail.can_decline_offer) btns.push(`<button class="act danger" data-opp-decline-offer="${esc(detail.game_id)}">Decline Offer</button>`);
+    if (detail.can_accept_offer) btns.push(`<button class="act success" data-opp-accept-offer="${esc(detail.game_id)}"${targetAttr}${pendingAttr}>Accept Offer</button>`);
+    if (detail.can_decline_offer) btns.push(`<button class="act danger" data-opp-decline-offer="${esc(detail.game_id)}"${targetAttr}${pendingAttr}>${detail.offer_expired ? "Dismiss Expired Offer" : "Decline Offer"}</button>`);
     actions = btns.join("");
     if (detail.blocked_reason)
       note = `<div class="banner ${btns.length ? "warn" : "neutral"}"><p>${esc(detail.blocked_reason)}</p></div>`;
   } else if (detail.can_withdraw) {
-    actions = `<button class="act danger" data-opp-withdraw="${esc(detail.game_id)}">Withdraw</button>`;
+    actions = `<button class="act danger" data-opp-withdraw="${esc(detail.game_id)}"${targetAttr}${pendingAttr}>Withdraw</button>`;
+    if (detail.blocked_reason)
+      note = `<div class="banner warn"><p>${esc(detail.blocked_reason)}</p></div>`;
   } else if (detail.can_accept) {
-    actions = `<button class="act success" data-opp-accept="${esc(detail.game_id)}">Accept — Enroll as Sub</button>`;
+    actions = `<button class="act success" data-opp-accept="${esc(detail.game_id)}"${targetAttr}${pendingAttr}>Accept — Enroll as Sub</button>`;
   } else {
     note = `<div class="banner neutral"><p>${esc(detail.blocked_reason || "You can't respond to this opportunity right now.")}</p></div>`;
   }
-  return `<div class="section-title" style="margin-top:0">${offered ? "Substitute Offer" : "Substitute Opportunity"}</div>
+  if (pending) {
+    const pendingText = {
+      enroll: "Saving your availability…",
+      withdraw: "Removing your availability…",
+      "accept-offer": "Accepting your substitute offer…",
+      "decline-offer": "Declining your substitute offer…",
+    }[pending.action] || "Saving your response…";
+    note = `<div class="banner neutral" role="status" aria-live="polite"><p>${pendingText}</p></div>`;
+  }
+  return `<h2 class="section-title" id="opp-detail-title" tabindex="-1" style="margin-top:0">${offered ? "Substitute Offer" : "Substitute Opportunity"}</h2>
     ${note}
     <div class="card">${rows}</div>
     <div class="actions">${actions}
@@ -8881,15 +8951,23 @@ function renderPlayerHome(playerHome) {
   const ng = playerHome.next_game;
   const welcome = `<div class="section-title" style="margin-top:0">Hi, ${esc(playerHome.player_name || "there")}</div>
     <p class="muted">Ready for your next game?</p>`;
-  // "Tonight" + "Team Status" summary cards (#107 doc §6.3), reusing the
-  // dashboard's stat-tile classes (responsive stacking comes with them).
+  // A borrowed cross-team seat is part of the player's schedule, but it does
+  // not grant access to the target side's private roster state. Name the
+  // player's role instead of inventing a Team Status value for that card.
+  const nextGameContextLabel = ng && ng.cross_team ? "Game Role" : "Team Status";
+  const nextGameContextBadge = ng
+    ? (ng.cross_team
+      ? '<span class="badge blue">Substitute</span>'
+      : phBadge(PH_TEAM_STATUS, ng.team_status))
+    : '<span class="badge gray">No game</span>';
+  // "Tonight" + next-game context summary cards (#107 doc §6.3), reusing
+  // the dashboard's stat-tile classes (responsive stacking comes with them).
   const summary = `<div class="dash-stats">
       <div class="dash-stat"><div class="ds-label">Tonight</div>
         <div class="ds-n">${playerHome.today_count || 0}</div>
         <div class="ds-sub">game${playerHome.today_count === 1 ? "" : "s"} today</div></div>
-      <div class="dash-stat"><div class="ds-label">Team Status</div>
-        <div class="ds-n">${ng ? phBadge(PH_TEAM_STATUS, ng.team_status)
-          : `<span class="badge gray">No game</span>`}</div></div>
+      <div class="dash-stat"><div class="ds-label">${nextGameContextLabel}</div>
+        <div class="ds-n">${nextGameContextBadge}</div></div>
     </div>`;
   let nextGameBlock;
   if (!ng) {
@@ -8910,44 +8988,144 @@ function renderPlayerHome(playerHome) {
           <div class="li-sub">${esc(fmtDateTime(ng.start_time))}
             ${ng.venue_name ? " · " + esc(ng.venue_name) : ""}${ng.rink_name ? " · " + esc(ng.rink_name) : ""}</div></div>
       </div>
-      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
+      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${ng.cross_team
+        ? '<span class="badge blue">Substitute</span>'
+        : phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
       <div class="actions">
         <button class="act success" data-ph-confirm ${confirmed ? "disabled" : ""}>${confirmed ? "You're In ✓" : "I'm In"}</button>
         <button class="act danger" data-ph-backout>Can't Play</button>
-        <button class="act ghost" data-open-roster="${esc(ng.game_id)}">View Roster</button>
+        ${ng.cross_team ? "" : `<button class="act ghost" data-open-roster="${esc(ng.game_id)}">View Roster</button>`}
       </div>`;
   }
   // A row for a substitute opportunity/offer, with its call-to-action button.
-  const subRow = (o, label) => `<div class="li">
+  const subRow = (o, label) => {
+    const pending = o.cross_team
+      ? currentSubstituteOptInWrite(o.game_id) : null;
+    const pendingLabel = pending ? ({
+      enroll: "Saving…", withdraw: "Removing…",
+      "accept-offer": "Accepting…", "decline-offer": "Declining…",
+    })[pending.action] || "Saving…" : label;
+    return `<div class="li" ${pending ? 'aria-busy="true"' : ""}>
       <span class="li-time">${fmt(o.start_time)}</span>
       <div class="li-main"><div class="li-title">${esc(o.team_name)} vs ${esc(o.opponent_name || "TBD")}</div>
         <div class="li-sub">${esc(fmtDateTime(o.start_time))}
           ${o.rink_name ? " · " + esc(o.rink_name) : ""} · needs ${esc(o.position_needed)}</div></div>
-      <button class="act primary" data-ph-view-opp="${esc(o.game_id)}">${label}</button>
+      <button class="act primary" data-ph-view-opp="${esc(o.game_id)}"
+        ${o.cross_team && o.target_team_id ? `data-ph-opp-target="${esc(o.target_team_id)}"` : ""}
+        ${pending ? "disabled" : ""}>${pendingLabel}</button>
     </div>`;
+  };
+  // Screenshot-compatible proactive opt-in (#287): a native checkbox rather
+  // than a batch Submit button. The label names BOTH sides and the target
+  // explicitly; game_id alone is not an identity because one fixture can
+  // legitimately expose one choice for each non-source side.
+  const crossTeamSubRow = (o) => {
+    const canonicalChecked = o.enrollment_status === "enrolled"
+      || o.enrollment_status === "offered";
+    const target = o.target_team_id || "";
+    const pending = currentSubstituteOptInWrite(o.game_id);
+    const isPendingTarget = !!pending && pending.target === target;
+    let notice = currentSubstituteOptInNotice(o.game_id);
+    // A local outcome is evidence about one transition, not a durable status.
+    // Once the canonical row contradicts it, retire it permanently; merely
+    // hiding it would let the old message resurrect if a later independent
+    // transition happened to return to the same checked state.
+    if (notice && notice.target === target
+        && notice.expectedChecked !== canonicalChecked) {
+      substituteOptInNotices.delete(o.game_id);
+      notice = null;
+    }
+    const isNoticeTarget = !!notice && notice.target === target
+      && notice.expectedChecked === canonicalChecked;
+    // A navigation-triggered render can finish from a canonical GET while
+    // this game's write is still held. Keep the chosen target optimistic and
+    // leave its sibling at canonical state, rather than making both appear
+    // unchecked during the request.
+    const checked = isPendingTarget ? pending.enrolling : canonicalChecked;
+    const canToggle = !!target && !pending
+      && (checked ? o.can_withdraw !== false : o.can_enroll !== false);
+    // Pending copy mutates an existing node and is therefore a useful live
+    // update. A settled notice arrives in a newly rendered node, so keep it as
+    // visible row context and let the persistent #toast-root announce it.
+    const liveStatus = pending ? ' aria-live="polite" role="status"' : "";
+    const statusText = pending
+      ? (isPendingTarget
+        ? (pending.enrolling
+          ? "Saving availability…" : "Removing availability…")
+        : "Another team choice for this game is being saved…")
+      : o.needs_cleanup
+      ? (o.can_withdraw !== false
+        ? `No longer available — uncheck to remove${o.blocked_reason ? ` (${o.blocked_reason})` : ""}`
+        : `No longer available — ${o.blocked_reason || "removal is unavailable"}`)
+      : isNoticeTarget
+      ? notice.message
+      : `I can sub for ${o.team_name}`;
+    return `<div class="li ph-sub-row" ${pending ? 'aria-busy="true"' : ""}>
+      <label class="ph-sub-choice">
+        <input type="checkbox" data-ph-sub-optin
+          data-ph-sub-game="${esc(o.game_id)}" data-ph-sub-target="${esc(target)}"
+          aria-describedby="ph-sub-help" ${checked ? "checked" : ""} ${canToggle ? "" : "disabled"}>
+        <span class="ph-sub-choice-copy">
+          <span class="li-title">Sub for ${esc(o.team_name)}</span>
+          <span class="li-sub">vs ${esc(o.opponent_name || "TBD")} · ${esc(fmtDateTime(o.start_time))}
+            ${o.rink_name ? " · " + esc(o.rink_name) : ""} · available as ${esc(o.position_needed)}</span>
+          <span class="ph-sub-optin-text"${liveStatus}>${esc(statusText)}</span>
+        </span>
+      </label>
+      <button class="act ghost" data-ph-view-opp="${esc(o.game_id)}"
+        data-ph-opp-target="${esc(target)}"
+        aria-label="View details for ${esc(o.team_name)} versus ${esc(o.opponent_name || "TBD")} on ${esc(fmtDateTime(o.start_time))}"
+        ${target && !pending ? "" : "disabled"}>Details</button>
+    </div>`;
+  };
   // Slots a coach has OFFERED this player (#112) — surfaced first, since they
   // are time-sensitive and need an explicit accept/decline.
   const offers = playerHome.substitute_offers || [];
-  const offersCard = offers.length ? `<div class="card">
-      <div class="section-title" style="margin-top:0">Substitute Offers (${offers.length})</div>
+  const opps = playerHome.substitute_opportunities || [];
+  // Reconcile every local outcome against the complete canonical game view
+  // before rendering either collection.  Checking only the row that owns the
+  // notice misses a concurrent switch to the game's other target: that row
+  // may disappear while the new target moves into Offers, allowing the old
+  // message to resurrect on a later lifecycle.
+  for (const [gameId, notice] of substituteOptInNotices) {
+    if (notice !== currentSubstituteOptInNotice(gameId)) continue;
+    const canonical = [...opps, ...offers].find((row) =>
+      row.cross_team && row.game_id === gameId
+      && (row.target_team_id || "") === notice.target);
+    const canonicalChecked = !!canonical
+      && (canonical.enrollment_status === "enrolled"
+        || canonical.enrollment_status === "offered");
+    if (!canonical || canonicalChecked !== notice.expectedChecked)
+      substituteOptInNotices.delete(gameId);
+  }
+  const offersCard = offers.length ? `<div class="card ph-sub-offers" aria-labelledby="ph-sub-offers-title">
+      <h2 class="section-title" id="ph-sub-offers-title" tabindex="-1" style="margin-top:0">Substitute Offers (${offers.length})</h2>
       ${offers.map((o) => subRow(o, "View Offer")).join("")}
     </div>` : "";
-  const opps = playerHome.substitute_opportunities || [];
-  const shown = opps.slice(0, 3);  // up to 3 on Home (#107 §17)
-  const oppRows = shown.map((o) => subRow(o, "View Opportunity")).join("")
-    + (opps.length > 3 ? `<div class="li"><div class="li-main">
-        <div class="li-sub">+ ${opps.length - 3} more opportunit${opps.length - 3 === 1 ? "y" : "ies"}</div></div></div>` : "");
+  // Every compound (game, target-team) choice must stay actionable.  The old
+  // three-row truncation had no "View all" destination, so adding two
+  // cross-team sides could silently push a valid fourth target—or the
+  // pre-existing same-team vacancy—out of the UI entirely.
+  const oppRows = opps.map((o) => o.cross_team
+      ? crossTeamSubRow(o) : subRow(o, "View Opportunity")).join("");
+  const hasCrossTeamChoices = opps.some((o) => o.cross_team);
+  const opportunityGameCount = new Set(
+    opps.filter((o) => !o.needs_cleanup)
+      .map((o) => o.game_id).filter(Boolean)).size;
+  const newOpportunityCount = opps.filter(
+    (o) => !o.cross_team || o.can_enroll === true).length;
   return `${welcome}${summary}
     <div class="card">
       <div class="section-title" style="margin-top:0">Next Game</div>
       ${nextGameBlock}
     </div>
     ${offersCard}
-    <div class="card">
-      <div class="section-title" style="margin-top:0">Substitute Opportunities (${opps.length})</div>
-      ${oppRows || '<div class="empty">No open opportunities right now.</div>'}
+    <div class="card" aria-labelledby="ph-sub-opportunities-title">
+      <h2 class="section-title" id="ph-sub-opportunities-title" tabindex="-1" style="margin-top:0">Games you can sub in (${opportunityGameCount})</h2>
+      ${hasCrossTeamChoices ? '<p class="muted ph-sub-help" id="ph-sub-help">Mark the games you are available for. The team will notify you if you are selected.</p>' : ""}
+      ${oppRows || '<div class="empty">No games available for substitute opt-in right now.</div>'}
     </div>
-    ${phStatusFeed(ng, opps.length)}
+    ${phStatusFeed(ng, newOpportunityCount)}
     <button class="row-btn" data-goto="notifications">
       <span class="row-main">Notifications</span>
       <span class="row-sub">${playerHome.unread_notifications} unread</span>
@@ -8995,7 +9173,9 @@ function renderJuniorCard(j) {
           <div class="li-sub">${esc(fmtDateTime(ng.start_time))}
             ${ng.venue_name ? " · " + esc(ng.venue_name) : ""}${ng.rink_name ? " · " + esc(ng.rink_name) : ""}</div></div>
       </div>
-      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
+      <div class="li">${phBadge(PH_ATTENDANCE, ng.attendance_status)}${ng.cross_team
+        ? '<span class="badge blue">Substitute</span>'
+        : phBadge(PH_TEAM_STATUS, ng.team_status)}</div>
       <div class="actions">
         <button class="act success" data-g-confirm="${esc(jid)}" ${confirmed ? "disabled" : ""}>${confirmed ? "In ✓" : "I'm In"}</button>
         <button class="act danger" data-g-backout="${esc(jid)}">Can't Play</button>
@@ -9004,18 +9184,25 @@ function renderJuniorCard(j) {
   // Offer/opportunity row with a per-junior call-to-action. `verb` chooses the
   // wiring: offers get inline Accept/Decline, opportunities get "View".
   const subRow = (o, kind) => {
+    const targetAttr = o.cross_team && o.target_team_id
+      ? ` data-g-opp-target="${esc(o.target_team_id)}"` : "";
     let cta;
     if (kind === "offer") {
-      cta = `<button class="act success" data-g-accept-offer="${esc(jid)}|${esc(o.game_id)}">Accept</button>
-        <button class="act danger" data-g-decline-offer="${esc(jid)}|${esc(o.game_id)}">Decline</button>`;
+      const buttons = [];
+      if (o.can_accept_offer) buttons.push(
+        `<button class="act success" data-g-accept-offer="${esc(jid)}|${esc(o.game_id)}"${targetAttr}>Accept</button>`);
+      if (o.can_decline_offer) buttons.push(
+        `<button class="act danger" data-g-decline-offer="${esc(jid)}|${esc(o.game_id)}"${targetAttr}>${o.offer_expired ? "Dismiss Expired" : "Decline"}</button>`);
+      cta = buttons.join("") || `<span class="li-sub">${esc(
+        o.blocked_reason || "This offer cannot be changed right now.")}</span>`;
     } else {
-      cta = `<button class="act primary" data-g-view-opp="${esc(jid)}|${esc(o.game_id)}">View</button>`;
+      cta = `<button class="act primary" data-g-view-opp="${esc(jid)}|${esc(o.game_id)}"${targetAttr}>View</button>`;
     }
     return `<div class="li">
       <span class="li-time">${fmt(o.start_time)}</span>
       <div class="li-main"><div class="li-title">${esc(o.team_name)} vs ${esc(o.opponent_name || "TBD")}</div>
         <div class="li-sub">${esc(fmtDateTime(o.start_time))}
-          ${o.rink_name ? " · " + esc(o.rink_name) : ""} · needs ${esc(o.position_needed)}</div></div>
+          ${o.rink_name ? " · " + esc(o.rink_name) : ""} · ${o.cross_team ? "available as" : "needs"} ${esc(o.position_needed)}</div></div>
       <div class="actions" style="margin:0">${cta}</div>
     </div>`;
   };
@@ -9045,22 +9232,28 @@ function renderGuardianOppDetail(detail) {
       <p>${esc((detail && detail.error && detail.error.message) || "This opportunity could not be loaded.")}</p></div>
       <div class="actions"><button class="act ghost" data-g-opp-back>Back</button></div>`;
   }
-  const rows = [
+  const rowData = [
     ["Team", detail.team_name],
     ["Opponent", detail.opponent_name || "TBD"],
     ["When", fmtDateTime(detail.start_time)],
     ["Venue", [detail.venue_name, detail.rink_name].filter(Boolean).join(" · ") || "—"],
-    ["Position needed", detail.position_needed],
-  ].map(([k, v]) => `<div class="li"><div class="li-main">
-      <div class="li-sub">${esc(k)}</div><div class="li-title">${esc(v)}</div></div></div>`).join("")
-    + `<div class="li"><div class="li-main"><div class="li-sub">Team status</div></div>
+    [detail.cross_team ? "Your substitute position" : "Position needed",
+      detail.position_needed],
+  ];
+  let rows = rowData.map(([k, v]) => `<div class="li"><div class="li-main">
+      <div class="li-sub">${esc(k)}</div><div class="li-title">${esc(v)}</div></div></div>`).join("");
+  if (!detail.cross_team && detail.team_status) {
+    rows += `<div class="li"><div class="li-main"><div class="li-sub">Team status</div></div>
         ${phBadge(PH_TEAM_STATUS, detail.team_status)}</div>`;
+  }
   const offered = detail.enrollment_status === "offered";
+  const targetAttr = detail.cross_team && detail.target_team_id
+    ? ` data-g-opp-target="${esc(detail.target_team_id)}"` : "";
   let note = "", actions = "";
   if (offered) {
     const btns = [];
-    if (detail.can_accept_offer) btns.push(`<button class="act success" data-g-accept-offer="${esc(jid)}|${esc(detail.game_id)}">Accept Offer</button>`);
-    if (detail.can_decline_offer) btns.push(`<button class="act danger" data-g-decline-offer="${esc(jid)}|${esc(detail.game_id)}">Decline Offer</button>`);
+    if (detail.can_accept_offer) btns.push(`<button class="act success" data-g-accept-offer="${esc(jid)}|${esc(detail.game_id)}"${targetAttr}>Accept Offer</button>`);
+    if (detail.can_decline_offer) btns.push(`<button class="act danger" data-g-decline-offer="${esc(jid)}|${esc(detail.game_id)}"${targetAttr}>${detail.offer_expired ? "Dismiss Expired Offer" : "Decline Offer"}</button>`);
     actions = btns.join("");
     if (detail.blocked_reason)
       note = `<div class="banner ${btns.length ? "warn" : "neutral"}"><p>${esc(detail.blocked_reason)}</p></div>`;
@@ -10686,6 +10879,7 @@ const AUDIT_LABEL = {
   player_backed_out: "Player backed out", substitute_enrolled: "Substitute enrolled",
   substitute_withdrawn: "Substitute withdrawn", substitute_offered: "Substitute offered",
   substitute_accepted: "Substitute accepted", substitute_declined: "Substitute declined",
+  substitute_expired: "Substitute offer expired",
   substitute_added_to_roster: "Substitute added to roster", player_removed: "Player removed",
   roster_locked: "Roster locked", roster_unlocked: "Roster unlocked", game_cancelled: "Game cancelled",
 };
@@ -11631,8 +11825,10 @@ async function render() {
       // Read, CHECK, then commit -- `oppDetail` is module-level, so assigning
       // straight out of the await expression would land the write before any
       // guard could run (#215 owner correction).
+      const oppTargetQuery = oppDetailTeam
+        ? `?target_team_id=${encodeURIComponent(oppDetailTeam)}` : "";
       const oppDetailRead = oppDetailGame
-        ? await getJSON(`/api/me/substitute-opportunities/${encodeURIComponent(oppDetailGame)}`)
+        ? await getJSON(`/api/me/substitute-opportunities/${encodeURIComponent(oppDetailGame)}${oppTargetQuery}`)
         : null;
       if (renderPass !== myRenderPass) return;  // superseded (#215)
       oppDetail = oppDetailRead;
@@ -11648,8 +11844,10 @@ async function render() {
         if (renderPass !== myRenderPass) return;  // superseded (#215)
         guardianHome = guardianHomeRead;
       }
+      const gOppTargetQuery = gOpp && gOpp.target_team_id
+        ? `?target_team_id=${encodeURIComponent(gOpp.target_team_id)}` : "";
       const gOppDetailRead = gOpp
-        ? await getJSON(`/api/me/guardian/${encodeURIComponent(gOpp.jid)}/substitute-opportunities/${encodeURIComponent(gOpp.game_id)}`)
+        ? await getJSON(`/api/me/guardian/${encodeURIComponent(gOpp.jid)}/substitute-opportunities/${encodeURIComponent(gOpp.game_id)}${gOppTargetQuery}`)
         : null;
       if (renderPass !== myRenderPass) return;  // superseded (#215)
       gOppDetail = gOppDetailRead;
@@ -12536,11 +12734,234 @@ async function render() {
   };
   // Substitute opportunity detail + response (#110). The response actions hit
   // signed-in-player scoped routes, so no player_id is sent from the browser.
-  c.querySelectorAll("[data-ph-view-opp]").forEach((b) => b.onclick = () => {
-    oppDetailGame = b.dataset.phViewOpp; oppDetail = null; toast = ""; render();
+  c.querySelectorAll("[data-ph-view-opp]").forEach((b) => b.onclick = async () => {
+    if (currentSubstituteOptInWrite(b.dataset.phViewOpp)) return;
+    const requestedGame = b.dataset.phViewOpp;
+    const requestedTeam = b.dataset.phOppTarget || null;
+    const requestedEpoch = uiIdentityEpoch;
+    const requestedPlayer = ownPlayerId();
+    const restoreFocus = document.activeElement === b;
+    let focusSuperseded = false;
+    const trackNewFocusIntent = (event) => {
+      if (event.target !== b) focusSuperseded = true;
+    };
+    if (restoreFocus) {
+      document.addEventListener("focusin", trackNewFocusIntent, true);
+    }
+    oppDetailGame = requestedGame;
+    oppDetailTeam = requestedTeam;
+    oppDetail = null; toast = "";
+    try {
+      await render();
+      if (restoreFocus && !focusSuperseded
+          && requestedEpoch === uiIdentityEpoch
+          && requestedPlayer === ownPlayerId()
+          && view === "player_home"
+          && oppDetailGame === requestedGame
+          && oppDetailTeam === requestedTeam) {
+        document.getElementById("opp-detail-title")?.focus();
+      }
+    } finally {
+      if (restoreFocus) {
+        document.removeEventListener("focusin", trackNewFocusIntent, true);
+      }
+    }
   });
   const oppBack = c.querySelector("[data-opp-back]");
-  if (oppBack) oppBack.onclick = () => { oppDetailGame = null; oppDetail = null; render(); };
+  if (oppBack) oppBack.onclick = async () => {
+    const returnGame = oppDetailGame;
+    const returnTarget = oppDetailTeam || "";
+    const restoreFocus = document.activeElement === oppBack;
+    let focusSuperseded = false;
+    const trackNewFocusIntent = (event) => {
+      if (event.target !== oppBack) focusSuperseded = true;
+    };
+    if (restoreFocus) {
+      document.addEventListener("focusin", trackNewFocusIntent, true);
+    }
+    oppDetailGame = null; oppDetailTeam = null; oppDetail = null;
+    try {
+      await render();
+      if (!restoreFocus || focusSuperseded || view !== "player_home") return;
+      const replacement = Array.from(document.querySelectorAll(
+        "[data-ph-view-opp],[data-ph-sub-optin]",
+      )).find((candidate) =>
+        !candidate.disabled
+        && (candidate.dataset.phViewOpp === returnGame
+          || candidate.dataset.phSubGame === returnGame)
+        && ((candidate.dataset.phOppTarget
+            || candidate.dataset.phSubTarget || "") === returnTarget));
+      const focusTarget = replacement
+        || document.getElementById("ph-sub-opportunities-title");
+      if (focusTarget) focusTarget.focus();
+    } finally {
+      if (restoreFocus) {
+        document.removeEventListener("focusin", trackNewFocusIntent, true);
+      }
+    }
+  };
+  // Cross-team availability is a direct, auto-saved opt-in like the reference
+  // workflow: checked means ENROLLED for this exact (game, target team), and
+  // unchecked withdraws the active enrollment. Disable during the write so a
+  // double click cannot invert two requests; render() then re-reads canonical
+  // state. Same-team opportunities retain their existing detail-first flow.
+  c.querySelectorAll("[data-ph-sub-optin]").forEach((box) => box.onchange = async () => {
+    const gid = box.dataset.phSubGame;
+    const target = box.dataset.phSubTarget;
+    if (!gid || !target) return;
+    const enrolling = box.checked;
+    const alreadyPending = currentSubstituteOptInWrite(gid);
+    if (alreadyPending) {
+      box.checked = alreadyPending.target === target
+        ? alreadyPending.enrolling : !enrolling;
+      box.disabled = true;
+      return;
+    }
+    const operation = beginSubstituteOptInWrite(
+      gid, target, enrolling, ownPlayerId());
+    if (!operation) return;
+    const restoreFocus = document.activeElement === box;
+    let focusSuperseded = false;
+    let supersedingElement = null;
+    let supersedingControl = null;
+    const homeControlIdentity = (element) => {
+      if (!element || !element.dataset) return null;
+      if (element.matches("[data-ph-sub-optin]")) return {
+        kind: "optin", game: element.dataset.phSubGame,
+        target: element.dataset.phSubTarget || "",
+      };
+      if (element.matches("[data-ph-view-opp]")) return {
+        kind: "detail", game: element.dataset.phViewOpp,
+        target: element.dataset.phOppTarget || "",
+      };
+      return null;
+    };
+    const trackNewFocusIntent = (event) => {
+      if (event.target === box) return;
+      focusSuperseded = true;
+      supersedingElement = event.target;
+      supersedingControl = homeControlIdentity(event.target);
+    };
+    if (restoreFocus) {
+      // Disabling a focused native checkbox moves activeElement to BODY in
+      // Chromium without representing a new user intent. Track subsequent
+      // focus explicitly so completion restores this compound choice only
+      // when the player did not move elsewhere while the request was held.
+      document.addEventListener("focusin", trackNewFocusIntent, true);
+    }
+    c.querySelectorAll(".ph-sub-row").forEach((row) => {
+      const candidate = row.querySelector("[data-ph-sub-optin]");
+      if (!candidate || candidate.dataset.phSubGame !== gid) return;
+      candidate.disabled = true;
+      row.setAttribute("aria-busy", "true");
+      const candidateStatus = row.querySelector(".ph-sub-optin-text");
+      if (candidateStatus) {
+        candidateStatus.setAttribute("role", "status");
+        candidateStatus.setAttribute("aria-live", "polite");
+        candidateStatus.textContent = candidate.dataset.phSubTarget === target
+          ? (enrolling
+            ? "Saving availability…" : "Removing availability…")
+          : "Another team choice for this game is being saved…";
+      }
+    });
+    c.querySelectorAll("[data-ph-view-opp]").forEach((candidate) => {
+      if (candidate.dataset.phViewOpp === gid) candidate.disabled = true;
+    });
+    const verb = enrolling ? "enroll" : "withdraw";
+    const body = { target_team_id: target };
+    let outcome = null;
+    try {
+      let identityCurrent = false;
+      try {
+        // Side-effect-free transport: only the identity that issued this write
+        // may publish its eventual error/success into the module-level toast.
+        const r = await postScoped(
+          `/api/me/substitute-opportunities/${encodeURIComponent(gid)}/${verb}`,
+          body);
+        identityCurrent = substituteOptInWriteIsCurrent(operation);
+        if (identityCurrent) {
+          let message;
+          let isError = false;
+          if (r && !r.error) {
+            message = enrolling
+              ? "You're available to substitute for this team."
+              : "Your substitute availability was removed.";
+          } else {
+            message = (r && r.error && r.error.message)
+              || "The request could not be completed.";
+            isError = true;
+            // Keep the control truthful until the canonical read lands.
+            box.checked = !enrolling;
+          }
+          // Outcome belongs to this compound row, not the page-global toast:
+          // two different games may save concurrently and neither result may
+          // overwrite the other or leak onto the view the player navigated to.
+          substituteOptInNotices.set(gid, {
+            target, message, isError,
+            expectedChecked: isError ? !enrolling : enrolling,
+            playerId: operation.playerId, epoch: operation.epoch,
+          });
+          outcome = { message, isError };
+        }
+      } finally {
+        settleSubstituteOptInWrite(operation);
+      }
+      if (!identityCurrent || view !== "player_home") return;
+      await render();
+      if (operation.epoch !== uiIdentityEpoch
+          || operation.playerId !== ownPlayerId()
+          || view !== "player_home") return;
+      // Canonical rendering replaces the row-local status node, so inserting
+      // the completed sentence there is not a reliable screen-reader
+      // announcement. Publish it only after that render, through the one
+      // persistent sitewide live region, and only while the issuing player and
+      // view still own the result. The row-local notice remains as durable
+      // visible context beside its compound choice.
+      if (outcome) {
+        toast = outcome.message;
+        toastIsError = outcome.isError;
+        updateToast();
+      }
+      const replacement = Array.from(document.querySelectorAll(
+        "[data-ph-sub-optin]")).find((candidate) =>
+          candidate.dataset.phSubGame === gid
+          && candidate.dataset.phSubTarget === target);
+      // Keep observing focus through the canonical refresh. A user may move
+      // to a newly-rendered control while that GET is held; completion must
+      // not steal that newer intent back to the original checkbox.
+      if (restoreFocus) {
+        if (focusSuperseded) {
+          const newerControl = supersedingControl
+            ? Array.from(document.querySelectorAll(
+                supersedingControl.kind === "optin"
+                  ? "[data-ph-sub-optin]" : "[data-ph-view-opp]",
+              )).find((candidate) =>
+                !candidate.disabled
+                && (candidate.dataset.phSubGame
+                  || candidate.dataset.phViewOpp) === supersedingControl.game
+                && (candidate.dataset.phSubTarget
+                  || candidate.dataset.phOppTarget || "")
+                  === supersedingControl.target)
+            : null;
+          if (newerControl) {
+            newerControl.focus();
+          } else if (!(supersedingElement && supersedingElement.isConnected
+                       && document.activeElement === supersedingElement)) {
+            document.getElementById("ph-sub-opportunities-title")?.focus();
+          }
+        } else {
+          const focusTarget = (replacement && !replacement.disabled)
+            ? replacement
+            : document.getElementById("ph-sub-opportunities-title");
+          if (focusTarget) focusTarget.focus();
+        }
+      }
+    } finally {
+      if (restoreFocus) {
+        document.removeEventListener("focusin", trackNewFocusIntent, true);
+      }
+    }
+  });
   // The four player opportunity actions all POST to the same scoped route
   // family, toast on success, close the detail, and re-render (#110/#112).
   const oppAction = (attr, verb, okMsg) => {
@@ -12549,9 +12970,159 @@ async function render() {
     const gid = btn.getAttribute(attr);
     btn.onclick = async () => {
       toast = "";
-      const r = await post(`/api/me/substitute-opportunities/${encodeURIComponent(gid)}/${verb}`, {});
-      if (r && !r.error) { toast = okMsg; oppDetailGame = null; oppDetail = null; }
-      await render();
+      const target = btn.dataset.oppTarget || oppDetailTeam;
+      const body = target ? { target_team_id: target } : {};
+      const crossScoped = !!target;
+      const operation = crossScoped
+        ? beginSubstituteOptInWrite(
+            gid, target, verb === "enroll", ownPlayerId(), verb)
+        : null;
+      if (crossScoped && !operation) return;
+      // Capture focus before disabling the initiating button: Chromium moves
+      // focus to BODY synchronously when a focused control becomes disabled.
+      const restoreFocus = !!operation && document.activeElement === btn;
+      let focusSuperseded = false;
+      let supersedingHomeControl = null;
+      let supersedingElement = null;
+      const homeControlIdentity = (element) => {
+        if (!element || !element.dataset) return null;
+        if (element.matches("[data-ph-sub-optin]")) return {
+          kind: "optin", game: element.dataset.phSubGame,
+          target: element.dataset.phSubTarget || "",
+        };
+        if (element.matches("[data-ph-view-opp]")) return {
+          kind: "detail", game: element.dataset.phViewOpp,
+          target: element.dataset.phOppTarget || "",
+        };
+        return null;
+      };
+      const trackNewFocusIntent = (event) => {
+        if (event.target === btn) return;
+        focusSuperseded = true;
+        supersedingElement = event.target;
+        supersedingHomeControl = homeControlIdentity(event.target);
+      };
+      if (restoreFocus) {
+        document.addEventListener("focusin", trackNewFocusIntent, true);
+      }
+      if (operation) {
+        const pendingLabel = ({
+          enroll: "Saving…", withdraw: "Removing…",
+          "accept-offer": "Accepting…", "decline-offer": "Declining…",
+        })[verb] || "Saving…";
+        const pendingMessage = ({
+          enroll: "Saving your availability…",
+          withdraw: "Removing your availability…",
+          "accept-offer": "Accepting your substitute offer…",
+          "decline-offer": "Declining your substitute offer…",
+        })[verb] || "Saving your response…";
+        // Accept/Decline (and any other same-game detail action) are mutually
+        // exclusive. The module ledger is the race authority; disabling every
+        // sibling and announcing pending state makes that truth visible before
+        // the held response causes a rerender.
+        c.querySelectorAll(
+          "[data-opp-accept],[data-opp-withdraw],"
+          + "[data-opp-accept-offer],[data-opp-decline-offer]",
+        ).forEach((candidate) => {
+          if (candidate.getAttribute("data-opp-accept") === gid
+              || candidate.getAttribute("data-opp-withdraw") === gid
+              || candidate.getAttribute("data-opp-accept-offer") === gid
+              || candidate.getAttribute("data-opp-decline-offer") === gid) {
+            candidate.disabled = true;
+            candidate.setAttribute("aria-busy", "true");
+          }
+        });
+        btn.textContent = pendingLabel;
+        const pendingBanner = document.createElement("div");
+        pendingBanner.className = "banner neutral";
+        pendingBanner.setAttribute("role", "status");
+        pendingBanner.setAttribute("aria-live", "polite");
+        const pendingCopy = document.createElement("p");
+        pendingCopy.textContent = pendingMessage;
+        pendingBanner.appendChild(pendingCopy);
+        c.querySelector(".section-title")?.insertAdjacentElement(
+          "afterend", pendingBanner);
+      }
+      // A held response belongs to the detail identity that issued it.  A
+      // user may return Home or open another game while it is in flight; the
+      // old response may refresh Home, but must never close or overwrite the
+      // newly opened detail.
+      const actionDetailGame = oppDetailGame;
+      const actionDetailTeam = oppDetailTeam;
+      try {
+        let r;
+        try {
+          r = await (operation ? postScoped : post)(
+            `/api/me/substitute-opportunities/${encodeURIComponent(gid)}/${verb}`,
+            body);
+        } finally {
+          settleSubstituteOptInWrite(operation);
+        }
+        if (operation && !substituteOptInWriteIsCurrent(operation)) return;
+        const anotherDetailIsOpen = oppDetailGame !== null
+          && (oppDetailGame !== actionDetailGame
+            || oppDetailTeam !== actionDetailTeam);
+        if (operation && (view !== "player_home" || anotherDetailIsOpen)) return;
+        if (operation && r && r.error) {
+          toast = r.error.message || "The request could not be completed.";
+          toastIsError = true;
+        }
+        if (r && !r.error) {
+          toast = r.status === "expired" ? "Expired offer removed." : okMsg;
+          toastIsError = false;
+          oppDetailGame = null; oppDetailTeam = null; oppDetail = null;
+        }
+        await render();
+        if (restoreFocus
+            && operation.epoch === uiIdentityEpoch
+            && operation.playerId === ownPlayerId()
+            && view === "player_home") {
+          if (focusSuperseded) {
+            const newerControl = supersedingHomeControl
+              ? Array.from(document.querySelectorAll(
+                  supersedingHomeControl.kind === "optin"
+                    ? "[data-ph-sub-optin]" : "[data-ph-view-opp]",
+                )).find((candidate) =>
+                  !candidate.disabled
+                  && (candidate.dataset.phSubGame
+                    || candidate.dataset.phViewOpp) === supersedingHomeControl.game
+                  && (candidate.dataset.phSubTarget
+                    || candidate.dataset.phOppTarget || "")
+                    === supersedingHomeControl.target)
+              : null;
+            if (newerControl) {
+              newerControl.focus();
+            } else if (!(supersedingElement && supersedingElement.isConnected
+                         && document.activeElement === supersedingElement)) {
+              // The canonical Home render replaced the newly focused control.
+              // Do not leave keyboard focus on BODY; use the stable section
+              // heading while preserving any still-connected newer intent.
+              document.getElementById("ph-sub-opportunities-title")?.focus();
+            }
+            return;
+          }
+          const actionReplacement = Array.from(
+            document.querySelectorAll(`[${attr}]`),
+          ).find((candidate) =>
+            !candidate.disabled && candidate.getAttribute(attr) === gid);
+          const homeReplacement = Array.from(document.querySelectorAll(
+            "[data-ph-sub-optin],[data-ph-view-opp]",
+          )).find((candidate) =>
+            !candidate.disabled
+            && (candidate.dataset.phSubGame === gid
+              || candidate.dataset.phViewOpp === gid)
+            && ((candidate.dataset.phSubTarget
+                || candidate.dataset.phOppTarget || "") === (target || "")));
+          const focusTarget = actionReplacement || homeReplacement
+            || document.getElementById("opp-detail-title")
+            || document.getElementById("ph-sub-opportunities-title");
+          if (focusTarget) focusTarget.focus();
+        }
+      } finally {
+        if (restoreFocus) {
+          document.removeEventListener("focusin", trackNewFocusIntent, true);
+        }
+      }
     };
   };
   oppAction("data-opp-accept", "enroll", "You're enrolled as a substitute.");
@@ -12596,7 +13167,9 @@ async function render() {
   // "View" opens the junior-scoped opportunity detail.
   c.querySelectorAll("[data-g-view-opp]").forEach((b) => b.onclick = () => {
     const [jid, game_id] = b.getAttribute("data-g-view-opp").split("|");
-    gOpp = { jid, game_id }; gOppDetail = null; toast = ""; render();
+    const target_team_id = b.dataset.gOppTarget || null;
+    gOpp = { jid, game_id, target_team_id };
+    gOppDetail = null; toast = ""; render();
   });
   const gOppBack = c.querySelector("[data-g-opp-back]");
   if (gOppBack) gOppBack.onclick = () => { gOpp = null; gOppDetail = null; render(); };
@@ -12607,8 +13180,10 @@ async function render() {
       btn.onclick = async () => {
         toast = "";
         const [jid, game_id] = btn.getAttribute(attr).split("|");
+        const target = btn.dataset.gOppTarget || null;
+        const body = target ? { target_team_id: target } : {};
         const r = await post(
-          `/api/me/guardian/${encodeURIComponent(jid)}/substitute-opportunities/${encodeURIComponent(game_id)}/${verb}`, {});
+          `/api/me/guardian/${encodeURIComponent(jid)}/substitute-opportunities/${encodeURIComponent(game_id)}/${verb}`, body);
         if (r && !r.error) { toast = okMsg; gOpp = null; gOppDetail = null; }
         await render();
       };
@@ -13926,7 +14501,7 @@ function resetTransientViewState(next) {
   // A pending checkout confirmation doesn't survive leaving Home (#107) —
   // so a stale "are you sure?" never reappears over changed attendance state.
   if (next !== "player_home") {
-    checkoutConfirm = null; oppDetailGame = null; oppDetail = null;
+    checkoutConfirm = null; oppDetailGame = null; oppDetailTeam = null; oppDetail = null;
   }
   // Same discipline for the guardian surface (#26): leaving "My Players"
   // clears any open junior checkout confirm / opportunity detail.
@@ -15051,7 +15626,9 @@ function resetTransientUiState() {
   // privileged response delivered in that window still holds the current
   // renderPass and can write the private data straight back after this reset.
   renderPass += 1;
-  checkoutConfirm = null; oppDetailGame = null; oppDetail = null;
+  checkoutConfirm = null; oppDetailGame = null; oppDetailTeam = null; oppDetail = null;
+  substituteOptInWrites.clear();
+  substituteOptInNotices.clear();
   gCheckout = null; gOpp = null; gOppDetail = null;
   newFeedUrl = null;
   publicState.game = null;

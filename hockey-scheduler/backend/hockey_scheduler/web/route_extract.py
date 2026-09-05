@@ -3570,6 +3570,14 @@ _AUDIT_WAIVERS = {
         "not a routing test, and threaded through this ONE shared call "
         "rather than bound into the dict's three values, so the three "
         "methods reached as VALUES stay a single reviewed site",
+    ("do_POST",
+     "fn(gid, player_id, user_id, authorized_team_id=coach_team, "
+     "allow_cross_team_response=False)",
+     "call_argument", "op in {'accept', 'decline'}"):
+        "the explicit response-only sibling of the shared fn call above. The "
+        "captured op has already selected accept/decline; the constant false "
+        "keeps cross-team offer response player/guardian-owned and cannot "
+        "choose a different route",
     ("do_POST", "coach(gid, user_id)", "call_argument", "coach"):
         "#202 repair round 5, finding 2b -- `coach` is one of "
         "`api.{lock_roster,unlock_roster,cancel_game}`, selected by "
@@ -3595,6 +3603,28 @@ _AUDIT_WAIVERS = {
     # refuse the request (a resource-scoping/ownership check, same
     # category as `scope_violation(...)`'s own waiver above) but never
     # which route this is.
+    ("_dispatch_get", "parse_qs(urlparse(self.path).query)", "assign_rhs",
+     "mso"):
+        "get_me_substitute_opportunity: the query-string parse for the "
+        "optional target_team_id resource selector. The enclosing mso "
+        "regex has already selected the one-player substitute-opportunity "
+        "detail route; this value selects the target side within that "
+        "already-decided resource and is revalidated by the API/service",
+    ("_dispatch_get", "urlparse(self.path)", "attribute", "mso"):
+        "the same target_team_id query parse, reached as urlparse's own "
+        "call node. The route is already selected by mso; only the query "
+        "component is consumed",
+    ("_dispatch_get", "query.get('target_team_id')", "boolop", "mso"):
+        "the one literal query key read from the already-parsed query. It "
+        "selects the target side of the already-decided opportunity detail "
+        "and cannot select a different HTTP route",
+    ("_dispatch_get",
+     "api.get_substitute_opportunity(pid, mso.group(1), "
+     "target_team_id=target_team_id)", "call_argument", "mso"):
+        "the facade call consuming the session-derived player id, captured "
+        "game id, and already-waived target-side selector. The mso match "
+        "already selected this route; the service revalidates the compound "
+        "resource identity and may return only this route's response",
     ("_dispatch_get", "parse_qs(urlparse(self.path).query)", "assign_rhs",
      "path == '/api/setup/scheduling-policy'"):
         "get_setup_scheduling_policy: the query-string parse itself. "
@@ -3758,11 +3788,14 @@ _AUDIT_WAIVERS = {
     # leaf chosen upstream, the same "produces a RESULT, not a routing
     # decision" shape every other captured-argument waiver in this dict
     # already uses.
-    ('_dispatch_get', 'api.get_substitute_opportunity(jid, mgo.group(2))', 'call_argument', 'mgo'):
+    ('_dispatch_get',
+     'api.get_substitute_opportunity(jid, mgo.group(2), '
+     'target_team_id=target_team_id)', 'call_argument', 'mgo'):
         "jid (mgo.group(1)) and mgo.group(2) are both captured groups off "
         "the SAME regex match; the route (one substitute-opportunity "
         "detail, for the signed-in guardian's junior) is already decided by "
-        "mgo's own alternation, this only fetches the record",
+        "mgo's own alternation; target_team_id selects the exact cross-team "
+        "choice and this call only fetches that compound record",
     ('_dispatch_get', 'api.get_game(gid)', 'call_argument', 'sub is None'):
         "gid is captured by the enclosing /api/games/{gid}[/<sub>] match; "
         "`sub is None` (no sub-resource segment) is the bare game-detail "
@@ -3830,35 +3863,60 @@ _AUDIT_WAIVERS = {
         "gid captured off the SAME match; `sub == 'reschedule'` already "
         "selects this leaf -- reached as a dict VALUE, the same shape as "
         "get_officials_for_game above",
-    ('do_POST', 'api.enroll_substitute(gid, ppid, actor_id=uid)', 'call_argument', "action == 'enroll'"):
+    ('do_POST',
+     "api.enroll_substitute(gid, ppid, actor_id=uid, "
+     "target_team_id=body.get('target_team_id'))",
+     'call_argument', "action == 'enroll'"):
         "gid/ppid captured off the SAME /api/me/substitute- "
         "opportunities/... match as `action`; `action == 'enroll'` already "
-        "selects this leaf",
-    ('do_POST', 'api.withdraw_substitute(gid, ppid, actor_id=uid)', 'call_argument', "action == 'withdraw'"):
+        "selects this leaf. target_team_id is a strictly schema-checked "
+        "resource selector consumed by that already-decided command; player "
+        "identity remains session-derived",
+    ('do_POST',
+     "api.withdraw_substitute(gid, ppid, actor_id=uid, "
+     "expected_target_team_id=body.get('target_team_id'), "
+     "require_target_identity=True)", 'call_argument', "action == 'withdraw'"):
         "the withdraw sibling of enroll_substitute immediately above -- "
         "same match, same reasoning, `action == 'withdraw'` already selects "
-        "this leaf",
-    ('do_POST', 'api.accept_substitute(gid, ppid, actor_id=uid)', 'call_argument', "action == 'accept-offer'"):
+        "this leaf. The checked target binds the compound row inside the "
+        "service transaction",
+    ('do_POST',
+     "api.accept_substitute(gid, ppid, actor_id=uid, "
+     "expected_target_team_id=body.get('target_team_id'), "
+     "require_target_identity=True)", 'call_argument', "action == 'accept-offer'"):
         "the accept-offer sibling -- same match, `action == 'accept-offer'` "
-        "already selects this leaf",
-    ('do_POST', 'api.decline_substitute(gid, ppid, actor_id=uid)', 'call_argument', 'mso'):
+        "already selects this leaf; the target is resource identity, not a "
+        "route selector",
+    ('do_POST',
+     "api.decline_substitute(gid, ppid, actor_id=uid, "
+     "expected_target_team_id=body.get('target_team_id'), "
+     "require_target_identity=True)", 'call_argument', 'mso'):
         "the terminal else of the SAME four-way action dispatch "
         "(enroll/withdraw/accept-offer already returned above) -- mso's own "
         "regex alternation admits only these four actions, so this is the "
-        "fourth, not an unconditional fallback",
+        "fourth, not an unconditional fallback. The target only binds the "
+        "already-selected enrollment",
     ('do_POST', "api.set_availability(gid, jid, body.get('availability_status'), 'guardian', guid)", 'call_argument', 'mga'):
         "jid/gid captured off mga's own regex groups, reached only after "
         "the guardian-link gate a few lines up and a strict body-schema "
         "check (both already independently reviewed/waived control flow) -- "
         "mga's match alone already fully decides this one-leaf route",
-    ('do_POST', 'api.accept_substitute(gid, jid, actor_id=guid)', 'call_argument', "action == 'accept-offer'"):
+    ('do_POST',
+     "api.accept_substitute(gid, jid, actor_id=guid, "
+     "expected_target_team_id=body.get('target_team_id'), "
+     "require_target_identity=True, response_source='guardian')", 'call_argument',
+     "action == 'accept-offer'"):
         "jid/gid/action captured off the SAME mgs match; `action == "
-        "'accept-offer'` already selects this leaf",
-    ('do_POST', 'api.decline_substitute(gid, jid, actor_id=guid)', 'call_argument', 'mgs'):
+        "'accept-offer'` already selects this leaf; target_team_id is the "
+        "strictly checked compound-resource selector",
+    ('do_POST',
+     "api.decline_substitute(gid, jid, actor_id=guid, "
+     "expected_target_team_id=body.get('target_team_id'), "
+     "require_target_identity=True)", 'call_argument', 'mgs'):
         "the terminal else of mgs's own two-way action alternation (accept- "
         "offer already returned above) -- the SAME 'regex alternation "
-        "already admits only these values' shape as decline_substitute "
-        "above",
+        "already admits only these values' shape as decline_substitute above; "
+        "the target binds the junior's already-selected offer",
     ('do_POST', 'api.unassign_official(aid, user_id)', 'call_argument', "op == 'unassign'"):
         "aid/op captured off the SAME oa match, reached only after the "
         "empty-body schema check just above; `op == 'unassign'` already "
@@ -3912,9 +3970,13 @@ _AUDIT_WAIVERS = {
         "coach/operator side of enrollment -- distinct actor/permission "
         "from the player self-service /api/me/substitute-opportunities/... "
         "route above, same service call)",
-    ('do_POST', 'api.withdraw_substitute(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'substitutes/withdraw'"):
+    ('do_POST',
+     'api.withdraw_substitute(gid, pid, user_id, '
+     'authorized_team_id=coach_team, allow_cross_team_response=False)',
+     'call_argument', "action == 'substitutes/withdraw'"):
         "gid/action captured off the SAME match; `action == "
-        "'substitutes/withdraw'` already selects this leaf",
+        "'substitutes/withdraw'` already selects this leaf; the constant "
+        "false narrows cross-team authority and does not select a route",
     ('do_POST', 'api.add_substitute_candidate(gid, pid, user_id, authorized_team_id=coach_team)', 'call_argument', "action == 'substitutes/add-candidate'"):
         "gid/action captured off the SAME match; `action == "
         "'substitutes/add-candidate'` already selects this leaf",
@@ -3923,6 +3985,16 @@ _AUDIT_WAIVERS = {
         "nested `sub` match on the SAME already-selected `action == "
         "'substitutes/<player_id>/<op>'` shape; `op == 'offer'` already "
         "selects this leaf",
+    ('do_POST',
+     "fn(gid, player_id, user_id, "
+     "expected_target_team_id=body.get('target_team_id'), "
+     "require_target_identity=True)",
+     'call_argument', "op in {'accept', 'decline'}"):
+        "the player-only arm of the already-selected generic response route; "
+        "gid/player_id/op came from the outer and nested route matches, while "
+        "role is session-derived. `fn` is selected from the closed literal "
+        "map waived below, and the strictly checked target binds the active "
+        "cross-team enrollment rather than selecting a route",
     ('do_POST', "{'accept': api.accept_substitute, 'decline': api.decline_substitute, 'add-to-roster': api.add_substitute_to_roster}[op]", 'assign_rhs', 'sub'):
         "the terminal else of sub's own three-way alternation (offer "
         "already returned above); a dict LITERAL of api.X values keyed on "

@@ -119,6 +119,32 @@ def assert_no_duplicate_roster_players(conn):
             "before upgrading.")
 
 
+def find_duplicate_active_substitute_players(conn):
+    """Active ``(game, player)`` keys with more than one substitute row.
+
+    Terminal declined/withdrawn/expired rows are historical evidence and are
+    intentionally outside migration 064's partial unique index.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT game_id, player_id FROM substitute_enrollments "
+        "WHERE game_id IS NOT NULL AND player_id IS NOT NULL "
+        "AND status IN ('enrolled', 'offered') "
+        "GROUP BY game_id, player_id HAVING COUNT(*) > 1")
+    return sorted((row["game_id"], row["player_id"])
+                  for row in cur.fetchall())
+
+
+def assert_no_duplicate_active_substitute_players(conn):
+    """Abort migration 064 before its active-enrollment index would fail."""
+    duplicates = find_duplicate_active_substitute_players(conn)
+    if duplicates:
+        raise MigrationDataError(
+            "Cannot enforce one active substitute enrollment per player and "
+            f"game: {len(duplicates)} duplicate pair(s) exist. Withdraw or "
+            "expire the extra active rows before upgrading.")
+
+
 def find_duplicate_result_games(conn):
     """Concrete game_ids that already back more than one result row.
 

@@ -239,8 +239,8 @@ class SubstituteEnrollment:
     # the transition, at the moment that context was genuinely valid (the
     # pattern `position` above already established: resolve once, store it).
     #
-    # WRITTEN TWICE, ONE FIELD, TWO PHASES, and each phase's value is the
-    # authority for that phase:
+    # WRITTEN AT ENROLLMENT, and (for the established same-team workflow)
+    # refreshed at offer time; each phase's value is its authority:
     #
     #   ENROLLED — written by `enroll_substitute` from the context its
     #     eligibility gate accepted (owner ruling, PR #427, comment
@@ -252,8 +252,10 @@ class SubstituteEnrollment:
     #     forbids, because it hands a row to whichever coach the player
     #     happens to belong to NOW rather than the one who owns the row.
     #
-    #   OFFERED — REPLACED by `offer_substitute` with the side IT validated
-    #     the offer against. "Once OFFERED, the existing offer-owner
+    #   OFFERED — same-team rows are REPLACED by `offer_substitute` with the
+    #     live side IT validated the offer against. Cross-team rows keep the
+    #     explicit target selected at enrollment and revalidate their exact
+    #     source membership separately. "Once OFFERED, the offer-owner
     #     snapshot remains authoritative for that phase" (same ruling), so
     #     the offer phase keeps the #205 blocker-3 contract below unchanged.
     #
@@ -265,8 +267,9 @@ class SubstituteEnrollment:
     # audience is whoever OWNS that offer, never a team re-resolved at
     # decline time (which, after a reassignment or a transfer, is the
     # OPPONENT — see roster_service.decline_substitute and
-    # 060_substitute_team_id.sql for why accept's live re-resolution is not
-    # a precedent here). It is also durable by construction, so a membership
+    # 060_substitute_team_id.sql for why the legacy same-team accept path's
+    # live re-resolution is not a precedent here). It is also durable by
+    # construction, so a membership
     # ending after the offer can no longer make that audience_ref come back
     # None and crash the decline.
     #
@@ -287,6 +290,15 @@ class SubstituteEnrollment:
     # self-service and an unscoped League Admin are unaffected — their
     # authority never came from this column.
     team_id: Optional[str] = None
+    # #287 cross-team provenance.  These are populated together only when a
+    # player volunteers for a different team's game.  They identify the exact
+    # live stint that supplied eligibility and the source team it represented;
+    # later offer/accept transitions revalidate that same source rather than
+    # silently borrowing authority from a newly-created membership.  No
+    # foreign keys by design: terminal substitute history must remain readable
+    # after membership or team cleanup.
+    source_membership_id: Optional[str] = None
+    source_team_id: Optional[str] = None
 
     @property
     def slot_type(self) -> SlotType:
@@ -302,6 +314,11 @@ class AuditLog:
     actor_id: Optional[str] = None
     subject_player_id: Optional[str] = None
     detail: dict = field(default_factory=dict)
+    # Durable event-side attribution for side-scoped activity projection.
+    # It is a frozen snapshot, deliberately without a foreign key: audit
+    # history must survive later Team/subtree deletion.  Legacy rows remain
+    # NULL and continue through the conservative player-attribution fallback.
+    team_id: Optional[str] = None
 
 
 @dataclass
@@ -313,6 +330,9 @@ class NotificationEvent:
     message: str
     at: datetime
     subject_player_id: Optional[str] = None
+    # Same frozen event-side snapshot as AuditLog.team_id.  This is internal
+    # authorization metadata and is never serialized in the board response.
+    team_id: Optional[str] = None
 
 
 @dataclass

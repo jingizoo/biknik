@@ -257,6 +257,7 @@ jobs:
           node --check hockey-scheduler/e2e/setup-workflow-hub.js
           node --check hockey-scheduler/e2e/setup-accessibility-axe-gate.js
           node --check hockey-scheduler/e2e/role-home-journeys.js
+          node --check hockey-scheduler/e2e/cross-team-substitution-ui.js
           node --check hockey-scheduler/e2e/role-authorization-matrix.js
           node --check hockey-scheduler/e2e/seven-area-navigation.js
           node --check hockey-scheduler/e2e/setup-progress-conflict-attention.js
@@ -279,7 +280,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.browser_smoke == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Four bounded shards now run 14-17 real journeys each. On a slow hosted
+    # runner dependency setup alone can consume 7+ minutes; retain a hard cap
+    # while leaving enough time for the journeys to execute.
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: hockey-scheduler/e2e
@@ -311,7 +315,7 @@ jobs:
           - shard: 2
             scripts: "team-division-participation scheduler-empty-state scheduler-already-scheduled scheduler-team-overlap scheduler-games-per-team scheduler-turnaround allowed-venues venue-access-cleanup facilities-venue-access venue-sharing permanent-teams player-edit accessibility-foundations setup-workflow-hub setup-v2-context-scope context-identity-withdrawal"
           - shard: 3
-            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience ice-availability-builder context-switcher league-context-bar league-filtered-data dashboard-season-ceiling role-home-journeys role-authorization-matrix home-tasks-state-matrix bootstrap-program-selection"
+            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience ice-availability-builder context-switcher league-context-bar league-filtered-data dashboard-season-ceiling role-home-journeys cross-team-substitution-ui role-authorization-matrix home-tasks-state-matrix bootstrap-program-selection"
           - shard: 4
             scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete coach-scope player-lifecycle home-tasks-hub setup-progress-conflict-attention setup-accessibility-axe-gate setup-prerequisite-floors setup-card-write-identity calendar-today context-scope-truth"
     steps:

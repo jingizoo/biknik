@@ -106,6 +106,7 @@ from .db_errors import (
     translate_program_org_fk_exception,
     translate_reassignment_fk_exception,
     translate_registration_number_exception,
+    translate_substitute_active_conflict_exception,
     translate_venue_hierarchy_fk_exception,
 )
 from .integrity_checks import (
@@ -117,6 +118,7 @@ from .integrity_checks import (
     assert_reassignment_fks_ready,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
+    assert_no_duplicate_active_substitute_players,
     assert_no_duplicate_device_tokens,
     assert_no_duplicate_ice_slot_times,
     assert_no_duplicate_result_games,
@@ -279,7 +281,7 @@ SPECS = {
                                 "status": _enum(SubstituteStatus),
                                 "enrolled_at": _dt(), "offered_at": _dt(),
                                 "offer_expires_at": _dt(), "accepted_at": _dt(),
-                                "declined_at": _dt()}),  # team_id: plain TEXT, no codec
+                                "declined_at": _dt()}),  # team/source ids: plain TEXT
     AuditLog: Spec(AuditLog, "audit_logs",
                    {"action": _enum(AuditAction), "at": _dt(), "detail": _jsonc()}),
     NotificationEvent: Spec(NotificationEvent, "notification_events",
@@ -504,6 +506,9 @@ _PRE_MIGRATION_CHECKS = {
 _ATOMIC_PRE_MIGRATION_CHECKS = {
     "057_device_token_unique_key":
         (assert_no_duplicate_device_tokens, "device_tokens"),
+    "064_cross_team_substitute_provenance":
+        (assert_no_duplicate_active_substitute_players,
+         "substitute_enrollments"),
 }
 
 
@@ -1698,8 +1703,20 @@ class SqlStore:
         return self._query(GameAvailability, "player_id = ?", (player_id,), order="id")
 
     # -- substitutes -------------------------------------------------------
-    def add_substitute(self, sub): return self._insert(sub)
-    def save_substitute(self, sub): return self._update(sub)
+    def _write_substitute(self, write, sub):
+        try:
+            return write(sub)
+        except Exception as exc:
+            translated = translate_substitute_active_conflict_exception(exc, sub)
+            if translated is not None:
+                raise translated from exc
+            raise
+
+    def add_substitute(self, sub):
+        return self._write_substitute(self._insert, sub)
+
+    def save_substitute(self, sub):
+        return self._write_substitute(self._update, sub)
 
     def substitutes_for_game(self, game_id):
         return self._query(SubstituteEnrollment, "game_id = ?", (game_id,), order="id")

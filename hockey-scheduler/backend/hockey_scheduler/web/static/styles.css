@@ -581,6 +581,43 @@ select.player-picker {
 .li .li-title { font-size: 15px; font-weight: 500; }
 .li .li-sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
 .li .li-time { font-size: 13px; font-weight: 600; color: var(--ink); }
+/* Player Home cross-team substitute opt-in (#287). The whole label is the
+   checkbox target (not just the 20px native control), keeping it comfortably
+   keyboard/touch usable while preserving the browser's native checked,
+   disabled and focus semantics. */
+.ph-sub-row { align-items: stretch; }
+.ph-sub-choice {
+  display: flex; align-items: center; gap: 12px; flex: 1 1 auto; min-width: 0;
+  min-height: 48px; cursor: pointer;
+}
+.ph-sub-choice input {
+  width: 20px; height: 20px; flex: 0 0 20px; margin: 0;
+  accent-color: var(--blue); cursor: inherit;
+}
+.ph-sub-choice input:disabled { cursor: not-allowed; opacity: .7; }
+.ph-sub-choice input:focus-visible {
+  outline: 3px solid #2563eb; outline-offset: 3px;
+}
+.ph-sub-choice-copy {
+  display: flex; flex-direction: column; min-width: 0;
+  overflow-wrap: anywhere;
+}
+.ph-sub-choice-copy .li-title, .ph-sub-choice-copy .li-sub { display: block; }
+.ph-sub-row .li-sub, .card p.ph-sub-help { color: #6b6b70; }
+.card #ph-sub-opportunities-title, .card #ph-sub-offers-title {
+  color: #6b6b70;
+}
+.ph-sub-offers .li-sub { color: #6b6b70; }
+#opp-detail-title { color: #6b6b70; }
+.ph-sub-offers button.primary { background: #0a64c4; }
+#opp-detail-title ~ .card .li-sub { color: #6b6b70; }
+#opp-detail-title ~ .actions button.success { background: #167029; }
+#ph-sub-opportunities-title:focus-visible, #ph-sub-offers-title:focus-visible,
+#opp-detail-title:focus-visible {
+  outline: 2px solid #2563eb; outline-offset: 2px; border-radius: 4px;
+}
+.ph-sub-optin-text { color: #0a64c4; font-size: 13px; font-weight: 600; margin-top: 4px; }
+.ph-sub-help { margin: 0 14px 8px; }
 /* #390 — the calendar day ABOVE the clock time on scheduler rows. A wrapper
    rather than nesting the date inside .li-time, so .li-time keeps holding
    exactly the clock: it is styled and read by surfaces that predate this.
@@ -893,6 +930,11 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
   .ib-grid2 { grid-template-columns: 1fr; }
   .ib-day-row { flex-direction: column; gap: 4px; }
   .mo-cell { min-height: 52px; }
+  /* Keep matchup text and each 44px+ control inside the canonical 390px
+     viewport; Details moves below the full-width checkbox target. */
+  .ph-sub-row { flex-wrap: wrap; }
+  .ph-sub-choice { flex: 1 1 100%; }
+  .ph-sub-row > .act { min-height: 44px; margin-left: 32px; }
 }
 .wk-cell .slot-card .t { font-size: 11px; }
 .wk-cell .slot-card .s { font-size: 10px; }

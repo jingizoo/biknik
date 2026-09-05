@@ -1093,15 +1093,15 @@ class TheGuardCatchesEveryLeakThisBlockerFixed(_GuardHarness,
         audience = lineup_visibility.route_audience(
             viewer_role, viewer_team_id, game.home_team_id, game.away_team_id)
         if audience == lineup_visibility.FULL:
-            return [_serialize(s)
+            return [self._substitute_row(s)
                     for s in self.store.substitutes_for_game(game_id)]
         if audience == lineup_visibility.OWN_SIDE:
-            return [_serialize(s)
+            return [self._substitute_row(s)
                     for s in self.store.substitutes_for_game(game_id)
                     if s.team_id is not None and s.team_id == viewer_team_id]
         raise NotAuthorizedError(_SUBSTITUTE_REFUSAL)""",
                           """        self.roster._require_game(game_id)
-        return [_serialize(s)
+        return [self._substitute_row(s)
                 for s in self.store.substitutes_for_game(game_id)]""")
         violations, _errors = self._audit(leaked)
         self.assertTrue(
@@ -1115,10 +1115,10 @@ class TheGuardCatchesEveryLeakThisBlockerFixed(_GuardHarness,
         of this gate BLESSED, under the ``SUBJECT_OWN_SIDE`` exemption whose
         only condition was "takes no caller-supplied side". It takes none;
         it derived the OPPONENT's side from ``Player.team_id``."""
-        leaked = _replace(_sources(), FACADE, """            my_team_id = game_scoped_own_team_id(
+        leaked = _replace(_sources(), FACADE, """            membership_team_id = game_scoped_own_team_id(
                 Role.PLAYER, None, player_id,
                 GameAuthorization.of(next_game), self.store)""",
-                          """            my_team_id = player.team_id""")
+                          """            membership_team_id = player.team_id""")
         violations, _errors = self._audit(leaked)
         self.assertTrue(
             self._caught(violations, "untrusted_side", "get_player_home"),

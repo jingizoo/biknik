@@ -435,9 +435,38 @@ class InMemoryStore:
         return [a for a in self.availability.values() if a.player_id == player_id]
 
     # -- substitutes -------------------------------------------------------
-    def add_substitute(self, sub: SubstituteEnrollment) -> SubstituteEnrollment:
-        self.substitutes[sub.id] = sub
+    def _write_substitute(
+        self, sub: SubstituteEnrollment
+    ) -> SubstituteEnrollment:
+        """Mirror migration 064's active ``(game, player)`` uniqueness.
+
+        SQL has a partial unique index covering ENROLLED/OFFERED rows.  The
+        in-memory backend has no engine constraint, so enforce the identical
+        key and stable error here under its writer lock.  Excluding the row's
+        own id keeps an ordinary ENROLLED -> OFFERED save valid while still
+        refusing reactivation beside a different active row.
+        """
+        with self._lock:
+            if (sub.game_id is not None
+                    and sub.player_id is not None
+                    and sub.status.is_active_enrollment
+                    and any(
+                    existing.id != sub.id
+                    and existing.game_id == sub.game_id
+                    and existing.player_id == sub.player_id
+                    and existing.status.is_active_enrollment
+                    for existing in self.substitutes.values())):
+                raise IntegrityConflictError(
+                    "Player already has an active substitute enrollment for "
+                    "this game.",
+                    details={"reason": "active_substitute_conflict",
+                             "game_id": sub.game_id,
+                             "player_id": sub.player_id})
+            self.substitutes[sub.id] = sub
         return sub
+
+    def add_substitute(self, sub: SubstituteEnrollment) -> SubstituteEnrollment:
+        return self._write_substitute(sub)
 
     def substitutes_for_game(self, game_id: str) -> List[SubstituteEnrollment]:
         return [s for s in self.substitutes.values() if s.game_id == game_id]
@@ -1988,8 +2017,7 @@ class InMemoryStore:
         return rink
 
     def save_substitute(self, sub: SubstituteEnrollment) -> SubstituteEnrollment:
-        self.substitutes[sub.id] = sub
-        return sub
+        return self._write_substitute(sub)
 
     def save_roster_entry(self, entry: GameRosterEntry) -> GameRosterEntry:
         self.roster_entries[entry.id] = entry

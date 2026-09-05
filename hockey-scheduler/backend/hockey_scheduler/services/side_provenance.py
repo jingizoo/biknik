@@ -338,7 +338,7 @@ SUBJECT_MEMBERSHIP_CONTEXT = "subject_membership_context"
 #: which is the check the fifth leak needed and did not have.
 
 #: Origins that ARE a resolved membership context's own side.
-_SUBJECT_CONTEXT_ORIGINS = ("attr:ctx.team_id",)
+_SUBJECT_CONTEXT_ORIGINS = ("attr:ctx.team_id", "attr:offer_ctx.team_id")
 
 DURABLE_ROW_SIDE = "durable_row_side"
 #: The side comes from the ROW's own durable attribution — the authority the
@@ -534,6 +534,13 @@ EXEMPTIONS = {
         "against THIS game. Re-examined when SUBJECT_OWN_SIDE was removed: "
         "the side is the authoritative game-scoped membership, not the "
         "permanent pointer, which is what the old class could not tell."),
+    ("get_player_home", "compute_roster_status",
+     "attr:offer_ctx.team_id"): (
+        SUBJECT_MEMBERSHIP_CONTEXT, None,
+        "the signed-in player's same-team OFFER is summarized against the "
+        "GameMembershipContext this method resolves for that exact player "
+        "and game; cross-team offers never take this branch or read target "
+        "roster status."),
     ("substitute_block_reason", "compute_roster_status",
      "attr:ctx.team_id"): (
         SUBJECT_MEMBERSHIP_CONTEXT, None,
@@ -541,6 +548,12 @@ EXEMPTIONS = {
         "be handed in by a caller that already resolved it for this exact "
         "(game, player), and this method resolves it itself when it is "
         "not."),
+    ("substitute_offer_block_reason", "compute_roster_status",
+     "attr:enrollment.team_id"): (
+        DURABLE_ROW_SIDE, None,
+        "a cross-team offer is evaluated against the durable target side "
+        "recorded on the enrollment; the original source membership is "
+        "revalidated separately and never supplies the target slot."),
     ("_back_out_entry", "compute_roster_status",
      "attr:entry.team_side"): (
         DURABLE_ROW_SIDE, None,
@@ -1352,6 +1365,11 @@ TWO_SIDED_READERS = {
         NARROWS_BY_TRUSTED_SIDE,
         "a declared producer: the four populations are computed for the one "
         "side it was handed."),
+    ("services/roster_service.py", "_lineup_substitutes"): (
+        ATTRIBUTION_PRIMITIVE,
+        "selects one deterministic active-or-newest durable enrollment per "
+        "player across the game; its only caller is the declared one-side "
+        "lineup_population producer, which performs the side narrowing."),
     ("services/roster_service.py", "_prior_side_candidates"): (
         NARROWS_BY_TRUSTED_SIDE,
         "a declared producer: the copy-roster source rows for the side the "
