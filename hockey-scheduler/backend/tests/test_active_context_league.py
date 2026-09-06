@@ -67,6 +67,23 @@ def _close(store):
         store.close()
 
 
+class _ObservedRLock:
+    """RLock that exposes when a different thread reaches its boundary."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.contended = threading.Event()
+
+    def __enter__(self):
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._lock.release()
+
+
 def _program_season_league(api, pname="P1", sname="S1", lname="Gold"):
     """A Program + Season + a League BOUND to that Season. Returns ids."""
     pid = api.create_program(pname, "US", "UTC")["id"]
@@ -334,6 +351,89 @@ class LeagueContextSelectionTest(unittest.TestCase):
                 self.assertEqual((rp.id, rs.id, rl.id), (pid, sid, lid), label)
                 self.assertEqual(rs.status, SeasonStatus.ARCHIVED, label)
                 _close(store)
+
+
+class TransactionBoundSavedContextTest(unittest.TestCase):
+    def test_requires_ambient_transaction_and_returns_detached_values(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                self.addCleanup(_close, store)
+                api = ApiService(store)
+                pid, sid, lid = _program_season_league(api)
+                context = ContextService(store)
+                context.set_with_league("u1", *ADMIN, pid, sid, lid)
+                expected = context.resolve_saved_with_league("u1", *ADMIN)
+
+                with self.assertRaisesRegex(
+                        RuntimeError, "requires an active store transaction"):
+                    context._resolve_saved_with_league_in_transaction(
+                        "u1", *ADMIN, lock=True)
+
+                with store.transaction():
+                    actual = context._resolve_saved_with_league_in_transaction(
+                        "u1", *ADMIN, lock=True)
+
+                values = lambda rows: tuple(
+                    asdict(row) if row is not None else None for row in rows)
+                self.assertEqual(values(actual), values(expected), label)
+                actual[0].program_id = "client-mutated"
+                actual[1].name = "client-mutated"
+                self.assertEqual(
+                    store.get_active_context("u1").program_id, pid, label)
+                self.assertNotEqual(
+                    store.get_program(pid).name, "client-mutated", label)
+
+                observed_lock = _ObservedRLock()
+                store._lock = observed_lock
+                holder_started = threading.Event()
+                release_holder = threading.Event()
+                outsider_done = threading.Event()
+                outcome = {}
+
+                def hold_transaction():
+                    try:
+                        with store.transaction():
+                            holder_started.set()
+                            if not release_holder.wait(5):
+                                raise RuntimeError("test did not release holder")
+                    except BaseException as exc:
+                        outcome["holder_error"] = exc
+
+                def call_from_outside_transaction():
+                    try:
+                        outcome["result"] = (
+                            context._resolve_saved_with_league_in_transaction(
+                                "u1", *ADMIN, lock=True))
+                    except BaseException as exc:
+                        outcome["outside_error"] = exc
+                    finally:
+                        outsider_done.set()
+
+                holder = threading.Thread(target=hold_transaction)
+                outsider = threading.Thread(
+                    target=call_from_outside_transaction)
+                holder.start()
+                try:
+                    self.assertTrue(holder_started.wait(5), label)
+                    outsider.start()
+                    self.assertTrue(
+                        observed_lock.contended.wait(5),
+                        f"{label}: outsider did not reach transaction guard")
+                    self.assertFalse(
+                        outsider_done.is_set(),
+                        f"{label}: outsider used another thread's transaction")
+                finally:
+                    release_holder.set()
+                    holder.join(5)
+                    if outsider.ident is not None:
+                        outsider.join(5)
+
+                self.assertFalse(holder.is_alive(), label)
+                self.assertFalse(outsider.is_alive(), label)
+                self.assertNotIn("holder_error", outcome, outcome)
+                self.assertNotIn("result", outcome, outcome)
+                self.assertIsInstance(
+                    outcome.get("outside_error"), RuntimeError, outcome)
 
 
 class LeagueContextRejectionTest(unittest.TestCase):
