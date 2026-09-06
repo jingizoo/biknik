@@ -1006,7 +1006,13 @@ class SubtreeDeletionService:
                 "Typed confirmation name did not match.",
                 {"reason": "confirmation_mismatch"})
 
-        with self.store.transaction(isolation="SERIALIZABLE"):
+        # PostgreSQL intentionally uses READ COMMITTED here.  Once the NOWAIT
+        # graph lock succeeds, each live authorization/projection statement
+        # sees writers that committed before the lock; in-flight writers make
+        # acquisition fail, and later writers remain blocked until commit.
+        # SERIALIZABLE would instead preserve the pre-lock snapshot and could
+        # therefore defeat both rechecks.
+        with self.store.transaction():
             # Join the same global cross-replica fence held SHARED by every
             # scoped read.  This is deliberately the transaction's first
             # store operation: it bumps the persisted epoch and, on

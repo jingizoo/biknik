@@ -425,6 +425,37 @@ class ContextService:
         # this round's regression traced to) genuinely does not.
         return self._snapshot(work, read_only=not lock)
 
+    def _resolve_saved_with_league_in_transaction(
+            self, user_id: Optional[str], role, scope, lock=False):
+        """Resolve the persisted tuple inside a transaction the caller owns.
+
+        This is the transaction-bound form used by subtree deletion (#452).
+        It deliberately opens no nested snapshot and performs no retry.  The
+        subtree caller first uses ``lock=True`` to take ActiveContext before
+        the graph lock, then resolves and authorizes again after acquiring the
+        graph lock; both locks remain held through the mutation.  Ordinary
+        callers use :meth:`resolve_saved_with_league`, whose SERIALIZABLE
+        snapshot contract remains unchanged.
+        """
+        # Both stores hold this re-entrant lock for the full transaction.  By
+        # taking it before inspecting the store-global depth, a caller cannot
+        # mistake another thread's transaction for its own: it waits for that
+        # transaction to finish and then observes depth zero.
+        store_lock = getattr(self.store, "_lock", None)
+        if store_lock is None:
+            raise RuntimeError(
+                "transaction-bound context resolution requires a store "
+                "transaction guard")
+        with store_lock:
+            if getattr(self.store, "_txn_depth", 0) < 1:
+                raise RuntimeError(
+                    "transaction-bound context resolution requires an active "
+                    "store transaction")
+            saved, program, season, league = self._saved_locked(
+                user_id, role, scope, lock=lock)
+            return (_detached(saved), _detached(program), _detached(season),
+                    _detached(league))
+
     def _saved_locked(self, user_id, role, scope, lock=False):
         """The persisted row and the axes it still validly names, as LIVE rows —
         MUST run inside the transaction; every caller detaches its result before
