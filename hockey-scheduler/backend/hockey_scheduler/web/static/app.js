@@ -22,7 +22,7 @@ let currentGame = null;     // game id whose roster we're viewing
 let rosterBatch = null;
 let pickedPlayer = null;
 let wizard = null;          // {slot_id, league_id, division_id, home_id, away_id} when scheduling
-let iceBuilder = null;      // {form, preview} when the Ice Availability Builder is open (#158)
+let iceBuilder = null;      // {form, contextRevision} while Ice Builder is open; preview lives in its card (#393)
 let calendarDate = todayISO();    // YYYY-MM-DD shown on the arena calendar
 let calendarMode = "day";   // day | week | month (#158)
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
@@ -190,7 +190,10 @@ let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
 let schedulerState = {
-  division: null, preview: null, drafts: [], summary: null,
+  // Inputs and filters only. Proposal/review response data is owned by the
+  // two Scheduler card models below, so a response cannot outlive the
+  // Program/Season/League or authenticated identity it was requested for.
+  division: null,
   // #375 — the regular-season format, INVERTED to the number the operator
   // actually signs up for: guaranteed games their own team plays. `null`
   // means "single round-robin" (the historical default, sent as the legacy
@@ -202,17 +205,6 @@ let schedulerState = {
   // state would make "both set" representable on the client, which is the
   // drift the refusal exists to prevent.
   gamesPerTeam: null,
-  // #375 residual blocker — the backend's structured refusal of the CURRENT
-  // format request (`games_per_team_infeasible` and its two residual
-  // siblings), held so the guidance renders next to the control that caused
-  // it instead of only in a toast. Cleared by any successful Generate.
-  //
-  // It exists because the option list no longer pre-filters feasibility:
-  // whether a G works depends on the selected Division's team count and on
-  // the Games it already has, and this screen knows neither before Generate
-  // runs. Refusing to offer the value was the old answer, and it cost every
-  // even-team Division its odd formats.
-  formatRefusal: null,
   // #390 — the configurable turnaround, in MINUTES, measured from the
   // previous game's end. 0 is exactly the pre-#390 behaviour, so an operator
   // who never touches the control gets the historical proposal; the field
@@ -221,17 +213,7 @@ let schedulerState = {
   // field defaulted to zero and the engine's other two defects were masked.
   turnaround: 0,
   filters: { division: "all", rink: "all", issue: "all" },  // (#106)
-  selected: new Set(),  // game_ids picked for publish/discard (#106)
 };  // (#86)
-// #328 review round 8 finding 4 -- a terminal commit refusal
-// (pairing_already_scheduled/preview_stale) clears the preview and forces
-// a fresh Generate, but render() replaces #content wholesale, so the
-// focused Commit button is simply gone -- nothing moves focus anywhere,
-// silently dropping a keyboard user back to the document body. Set by
-// schedCommit's error branch, consumed once by the scheduler wiring below
-// right after the fresh content (with a Generate button again) is in the
-// DOM.
-let schedFocusGenerateAfterRender = false;
 let officialAvailability = [];      // signed-in official's windows (#88)
 let availSummary = null;            // roster availability rollup (#89)
 let subCandidates = null;           // coach substitute outreach queue (#112)
@@ -806,8 +788,14 @@ function contextScopedReadSignal() {
 // `services/context_gate.py` and need nothing from this barrier to be correct:
 // cancelling a read client-side cannot un-send it anyway (that is the whole
 // reason the gate exists), so enrolment here is a UX nicety -- it stops a stale
-// answer from being rendered -- and never the ordering guarantee. Do not read
-// "not enrolled here" as "not context-scoped"; read the registry contract.
+// answer from being rendered -- and never the ordering guarantee. The four
+// Schedule/Facilities cards also enrol their overview and draft-list reads:
+// those payloads are selected by the persisted context, and the client-side
+// barrier prevents an old card request from reaching the server after
+// `/api/context` commits a new tuple. This is deliberately broader than the
+// server's context_read_fence; enrolment is also response ownership and UX.
+// Do not read "not enrolled here" as "not context-scoped"; read the registry
+// contract.
 //
 // `renderedEpoch` is the epoch the CALLER captured beside the tuple it is
 // asking about, and it is a REQUIRED argument in spirit rather than a
@@ -1327,6 +1315,23 @@ const CARD_READ = Object.freeze({
 // get_setup_progress reports, so a card can never be identified one way in
 // the model and another way anywhere else.
 const HOME_TASKS_CARD = "home/setup-progress";
+const SCHEDULER_DRAFT_CARD = "scheduler/draft";
+const SCHEDULER_REVIEW_CARD = "scheduler/review";
+const ICE_BUILDER_CARD = "facilities/ice-builder";
+const CALENDAR_CARD = "calendar/board";
+// The production-owned #393 axis. The state-matrix journey reads this tuple
+// from app.js, so adding/removing a card cannot silently shrink its sweep.
+const SCHEDULE_FACILITY_CARD_IDS = Object.freeze([
+  SCHEDULER_DRAFT_CARD,
+  SCHEDULER_REVIEW_CARD,
+  ICE_BUILDER_CARD,
+  CALENDAR_CARD,
+]);
+function invalidateScheduleFacilityCardRequests() {
+  SCHEDULE_FACILITY_CARD_IDS.forEach((cardId) => {
+    cardGenerations[cardId] = (cardGenerations[cardId] || 0) + 1;
+  });
+}
 function setupWorkflowCardId(key) { return `setup/${key}`; }
 
 // card id -> newest generation issued for THAT card, and card id -> its
@@ -1852,10 +1857,201 @@ function readCardState(cardId) {
   if (!cardIdentitySamePrincipal(entry.identity)) {
     return { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN };
   }
-  if (entry.state !== CARD_STATE.LOADING && !cardTupleCurrent(entry.identity)) {
+  const generationSuperseded = !!entry.identity
+    && cardGenerations[cardId] !== entry.identity.generation;
+  // A payload-free initial load has nothing that could be stale. Operational
+  // cards, however, can retain last-good data while LOADING; once its tuple
+  // moves that visible payload must become explicitly STALE immediately.
+  const retainedFromEarlierTuple = entry.state === CARD_STATE.LOADING
+    && entry.retained && entry.retained.identity
+    && !cardTupleCurrent(entry.retained.identity);
+  if (retainedFromEarlierTuple) {
+    return Object.assign({}, entry, {
+      state: CARD_STATE.STALE, staleFrom: CARD_STATE.LOADING, refreshing: true,
+    });
+  }
+  if (entry.state !== CARD_STATE.LOADING
+      && (!cardTupleCurrent(entry.identity) || generationSuperseded)) {
+    // STALE means last-good data remains visible read-only. An operational
+    // card that never obtained any payload has nothing truthful to retain;
+    // after a tuple/generation boundary it is simply waiting for the new
+    // tuple's first read, not "showing earlier data".
+    if (SCHEDULE_FACILITY_CARD_IDS.includes(cardId)
+        && !cardDisplayModel(entry)) {
+      return { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN };
+    }
     return Object.assign({}, entry, { state: CARD_STATE.STALE, staleFrom: entry.state });
   }
   return entry;
+}
+
+// Operational-card helpers shared by Scheduler, Calendar and Ice Builder
+// (#393 PR B). A refresh may begin after a tuple change while the old card is
+// still useful as explicitly stale, read-only context. Keep that payload as a
+// nested retained model while the new generation is LOADING or ERROR; never
+// promote it back to current data and never expose its actions.
+function cardDisplayModel(entry) {
+  if (entry && entry.payload) return entry;
+  if (entry && entry.retained && entry.retained.payload) return entry.retained;
+  return null;
+}
+function cardDisplayPayload(entry) {
+  const model = cardDisplayModel(entry);
+  return model ? model.payload : null;
+}
+function retainableCardModel(entry) {
+  // ERROR/LOADING can hold the last-good model one level down in `retained`.
+  // Normalize to that payload-bearing model before starting the next request
+  // so STALE -> ERROR -> Retry never drops the only read-only data we have.
+  const model = cardDisplayModel(entry);
+  if (!model || !model.payload) return null;
+  if (model.state === CARD_STATE.READY || model.state === CARD_STATE.EMPTY
+      || model.state === CARD_STATE.STALE || model.state === CARD_STATE.ERROR) {
+    return model;
+  }
+  return null;
+}
+function beginOperationalCardLoad(cardId, opts) {
+  const before = readCardState(cardId);
+  const held = opts && opts.retain === false
+    ? null : retainableCardModel(before);
+  // A second same-tuple refresh sees the proposal nested under the first
+  // refresh's LOADING model, whose own generation is now current while the
+  // retained model's generation is necessarily older. Carry whether that
+  // retention chain began from current data. A context/identity invalidation
+  // makes the outer identity non-current, so A -> B -> A cannot turn this bit
+  // back on and revive A's pre-switch payload.
+  const retainedCurrentAtStart = !!held && (
+    cardIdentityCurrent(held.identity)
+    || (!!before.retainedCurrentAtStart && cardIdentityCurrent(before.identity)));
+  const identity = beginCardRequest(cardId, opts);
+  if (!identity) return null;
+  // A newly requested operation owns the next status. Retire an older toast
+  // before its LOADING state appears so a prior success cannot contradict a
+  // new inline ERROR. Internal reconciliation reads can opt out when the
+  // success sentence they are following is still the one to announce.
+  if (identity.userInitiated && !(opts && opts.preserveAnnouncement)) {
+    toast = "";
+    toastIsError = false;
+    updateToast();
+  }
+  const heldFromEarlierTuple = !!(held && held.identity
+    && !cardTupleCurrent(held.identity));
+  commitCardState(identity, {
+    // A confirmed tuple change is immediately and explicitly STALE even
+    // while the replacement read is in flight. Same-tuple retries are plain
+    // LOADING. The `refreshing` flag carries aria-busy without lying about
+    // which tuple the retained payload belongs to.
+    state: heldFromEarlierTuple ? CARD_STATE.STALE : CARD_STATE.LOADING,
+    status: CARD_STATUS.UNKNOWN,
+    retained: held,
+    retainedCurrentAtStart: retainedCurrentAtStart,
+    refreshing: heldFromEarlierTuple,
+  });
+  return identity;
+}
+function operationalCardError(identity, response, fallback, extra) {
+  const loading = readCardState(identity.card);
+  return commitCardState(identity, Object.assign({
+    state: CARD_STATE.ERROR,
+    status: CARD_STATUS.UNKNOWN,
+    error: (response && response.error && response.error.message) || fallback,
+    readOutcome: CARD_READ.FAILED,
+    retained: loading && loading.retained || null,
+    retainedCurrentAtStart: !!(loading && loading.retainedCurrentAtStart),
+  }, extra || {}));
+}
+function resetOperationalCard(cardId, reason, payload) {
+  const identity = beginCardRequest(cardId);
+  if (!identity) return null;
+  commitCardState(identity, {
+    state: CARD_STATE.EMPTY,
+    status: CARD_STATUS.UNKNOWN,
+    reason: reason,
+    payload: payload || null,
+    readOutcome: CARD_READ.OK,
+  });
+  return identity;
+}
+function currentReadyCard(cardId) {
+  const entry = readCardState(cardId);
+  return entry.state === CARD_STATE.READY && cardIdentityCurrent(entry.identity)
+    ? entry : null;
+}
+function operationalCardFrame(cardId, entry, body) {
+  // STALE is itself a replacement-in-progress state. Some cards (notably Ice
+  // Builder) wait on another card's current-context read before they can
+  // start their own request, so `refreshing` is not guaranteed to be set on
+  // the stale entry even though the replacement pipeline is still active.
+  const busy = entry.state === CARD_STATE.LOADING
+    || entry.state === CARD_STATE.STALE || entry.refreshing ? "true" : "false";
+  return `<section class="operational-card" data-operational-card="${esc(cardId)}"
+      data-card-state="${esc(entry.state)}" aria-busy="${busy}">${body}</section>`;
+}
+
+// Replacing the card that owns keyboard focus must not strand focus on BODY.
+// A stale Refresh is the important case: keep the same control when the next
+// state still offers it, otherwise land on that same card's new heading/empty
+// lead. Never move to a sibling card, and never manufacture a tab stop (the
+// fallback is programmatic-only tabindex=-1).
+function focusedOperationalRetryCard(container) {
+  const active = document.activeElement;
+  if (!active || !container || !container.contains(active)
+      || !active.matches || !active.matches("[data-card-retry]")) return null;
+  const root = active.closest("[data-operational-card]");
+  return root && root.dataset.operationalCard || null;
+}
+function restoreOperationalRetryFocus(cardId) {
+  if (!cardId) return;
+  const root = Array.from(document.querySelectorAll("[data-operational-card]"))
+    .find((card) => card.dataset.operationalCard === cardId);
+  if (!root) return;
+  const retry = Array.from(root.querySelectorAll("[data-card-retry]"))
+    .find((button) => button.dataset.cardRetry === cardId);
+  const target = retry || root.querySelector(".sched-empty-lead,h2,.section-title")
+    || root;
+  if (target.tabIndex < 0) target.setAttribute("tabindex", "-1");
+  target.focus({ preventScroll: true });
+}
+function operationalLoadingCopy(entry, noun) {
+  const held = cardDisplayModel(entry);
+  if (held) {
+    return `<div class="banner neutral operational-stale-note" role="status">
+      <h2>Loading ${esc(noun)}</h2>
+      <p>${cardTupleCurrent(held.identity)
+        ? "Showing the last loaded data read-only until the refresh arrives."
+        : "Showing read-only data from your earlier selection until the current one arrives."}</p></div>`;
+  }
+  return `<div class="skeleton"><span class="sr-only">Loading ${esc(noun)}…</span></div>`;
+}
+function operationalStaleCopy(cardId, noun) {
+  return `<div class="banner neutral operational-stale-note" role="status">
+    <h2>${esc(noun)} — showing earlier data</h2>
+    <p>This belongs to the program, season and league you had selected earlier.</p>
+    <div class="actions"><button class="act ghost" data-card-retry="${esc(cardId)}"
+      >Refresh ${esc(noun.toLowerCase())}</button></div></div>`;
+}
+function operationalErrorCopy(cardId, noun, entry) {
+  const displayed = cardDisplayModel(entry);
+  const earlier = displayed && displayed.identity
+    && !cardTupleCurrent(displayed.identity)
+    ? `<p class="operational-stale-note">The data below belongs to your earlier
+      selection and is read-only until this card refreshes.</p>` : "";
+  // `role=alert` belongs to the transition into ERROR, not to every later
+  // serialization of the stored error when a person revisits the surface.
+  // The wiring pass marks the event exposed after this markup enters the DOM.
+  const liveRole = entry.errorAnnounced ? "" : ' role="alert"';
+  return `<div class="banner alert"${liveRole}><h2>Couldn't load ${esc(noun.toLowerCase())}</h2>
+    <p>${esc(entry.error || "Try again.")}</p>${earlier}</div>
+    <div class="actions"><button class="act ghost" data-card-retry="${esc(cardId)}"
+      >Retry ${esc(noun.toLowerCase())}</button></div>`;
+}
+
+function markOperationalErrorAnnounced(cardId) {
+  const entry = cardStates[cardId];
+  if (!entry || entry.state !== CARD_STATE.ERROR || entry.errorAnnounced
+      || !cardIdentityCurrent(entry.identity)) return;
+  cardStates[cardId] = Object.assign({}, entry, { errorAnnounced: true });
 }
 
 // (3) live-region announcement, for the surfaces that have no live region of
@@ -1869,7 +2065,7 @@ function announceCardStatus(identity, message, isError) {
   if (!cardIdentityCurrent(identity)) return false;   // #365 identity gate — announcement
   toast = message;
   toastIsError = !!isError;
-  updateToast();
+  updateToast(true);
   return true;
 }
 
@@ -2517,7 +2713,7 @@ async function goToSetupWorkflow(key) {
     // PREVIOUS one (canceled, or left over from before this hub-driven
     // navigation) must not be mistaken for belonging to this new one.
     iceOperationSeq += 1;
-    iceBuilder = { form: null, preview: null };
+    iceBuilder = { form: null, contextRevision: null };
     switchTab("calendar");
     focusContentHeading();
     return;
@@ -3795,6 +3991,26 @@ function delBtn(kind, id, name, label) {
     title="${esc(aria)}" aria-label="${esc(aria)}">${ICONS.trash}</button>`;
 }
 
+function wireDeleteControls(root, cardIdentity) {
+  if (!root) return;
+  root.querySelectorAll("[data-del]").forEach((button) => {
+    button.onclick = (event) => {
+      // A delete control can sit inside a click target (e.g. an available
+      // slot card that schedules on click), so don't let the click bubble.
+      event.stopPropagation();
+      modal = { type: "confirm-delete", kind: button.dataset.del,
+                id: button.dataset.delId, name: button.dataset.delName,
+                cardIdentity: cardIdentity || null };
+      // A Scheduler Review confirmation is part of that card. Opening it must
+      // not launch a full render (and thereby supersede the very identity the
+      // confirmation is bound to); paint only the overlay. Generic Setup
+      // deletes retain their established full-render path.
+      if (cardIdentity) repaintModalOnly();
+      else render();
+    };
+  });
+}
+
 function editBtn(kind, id, name) {
   // Compact neutral pencil button (#268): opens the edit drawer prefilled from
   // the record. MANAGE_SETUP-gated, same as create/delete.
@@ -4274,7 +4490,12 @@ async function afterDemoLifecycleChange(message) {
 
 function wireModal(c) {
   c.querySelectorAll("[data-modal-close]").forEach((b) =>
-    b.onclick = () => { modal = null; render(); });
+    b.onclick = () => {
+      const cardOwned = !!(modal && modal.cardIdentity);
+      modal = null;
+      if (cardOwned) repaintModalOnly();
+      else render();
+    });
   // Demo reset/clear flow: enable the destructive button only once the exact
   // word is typed, then POST the matching route.
   const demoInput = c.querySelector("#demo-confirm-input");
@@ -4315,8 +4536,34 @@ function wireModal(c) {
     }
     delConfirm.onclick = async () => {
       if (!confirmed()) return;  // defense in depth; the button is disabled too
+      const cardIdentity = m.cardIdentity || null;
+      if (cardIdentity && !cardIdentityCurrent(cardIdentity)) {
+        modal = null;
+        repaintModalOnly();
+        return;
+      }
+      delConfirm.disabled = true;
       toast = "";
-      const res = await attemptDelete(m.kind, m.id);
+      // A draft row belongs to Scheduler Review and uses that card's own
+      // discard contract/transport. postScoped says nothing globally until
+      // the captured identity has been rechecked after the await.
+      const res = cardIdentity
+        ? await postScoped("/api/scheduler/drafts/discard", { game_ids: [m.id] })
+        : await attemptDelete(m.kind, m.id);
+      if (cardIdentity && !cardIdentityCurrent(cardIdentity)) return;
+      if (cardIdentity) {
+        modal = null;
+        if (res && res.error) {
+          announceCardStatus(cardIdentity,
+            res.error.message || "The draft game could not be discarded.", true);
+          repaintModalOnly();
+          return;
+        }
+        announceCardStatus(cardIdentity, "Discarded 1 draft game.", false);
+        repaintModalOnly();
+        loadSchedulerReviewCard({ userInitiated: true, preserveAnnouncement: true });
+        return;
+      }
       if (res && res.error && res.error.code === "has_dependencies") {
         modal = { type: "blocked", kind: m.kind, id: m.id, name: m.name, error: res.error };
         return render();
@@ -7640,7 +7887,7 @@ function slotCard(s, draggable, ctx) {
   return `<div class="slot-card ${cls}${extra}" ${dropClick} ${drag}><div class="t">${fmt(s.start_time)}–${fmt(s.end_time)}</div>${rsv}<div class="s">${slotLabel(s)}${state}${cta}</div>${moveBtn}${delSlot}</div>`;
 }
 
-function calToolbar(ov) {
+function calToolbar(ov, actionable) {
   const opt2 = (v, label, sel) => `<option value="${esc(v)}" ${sel ? "selected" : ""}>${esc(label)}</option>`;
   const venueOpts = `<option value="all">All venues</option>` +
     ov.venues.map((v) => opt2(v.id, v.name, v.id === calFilters.venueId)).join("");
@@ -7661,7 +7908,7 @@ function calToolbar(ov) {
       <div class="cal-toprow">
         <div><div class="cal-date">${head}</div>
           <div class="cal-venue">${esc(calFilters.venueId === "all" ? "All venues" : (ov.venues.find((v) => v.id === calFilters.venueId) || {}).name || "Arena")}</div></div>
-        <div class="cal-controls">
+        ${actionable ? `<div class="cal-controls">
           <div class="seg-mini"><button class="segm ${calendarMode === "day" ? "active" : ""}" data-mode="day">Day</button>
             <button class="segm ${calendarMode === "week" ? "active" : ""}" data-mode="week">Week</button>
             <button class="segm ${calendarMode === "month" ? "active" : ""}" data-mode="month">Month</button></div>
@@ -7669,14 +7916,14 @@ function calToolbar(ov) {
             <button class="act ghost" data-cal="0">Today</button>
             <button class="act ghost" data-cal="1">›</button></div>
           ${hasPerm("manage_arena") ? `<button class="act ghost cal-build-ice" data-ice-builder-open>🧊 Build ice</button>` : ""}
-        </div>
+        </div>` : ""}
       </div>
-      <div class="cal-filters">
+      ${actionable ? `<div class="cal-filters">
         <select data-filter="venueId">${venueOpts}</select>
         <select data-filter="rinkId">${rinkOpts}</select>
         <select data-filter="divisionId">${divOpts}</select>
         <select data-filter="teamId">${teamOpts}</select>
-      </div>
+      </div>` : ""}
     </div>
     <div class="legend">
       <span><i class="dot lg-game"></i>Available</span>
@@ -7791,18 +8038,565 @@ function movePanelHtml(ov) {
   </aside>`;
 }
 
-function renderCalendar(ov) {
-  if (iceBuilder) return renderIceBuilder(ov);
-  if (wizard) return renderWizard(ov);
+function calendarBoardHtml(ov, actionable) {
   const ctx = calContext(ov);
   const rinks = visibleRinks(ov);
   const board = calendarMode === "month"
-    ? renderMonth(ov, ctx, rinks)
+    ? renderMonth(ov, ctx, rinks, actionable)
     : calendarMode === "week"
     ? renderWeek(ov, ctx, rinks)
-    : renderDay(ov, ctx, rinks);
-  return calToolbar(ov) +
-    `<div class="cal-layout"><div class="cal-main">${board}</div>${movePanelHtml(ov)}${conflictPanelHtml()}</div>`;
+    : renderDay(ov, ctx, rinks, actionable);
+  return calToolbar(ov, actionable) +
+    `<div class="cal-layout"><div class="cal-main">${board}</div>${
+      actionable ? movePanelHtml(ov) + conflictPanelHtml() : ""}</div>`;
+}
+
+function renderCalendar(ov) {
+  const entry = readCardState(CALENDAR_CARD);
+  const payload = cardDisplayPayload(entry) || {};
+  const calendarOv = payload.overview || ov || {};
+  const hasData = Array.isArray(calendarOv.rinks) && Array.isArray(calendarOv.ice_slots)
+    && Array.isArray(calendarOv.schedule) && Array.isArray(calendarOv.venues)
+    && Array.isArray(calendarOv.divisions) && Array.isArray(calendarOv.teams);
+  if (iceBuilder) {
+    const builderPayload = cardDisplayPayload(
+      readCardState(ICE_BUILDER_CARD)) || {};
+    return renderIceBuilder(builderPayload.overview || {});
+  }
+  if (wizard && cardIdentityCurrent(entry.identity)) return renderWizard(calendarOv);
+  let body = "";
+  if (entry.state === CARD_STATE.LOADING) {
+    body = operationalLoadingCopy(entry, "arena calendar")
+      + (hasData ? calendarBoardHtml(calendarOv, false) : "");
+  } else if (entry.state === CARD_STATE.ERROR) {
+    body = operationalErrorCopy(CALENDAR_CARD, "Arena calendar", entry)
+      + (hasData ? calendarBoardHtml(calendarOv, false) : "");
+  } else if (entry.state === CARD_STATE.STALE) {
+    body = operationalStaleCopy(CALENDAR_CARD, "Arena calendar")
+      + (hasData ? calendarBoardHtml(calendarOv, false) : "");
+  } else if (entry.state === CARD_STATE.EMPTY) {
+    body = calendarBoardHtml(calendarOv, true)
+      + `<div class="card sched-empty" data-card-empty="calendar">
+        <div class="sched-empty-lead">No ice is available in this selection yet.</div>
+        <p>Build recurring ice or add a rink and slot in Setup.</p></div>`;
+  } else {
+    body = calendarBoardHtml(calendarOv, true);
+  }
+  return operationalCardFrame(CALENDAR_CARD, entry, body);
+}
+
+function repaintCalendarSurface(cardId, chromeOverview) {
+  if (view !== "calendar") return;
+  const content = document.getElementById("content");
+  if (!content) return;
+  const focusedRetryCard = focusedOperationalRetryCard(content);
+  // The Calendar card owns the page-level season/context chrome. Ice Builder
+  // is a sibling request owner: its response may repaint only its own card,
+  // never rewrite the breadcrumb/header from a different request lifetime.
+  if (chromeOverview) {
+    setChrome(chromeOverview);
+  } else if (cardId === CALENDAR_CARD) {
+    const entry = readCardState(CALENDAR_CARD);
+    const displayed = cardDisplayModel(entry);
+    const payload = displayed && displayed.payload || {};
+    setChrome(displayed && cardTupleCurrent(displayed.identity)
+      ? (payload.overview || {}) : selectedContextChromeOverview());
+  }
+  content.innerHTML = renderCalendar({});
+  content.insertAdjacentHTML("beforeend", renderModal());
+  wireModal(content);
+  content.querySelectorAll("[data-goto]").forEach((button) => {
+    button.onclick = () => switchTab(button.dataset.goto);
+  });
+  wireCalendarCards(content);
+  restoreOperationalRetryFocus(focusedRetryCard);
+  syncOverlayFocus();
+}
+
+async function loadCalendarCard(opts) {
+  const identity = beginOperationalCardLoad(CALENDAR_CARD, opts);
+  if (!identity) return;
+  const renderedEpoch = contextEpoch;
+  // Ice Builder is a sibling request owner on the same route. Its visible DOM
+  // belongs to ICE_BUILDER_CARD, so a Calendar request may update only its
+  // hidden model while the Builder is open; repainting here would let the
+  // sibling's response destroy Builder focus and re-announce its status.
+  if (!iceBuilder) repaintCalendarSurface(CALENDAR_CARD);
+  const result = await getJSONContextScoped("/api/demo/overview", renderedEpoch);
+  if (result === CONTEXT_READ_ABORTED) return;
+  if (result && result.error) {
+    if (!operationalCardError(
+        identity, result, "The arena calendar could not be loaded.")) return;
+  } else {
+    const empty = !((result && result.ice_slots) || []).length;
+    if (!commitCardState(identity, {
+      state: empty ? CARD_STATE.EMPTY : CARD_STATE.READY,
+      status: CARD_STATUS.UNKNOWN,
+      reason: empty ? "no_ice" : null,
+      readOutcome: CARD_READ.OK,
+      payload: { overview: result || {} },
+    })) return;
+  }
+  if (!iceBuilder) repaintCalendarSurface(CALENDAR_CARD);
+  if (identity.userInitiated) {
+    const root = document.querySelector(`[data-operational-card="${CALENDAR_CARD}"]`);
+    focusCardTarget(identity, root && (root.querySelector("[data-ice-builder-open]")
+      || root.querySelector("h2,.cal-date,.sched-empty-lead")));
+  }
+}
+
+function reconcileIceBuilderForm(form, overview) {
+  const fallback = defaultIceForm(overview);
+  if (!form || form.season_id !== fallback.season_id) return fallback;
+  const offeredRinks = new Set((overview.rinks || []).map((rink) => rink.id));
+  const next = iceFormSnapshot(form);
+  next.rink_ids = (next.rink_ids || []).filter((rinkId) => offeredRinks.has(rinkId));
+  return next;
+}
+
+// Ice Builder owns its option inventory rather than borrowing Calendar's last
+// payload. The two cards share an endpoint but not an identity or a paint
+// boundary: an early Home/Tasks navigation can open Builder before Calendar
+// settles, and a later venue grant/revocation can refresh Builder without a
+// Calendar response rewriting its DOM or focus.
+async function loadIceBuilderCard(opts) {
+  if (!iceBuilder) return null;
+  const freshInstance = !!(opts && opts.fresh) || !iceBuilder.form;
+  const before = readCardState(ICE_BUILDER_CARD);
+  const priorModel = cardDisplayModel(before);
+  const sameTuple = priorModel && cardTupleCurrent(priorModel.identity)
+    && cardIdentitySamePrincipal(priorModel.identity);
+  const requestedForm = opts && opts.form
+    ? iceFormSnapshot(opts.form)
+    : (!freshInstance && sameTuple ? iceFormSnapshot(iceBuilder.form) : null);
+  const identity = beginOperationalCardLoad(ICE_BUILDER_CARD,
+    Object.assign({}, opts || {}, { retain: !freshInstance }));
+  if (!identity) return null;
+  const renderedEpoch = contextEpoch;
+  repaintCalendarSurface(ICE_BUILDER_CARD);
+  const result = await getJSONContextScoped("/api/demo/overview", renderedEpoch);
+  if (result === CONTEXT_READ_ABORTED) return null;
+  if (!iceBuilder || !cardIdentityCurrent(identity)) return null;
+  if (result && result.error) {
+    if (!operationalCardError(identity, result,
+        "The ice-builder options could not be loaded.",
+        { retryOperation: "options" })) return null;
+  } else {
+    const form = reconcileIceBuilderForm(requestedForm, result || {});
+    if (!commitCardState(identity, {
+      state: CARD_STATE.EMPTY,
+      status: CARD_STATUS.UNKNOWN,
+      reason: "no_preview",
+      readOutcome: CARD_READ.OK,
+      payload: { overview: result || {}, form: iceFormSnapshot(form), preview: null },
+    })) return null;
+    iceBuilder.form = iceFormSnapshot(form);
+    iceBuilder.contextRevision = contextRevision;
+  }
+  repaintCalendarSurface(ICE_BUILDER_CARD);
+  if (identity.userInitiated) {
+    const root = document.querySelector(
+      `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+    focusCardTarget(identity, root && (root.querySelector("[data-ib-preview]")
+      || root.querySelector("h2,.section-title")));
+  }
+  return identity;
+}
+
+async function previewIceBuilder(requestForm, opts) {
+  if (!iceBuilder) return;
+  const form = iceFormSnapshot(requestForm || iceBuilder.form);
+  if (!form) return;
+  const priorPayload = cardDisplayPayload(readCardState(ICE_BUILDER_CARD)) || {};
+  const requestOp = ++iceOperationSeq;
+  const identity = beginOperationalCardLoad(
+    ICE_BUILDER_CARD, { userInitiated: true });
+  if (!identity) return;
+  repaintCalendarSurface(ICE_BUILDER_CARD);
+  const result = await postScoped("/api/setup/ice-availability/preview", form);
+  await awaitOperationalCardContextSettlement(identity);
+  if (!iceBuilder || requestOp !== iceOperationSeq
+      || !cardIdentityCurrent(identity)) return;
+  if (result && !result.error) {
+    // Preview is also the authoritative access reconciliation for the
+    // submitted rinks. Keep the reviewed response/fingerprint intact in the
+    // card payload, but withdraw any rink the server says this Season can no
+    // longer use from the NEXT editable request. The old page-wide render did
+    // this accidentally by refetching overview after every preview; card-only
+    // repainting must preserve the behavior deliberately.
+    const inaccessibleRinks = new Set(
+      (result.venue_access_missing || []).map((row) => row.rink_id));
+    const nextForm = iceFormSnapshot(form);
+    nextForm.rink_ids = (nextForm.rink_ids || [])
+      .filter((rinkId) => !inaccessibleRinks.has(rinkId));
+    commitCardState(identity, {
+      state: CARD_STATE.READY, status: CARD_STATUS.UNKNOWN,
+      readOutcome: CARD_READ.OK,
+      payload: { overview: priorPayload.overview || {},
+                 form: iceFormSnapshot(form), preview: result },
+    });
+    iceBuilder.form = nextForm;
+    announceCardStatus(identity,
+      (opts && opts.successMessage) || "Ice preview updated.",
+      !!(opts && opts.successIsError));
+  } else {
+    commitCardState(identity, {
+      state: CARD_STATE.ERROR, status: CARD_STATUS.UNKNOWN,
+      error: (result && result.error && result.error.message)
+        || "The ice preview could not be generated.",
+      readOutcome: CARD_READ.FAILED,
+      retryOperation: "preview",
+      payload: { overview: priorPayload.overview || {},
+                 form: iceFormSnapshot(form), preview: null },
+    });
+    // The ERROR repaint inserts this message in the card's role=alert.
+    // Publishing it to the sitewide live region too would speak it twice.
+  }
+  repaintCalendarSurface(ICE_BUILDER_CARD);
+  const root = document.querySelector(
+    `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+  focusCardTarget(identity, root && (root.querySelector("[data-ib-commit]")
+    || root.querySelector("[data-ib-preview]")
+    || root.querySelector("h2,.section-title")));
+}
+
+// Calendar and Ice Builder use the same overview data but have independent
+// card identities and outcomes. This wiring always resolves `ov` through the
+// Calendar card that is current now; it never closes over render()'s earlier
+// page-wide payload.
+function wireCalendarCards(c) {
+  if (view !== "calendar") return;
+  markOperationalErrorAnnounced(CALENDAR_CARD);
+  markOperationalErrorAnnounced(ICE_BUILDER_CARD);
+  const calendarEntry = readCardState(CALENDAR_CARD);
+  const calendarPayload = cardDisplayPayload(calendarEntry) || {};
+  const ov = calendarPayload.overview || {};
+  const calendarCurrent = cardIdentityCurrent(calendarEntry.identity)
+    && (calendarEntry.state === CARD_STATE.READY
+        || calendarEntry.state === CARD_STATE.EMPTY);
+  const calendarRetry = c.querySelector(
+    `[data-card-retry="${CALENDAR_CARD}"]`);
+  if (calendarRetry) calendarRetry.onclick = () =>
+    loadCalendarCard({ userInitiated: true });
+  const iceRetry = c.querySelector(
+    `[data-card-retry="${ICE_BUILDER_CARD}"]`);
+  if (iceRetry) iceRetry.onclick = () => {
+    const entry = readCardState(ICE_BUILDER_CARD);
+    const failed = cardDisplayPayload(entry) || {};
+    if (entry.state === CARD_STATE.ERROR
+        && entry.retryOperation === "preview" && failed.form) {
+      iceBuilder.form = iceFormSnapshot(failed.form);
+      previewIceBuilder(failed.form);
+    } else loadIceBuilderCard({ userInitiated: true });
+  };
+
+  const rerender = () => repaintCalendarSurface(
+    iceBuilder ? ICE_BUILDER_CARD : CALENDAR_CARD);
+  const refreshCalendar = (opts) => loadCalendarCard(opts || {});
+  const commitMove = async (gid, slotId) => {
+    if (!calendarCurrent) return;
+    const identity = calendarEntry.identity;
+    const result = await postScoped(`/api/games/${gid}/move`, {
+      ice_slot_id: slotId, reason: "Moved on arena calendar",
+    });
+    if (!cardIdentityCurrent(identity)) return;
+    conflict = buildConflict(result, ov, gid, slotId);
+    pendingMove = null; movingGameId = null;
+    refreshCalendar({ userInitiated: true });
+  };
+  const requestMove = (gid, slotId) => {
+    const game = (ov.schedule || []).find((x) => x.game_id === gid);
+    const willUnpublish = !!(game && game.published);
+    const willUnlock = !!(game && game.roster_status === "locked");
+    if (willUnpublish || willUnlock) {
+      pendingMove = { gid: gid, slotId: slotId, willUnpublish: willUnpublish,
+                      willUnlock: willUnlock };
+      conflict = null; movingGameId = null; toast = ""; rerender();
+    } else commitMove(gid, slotId);
+  };
+  c.querySelectorAll("[data-slot]").forEach((button) => {
+    button.onclick = () => {
+      if (!calendarCurrent) return;
+      if (movingGameId != null) return requestMove(movingGameId, button.dataset.slot);
+      wizard = { slot_id: button.dataset.slot }; toast = ""; rerender();
+    };
+  });
+  c.querySelectorAll("[data-move-game]").forEach((button) => {
+    button.onclick = (event) => {
+      event.stopPropagation();
+      if (!calendarCurrent) return;
+      movingGameId = button.dataset.moveGame;
+      conflict = null; pendingMove = null; toast = ""; rerender();
+    };
+  });
+  c.querySelectorAll("[data-move-cancel]").forEach((button) => {
+    button.onclick = () => { movingGameId = null; rerender(); };
+  });
+  c.querySelectorAll("[data-move-confirm]").forEach((button) => {
+    button.onclick = () => {
+      if (pendingMove) commitMove(pendingMove.gid, pendingMove.slotId);
+    };
+  });
+  c.querySelectorAll("[data-move-cancel-pending]").forEach((button) => {
+    button.onclick = () => { pendingMove = null; rerender(); };
+  });
+  c.querySelectorAll("[data-move-undo]").forEach((button) => {
+    button.onclick = () => {
+      if (conflict && conflict.undo)
+        commitMove(conflict.undo.gid, conflict.undo.oldSlotId);
+    };
+  });
+  c.querySelectorAll("[data-addslot]").forEach((button) => {
+    button.onclick = async () => {
+      if (!calendarCurrent) return;
+      const identity = calendarEntry.identity;
+      await postScoped("/api/demo/add-ice-slot", {
+        rink_id: button.dataset.addslot, date: calendarDate,
+      });
+      if (cardIdentityCurrent(identity)) refreshCalendar({ userInitiated: true });
+    };
+  });
+  c.querySelectorAll("[data-cal]").forEach((button) => {
+    button.onclick = () => {
+      const direction = +button.dataset.cal;
+      if (direction === 0) calendarDate = todayISO();
+      else if (calendarMode === "month") calendarDate = addMonths(calendarDate, direction);
+      else shiftDate(direction * (calendarMode === "week" ? 7 : 1));
+      toast = ""; conflict = null; movingGameId = null; pendingMove = null;
+      rerender();
+    };
+  });
+  c.querySelectorAll("[data-mode]").forEach((button) => {
+    button.onclick = () => {
+      calendarMode = button.dataset.mode;
+      toast = ""; conflict = null; movingGameId = null; pendingMove = null;
+      rerender();
+    };
+  });
+  c.querySelectorAll("[data-cal-day]").forEach((button) => {
+    button.onclick = () => {
+      calendarDate = button.dataset.calDay; calendarMode = "day"; toast = "";
+      rerender();
+    };
+  });
+  c.querySelectorAll("[data-filter]").forEach((select) => {
+    select.onchange = (event) => {
+      const key = select.dataset.filter;
+      calFilters[key] = event.target.value;
+      if (key === "venueId") calFilters.rinkId = "all";
+      toast = ""; conflict = null; movingGameId = null; pendingMove = null;
+      rerender();
+    };
+  });
+  c.querySelectorAll("[data-game]").forEach((element) => {
+    element.addEventListener("dragstart", (event) => {
+      event.dataTransfer.setData("text/plain", element.dataset.game);
+      event.dataTransfer.effectAllowed = "move";
+      element.classList.add("dragging");
+    });
+    element.addEventListener("dragend", () => element.classList.remove("dragging"));
+  });
+  c.querySelectorAll("[data-drop]").forEach((element) => {
+    element.addEventListener("dragover", (event) => {
+      event.preventDefault(); element.classList.add("drop-hover");
+    });
+    element.addEventListener("dragleave", () => element.classList.remove("drop-hover"));
+    element.addEventListener("drop", (event) => {
+      event.preventDefault(); element.classList.remove("drop-hover");
+      const gid = event.dataTransfer.getData("text/plain");
+      if (gid) requestMove(gid, element.dataset.drop);
+    });
+  });
+  const dismiss = c.querySelector("[data-conflict-dismiss]");
+  if (dismiss) dismiss.onclick = () => { conflict = null; rerender(); };
+
+  const ibOpen = c.querySelector("[data-ice-builder-open]");
+  if (ibOpen) ibOpen.onclick = () => {
+    if (!calendarCurrent) return;
+    iceOperationSeq += 1;
+    iceBuilder = { form: null, contextRevision: null };
+    toast = "";
+    loadIceBuilderCard({ userInitiated: true, fresh: true });
+  };
+  const ibCancel = c.querySelector("[data-ib-cancel]");
+  if (ibCancel) ibCancel.onclick = () => {
+    iceOperationSeq += 1; iceBuilder = null; toast = ""; rerender();
+  };
+  const invalidateIcePreview = (shouldRepaint) => {
+    if (!iceBuilder) return;
+    iceOperationSeq += 1;
+    const form = iceFormSnapshot(iceBuilder.form);
+    const payload = cardDisplayPayload(readCardState(ICE_BUILDER_CARD)) || {};
+    resetOperationalCard(ICE_BUILDER_CARD, "no_preview", {
+      overview: payload.overview || {}, form: form, preview: null,
+    });
+    if (shouldRepaint) loadIceBuilderCard({ form: form });
+    else {
+      const preview = c.querySelector(".ib-preview");
+      if (preview) preview.remove();
+      const card = c.querySelector(`[data-operational-card="${ICE_BUILDER_CARD}"]`);
+      if (card) { card.dataset.cardState = CARD_STATE.EMPTY; card.setAttribute("aria-busy", "false"); }
+    }
+  };
+  const ibForm = c.querySelector(".ib-form");
+  if (ibForm) ibForm.addEventListener("change", (event) => {
+    if (!iceBuilder || (event.target && event.target.id === "ib-excl")) return;
+    const weekday = event.target.classList
+      && event.target.classList.contains("ib-weekday");
+    iceBuilder.form = readIceBuilderForm(c);
+    invalidateIcePreview(weekday || !!c.querySelector(".ib-preview"));
+  });
+  if (ibForm) ibForm.addEventListener("input", (event) => {
+    if (!iceBuilder || (event.target && event.target.id === "ib-excl")) return;
+    iceBuilder.form = readIceBuilderForm(c);
+    invalidateIcePreview(false);
+  });
+  c.querySelectorAll("[data-ib-preview]").forEach((button) => {
+    button.onclick = () => {
+      if (!iceBuilder) return;
+      iceBuilder.form = readIceBuilderForm(c);
+      previewIceBuilder(iceBuilder.form);
+    };
+  });
+  const ibCommit = c.querySelector("[data-ib-commit]");
+  if (ibCommit) ibCommit.onclick = async () => {
+    if (!iceBuilder) return;
+    const ready = currentReadyCard(ICE_BUILDER_CARD);
+    const preview = ready && ready.payload && ready.payload.preview;
+    const fingerprint = preview && preview.template_fingerprint;
+    if (!ready || !fingerprint) return;
+    iceBuilder.form = readIceBuilderForm(c);
+    const form = iceFormSnapshot(iceBuilder.form);
+    const requestOp = ++iceOperationSeq;
+    const identity = beginOperationalCardLoad(
+      ICE_BUILDER_CARD, { userInitiated: true });
+    if (!identity) return;
+    rerender();
+    const result = await postScoped("/api/setup/ice-availability/commit", {
+      ...form, template_fingerprint: fingerprint,
+    });
+    await awaitOperationalCardContextSettlement(identity);
+    if (!iceBuilder || requestOp !== iceOperationSeq
+        || !cardIdentityCurrent(identity)) return;
+    const reason = result && result.error && result.error.details
+      && result.error.details.reason;
+    if (result && !result.error) {
+      announceCardStatus(identity,
+        `Created ${result.totals.created} ice slot(s).`, false);
+      iceBuilder = null;
+      refreshCalendar({ userInitiated: true, preserveAnnouncement: true });
+      return;
+    }
+    if (reason === "preview_mismatch") {
+      // Keep the mismatch explanation standing AFTER the replacement preview
+      // arrives. Announcing before this fast second request let its generic
+      // "preview updated" sentence overwrite the reason before a person or
+      // assistive technology could perceive it.
+      previewIceBuilder(form, {
+        successMessage: "The schedule changed since preview. Review the updated proposal before creating.",
+        successIsError: true,
+      });
+      return;
+    }
+    operationalCardError(identity, result, "The ice slots could not be created.");
+    // operationalErrorCopy owns the one assertive announcement for ERROR.
+    rerender();
+  };
+  const ibExclAdd = c.querySelector("[data-ib-excl-add]");
+  if (ibExclAdd) ibExclAdd.onclick = () => {
+    if (!iceBuilder) return;
+    iceBuilder.form = readIceBuilderForm(c);
+    const input = c.querySelector("#ib-excl");
+    const date = input && input.value;
+    if (date && !iceBuilder.form.exclusion_dates.includes(date))
+      iceBuilder.form.exclusion_dates.push(date);
+    invalidateIcePreview(true);
+  };
+  c.querySelectorAll("[data-ib-excl-remove]").forEach((button) => {
+    button.onclick = () => {
+      if (!iceBuilder) return;
+      iceBuilder.form = readIceBuilderForm(c);
+      iceBuilder.form.exclusion_dates = iceBuilder.form.exclusion_dates
+        .filter((date) => date !== button.dataset.ibExclRemove);
+      invalidateIcePreview(true);
+    };
+  });
+
+  const publish = c.querySelectorAll("[data-publish]");
+  publish.forEach((button) => {
+    button.onclick = async () => {
+      const identity = calendarEntry.identity;
+      const result = await postScoped(`/api/games/${button.dataset.publish}/publish`, {});
+      if (cardIdentityCurrent(identity) && result && !result.error) {
+        announceCardStatus(identity, "Game published.", false);
+        refreshCalendar({ userInitiated: true });
+      }
+    };
+  });
+  c.querySelectorAll("[data-openroster]").forEach((button) => {
+    button.onclick = () => {
+      currentGame = button.dataset.openroster; switchTab("roster");
+    };
+  });
+  const picker = c.querySelector("#player-picker");
+  if (picker) picker.onchange = (event) => {
+    pickedPlayer = event.target.value; toast = ""; rerender();
+  };
+  const exhibition = c.querySelector("#w-exhibition");
+  if (exhibition) exhibition.onchange = (event) => {
+    wizard.exhibition = event.target.checked; wizard.league_id = "";
+    wizard.division_id = ""; wizard.home_id = null; wizard.away_id = null;
+    rerender();
+  };
+  const wizardSelect = (selector, change) => {
+    const element = c.querySelector(selector);
+    if (element) element.onchange = (event) => { change(event.target.value); rerender(); };
+  };
+  wizardSelect("#w-season", (value) => {
+    wizard.season_id = value; wizard.home_id = null; wizard.away_id = null;
+  });
+  wizardSelect("#w-league", (value) => {
+    wizard.league_id = value; wizard.division_id = "";
+    wizard.home_id = null; wizard.away_id = null;
+  });
+  wizardSelect("#w-div", (value) => {
+    wizard.division_id = value; wizard.home_id = null; wizard.away_id = null;
+  });
+  wizardSelect("#w-home", (value) => {
+    wizard.home_id = value; wizard.away_id = null;
+  });
+  wizardSelect("#w-away", (value) => { wizard.away_id = value; });
+  const wizardCancel = c.querySelector("[data-wizcancel]");
+  if (wizardCancel) wizardCancel.onclick = () => { wizard = null; rerender(); };
+  const wizardCreate = c.querySelector("[data-wizcreate]");
+  if (wizardCreate) wizardCreate.onclick = async () => {
+    if (!wizard || !calendarCurrent) return;
+    let body;
+    if (wizard.exhibition) {
+      body = { season_id: wizard.season_id, game_type: "exhibition",
+        home_team_id: wizard.home_id, away_team_id: wizard.away_id,
+        ice_slot_id: wizard.slot_id };
+    } else {
+      const league = (ov.levels || []).find((level) =>
+        level.id === wizard.league_id);
+      body = { season_id: league ? league.season_id : ((ov.seasons || [])[0] || {}).id,
+        league_id: wizard.league_id, division_id: wizard.division_id || null,
+        home_team_id: wizard.home_id, away_team_id: wizard.away_id,
+        ice_slot_id: wizard.slot_id };
+    }
+    const identity = calendarEntry.identity;
+    const result = await postScoped("/api/v2/setup/game", body);
+    if (!cardIdentityCurrent(identity)) return;
+    if (result && !result.error) {
+      announceCardStatus(identity,
+        wizard.exhibition ? "Exhibition game scheduled." : "Game scheduled.", false);
+      currentGame = result.id; wizard = null; view = "games"; render();
+    } else {
+      toast = (result && result.error && result.error.message)
+        || "The game could not be scheduled.";
+      toastIsError = true; updateToast();
+    }
+  };
 }
 
 function moveBanner(ov) {
@@ -7814,13 +8608,13 @@ function moveBanner(ov) {
     <button class="act ghost" data-move-cancel>Cancel</button></div>`;
 }
 
-function renderDay(ov, ctx, rinks) {
+function renderDay(ov, ctx, rinks, actionable) {
   const moving = movingGameId != null;
-  const canArena = hasPerm("manage_arena");   // #24: arena manager / admin adds ice
+  const canArena = actionable && hasPerm("manage_arena");   // #24: arena manager / admin adds ice
   const onDay = (s) => (s.start_time || "").startsWith(calendarDate) && slotPasses(s, ctx);
   const rows = rinks.map((r) => {
     const slots = ov.ice_slots.filter((s) => s.rink_id === r.id && onDay(s));
-    const cards = slots.map((s) => slotCard(s, true, ctx)).join("")
+    const cards = slots.map((s) => slotCard(s, actionable, ctx)).join("")
       || `<div class="slot-card"><div class="s">No ice</div></div>`;
     // Demo-only quick-add: it posts to /api/demo/add-ice-slot, which is gated
     // off in production (#303). Hide it in production — like the other demo
@@ -7841,9 +8635,12 @@ function renderDay(ov, ctx, rinks) {
     return slot ? slotPasses(slot, ctx) : true;
   });
   const tray = drafts.length ? `<div class="tray"><span class="tray-label">Draft games</span>
-    ${drafts.map((g) => `<span class="chip-drag${g.game_id === movingGameId ? " moving" : ""}" ${moving ? "" : `draggable="true" data-game="${esc(g.game_id)}"`}>⠿ ${esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}${moving ? "" : ` <button class="icon-btn" data-move-game="${esc(g.game_id)}" title="Move game" aria-label="Move game">${ICONS.swap}</button>`}</span>`).join("")}</div>` : "";
+    ${drafts.map((g) => `<span class="chip-drag${g.game_id === movingGameId ? " moving" : ""}" ${
+      !actionable || moving ? "" : `draggable="true" data-game="${esc(g.game_id)}"`}>⠿ ${
+      esc(g.home_team_name)} vs ${esc(g.away_team_name)} · ${fmt(g.start_time)}${
+      !actionable || moving ? "" : ` <button class="icon-btn" data-move-game="${esc(g.game_id)}" title="Move game" aria-label="Move game">${ICONS.swap}</button>`}</span>`).join("")}</div>` : "";
   const body = rinks.length
-    ? moveBanner(ov) + tray + rows
+    ? (actionable ? moveBanner(ov) : "") + tray + rows
     : `<div class="empty">No rinks match the selected filters.</div>`;
   return body + `<div class="privacy-note">📅 Tap an <strong>Available</strong> slot to schedule, or move a
     game onto available ice — <strong>drag</strong> it, or tap <strong>Move</strong> then tap a slot
@@ -7872,7 +8669,7 @@ function renderWeek(ov, ctx, rinks) {
 
 // Month overview (#158): a read-only calendar grid of ice density per day. Tap a
 // day to open it in Day view. Six week-rows always cover any month.
-function renderMonth(ov, ctx, rinks) {
+function renderMonth(ov, ctx, rinks, actionable) {
   if (!rinks.length) return `<div class="empty">No rinks match the selected filters.</div>`;
   const rinkIds = new Set(rinks.map((r) => r.id));
   const byDay = {};
@@ -7896,8 +8693,11 @@ function renderMonth(ov, ctx, rinks) {
     const badge = b
       ? `<span class="mo-count${b.allocated ? " has-alloc" : ""}">${b.total} ice${b.allocated ? ` · ${b.allocated} booked` : ""}</span>`
       : "";
-    return `<button class="mo-cell${inMonth ? "" : " mo-out"}${isToday ? " mo-today" : ""}" data-cal-day="${day}">
-      <span class="mo-num">${+day.slice(8, 10)}</span>${badge}</button>`;
+    return actionable
+      ? `<button class="mo-cell${inMonth ? "" : " mo-out"}${isToday ? " mo-today" : ""}" data-cal-day="${day}">
+          <span class="mo-num">${+day.slice(8, 10)}</span>${badge}</button>`
+      : `<div class="mo-cell${inMonth ? "" : " mo-out"}${isToday ? " mo-today" : ""}">
+          <span class="mo-num">${+day.slice(8, 10)}</span>${badge}</div>`;
   }).join("");
   return `<div class="mo-grid"><div class="mo-dows">${dows}</div><div class="mo-cells">${body}</div></div>
     <div class="privacy-note">📅 Month view is read-only — tap a day to open it in Day view.
@@ -7975,28 +8775,51 @@ function ibLocalOffset(iso) {
 }
 function ibDateOnly(v) { return v ? String(v).slice(0, 10) : "—"; }
 
+// The editable form stays local to the open builder, but every asynchronous
+// Preview/Commit binds to an immutable copy. In particular the fingerprint
+// and resolved slots live only in ICE_BUILDER_CARD's payload; they are never
+// read from a page-wide `iceBuilder.preview` cache.
+function iceFormSnapshot(form) {
+  if (!form) return null;
+  return Object.assign({}, form, {
+    rink_ids: (form.rink_ids || []).slice(),
+    weekdays: (form.weekdays || []).slice(),
+    windows: (form.windows || []).map((w) => Object.assign({}, w)),
+    exclusion_dates: (form.exclusion_dates || []).slice(),
+  });
+}
+
 function renderIceBuilder(ov) {
-  // Rebind to the active Program/Season on any context revision (#331
-  // review round 7): a form/preview cached from BEFORE the operator
-  // switched Program via the #159 switcher is exactly the same
-  // committable wrong-Program risk as Import's own stale Season (both
-  // send season_id verbatim to their commit endpoint, and the WRITE path
-  // takes that id at its word -- #367/#369 scoped the operational reads
-  // and added the parent-id write gate, but a cached form still holds an
-  // id chosen under the PREVIOUS selection, which nothing else here
-  // re-validates). Rinks are ALSO Program/Venue-scoped, so a context change
-  // discards the WHOLE form, not just season_id -- defaultIceForm(ov)
-  // already prefers the active Season the same way Import's own re-seed
-  // does. Clearing preview too makes it uncommittable the same way an
-  // edited form already does (Create is bound to the previewed
-  // template's own fingerprint, see its onclick below): with no preview,
-  // Create has nothing to send.
-  if (iceBuilder.contextRevision !== contextRevision) {
-    iceBuilder.form = defaultIceForm(ov);
-    iceBuilder.preview = null;
+  const entry = readCardState(ICE_BUILDER_CARD);
+  const payload = cardDisplayPayload(entry) || {};
+  const current = cardIdentityCurrent(entry.identity);
+  const displayed = cardDisplayModel(entry);
+  const displayedCurrent = displayed && displayed.identity
+    && cardTupleCurrent(displayed.identity)
+    && cardIdentitySamePrincipal(displayed.identity);
+  // Preview reads are supersedable. Keep the current template editable while
+  // one is in flight so a newer Preview can replace it; the last preview data
+  // remains read-only. An initial options load has no form and stays a true
+  // skeleton until its own scoped overview arrives.
+  const editableLoading = entry.state === CARD_STATE.LOADING
+    && !!payload.form && displayedCurrent;
+  const actionable = current
+    && (entry.state === CARD_STATE.EMPTY || entry.state === CARD_STATE.READY
+        || (entry.state === CARD_STATE.ERROR && displayedCurrent)
+        || editableLoading)
+    && !contextSwitchIntentPending;
+  // A current EMPTY model is the builder's explicit starting state. A stale
+  // model deliberately uses its OWN snapshotted form below, never a form
+  // freshly derived from the selection named in the header.
+  if (actionable && (!iceBuilder.form
+      || iceBuilder.contextRevision !== contextRevision)) {
+    iceBuilder.form = iceFormSnapshot(payload.form || defaultIceForm(ov));
     iceBuilder.contextRevision = contextRevision;
   }
-  const f = iceBuilder.form;
+  const f = actionable
+    ? (iceBuilder.form || iceFormSnapshot(payload.form) || defaultIceForm(ov))
+    : (iceFormSnapshot(payload.form) || defaultIceForm(ov));
+  const preview = payload.preview || null;
   const seasons = ov.seasons || [];
   const season = seasons.find((s) => s.id === f.season_id) || null;
   // No selected `<option>` (#331 review round 8, mirroring Import's own
@@ -8039,12 +8862,7 @@ function renderIceBuilder(ov) {
     ? `<div class="ib-hint">Season runs ${esc(ibDateOnly(season.start_date))} → ${esc(ibDateOnly(season.end_date))}. Leave the date range blank to cover the whole Season. Times are in the Season's local timezone; Season dates are never changed here.</div>`
     : `<div class="ib-hint">Select a Season — slots generate in its local timezone.</div>`;
 
-  return `<div class="ib-wrap">
-    <div class="ib-head"><h2>🧊 Build recurring ice</h2>
-      <button class="act ghost" data-ib-cancel>← Back to calendar</button></div>
-    <p class="ib-lead">Generate a draft ice inventory from a recurring weekly block, preview every slot,
-      then create the Available Game ice. Nothing is scheduled here.</p>
-    <div class="card ib-form">
+  const formHtml = actionable ? `<div class="card ib-form">
       <label class="ib-field"><span>Season</span>
         <select id="ib-season">${seasonOpts || `<option value="">No seasons yet</option>`}</select></label>
       ${seasonHint}
@@ -8063,12 +8881,34 @@ function renderIceBuilder(ov) {
         <div class="ib-excl-add"><input type="date" id="ib-excl"><button class="act ghost" data-ib-excl-add>Add</button></div>
         <div class="ib-chips">${exclusionChips}</div></div>
       <div class="dq-actions"><button class="act primary" data-ib-preview>Preview slots</button></div>
-    </div>
-    ${iceBuilder.preview ? renderIcePreview(iceBuilder.preview) : ""}
+    </div>` : "";
+  let stateHtml = "";
+  if (entry.state === CARD_STATE.LOADING) {
+    stateHtml = operationalLoadingCopy(entry, "ice-builder preview")
+      + (preview ? renderIcePreview(preview, false) : "");
+  } else if (entry.state === CARD_STATE.STALE) {
+    stateHtml = operationalStaleCopy(ICE_BUILDER_CARD, "Ice-builder preview")
+      + (preview ? renderIcePreview(preview, false)
+        : '<div class="card"><div class="empty">The earlier template is read-only. Refresh to bind a template to this selection.</div></div>');
+  } else if (entry.state === CARD_STATE.ERROR) {
+    stateHtml = operationalErrorCopy(ICE_BUILDER_CARD, "Ice-builder preview", entry)
+      + (preview ? renderIcePreview(preview, false) : "");
+  } else if (entry.state === CARD_STATE.EMPTY) {
+    stateHtml = '<div class="card sched-empty" data-card-empty="ice-builder"><div class="sched-empty-lead">No ice preview yet.</div><p>Complete the template and preview every resolved slot before creating ice.</p></div>';
+  } else if (preview) {
+    stateHtml = renderIcePreview(preview, actionable);
+  }
+  const body = `<div class="ib-wrap">
+    <div class="ib-head"><h2>🧊 Build recurring ice</h2>
+      <button class="act ghost" data-ib-cancel>← Back to calendar</button></div>
+    <p class="ib-lead">Generate a draft ice inventory from a recurring weekly block, preview every slot,
+      then create the Available Game ice. Nothing is scheduled here.</p>
+    ${formHtml}${stateHtml}
   </div>`;
+  return operationalCardFrame(ICE_BUILDER_CARD, entry, body);
 }
 
-function renderIcePreview(pv) {
+function renderIcePreview(pv, actionable) {
   if (pv.error) {
     return `<div class="banner warn"><h2>Couldn't preview</h2>
       <p>${esc((pv.error && pv.error.message) || "Check the template inputs and try again.")}</p></div>`;
@@ -8079,7 +8919,9 @@ function renderIcePreview(pv) {
   const accessWarn = access.length
     ? `<div class="ib-warn">⚠ ${access.length} rink(s) skipped — their venue isn't granted to this Season:
         <strong>${access.map((m) => esc(m.rink_name || m.rink_id)).join(", ")}</strong>.
-        <button class="linklike" data-goto="setup">Grant Season participation → Venue access</button>, then preview again.</div>`
+        ${actionable
+          ? '<button class="linklike" data-goto="setup">Grant Season participation → Venue access</button>'
+          : '<strong>Grant Season participation → Venue access</strong>'}, then preview again.</div>`
     : "";
   const conflictWarn = t.conflict
     ? `<div class="ib-warn">⚠ ${t.conflict} slot(s) overlap existing ice or games — each is listed below with its target, never overwritten.</div>` : "";
@@ -8188,10 +9030,10 @@ function renderIcePreview(pv) {
     ${rinkRows ? `<div class="ib-rink-rows">${rinkRows}</div>` : ""}
     <div class="ib-slot-list">${slotList || `<div class="empty">No slots generated — adjust the template above.</div>`}</div>
     ${listNote}
-    <div class="dq-actions">
+    ${actionable ? `<div class="dq-actions">
       <button class="act success" data-ib-commit ${t.new ? "" : "disabled"}>Create ${t.new} slot(s)</button>
       <button class="act ghost" data-ib-preview>Re-preview</button>
-    </div>
+    </div>` : ""}
   </div>`;
 }
 
@@ -9283,11 +10125,24 @@ function updateNotifBadge() {
 // Drives the single fixed toast container directly (#118 Phase 5) — a light
 // DOM update, not a full render(), so a success toast can auto-clear itself
 // without refetching every API call render() makes for the current view.
-function updateToast() {
+function updateToast(forceAnnouncement) {
   const root = document.getElementById("toast-root");
   if (!root) return;
+  if (!toast) {
+    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+    root.hidden = true;
+    return;
+  }
+  const painted = root.querySelector(".toast-msg");
+  const sameAnnouncement = !root.hidden && painted
+    && painted.textContent === toast
+    && root.classList.contains("error") === !!toastIsError;
+  // render() calls this at entry. Replacing an unchanged live-region node
+  // would speak one operation outcome twice; an explicit new announcement
+  // passes forceAnnouncement so two genuinely separate equal outcomes still
+  // remain two events. A no-op also keeps the original auto-dismiss deadline.
+  if (sameAnnouncement && !forceAnnouncement) return;
   if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
-  if (!toast) { root.hidden = true; return; }
   root.hidden = false;
   root.classList.toggle("error", !!toastIsError);
   root.innerHTML = `<span class="toast-msg">${esc(toast)}</span>
@@ -9877,29 +10732,29 @@ function renderDangerZone() {
 }
 
 /* ---------- Draft scheduler review + publish (#86/#106) ---------- */
-// Reconciles schedulerState.selected against the latest drafts fetch against
-// `previousDrafts` (the prior fetch's snapshot, taken by the caller before
-// overwriting schedulerState.drafts): default-selects only NEWLY-seen clean
+// Reconciles a Scheduler Review card's selection against the latest drafts
+// fetch and `previousDrafts` (the prior card payload): default-selects only
+// NEWLY-seen clean
 // (issue-free) drafts, and drops a selection if a game the operator hadn't
 // looked at yet silently went from clean to flagged between fetches — so
 // publish can't include a problem game the operator never consciously
 // approved in its broken state. A game the operator explicitly selected
 // DESPITE a pre-existing issue (e.g. via "Select all") stays selected; only
 // a clean → flagged transition on an untouched selection clears it.
-function reconcileDraftSelection(drafts, previousDrafts) {
+function reconcileDraftSelection(drafts, previousDrafts, selected) {
   const previousIssues = new Map((previousDrafts || []).map((g) => [g.game_id, g.issues]));
   const next = new Set();
   for (const g of drafts) {
     const wasSeen = previousIssues.has(g.game_id);
     const wasClean = wasSeen && previousIssues.get(g.game_id).length === 0;
-    if (schedulerState.selected.has(g.game_id)) {
+    if ((selected || new Set()).has(g.game_id)) {
       if (g.issues.length && wasClean) continue;  // drifted clean -> flagged
       next.add(g.game_id);
     } else if (!wasSeen && !g.issues.length) {
       next.add(g.game_id);
     }
   }
-  schedulerState.selected = next;
+  return next;
 }
 const SCHED_ISSUE_LABEL = {
   missing_officials: "Missing officials", officials_pending: "Officials pending",
@@ -9910,8 +10765,8 @@ const SCHED_ISSUE_LABEL = {
 // read red; softer in-progress states (pending acceptance, roster not yet
 // confirmed) read as a warning — same red/orange split as everywhere else.
 const SCHED_ISSUE_SEVERE = new Set(["missing_officials", "slot_conflict", "team_double_booked"]);
-function schedDraftRow(g) {
-  const checked = schedulerState.selected.has(g.game_id);
+function schedDraftRow(g, selected, actionable) {
+  const checked = selected.has(g.game_id);
   const badges = g.issues.map((i) =>
     `<span class="badge ${SCHED_ISSUE_SEVERE.has(i) ? "red" : "orange"}">${esc(SCHED_ISSUE_LABEL[i] || i)}</span>`).join(" ");
   // #277: a committed draft physically blocks warm-up/resurfacing facility
@@ -9921,12 +10776,14 @@ function schedDraftRow(g) {
     ? `<div class="slot-reserved">reserved ${fmt(g.reserved.reserved_start_time)}–${fmt(g.reserved.reserved_end_time)} (+${g.reserved.warmup_minutes}m warm-up, +${g.reserved.resurfacing_minutes}m resurfacing)</div>`
     : "";
   return `<div class="li">
-    <input type="checkbox" class="sched-pick" data-sched-pick="${esc(g.game_id)}" ${checked ? "checked" : ""} />
+    ${actionable ? `<input type="checkbox" class="sched-pick" data-sched-pick="${esc(g.game_id)}" ${checked ? "checked" : ""} />` : ""}
     <span class="li-when"><span class="li-date">${esc(fmtRowDate(g.start_time))}</span><span class="li-time">${fmt(g.start_time)}</span></span>
     <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
       <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}${badges ? " · " + badges : ""}</div>${rsv}</div>
-    <span class="pill gray">Draft</span>${delBtn("game", g.game_id,
-      g.home_team_name + " vs " + g.away_team_name, "Delete draft")}</div>`;
+    <span class="pill gray">Draft</span>${actionable
+      ? delBtn("game", g.game_id,
+          g.home_team_name + " vs " + g.away_team_name, "Delete draft")
+      : ""}</div>`;
 }
 // #375 residual blocker — MIRRORS `MAX_GAMES_PER_TEAM` in
 // `services/scheduler.py`, the ceiling `_normalize_games_per_team` enforces.
@@ -9952,8 +10809,7 @@ const SCHED_FORMAT_REFUSALS = [
   "games_per_team_residual_infeasible",
 ];
 
-function schedFormatRefusalBlock() {
-  const refusal = schedulerState.formatRefusal;
+function schedFormatRefusalBlock(refusal) {
   if (!refusal) return "";
   const details = refusal.details || {};
   // `games_per_team_infeasible` names both parity neighbours; the residual
@@ -9980,94 +10836,148 @@ function schedFormatRefusalBlock() {
   </div>`;
 }
 
+function schedulerGeneratorControls(divs) {
+  const divOptions = divs.map((d) =>
+    `<option value="${esc(d.id)}" ${d.id === schedulerState.division ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+  return `<div class="card">
+    <div class="section-title" style="margin-top:0">Generate draft schedule</div>
+    <div class="dq-actions sched-generate-row">
+      <select id="sched-div">${divOptions}</select>
+      <label class="sr-only" for="sched-format">Regular-season format</label>
+      <select id="sched-format" title="Regular-season format">${
+        [{ value: "rr", label: "Single round-robin (play everyone once)" },
+         { value: "games", label: "Guaranteed games per team" }]
+          .map((opt) => `<option value="${opt.value}"${
+            opt.value === (schedulerState.gamesPerTeam === null ? "rr" : "games")
+              ? " selected" : ""
+          }>${opt.label}</option>`).join("")
+      }</select>
+      <label class="sr-only" for="sched-games">Guaranteed games per team</label>
+      <input id="sched-games" type="number" inputmode="numeric" required
+        min="1" max="${SCHED_MAX_GAMES_PER_TEAM}" step="1"
+        class="sched-games-input"
+        title="Guaranteed games per team (1–${SCHED_MAX_GAMES_PER_TEAM})"
+        value="${schedulerState.gamesPerTeam === null
+          ? SCHED_DEFAULT_GAMES_PER_TEAM : schedulerState.gamesPerTeam}"
+        ${schedulerState.gamesPerTeam === null ? "disabled" : ""}>
+      <label class="sr-only" for="sched-turnaround">Minimum turnaround between a team's games</label>
+      <select id="sched-turnaround" title="Minimum turnaround between a team's games">${
+        [0, 15, 30, 45, 60, 90, 120].map((m) => `<option value="${m}"${
+          m === schedulerState.turnaround ? " selected" : ""
+        }>${m === 0 ? "No minimum turnaround" : `${m} min turnaround`}</option>`).join("")
+      }</select>
+      <button class="act" data-sched-generate>Generate</button>
+    </div></div>`;
+}
+
+function schedulerPreviewHtml(pv, divs, actionable) {
+  if (!pv) return "";
+  const games = (pv.draft_games || pv.created || []);
+  const unsched = (pv.unscheduled || []);
+  const teamCount = typeof pv.team_count === "number" ? pv.team_count : null;
+  const notEnoughTeams = teamCount !== null && teamCount < 2;
+  let head, cardBody;
+  if (notEnoughTeams) {
+    const selDiv = divs.find((d) => d.id === schedulerState.division);
+    const divName = selDiv ? selDiv.name : "the selected division";
+    const leagueName = selDiv && (selDiv.league_name || selDiv.level_name);
+    const ctx = leagueName ? `${esc(divName)} (${esc(leagueName)})` : esc(divName);
+    const lead = teamCount === 0
+      ? "No Teams are registered for this schedule yet."
+      : "Only one Team is registered — a schedule needs at least two.";
+    head = `<div class="section-title">Preview — not enough registered Teams</div>`;
+    cardBody = `<div class="sched-empty"><div class="sched-empty-lead">${esc(lead)}</div>
+      <p>Generate found <strong>${teamCount}</strong> eligible Team${teamCount === 1 ? "" : "s"} for <strong>${ctx}</strong>.</p>
+      <p>Teams appear here only when they are <strong>actively registered</strong> for the selected Season, League, and Division.</p>
+      <p>Register at least two Teams under ${actionable
+        ? '<button class="linklike" data-goto="setup">Setup → Season participation</button>'
+        : '<strong>Setup → Season participation</strong>'}, then Generate again.</p></div>`;
+  } else {
+    const already = pv.already_scheduled || [];
+    const gRows = games.map((g) => `<div class="li">
+      <span class="li-when"><span class="li-date">${esc(fmtRowDate(g.start_time))}</span><span class="li-time">${fmt(g.start_time)}</span></span>
+      <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
+        <div class="li-sub">${esc(g.rink_name || "")}</div></div></div>`).join("");
+    const aRows = already.map((a) => `<div class="li"><div class="li-main">
+      <div class="li-title">${esc(a.home_team_name)} vs ${esc(a.away_team_name)}</div>
+      <div class="li-sub">✓ Already scheduled — Game ${esc(a.existing_game_id)}</div></div></div>`).join("");
+    const uRows = unsched.map((u) => `<div class="li"><div class="li-main">
+      <div class="li-title">${esc(u.home_team_name)} vs ${esc(u.away_team_name)}</div>
+      <div class="li-sub conflict">⚠ ${esc(u.reason)}</div></div></div>`).join("");
+    head = `<div class="section-title">Preview — ${games.length} game(s), ${unsched.length} conflict(s)${already.length ? `, ${already.length} already scheduled` : ""}</div>`;
+    const nothingMissing = !games.length && !unsched.length && already.length > 0;
+    cardBody = (nothingMissing
+      ? '<div class="li"><div class="li-main"><div class="li-sub">Every pairing is already scheduled — nothing missing to generate.</div></div></div>'
+      : "") + gRows + aRows + uRows || '<div class="empty">No games generated.</div>';
+  }
+  return `<div id="sched-preview" class="sched-preview"
+      data-team-count="${teamCount === null ? "" : teamCount}"
+      data-games="${games.length}" data-conflicts="${unsched.length}"
+      data-already-scheduled="${(pv.already_scheduled || []).length}"
+      data-not-enough-teams="${notEnoughTeams ? "1" : "0"}">
+    ${head}<div class="card">${cardBody}</div>
+    ${actionable ? `<div class="dq-actions"><button class="act primary" data-sched-commit
+      ${games.length ? "" : "disabled"}>Commit as draft</button></div>` : ""}</div>`;
+}
+
 function renderScheduler(ov) {
   if (!hasPerm("manage_schedule")) {
     return `<div class="banner neutral"><h2>Operators only</h2>
       <p>The draft scheduler is available to league admins and arena managers.</p></div>`;
   }
-  const divs = ov.divisions || [];
-  const divOptions = (selectedId) => divs.map((d) =>
-    `<option value="${esc(d.id)}" ${d.id === selectedId ? "selected" : ""}>${esc(d.name)}</option>`).join("");
-  const pv = schedulerState.preview;
-  let previewBlock = "";
-  if (pv) {
-    const games = (pv.draft_games || pv.created || []);
-    const unsched = (pv.unscheduled || []);
-    // The draft service reports how many eligible seasonal registrations it
-    // resolved (#311). A round robin needs at least two Teams, so team_count < 2
-    // can only ever yield 0 games / 0 conflicts — surface that explicitly rather
-    // than as a bare, misleading "0 game(s), 0 conflict(s)". Commit is gated on
-    // there being games to commit, so there is never an invalid commit path.
-    const teamCount = (typeof pv.team_count === "number") ? pv.team_count : null;
-    const notEnoughTeams = teamCount !== null && teamCount < 2;
-    const commitBtn = `<div class="dq-actions">
-      <button class="act primary" data-sched-commit ${games.length ? "" : "disabled"}>Commit as draft</button></div>`;
-
-    let head, cardBody;
-    if (notEnoughTeams) {
-      // Name the selected context (Division, and League when the overview
-      // carries it) so the operator can see exactly which Season/League/Division
-      // resolved too few registrations, and point at the corrective path — the
-      // same "Season participation" target the Setup tree already links to.
-      const selDiv = divs.find((d) => d.id === schedulerState.division);
-      const divName = selDiv ? selDiv.name : "the selected division";
-      const leagueName = selDiv && (selDiv.league_name || selDiv.level_name);
-      const ctx = leagueName ? `${esc(divName)} (${esc(leagueName)})` : esc(divName);
-      const lead = teamCount === 0
-        ? "No Teams are registered for this schedule yet."
-        : "Only one Team is registered — a schedule needs at least two.";
-      head = `<div class="section-title">Preview — not enough registered Teams</div>`;
-      cardBody = `<div class="sched-empty">
-        <div class="sched-empty-lead">${esc(lead)}</div>
-        <p>Generate found <strong>${teamCount}</strong> eligible Team${teamCount === 1 ? "" : "s"} for <strong>${ctx}</strong>.</p>
-        <p>Teams appear here only when they are <strong>actively registered</strong> for the selected Season, League, and Division — permanent Team or League membership is not enough.</p>
-        <p>Register at least two Teams under <button class="linklike" data-goto="setup">Setup → Season participation</button>, then Generate again.</p>
-      </div>`;
-    } else {
-      // #328 review — a pairing that already has a real Game (#206 slice 1)
-      // is neither a proposed game nor a conflict; it must still be named,
-      // not silently folded into a misleading "No games generated." when
-      // every pairing in the round robin is already on the calendar.
-      const already = (pv.already_scheduled || []);
-      // #390 — the DATE joins the clock in a .li-when wrapper, never in
-      // .li-title: every other scheduler journey compares that title with
-      // ===, and a proposal's day is a property of when it is, not of who is
-      // playing. .li-time keeps holding exactly the clock.
-      const gRows = games.map((g) => `<div class="li">
-        <span class="li-when"><span class="li-date">${esc(fmtRowDate(g.start_time))}</span><span class="li-time">${fmt(g.start_time)}</span></span>
-        <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
-          <div class="li-sub">${esc(g.rink_name || "")}</div></div></div>`).join("");
-      const aRows = already.map((a) => `<div class="li">
-        <div class="li-main"><div class="li-title">${esc(a.home_team_name)} vs ${esc(a.away_team_name)}</div>
-          <div class="li-sub">✓ Already scheduled — Game ${esc(a.existing_game_id)}</div></div></div>`).join("");
-      const uRows = unsched.map((u) => `<div class="li">
-        <div class="li-main"><div class="li-title">${esc(u.home_team_name)} vs ${esc(u.away_team_name)}</div>
-          <div class="li-sub conflict">⚠ ${esc(u.reason)}</div></div></div>`).join("");
-      const alreadyPart = already.length
-        ? `, ${already.length} already scheduled` : "";
-      head = `<div class="section-title">Preview — ${games.length} game(s), ${unsched.length} conflict(s)${alreadyPart}</div>`;
-      // "Nothing missing" only when there is also nothing genuinely
-      // blocked (unsched) -- a mixed batch that is partly already-scheduled
-      // and partly conflicted still has something missing, just not free
-      // yet, so it must not claim victory.
-      const nothingMissing = !games.length && !unsched.length && already.length > 0;
-      const intro = nothingMissing
-        ? '<div class="li"><div class="li-main"><div class="li-sub">Every pairing is already scheduled — nothing missing to generate.</div></div></div>'
-        : "";
-      const rows = intro + gRows + aRows + uRows;
-      cardBody = rows || '<div class="empty">No games generated.</div>';
+  const draftEntry = readCardState(SCHEDULER_DRAFT_CARD);
+  const reviewEntry = readCardState(SCHEDULER_REVIEW_CARD);
+  const draftPayload = cardDisplayPayload(draftEntry) || {};
+  const reviewPayload = cardDisplayPayload(reviewEntry) || {};
+  const schedulerOv = draftPayload.overview || ov || {};
+  const divs = schedulerOv.divisions || [];
+  const draftCurrent = cardIdentityCurrent(draftEntry.identity);
+  const displayedDraft = cardDisplayModel(draftEntry);
+  const displayedDraftCurrent = !displayedDraft || !displayedDraft.identity
+    || cardTupleCurrent(displayedDraft.identity);
+  const draftActionable = draftCurrent
+    && (draftEntry.state === CARD_STATE.EMPTY || draftEntry.state === CARD_STATE.READY
+        || draftEntry.state === CARD_STATE.ERROR)
+    && displayedDraftCurrent
+    && !contextSwitchIntentPending;
+  const preview = draftPayload.preview || null;
+  let draftBody = "";
+  if (draftEntry.state === CARD_STATE.LOADING) {
+    draftBody = operationalLoadingCopy(draftEntry, "draft schedule")
+      + schedulerPreviewHtml(preview, divs, false);
+  } else if (draftEntry.state === CARD_STATE.STALE) {
+    draftBody = operationalStaleCopy(SCHEDULER_DRAFT_CARD, "Draft schedule")
+      + schedulerPreviewHtml(preview, divs, false);
+  } else {
+    if (draftEntry.state === CARD_STATE.ERROR) {
+      draftBody += operationalErrorCopy(SCHEDULER_DRAFT_CARD, "Draft schedule", draftEntry);
     }
-    const alreadyCount = (pv.already_scheduled || []).length;
-    previewBlock = `<div id="sched-preview" class="sched-preview" data-team-count="${teamCount === null ? "" : teamCount}" data-games="${games.length}" data-conflicts="${unsched.length}" data-already-scheduled="${alreadyCount}" data-not-enough-teams="${notEnoughTeams ? "1" : "0"}">
-      ${head}
-      <div class="card">${cardBody}</div>
-      ${commitBtn}</div>`;
+    if (draftActionable && divs.length) draftBody += schedulerGeneratorControls(divs);
+    if (draftEntry.state === CARD_STATE.EMPTY && !preview) {
+      draftBody += `<div class="card sched-empty" data-card-empty="draft">
+        <div class="sched-empty-lead">No generated preview yet.</div>
+        <p>Choose a Division and Generate to review a proposal before committing it.</p></div>`;
+    }
+    draftBody += schedFormatRefusalBlock(draftPayload.formatRefusal || null);
+    draftBody += schedulerPreviewHtml(preview, divs,
+      draftEntry.state === CARD_STATE.READY && draftActionable);
   }
 
-  const allDrafts = schedulerState.drafts || [];
-  const summary = schedulerState.summary;
+  const allDrafts = reviewPayload.drafts || [];
+  const summary = reviewPayload.summary || null;
+  const selected = reviewPayload.selected instanceof Set
+    ? reviewPayload.selected : new Set(reviewPayload.selected || []);
+  const reviewActionable = reviewEntry.state === CARD_STATE.READY
+    && cardIdentityCurrent(reviewEntry.identity) && !contextSwitchIntentPending;
   const f = schedulerState.filters;
-  const rinkOpts = (ov.rinks || []).map((r) =>
+  const draftDivs = divs.length ? divs : Array.from(new Map(allDrafts.map((g) =>
+    [g.division_id, { id: g.division_id, name: g.division_name || g.division_id }])).values());
+  const draftRinks = (schedulerOv.rinks || []).length ? schedulerOv.rinks
+    : Array.from(new Map(allDrafts.map((g) =>
+      [g.rink_id, { id: g.rink_id, name: g.rink_name || g.rink_id }])).values());
+  const divOptions = (selectedId) => draftDivs.map((d) =>
+    `<option value="${esc(d.id)}" ${d.id === selectedId ? "selected" : ""}>${esc(d.name)}</option>`).join("");
+  const rinkOpts = draftRinks.map((r) =>
     `<option value="${esc(r.id)}" ${r.id === f.rink ? "selected" : ""}>${esc(r.name)}</option>`).join("");
   const drafts = allDrafts.filter((g) => {
     if (f.division !== "all" && g.division_id !== f.division) return false;
@@ -10076,118 +10986,426 @@ function renderScheduler(ov) {
     if (f.issue === "clean" && g.issues.length) return false;
     return true;
   });
-
   const summaryBlock = summary ? `<div class="section-title" style="margin-top:0">
       Review summary — ${summary.draft_count} draft, ${summary.published_count} published,
       ${summary.issue_count} with issue${summary.issue_count === 1 ? "" : "s"}</div>
     <div class="li-sub" style="padding:0 4px 12px">
-      By division: ${Object.entries(summary.by_division).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
-      &nbsp;·&nbsp; By rink: ${Object.entries(summary.by_rink).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
+      By division: ${Object.entries(summary.by_division || {}).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
+      &nbsp;·&nbsp; By rink: ${Object.entries(summary.by_rink || {}).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
     </div>` : "";
-
   const filterBlock = allDrafts.length ? `<div class="dq-actions">
-      <select id="sched-filter-div"><option value="all">All divisions</option>${divOptions(f.division === "all" ? null : f.division)}</select>
-      <select id="sched-filter-rink"><option value="all">All rinks</option>${rinkOpts}</select>
-      <select id="sched-filter-issue">
-        <option value="all" ${f.issue === "all" ? "selected" : ""}>All</option>
-        <option value="issues" ${f.issue === "issues" ? "selected" : ""}>With issues</option>
-        <option value="clean" ${f.issue === "clean" ? "selected" : ""}>Clean only</option>
-      </select>
-    </div>` : "";
-
-  const dRows = drafts.map(schedDraftRow).join("");
-  const selectedCount = schedulerState.selected.size;
-  const draftBlock = `<div class="section-title">Draft games (${drafts.length}${drafts.length !== allDrafts.length ? ` of ${allDrafts.length}` : ""})</div>
-    ${filterBlock}
-    <div class="card">${dRows || '<div class="empty">No draft games match these filters.</div>'}</div>
-    ${allDrafts.length ? `<div class="dq-actions">
-      <button class="act ghost" data-sched-select-all>Select all</button>
+    <select id="sched-filter-div"><option value="all">All divisions</option>${divOptions(f.division === "all" ? null : f.division)}</select>
+    <select id="sched-filter-rink"><option value="all">All rinks</option>${rinkOpts}</select>
+    <select id="sched-filter-issue"><option value="all" ${f.issue === "all" ? "selected" : ""}>All</option>
+      <option value="issues" ${f.issue === "issues" ? "selected" : ""}>With issues</option>
+      <option value="clean" ${f.issue === "clean" ? "selected" : ""}>Clean only</option></select></div>` : "";
+  const rows = drafts.map((g) => schedDraftRow(g, selected, reviewActionable)).join("");
+  const selectedCount = reviewActionable ? selected.size : 0;
+  let reviewData = `${summaryBlock}<div class="section-title">Draft games (${drafts.length}${
+    drafts.length !== allDrafts.length ? ` of ${allDrafts.length}` : ""})</div>${filterBlock}
+    <div class="card">${rows || '<div class="empty">No draft games match these filters.</div>'}</div>`;
+  if (reviewActionable && allDrafts.length) {
+    reviewData += `<div class="dq-actions"><button class="act ghost" data-sched-select-all>Select all</button>
       <button class="act ghost" data-sched-select-clean>Select clean only</button>
-      <button class="act ghost" data-sched-select-none>Select none</button>
-    </div>
-    <div class="dq-actions">
-      <button class="act success" data-sched-publish ${selectedCount ? "" : "disabled"}>Publish ${selectedCount} of ${allDrafts.length}</button>
-      <button class="act ghost danger" data-sched-discard ${selectedCount ? "" : "disabled"}>Discard ${selectedCount} of ${allDrafts.length}</button>
-    </div>` : ""}`;
-
+      <button class="act ghost" data-sched-select-none>Select none</button></div>
+      <div class="dq-actions"><button class="act success" data-sched-publish ${selectedCount ? "" : "disabled"}
+        >Publish ${selectedCount} of ${allDrafts.length}</button>
+      <button class="act ghost danger" data-sched-discard ${selectedCount ? "" : "disabled"}
+        >Discard ${selectedCount} of ${allDrafts.length}</button></div>`;
+  }
+  let reviewBody;
+  if (reviewEntry.state === CARD_STATE.LOADING) {
+    reviewBody = operationalLoadingCopy(reviewEntry, "draft review")
+      + (allDrafts.length || summary ? reviewData : "");
+  } else if (reviewEntry.state === CARD_STATE.ERROR) {
+    reviewBody = operationalErrorCopy(SCHEDULER_REVIEW_CARD, "Draft review", reviewEntry)
+      + (allDrafts.length || summary ? reviewData : "");
+  } else if (reviewEntry.state === CARD_STATE.STALE) {
+    reviewBody = operationalStaleCopy(SCHEDULER_REVIEW_CARD, "Draft review") + reviewData;
+  } else if (reviewEntry.state === CARD_STATE.EMPTY) {
+    reviewBody = `${summaryBlock}<div class="card sched-empty" data-card-empty="review">
+      <div class="sched-empty-lead">No draft games in this selection.</div>
+      <p>Generate and commit a proposal to create drafts for review.</p></div>`;
+  } else {
+    reviewBody = reviewData;
+  }
   return `${pageIntro("Generate draft games from open ice slots, review for conflicts, then publish.")}
-    <div class="card">
-      <div class="section-title" style="margin-top:0">Generate draft schedule</div>
-      <div class="dq-actions sched-generate-row">
-        <select id="sched-div">${divOptions(schedulerState.division)}</select>
-        ${
-          // #375 — the regular-season format, as TWO controls rather than one
-          // list, because the two things being chosen are not the same kind of
-          // thing.
-          //
-          // `#sched-format` picks BETWEEN the formats. "Single round-robin"
-          // sends the legacy meetings_per_opponent: 1 and is not a spelling of
-          // any fixed games-per-team number — "play everyone once" is (T-1)
-          // games, which differs per Division — so it stays a distinct choice
-          // rather than being folded into the numbers.
-          //
-          // `#sched-games` is the NUMBER, and it is a bounded numeric input
-          // rather than a list of options. That is the whole point: the
-          // backend accepts every integer in 1..MAX_GAMES_PER_TEAM
-          // (`_normalize_games_per_team`), and any hand-written list is a
-          // strictly smaller set. The first version of this control offered
-          // only EVEN numbers, which deleted every odd season length; its
-          // replacement offered 1..30 plus a sparse tail, which still left 31,
-          // 33, 41, 42, 45, 50, 61, 119 and dozens more unreachable while
-          // claiming the full range was exposed. A list cannot represent a
-          // range; an input can, so the product and the API now agree by
-          // construction instead of by maintenance.
-          //
-          // THE ACCESSIBLE-NAME FIX THIS SUPERSEDES. A previous round put the
-          // round-robin option and the numeric options into separate labelled
-          // `<optgroup>`s, because ONE control named "Guaranteed games per
-          // team" announced a first option that is not a games-per-team value.
-          // That diagnosis was right, and splitting the control answers it at
-          // the root rather than annotating around it: each control now has a
-          // name true of everything it contains — "Regular-season format" for
-          // the choice, "Guaranteed games per team" for the number — so there
-          // is no group left to disclaim. The grouping is dropped because the
-          // two-control shape makes it unnecessary, not because the concern
-          // was wrong.
-          //
-          // FEASIBILITY is still not this control's job — it depends on the
-          // selected Division's live team count and on the Games it already
-          // has, neither of which this screen can know before Generate runs.
-          // The backend answers it and `schedFormatRefusalBlock` surfaces the
-          // answer, naming the counts that would work.
-          //
-          // `required` + the min/max/step bounds mean the browser's own
-          // constraint validation rejects 0, 121 and 1.5 before a request is
-          // built (see the Generate handler's reportValidity call) — native,
-          // keyboard-operable and screen-reader-announced, with no duplicated
-          // range logic to drift from the backend's.
-          ""
-        }<label class="sr-only" for="sched-format">Regular-season format</label>
-        <select id="sched-format" title="Regular-season format">${
-          [{ value: "rr", label: "Single round-robin (play everyone once)" },
-           { value: "games", label: "Guaranteed games per team" }]
-            .map((opt) => `<option value="${opt.value}"${
-              opt.value === (schedulerState.gamesPerTeam === null
-                ? "rr" : "games") ? " selected" : ""
-            }>${opt.label}</option>`).join("")
-        }</select>
-        <label class="sr-only" for="sched-games">Guaranteed games per team</label>
-        <input id="sched-games" type="number" inputmode="numeric" required
-          min="1" max="${SCHED_MAX_GAMES_PER_TEAM}" step="1"
-          class="sched-games-input"
-          title="Guaranteed games per team (1–${SCHED_MAX_GAMES_PER_TEAM})"
-          value="${schedulerState.gamesPerTeam === null
-            ? SCHED_DEFAULT_GAMES_PER_TEAM : schedulerState.gamesPerTeam}"
-          ${schedulerState.gamesPerTeam === null ? "disabled" : ""}>
-        <label class="sr-only" for="sched-turnaround">Minimum turnaround between a team's games</label>
-        <select id="sched-turnaround" title="Minimum turnaround between a team's games">${
-          [0, 15, 30, 45, 60, 90, 120].map((m) => `<option value="${m}"${
-            m === schedulerState.turnaround ? " selected" : ""
-          }>${m === 0 ? "No minimum turnaround" : `${m} min turnaround`}</option>`).join("")
-        }</select>
-        <button class="act" data-sched-generate>Generate</button>
-      </div></div>
-    ${schedFormatRefusalBlock()}${previewBlock}${summaryBlock}${draftBlock}`;
+    ${operationalCardFrame(SCHEDULER_DRAFT_CARD, draftEntry, draftBody)}
+    ${operationalCardFrame(SCHEDULER_REVIEW_CARD, reviewEntry, reviewBody)}`;
+}
+
+function repaintSchedulerSurface(cardId, chromeOverview) {
+  if (view !== "scheduler") return;
+  const content = document.getElementById("content");
+  if (!content) return;
+  const focusedRetryCard = focusedOperationalRetryCard(content);
+  // Draft owns the page-level inputs/context chrome. A Review response is a
+  // sibling settlement and must not rewrite the header from Draft's request.
+  if (chromeOverview) {
+    setChrome(chromeOverview);
+  } else if (!cardId || cardId === SCHEDULER_DRAFT_CARD) {
+    const entry = readCardState(SCHEDULER_DRAFT_CARD);
+    const displayed = cardDisplayModel(entry);
+    const payload = displayed && displayed.payload || {};
+    setChrome(displayed && cardTupleCurrent(displayed.identity)
+      ? (payload.overview || {}) : selectedContextChromeOverview());
+  }
+  let replacedOne = false;
+  if (cardId) {
+    const current = content.querySelector(
+      `[data-operational-card="${cardId}"]`);
+    const staging = document.createElement("div");
+    staging.innerHTML = renderScheduler({});
+    const replacement = staging.querySelector(
+      `[data-operational-card="${cardId}"]`);
+    if (current && replacement) {
+      current.replaceWith(replacement);
+      replacedOne = true;
+    }
+  }
+  if (!replacedOne) {
+    content.innerHTML = renderScheduler({});
+    content.insertAdjacentHTML("beforeend", renderModal());
+  }
+  wireModal(content);
+  content.querySelectorAll("[data-goto]").forEach((button) => {
+    button.onclick = () => switchTab(button.dataset.goto);
+  });
+  wireSchedulerCards(content);
+  restoreOperationalRetryFocus(focusedRetryCard);
+  syncOverlayFocus();
+}
+
+async function loadSchedulerDraftCard(opts) {
+  // Ordinary same-context navigation is not an invalidation event. Preserve a
+  // proposal that is still owned by the current card identity while the
+  // Scheduler inputs refresh; a confirmed context or principal move has
+  // already invalidated that identity, so it cannot revive an older proposal.
+  const before = readCardState(SCHEDULER_DRAFT_CARD);
+  const displayedBefore = cardDisplayModel(before);
+  const currentRetentionChain = !!displayedBefore && (
+    cardIdentityCurrent(displayedBefore.identity)
+    || (!!before.retainedCurrentAtStart && cardIdentityCurrent(before.identity)));
+  const currentProposal = currentRetentionChain
+    && displayedBefore.payload && displayedBefore.payload.preview
+    ? displayedBefore.payload : null;
+  const identity = beginOperationalCardLoad(SCHEDULER_DRAFT_CARD, opts);
+  if (!identity) return;
+  const renderedEpoch = contextEpoch;
+  repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+  const result = await getJSONContextScoped("/api/demo/overview", renderedEpoch);
+  if (result === CONTEXT_READ_ABORTED) return;
+  if (result && result.error) {
+    if (!operationalCardError(
+        identity, result, "The schedule inputs could not be loaded.",
+        { retryOperation: "load" })) return;
+  } else {
+    const offered = (result && result.divisions) || [];
+    const selectedDivisionStillOffered = offered.some(
+      (d) => d.id === schedulerState.division);
+    const proposalStillApplicable = !!currentProposal
+      && selectedDivisionStillOffered
+      && currentProposal.request
+      && currentProposal.request.division_id === schedulerState.division;
+    const division = selectedDivisionStillOffered
+      ? schedulerState.division : (offered[0] && offered[0].id) || null;
+    if (!commitCardState(identity, {
+      state: proposalStillApplicable ? CARD_STATE.READY : CARD_STATE.EMPTY,
+      status: CARD_STATUS.UNKNOWN,
+      reason: proposalStillApplicable ? null : "no_preview",
+      readOutcome: CARD_READ.OK,
+      payload: proposalStillApplicable
+        ? Object.assign({}, currentProposal, { overview: result || {} })
+        : { overview: result || {}, preview: null, formatRefusal: null },
+    })) return;
+    schedulerState.division = division;
+  }
+  repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+  if (identity.userInitiated) {
+    const root = document.querySelector(`[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
+    focusCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
+      || root.querySelector("h2,.section-title")));
+  }
+}
+
+async function loadSchedulerReviewCard(opts) {
+  const before = readCardState(SCHEDULER_REVIEW_CARD);
+  const priorModel = cardDisplayModel(before);
+  const prior = priorModel && priorModel.payload || {};
+  const priorIdentity = priorModel && priorModel.identity;
+  const currentRetentionChain = !!priorModel && (
+    cardIdentityCurrent(priorIdentity)
+    || (!!before.retainedCurrentAtStart && cardIdentityCurrent(before.identity)));
+  const identity = beginOperationalCardLoad(SCHEDULER_REVIEW_CARD, opts);
+  if (!identity) return;
+  const renderedEpoch = contextEpoch;
+  repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+  const result = await getJSONContextScoped(
+    "/api/scheduler/drafts", renderedEpoch);
+  if (result === CONTEXT_READ_ABORTED) return;
+  if (result && result.error) {
+    if (!operationalCardError(
+        identity, result, "The draft list could not be loaded.",
+        { retryOperation: "load" })) return;
+  } else {
+    const drafts = (result && result.draft_games) || [];
+    const sameTuple = currentRetentionChain && priorIdentity
+      && cardTupleKey(priorIdentity) === cardTupleKey(identity)
+      && cardIdentitySamePrincipal(priorIdentity);
+    const selected = reconcileDraftSelection(
+      drafts, sameTuple ? (prior.drafts || []) : [],
+      sameTuple ? (prior.selected instanceof Set
+        ? prior.selected : new Set(prior.selected || [])) : new Set());
+    if (!commitCardState(identity, {
+      state: drafts.length ? CARD_STATE.READY : CARD_STATE.EMPTY,
+      status: CARD_STATUS.UNKNOWN,
+      reason: drafts.length ? null : "no_drafts",
+      readOutcome: CARD_READ.OK,
+      payload: { drafts: drafts, summary: (result && result.summary) || null,
+                 selected: selected },
+    })) return;
+  }
+  repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+  if (identity.userInitiated) {
+    const root = document.querySelector(`[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
+    focusCardTarget(identity, root && (root.querySelector("[data-sched-publish]")
+      || root.querySelector("h2,.section-title,.sched-empty-lead")));
+  }
+}
+
+async function generateSchedulerDraft(request) {
+  const before = readCardState(SCHEDULER_DRAFT_CARD);
+  const prior = cardDisplayPayload(before) || {};
+  const identity = beginOperationalCardLoad(SCHEDULER_DRAFT_CARD, { userInitiated: true });
+  if (!identity) return;
+  repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+  const result = await postScoped("/api/scheduler/draft", request);
+  await awaitOperationalCardContextSettlement(identity);
+  if (!cardIdentityCurrent(identity)) return;
+  if (result && !result.error) {
+    commitCardState(identity, {
+      state: CARD_STATE.READY,
+      status: CARD_STATUS.UNKNOWN,
+      readOutcome: CARD_READ.OK,
+      payload: { overview: prior.overview || {}, preview: result,
+                 formatRefusal: null, request: request },
+    });
+    announceCardStatus(identity, "Draft schedule preview updated.", false);
+  } else {
+    const details = result && result.error && result.error.details;
+    const refusal = details && SCHED_FORMAT_REFUSALS.includes(details.reason)
+      ? { message: result.error.message, details: details } : null;
+    commitCardState(identity, {
+      state: CARD_STATE.ERROR,
+      status: CARD_STATUS.UNKNOWN,
+      error: (result && result.error && result.error.message)
+        || "The draft schedule could not be generated.",
+      readOutcome: CARD_READ.FAILED,
+      retryOperation: "generate",
+      payload: { overview: prior.overview || {}, preview: null,
+                 formatRefusal: refusal, request: request },
+    });
+    // operationalErrorCopy owns the one assertive announcement for ERROR.
+  }
+  repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+  const root = document.querySelector(`[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
+  focusCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
+    || root.querySelector("h2,.section-title")));
+}
+
+function updateSchedulerReviewCard(change) {
+  const entry = currentReadyCard(SCHEDULER_REVIEW_CARD);
+  if (!entry) return false;
+  const payload = Object.assign({}, entry.payload || {});
+  change(payload);
+  return commitCardState(entry.identity, Object.assign({}, entry, { payload: payload }));
+}
+
+// Scheduler owns two independent cards. Their wiring lives outside render()
+// so a response can repaint exactly its own surface without restarting the
+// page-wide fetch pipeline or cancelling its sibling's request.
+function wireSchedulerCards(c) {
+  markOperationalErrorAnnounced(SCHEDULER_DRAFT_CARD);
+  markOperationalErrorAnnounced(SCHEDULER_REVIEW_CARD);
+  const reviewRoot = c.querySelector(
+    `[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
+  const reviewEntryForDelete = readCardState(SCHEDULER_REVIEW_CARD);
+  if (reviewRoot && cardIdentityCurrent(reviewEntryForDelete.identity)) {
+    wireDeleteControls(reviewRoot, reviewEntryForDelete.identity);
+  }
+  const draftRetry = c.querySelector(
+    `[data-card-retry="${SCHEDULER_DRAFT_CARD}"]`);
+  if (draftRetry) draftRetry.onclick = () => {
+    const entry = readCardState(SCHEDULER_DRAFT_CARD);
+    const payload = cardDisplayPayload(entry) || {};
+    if (entry.retryOperation === "generate" && payload.request) {
+      generateSchedulerDraft(payload.request);
+    }
+    else loadSchedulerDraftCard({ userInitiated: true });
+  };
+  const reviewRetry = c.querySelector(
+    `[data-card-retry="${SCHEDULER_REVIEW_CARD}"]`);
+  if (reviewRetry) reviewRetry.onclick = () =>
+    loadSchedulerReviewCard({ userInitiated: true });
+
+  const schedDiv = c.querySelector("#sched-div");
+  if (schedDiv) schedDiv.onchange = () => { schedulerState.division = schedDiv.value; };
+  const schedFormat = c.querySelector("#sched-format");
+  const schedGames = c.querySelector("#sched-games");
+  const schedSyncFormat = () => {
+    const useGames = !!schedFormat && schedFormat.value === "games";
+    if (schedGames) schedGames.disabled = !useGames;
+    schedulerState.gamesPerTeam = (useGames && schedGames)
+      ? Number(schedGames.value) : null;
+  };
+  if (schedFormat) schedFormat.onchange = schedSyncFormat;
+  if (schedGames) schedGames.onchange = schedSyncFormat;
+  const schedTurnaround = c.querySelector("#sched-turnaround");
+  if (schedTurnaround) schedTurnaround.onchange = () => {
+    schedulerState.turnaround = Number(schedTurnaround.value) || 0;
+  };
+  const schedGen = c.querySelector("[data-sched-generate]");
+  if (schedGen) schedGen.onclick = () => {
+    toast = "";
+    schedSyncFormat();
+    if (schedulerState.gamesPerTeam !== null && schedGames
+        && !schedGames.reportValidity()) return;
+    generateSchedulerDraft({
+      division_id: schedulerState.division,
+      ...(schedulerState.gamesPerTeam === null
+        ? { meetings_per_opponent: 1 }
+        : { games_per_team: schedulerState.gamesPerTeam }),
+      constraints: { min_turnaround_minutes: schedulerState.turnaround },
+    });
+  };
+
+  const schedCommit = c.querySelector("[data-sched-commit]");
+  if (schedCommit) schedCommit.onclick = async () => {
+    const ready = currentReadyCard(SCHEDULER_DRAFT_CARD);
+    const preview = ready && ready.payload && ready.payload.preview;
+    if (!ready || !preview) return;
+    const identity = beginOperationalCardLoad(
+      SCHEDULER_DRAFT_CARD, { userInitiated: true });
+    if (!identity) return;
+    repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+    const result = await postScoped("/api/scheduler/commit", {
+      division_id: schedulerState.division,
+      ...(preview.games_per_team != null
+        ? { games_per_team: preview.games_per_team }
+        : { meetings_per_opponent: preview.meetings_per_opponent || 1 }),
+      constraints: { min_turnaround_minutes: preview.min_turnaround_minutes || 0 },
+      draft_fingerprint: preview.draft_fingerprint,
+    });
+    await awaitOperationalCardContextSettlement(identity);
+    if (!cardIdentityCurrent(identity)) return;
+    if (result && !result.error) {
+      commitCardState(identity, {
+        state: CARD_STATE.EMPTY, status: CARD_STATUS.UNKNOWN,
+        reason: "no_preview", readOutcome: CARD_READ.OK,
+        payload: { overview: ready.payload.overview || {}, preview: null,
+                   formatRefusal: null },
+      });
+      announceCardStatus(identity,
+        `Committed ${(result.created || []).length} draft game(s).`, false);
+      repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+      loadSchedulerReviewCard();
+      return;
+    }
+    const reason = result && result.error && result.error.details
+      && result.error.details.reason;
+    const clearPreview = reason === "pairing_already_scheduled"
+      || reason === "preview_stale";
+    commitCardState(identity, {
+      state: CARD_STATE.ERROR, status: CARD_STATUS.UNKNOWN,
+      error: (result && result.error && result.error.message)
+        || "The draft could not be committed.",
+      readOutcome: CARD_READ.FAILED,
+      retryOperation: "generate",
+      payload: { overview: ready.payload.overview || {},
+                 preview: clearPreview ? null : preview,
+                 formatRefusal: null, request: ready.payload.request || null },
+    });
+    // operationalErrorCopy owns the one assertive announcement for ERROR.
+    repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+    const root = document.querySelector(
+      `[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
+    focusCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
+      || root.querySelector("h2,.section-title")));
+  };
+
+  const schedFilterDiv = c.querySelector("#sched-filter-div");
+  if (schedFilterDiv) schedFilterDiv.onchange = () => {
+    schedulerState.filters.division = schedFilterDiv.value;
+    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+  };
+  const schedFilterRink = c.querySelector("#sched-filter-rink");
+  if (schedFilterRink) schedFilterRink.onchange = () => {
+    schedulerState.filters.rink = schedFilterRink.value;
+    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+  };
+  const schedFilterIssue = c.querySelector("#sched-filter-issue");
+  if (schedFilterIssue) schedFilterIssue.onchange = () => {
+    schedulerState.filters.issue = schedFilterIssue.value;
+    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+  };
+  c.querySelectorAll("[data-sched-pick]").forEach((el) => {
+    el.onchange = () => {
+      updateSchedulerReviewCard((payload) => {
+        const selected = payload.selected instanceof Set
+          ? new Set(payload.selected) : new Set(payload.selected || []);
+        if (el.checked) selected.add(el.dataset.schedPick);
+        else selected.delete(el.dataset.schedPick);
+        payload.selected = selected;
+      });
+      repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+    };
+  });
+  const setReviewSelection = (predicate) => {
+    updateSchedulerReviewCard((payload) => {
+      payload.selected = new Set((payload.drafts || []).filter(predicate)
+        .map((g) => g.game_id));
+    });
+    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+  };
+  const selectAll = c.querySelector("[data-sched-select-all]");
+  if (selectAll) selectAll.onclick = () => setReviewSelection(() => true);
+  const selectClean = c.querySelector("[data-sched-select-clean]");
+  if (selectClean) selectClean.onclick = () =>
+    setReviewSelection((g) => !g.issues.length);
+  const selectNone = c.querySelector("[data-sched-select-none]");
+  if (selectNone) selectNone.onclick = () => setReviewSelection(() => false);
+
+  const mutateDrafts = async (path, successNoun) => {
+    const ready = currentReadyCard(SCHEDULER_REVIEW_CARD);
+    const selected = ready && ready.payload && ready.payload.selected;
+    const ids = Array.from(selected || []);
+    if (!ready || !ids.length) return;
+    const identity = beginOperationalCardLoad(
+      SCHEDULER_REVIEW_CARD, { userInitiated: true });
+    if (!identity) return;
+    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+    const result = await postScoped(path, { game_ids: ids });
+    await awaitOperationalCardContextSettlement(identity);
+    if (!cardIdentityCurrent(identity)) return;
+    if (result && !result.error) {
+      announceCardStatus(identity,
+        `${successNoun} ${result.published == null ? result.discarded : result.published} game(s).`,
+        false);
+      await loadSchedulerReviewCard({
+        userInitiated: true, preserveAnnouncement: true,
+      });
+      return;
+    }
+    operationalCardError(identity, result, `The selected drafts could not be ${successNoun.toLowerCase()}.`);
+    // operationalErrorCopy owns the one assertive announcement for ERROR.
+    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+  };
+  const publish = c.querySelector("[data-sched-publish]");
+  if (publish) publish.onclick = () =>
+    mutateDrafts("/api/scheduler/drafts/publish", "Published");
+  const discard = c.querySelector("[data-sched-discard]");
+  if (discard) discard.onclick = () =>
+    mutateDrafts("/api/scheduler/drafts/discard", "Discarded");
 }
 
 /* ---------- Pilot onboarding import wizard (#96/#99) ----------
@@ -11419,10 +12637,23 @@ async function render() {
     } else {
       c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     }
-    ov = await getJSON("/api/demo/overview");
-    if (renderPass !== myRenderPass) return;  // superseded (#215)
-    if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
-    if (ov && ov.error) throw new Error(ov.error.message);
+    // Scheduler and Calendar now own their overview reads through independent
+    // card identities. Do not await the same endpoint here first: doing so
+    // would make its failure replace BOTH cards with the page-wide backend
+    // banner and would make Scheduler Review wait behind Scheduler Draft.
+    // The empty shape only carries the shell to the paint boundary; each card
+    // immediately starts its own guarded load below.
+    const independentOperationalView = view === "scheduler" || view === "calendar";
+    if (independentOperationalView) {
+      ov = { league: null, leagues: [], seasons: [], levels: [], divisions: [],
+        teams: [], venues: [], rinks: [], ice_slots: [], schedule: [],
+        public_fixtures: [] };
+    } else {
+      ov = await getJSON("/api/demo/overview");
+      if (renderPass !== myRenderPass) return;  // superseded (#215)
+      if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
+      if (ov && ov.error) throw new Error(ov.error.message);
+    }
     // Default the working game to the first one this user can actually open —
     // for a coach that's their own team's game, not an arbitrary game[0] that
     // would land Roster/Sheet on the "Restricted" guard before the game
@@ -11910,31 +13141,8 @@ async function render() {
         deviceTokens: (tokens && tokens.device_tokens) || [],
       };
     }
-    // Draft scheduler review (#86/#106), operator-only.
-    if (view === "scheduler" && hasPerm("manage_schedule")) {
-      // #386 — re-seed when the stored selection is no longer one the ACTIVE
-      // tuple offers, not only when it is empty. `schedulerState.division` is
-      // module-level and survives a context switch, while `ov.divisions` is
-      // narrowed to the active Program/Season/League. Keeping a stale id would
-      // leave the picker rendering a valid-looking Division of the NEW context
-      // while Generate/Commit still sent the OLD one — which the backend now
-      // refuses as not-found (it is a foreign hierarchy), so the screen and the
-      // request would disagree with no way for the operator to see why. Before
-      // this endpoint was bound, that same stale id silently returned the other
-      // Program's proposal, which is the defect itself.
-      const offered = ov.divisions || [];
-      if (!offered.some((d) => d.id === schedulerState.division)) {
-        schedulerState.division = offered[0] ? offered[0].id : null;
-        schedulerState.preview = null;
-      }
-      const dr = await getJSON("/api/scheduler/drafts");
-      if (renderPass !== myRenderPass) return;  // superseded (#215)
-      const drafts = (dr && dr.draft_games) || [];
-      const previousDrafts = schedulerState.drafts;
-      schedulerState.drafts = drafts;
-      schedulerState.summary = (dr && dr.summary) || null;
-      reconcileDraftSelection(drafts, previousDrafts);
-    }
+    // Scheduler's proposal and review reads are independent card loads below
+    // the paint boundary. Neither endpoint may hold the other card hostage.
     // Import wizard (#96): bind the season picker to the ACTIVE #159
     // Season, not "the first Season that happens to exist" (#331 review
     // round 7). When that rule was written `ov.seasons` was unfiltered
@@ -12087,7 +13295,7 @@ async function render() {
   // manual build, or an import — all of which flow through render(), whereas
   // envStatus.demo_empty is only refetched on session/lifecycle changes. The
   // overview is authoritative for what leagues/teams exist right now.
-  if (isDemo() && envStatus) {
+  if (view !== "scheduler" && view !== "calendar" && isDemo() && envStatus) {
     envStatus.demo_empty = !(ov.leagues || []).length && !(ov.teams || []).length;
   }
   renderDemoMenu();
@@ -12436,14 +13644,7 @@ async function render() {
   // Safe destructive delete (#215): a Delete control opens the themed confirm
   // modal; the modal's confirm handler (wireModal) posts the delete and shows
   // the dependency breakdown if the server refuses.
-  c.querySelectorAll("[data-del]").forEach((b) => b.onclick = (e) => {
-    // A delete control can sit inside a click target (e.g. an available slot
-    // card that schedules on click), so don't let the click bubble to it.
-    e.stopPropagation();
-    modal = { type: "confirm-delete", kind: b.dataset.del,
-              id: b.dataset.delId, name: b.dataset.delName };
-    render();
-  });
+  wireDeleteControls(c);
   // Deactivate/reactivate a Player (#270): open a confirmation, never toggle
   // outright — same "click opens a themed modal" convention as delete.
   c.querySelectorAll("[data-player-active]").forEach((b) => b.onclick = (e) => {
@@ -13305,195 +14506,7 @@ async function render() {
       { active: b.dataset.tokenNext === "1" });
     await render();
   });
-  // Draft scheduler (#86): generate preview, commit, publish, discard.
-  const schedDiv = c.querySelector("#sched-div");
-  if (schedDiv) schedDiv.onchange = () => { schedulerState.division = schedDiv.value; };
-  // #375 — the configurable format. Recorded exactly like the Division
-  // select above (no re-render).
-  //
-  // ONLY GENERATE reads these controls. Commit deliberately does NOT: it
-  // reads the format off the PREVIEW the operator reviewed (see
-  // `schedCommit.onclick` below), because the controls are the input to the
-  // NEXT Generate, and an operator who nudges one while reading a still-valid
-  // proposal must not thereby redefine the batch they are about to commit.
-  // The backend binds the format into draft_fingerprint, so a Commit that did
-  // send a nudged value would regenerate a different schedule and be refused
-  // as preview_stale — handled by the error branch, which clears the stale
-  // preview and returns focus to Generate.
-  const schedFormat = c.querySelector("#sched-format");
-  const schedGames = c.querySelector("#sched-games");
-  // Read BOTH controls into the single state field. `null` means the legacy
-  // single round-robin; any number means guaranteed-games. Held as one field
-  // rather than two because the two request spellings are alternatives the
-  // backend refuses to receive together, so "both set" must not be
-  // representable on the client either.
-  const schedSyncFormat = () => {
-    const useGames = !!schedFormat && schedFormat.value === "games";
-    if (schedGames) schedGames.disabled = !useGames;
-    schedulerState.gamesPerTeam = (useGames && schedGames)
-      ? Number(schedGames.value) : null;
-  };
-  if (schedFormat) schedFormat.onchange = schedSyncFormat;
-  if (schedGames) schedGames.onchange = schedSyncFormat;
-  // #390 — the configurable turnaround, recorded exactly like the two selects
-  // above (no re-render). It is an input to the backend's own regeneration at
-  // Commit, and therefore bound into draft_fingerprint, so changing it after a
-  // Generate makes Commit fail preview_stale — already handled by the error
-  // branch below, which clears the stale preview and returns focus to
-  // Generate.
-  const schedTurnaround = c.querySelector("#sched-turnaround");
-  if (schedTurnaround) schedTurnaround.onchange = () => {
-    schedulerState.turnaround = Number(schedTurnaround.value) || 0;
-  };
-  const schedGen = c.querySelector("[data-sched-generate]");
-  // #328 review round 8 finding 4 -- consume the flag set by the PREVIOUS
-  // render's Commit error branch below, now that this render's fresh
-  // content (with a live Generate button again) is in the DOM. A stale
-  // preview always disables Commit and re-enables Generate, so this
-  // control exists whenever the flag does.
-  if (schedFocusGenerateAfterRender) {
-    schedFocusGenerateAfterRender = false;
-    if (schedGen) schedGen.focus();
-  }
-  if (schedGen) schedGen.onclick = async () => {
-    toast = "";
-    // Read the live controls first: `onchange` fires on blur, and a click on
-    // Generate does blur the number input, but depending on that ordering to
-    // decide what gets SENT is exactly the kind of implicit coupling that
-    // silently sends a stale format.
-    schedSyncFormat();
-    // The browser's own constraint validation (min/max/step/required on the
-    // input) rejects 0, 121 and 1.5 — announced natively, with the range read
-    // off the same single mirror of MAX_GAMES_PER_TEAM the control renders
-    // from, so there is no second copy of the bounds to drift.
-    if (schedulerState.gamesPerTeam !== null && schedGames
-        && !schedGames.reportValidity()) {
-      return;
-    }
-    const res = await post("/api/scheduler/draft", {
-      division_id: schedulerState.division,
-      // #375 — EXACTLY ONE format field, never both: the backend refuses a
-      // request carrying both spellings, because they cannot be reconciled
-      // when a League's Divisions differ in team count.
-      ...(schedulerState.gamesPerTeam === null
-        ? { meetings_per_opponent: 1 }
-        : { games_per_team: schedulerState.gamesPerTeam }),
-      // #390 — ALWAYS sent, including the 0 an untouched control means.
-      // Omitting the key entirely is what the pre-#390 screen did, and the
-      // backend's default then made the whole capability unreachable: an
-      // operator had no way to ask for a turnaround at all.
-      constraints: { min_turnaround_minutes: schedulerState.turnaround },
-    });
-    schedulerState.preview = (res && !res.error) ? res : null;
-    // #375 residual blocker — keep the format refusal on screen, next to the
-    // control that caused it. post() puts error.message in a toast, but the
-    // toast is one line with no room for the achievable counts and is
-    // dismissible, and this is a decision the operator has to act on: the
-    // control now spans the backend's whole accepted range, so learning which
-    // of those values THIS Division can honour is the whole replacement for
-    // the curated lists that used to answer it by omission. A successful
-    // Generate clears it.
-    const failure = (res && res.error && res.error.details) || null;
-    schedulerState.formatRefusal =
-      (failure && SCHED_FORMAT_REFUSALS.indexOf(failure.reason) !== -1)
-        ? { message: res.error.message, details: failure }
-        : null;
-    if (schedulerState.formatRefusal) {
-      // #328 review round 8 finding 4, same defect on this path: render()
-      // below replaces #content wholesale, so the Generate button the
-      // operator just activated is gone and nothing moves focus anywhere —
-      // silently dropping a keyboard user to the document body while the
-      // guidance tells them to pick another number and Generate again. The
-      // next action is always Generate, and that control always exists on
-      // this screen, so send focus back to it once the fresh content lands.
-      schedFocusGenerateAfterRender = true;
-    }
-    await render();
-  };
-  const schedCommit = c.querySelector("[data-sched-commit]");
-  if (schedCommit) schedCommit.onclick = async () => {
-    toast = "";
-    // #328 review round 5 -- bind Commit to the exact preview on screen:
-    // the backend re-derives its own proposal fresh at commit time and
-    // refuses (rather than silently diverging from what was reviewed) if
-    // this fingerprint no longer matches that fresh regeneration.
-    const res = await post("/api/scheduler/commit", {
-      division_id: schedulerState.division,
-      // #375 — the format the PREVIEW was generated with, read off that
-      // preview and not off the live select, exactly like the
-      // draft_fingerprint below it. What Commit writes must be what is on
-      // screen: the select is the input to the NEXT Generate, so an
-      // operator who nudges it while reading a still-valid proposal must
-      // not thereby redefine the batch they are about to commit (nor be
-      // forced to regenerate an unchanged one).
-      //
-      // The proposal echoes exactly one of the two spellings and `null` for
-      // the other, so this forwards whichever one it actually ran under —
-      // sending both would be refused, and sending the wrong one would
-      // regenerate a different schedule and fail preview_stale.
-      ...((schedulerState.preview
-        && schedulerState.preview.games_per_team) != null
-        ? { games_per_team: schedulerState.preview.games_per_team }
-        : { meetings_per_opponent: (schedulerState.preview
-          && schedulerState.preview.meetings_per_opponent) || 1 }),
-      // #390 — the turnaround the PREVIEW was generated with, echoed back by
-      // the server on that proposal and read off it rather than off the live
-      // select, for exactly the reason above: the select is the input to the
-      // NEXT Generate. The commit's own regeneration takes this value, so
-      // dropping it here would regenerate with no turnaround, produce a
-      // different fingerprint, and refuse every legitimate commit as
-      // preview_stale.
-      constraints: {
-        min_turnaround_minutes: (schedulerState.preview
-          && schedulerState.preview.min_turnaround_minutes) || 0,
-      },
-      draft_fingerprint: schedulerState.preview && schedulerState.preview.draft_fingerprint,
-    });
-    if (res && !res.error) {
-      schedulerState.preview = null;
-      toast = `Committed ${res.created.length} draft game(s).`;
-    } else if (res && res.error && res.error.details
-               && (res.error.details.reason === "pairing_already_scheduled"
-                   || res.error.details.reason === "preview_stale")) {
-      // #328 review round 3 -- a concurrent commit already scheduled one
-      // of this batch's pairings. post()'s generic toast surfaces
-      // error.message alone (never error.details), so the backend builds
-      // that message itself with both team names and the winning Game id
-      // ("Team A vs Team B is already scheduled as Game G123 -- generate
-      // a fresh preview...") -- nothing further to extract here.
-      // #328 review round 5 -- a Game was created or cancelled somewhere
-      // in the (possibly long) gap between Generate and this click,
-      // silently changing what "missing" means; the backend's own
-      // generic-but-actionable message ("Generate a fresh preview...")
-      // is likewise complete on its own. Either way the reviewed preview
-      // is now stale; clear it rather than leave a now-wrong proposal on
-      // screen, so Commit cannot be retried without a fresh Generate.
-      schedulerState.preview = null;
-      // #328 review round 8 finding 4 -- render() below replaces #content
-      // wholesale, so the just-focused Commit button is simply gone;
-      // nothing otherwise moves focus anywhere, silently dropping a
-      // keyboard user back to the document body even though the toast
-      // (a live region OUTSIDE #content, so it survives) told them what
-      // to do next. Move focus to Generate once the fresh content render
-      // completes, below.
-      schedFocusGenerateAfterRender = true;
-    }
-    await render();
-  };
-  // Review filters (#106) — re-render() like every other interaction in this
-  // app; reconcileDraftSelection preserves the current selection across it.
-  const schedFilterDiv = c.querySelector("#sched-filter-div");
-  if (schedFilterDiv) schedFilterDiv.onchange = () => {
-    schedulerState.filters.division = schedFilterDiv.value; render();
-  };
-  const schedFilterRink = c.querySelector("#sched-filter-rink");
-  if (schedFilterRink) schedFilterRink.onchange = () => {
-    schedulerState.filters.rink = schedFilterRink.value; render();
-  };
-  const schedFilterIssue = c.querySelector("#sched-filter-issue");
-  if (schedFilterIssue) schedFilterIssue.onchange = () => {
-    schedulerState.filters.issue = schedFilterIssue.value; render();
-  };
+  wireSchedulerCards(c);
   // Games list filters + expand/collapse (#152).
   const gamesF = (id, key) => {
     const el = c.querySelector(id);
@@ -13512,47 +14525,6 @@ async function render() {
     if (gamesExpanded.has(id)) gamesExpanded.delete(id); else gamesExpanded.add(id);
     render();
   });
-  // Per-game publish/discard selection (#106).
-  c.querySelectorAll("[data-sched-pick]").forEach((el) => el.onchange = () => {
-    const id = el.dataset.schedPick;
-    if (el.checked) schedulerState.selected.add(id); else schedulerState.selected.delete(id);
-    render();
-  });
-  const schedSelectAll = c.querySelector("[data-sched-select-all]");
-  if (schedSelectAll) schedSelectAll.onclick = () => {
-    schedulerState.selected = new Set((schedulerState.drafts || []).map((g) => g.game_id));
-    render();
-  };
-  const schedSelectClean = c.querySelector("[data-sched-select-clean]");
-  if (schedSelectClean) schedSelectClean.onclick = () => {
-    schedulerState.selected = new Set((schedulerState.drafts || [])
-      .filter((g) => !g.issues.length).map((g) => g.game_id));
-    render();
-  };
-  const schedSelectNone = c.querySelector("[data-sched-select-none]");
-  if (schedSelectNone) schedSelectNone.onclick = () => {
-    schedulerState.selected = new Set(); render();
-  };
-  const schedPub = c.querySelector("[data-sched-publish]");
-  if (schedPub) schedPub.onclick = async () => {
-    if (!schedulerState.selected.size) return;
-    toast = "";
-    const ids = Array.from(schedulerState.selected);
-    const res = await post("/api/scheduler/drafts/publish", { game_ids: ids });
-    if (res && !res.error) toast = `Published ${res.published} game(s).`;
-    ids.forEach((id) => schedulerState.selected.delete(id));
-    await render();
-  };
-  const schedDis = c.querySelector("[data-sched-discard]");
-  if (schedDis) schedDis.onclick = async () => {
-    if (!schedulerState.selected.size) return;
-    toast = "";
-    const ids = Array.from(schedulerState.selected);
-    const res = await post("/api/scheduler/drafts/discard", { game_ids: ids });
-    if (res && !res.error) toast = `Discarded ${res.discarded} draft(s).`;
-    ids.forEach((id) => schedulerState.selected.delete(id));
-    await render();
-  };
   // Pilot onboarding import wizard (#96): switch type, validate, commit.
   c.querySelectorAll("[data-import-type]").forEach((b) => b.onclick = () => {
     importState.type = b.dataset.importType;
@@ -13831,50 +14803,6 @@ async function render() {
     if (res && !res.error) toast = "Guardian link verified.";
     await render();
   });
-  // Commit a move to the server, then show the outcome panel (with Undo).
-  // Shared by confirmed moves, harmless direct moves, and undo (#43/#153).
-  const commitMove = async (gid, slotId) => {
-    toast = "";
-    const res = await post(`/api/games/${gid}/move`, { ice_slot_id: slotId, reason: "Moved on arena calendar" });
-    conflict = buildConflict(res, ov, gid, slotId);   // #43 side panel explains outcome + offers undo
-    pendingMove = null; movingGameId = null;
-    await render();
-  };
-  // Moving a published/locked game silently reverts it to Draft / unlocks the
-  // roster (#153). Stage those and confirm first so a stray drag can't undo
-  // game-day-ready state unnoticed; a harmless draft move commits immediately
-  // so routine scheduling keeps its one-gesture flow. Both offer Undo after.
-  const requestMove = (gid, slotId) => {
-    const g = ov.schedule.find((x) => x.game_id === gid);
-    const willUnpublish = !!(g && g.published);
-    const willUnlock = !!(g && g.roster_status === "locked");
-    if (willUnpublish || willUnlock) {
-      pendingMove = { gid, slotId, willUnpublish, willUnlock };
-      conflict = null; movingGameId = null; toast = ""; render();
-    } else {
-      commitMove(gid, slotId);
-    }
-  };
-  // Tapping an Available slot: complete a pending move, else open the wizard.
-  c.querySelectorAll("[data-slot]").forEach((b) => b.onclick = () => {
-    if (movingGameId != null) return requestMove(movingGameId, b.dataset.slot);
-    wizard = { slot_id: b.dataset.slot }; toast = ""; render();
-  });
-  // Enter move mode (drag-free path for touch/mobile/keyboard).
-  c.querySelectorAll("[data-move-game]").forEach((b) => b.onclick = (e) => {
-    e.stopPropagation();
-    movingGameId = b.dataset.moveGame; conflict = null; pendingMove = null; toast = ""; render();
-  });
-  c.querySelectorAll("[data-move-cancel]").forEach((b) => b.onclick = () => { movingGameId = null; render(); });
-  // Confirm / cancel a staged move, and undo a committed one (#153).
-  c.querySelectorAll("[data-move-confirm]").forEach((b) => b.onclick = () => {
-    if (pendingMove) commitMove(pendingMove.gid, pendingMove.slotId);
-  });
-  c.querySelectorAll("[data-move-cancel-pending]").forEach((b) => b.onclick = () => { pendingMove = null; render(); });
-  c.querySelectorAll("[data-move-undo]").forEach((b) => b.onclick = () => {
-    if (conflict && conflict.undo) commitMove(conflict.undo.gid, conflict.undo.oldSlotId);
-  });
-  c.querySelectorAll("[data-addslot]").forEach((b) => b.onclick = async () => { await post("/api/demo/add-ice-slot", { rink_id: b.dataset.addslot, date: calendarDate }); await render(); });
   // Expand/collapse an import batch's row-level detail in the Activity feed (#102).
   c.querySelectorAll("[data-audit-toggle]").forEach((b) => b.onclick = () => {
     const id = b.dataset.auditToggle;
@@ -13882,273 +14810,14 @@ async function render() {
     else activityExpandedBatches.add(id);
     render();
   });
-  c.querySelectorAll("[data-cal]").forEach((b) => b.onclick = () => {
-    const v = +b.dataset.cal;
-    if (v === 0) calendarDate = todayISO();
-    else if (calendarMode === "month") calendarDate = addMonths(calendarDate, v);
-    else shiftDate(v * (calendarMode === "week" ? 7 : 1));
-    toast = ""; conflict = null; movingGameId = null; pendingMove = null; render();
-  });
-  c.querySelectorAll("[data-mode]").forEach((b) => b.onclick = () => { calendarMode = b.dataset.mode; toast = ""; conflict = null; movingGameId = null; pendingMove = null; render(); });
-  // Month-view day cell -> open that day in Day view (#158).
-  c.querySelectorAll("[data-cal-day]").forEach((b) => b.onclick = () => {
-    calendarDate = b.dataset.calDay; calendarMode = "day"; toast = ""; render();
-  });
-  // Ice Availability Builder (#158): open/cancel, preview, commit, exclusions.
-  const ibOpen = c.querySelector("[data-ice-builder-open]");
-  // Opening a builder bumps iceOperationSeq (#331 review round 10): a
-  // Preview/Commit issued by a PRIOR builder instance -- canceled, then
-  // this one opened fresh -- must never be mistaken for current just
-  // because contextRevision hasn't changed (same context throughout) and
-  // `iceBuilder` is non-null again by the time it resolves.
-  if (ibOpen) ibOpen.onclick = () => {
-    iceOperationSeq += 1;
-    iceBuilder = { form: null, preview: null }; toast = ""; render();
-  };
-  const ibCancel = c.querySelector("[data-ib-cancel]");
-  if (ibCancel) ibCancel.onclick = () => {
-    iceOperationSeq += 1;
-    iceBuilder = null; toast = ""; render();
-  };
-  // Any change to the template (season, rinks, weekdays, per-day times, dates,
-  // buffers) INVALIDATES a shown preview, so Create can never post a form
-  // edited after Preview — the create button re-reads the live form, and the
-  // server rejects a mismatched fingerprint as the authoritative backstop. A
-  // weekday toggle additionally re-renders to show/hide its per-day time row.
-  const ibFormEl = c.querySelector(".ib-form");
-  if (ibFormEl) ibFormEl.addEventListener("change", (e) => {
-    if (!iceBuilder) return;
-    if (e.target && e.target.id === "ib-excl") return;  // staging input, not the template
-    const isWeekday = e.target.classList && e.target.classList.contains("ib-weekday");
-    const hadPreview = !!iceBuilder.preview;
-    // Bump unconditionally, not only when clearing an existing preview
-    // (#331 review round 10): a Preview issued BEFORE this edit but still
-    // in flight when it lands must be recognized as stale even if no
-    // preview existed yet to clear -- otherwise it would still write its
-    // now-outdated slots onto the freshly-edited form once it resolves.
-    iceOperationSeq += 1;
-    iceBuilder.form = readIceBuilderForm(c);
-    if (hadPreview) { iceBuilder.preview = null; toast = ""; }
-    if (hadPreview || isWeekday) render();
-  });
-  // #331 review round 11: text/date/time controls fire `input` continuously
-  // WHILE FOCUSED but don't fire `change` until blur -- a Preview/Commit held
-  // in flight across an edit the operator hasn't blurred yet would still see
-  // iceOperationSeq unchanged (only `change` bumped it), so the stale
-  // response passes the guard above and render() replaces what's live in the
-  // focused field with the old value readIceBuilderForm() captured at click
-  // time. Bump the op token on every keystroke too, so that response is
-  // discarded before it ever reaches render() -- and if a preview panel is
-  // already showing, drop its DOM node DIRECTLY rather than calling the full
-  // render() this listener's own edit is trying to avoid mid-keystroke
-  // (matches the drawer-removal idiom from round 8: a full render() here
-  // would also rebuild the very field the operator is still typing in and
-  // steal focus/cursor out from under them).
-  if (ibFormEl) ibFormEl.addEventListener("input", (e) => {
-    if (!iceBuilder) return;
-    if (e.target && e.target.id === "ib-excl") return;  // staging input, not the template
-    iceOperationSeq += 1;
-    iceBuilder.form = readIceBuilderForm(c);
-    if (iceBuilder.preview) {
-      iceBuilder.preview = null;
-      const pv = c.querySelector(".ib-preview");
-      if (pv) pv.remove();
-    }
-  });
-  c.querySelectorAll("[data-ib-preview]").forEach((b) => b.onclick = async () => {
-    // A context/identity switch invalidated (round 8) or fully closed
-    // (identity switch, round 8) the builder between this button's last
-    // render and this click -- see invalidateContextScopedMutations()'s and
-    // resetTransientUiState()'s own comments. Guards the same way the form
-    // `change` listener above already does.
-    if (!iceBuilder) return;
-    toast = "";
-    // Snapshot the context generation (#331 review round 9): unlike the
-    // guard above, this one covers the AWAIT below, not just the click.
-    // iceBuilder.preview was previously assigned straight from the response
-    // with no staleness check at all -- a held preview held across a switch
-    // and then released restores stale (even other-context) slots into a
-    // preview that looks live, re-enabling Create. Re-check `iceBuilder`
-    // itself too: an identity switch nulls it wholesale, and a plain context
-    // switch could in principle let a new builder exist by the time this
-    // resolves.
-    const requestRevision = contextRevision;
-    // Snapshot the op token too (#331 review round 10): contextRevision
-    // alone only catches a CONTEXT change, not e.g. canceling and
-    // reopening the builder, editing the form, or a second Preview click
-    // -- all same-context events that must also obsolete this one. Each of
-    // those bumps iceOperationSeq at the point it happens; a mismatch here
-    // means one of them happened while this request was in flight.
-    const requestOp = ++iceOperationSeq;
-    iceBuilder.form = readIceBuilderForm(c);
-    const preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
-    if (!iceBuilder || contextRevision !== requestRevision || requestOp !== iceOperationSeq) return;
-    iceBuilder.preview = preview;
-    render();
-  });
-  const ibCommit = c.querySelector("[data-ib-commit]");
-  if (ibCommit) ibCommit.onclick = async () => {
-    if (!iceBuilder) return;
-    toast = "";
-    // Bind the commit to the previewed template: send the fingerprint the
-    // preview returned so the server refuses a form edited since (belt to the
-    // frontend's suspenders, which already drops the preview on any edit).
-    const fingerprint = iceBuilder.preview && iceBuilder.preview.template_fingerprint;
-    // No preview to bind to -- a context switch cleared it since this button
-    // was rendered (#331 review round 8: invalidateContextScopedMutations()
-    // clears iceBuilder.preview the instant a switch is even attempted, well
-    // before this button's own DOM node is removed by the next render). Bail
-    // out client-side rather than sending a doomed request with a null
-    // fingerprint and relying on the server's own rejection of it — the same
-    // belt-and-suspenders Import's own Commit handler already applies below.
-    if (!fingerprint) {
-      toast = "The preview changed — refresh it before creating.";
-      toastIsError = true;
-      return render();
-    }
-    // Snapshot the context generation (#331 review round 9): the commit
-    // itself is already correctly bound to whatever template this click
-    // captured -- the fingerprint check above is the authoritative guard for
-    // THAT, and the server independently rejects a mismatched fingerprint --
-    // but the RESPONSE handling below reaches into the live `iceBuilder`,
-    // including nulling it out on success or writing a fresh preview into it
-    // on a mismatch. If a context or identity switch happened while this
-    // request was in flight, the operator may already be looking at a
-    // brand-new B-context builder by the time it resolves; without this
-    // check an A-context commit's late response would wipe out that
-    // in-progress B builder, attach an A-context re-preview onto it, or
-    // crash outright against a `null` left by an identity switch.
-    const requestRevision = contextRevision;
-    // #331 review round 10, same reasoning as Preview above: contextRevision
-    // alone doesn't catch a same-context cancel/reopen of the builder --
-    // without this, a stale Commit success landing after the operator
-    // canceled and reopened a fresh builder in the SAME context would still
-    // pass the guard below and null out that brand-new builder out from
-    // under them.
-    const requestOp = ++iceOperationSeq;
-    iceBuilder.form = readIceBuilderForm(c);
-    const res = await post("/api/setup/ice-availability/commit",
-      { ...iceBuilder.form, template_fingerprint: fingerprint });
-    if (!iceBuilder || contextRevision !== requestRevision || requestOp !== iceOperationSeq) return;
-    const reason = res && res.error && res.error.details && res.error.details.reason;
-    if (res && !res.error) {
-      toast = `Created ${res.totals.created} ice slot(s).`; iceBuilder = null;
-    } else if (reason === "preview_mismatch") {
-      // The proposal changed since Preview — a slipped-through form edit, or a
-      // concurrent Season/timezone change moved the resolved slots. Refresh the
-      // preview so the operator reviews the CURRENT slots before creating again;
-      // never commit the stale set.
-      toast = "The schedule changed since preview — showing the updated proposal. Review, then create again.";
-      // Same guard around this second await (#331 review round 9/10) -- a
-      // switch, cancel/reopen, or edit could just as easily land during the
-      // re-preview as during the commit above. This re-preview counts as
-      // its own fresh operation (a new ++, not a re-read of requestOp):
-      // a genuinely independent Preview click racing it must still be able
-      // to supersede it.
-      const rePreviewRevision = contextRevision;
-      const rePreviewOp = ++iceOperationSeq;
-      const rePreview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
-      if (!iceBuilder || contextRevision !== rePreviewRevision || rePreviewOp !== iceOperationSeq) return;
-      iceBuilder.preview = rePreview;
-    } else {
-      iceBuilder.preview = res;
-    }
-    render();
-  };
-  const ibExclAdd = c.querySelector("[data-ib-excl-add]");
-  if (ibExclAdd) ibExclAdd.onclick = () => {
-    if (!iceBuilder) return;
-    iceBuilder.form = readIceBuilderForm(c);
-    const el = c.querySelector("#ib-excl");
-    const d = el && el.value;
-    if (d && !iceBuilder.form.exclusion_dates.includes(d)) iceBuilder.form.exclusion_dates.push(d);
-    iceBuilder.preview = null;   // exclusions changed the template — re-preview
-    iceOperationSeq += 1;  // #331 review round 10, same reasoning as the form change listener above
-    render();
-  };
-  c.querySelectorAll("[data-ib-excl-remove]").forEach((b) => b.onclick = () => {
-    if (!iceBuilder) return;
-    iceBuilder.form = readIceBuilderForm(c);
-    iceBuilder.form.exclusion_dates =
-      iceBuilder.form.exclusion_dates.filter((x) => x !== b.dataset.ibExclRemove);
-    iceBuilder.preview = null;   // exclusions changed the template — re-preview
-    iceOperationSeq += 1;  // #331 review round 10, same reasoning as the form change listener above
-    render();
-  });
-  c.querySelectorAll("[data-filter]").forEach((sel) => sel.onchange = (e) => {
-    const key = sel.dataset.filter;
-    calFilters[key] = e.target.value;
-    if (key === "venueId") calFilters.rinkId = "all";  // rink list depends on venue
-    toast = ""; conflict = null; movingGameId = null; pendingMove = null; render();
-  });
-  // Drag a game (allocated card or draft chip) onto an available slot to move it.
-  c.querySelectorAll("[data-game]").forEach((el) => {
-    el.addEventListener("dragstart", (e) => {
-      e.dataTransfer.setData("text/plain", el.dataset.game);
-      e.dataTransfer.effectAllowed = "move";
-      el.classList.add("dragging");
-    });
-    el.addEventListener("dragend", () => el.classList.remove("dragging"));
-  });
-  c.querySelectorAll("[data-drop]").forEach((el) => {
-    el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("drop-hover"); });
-    el.addEventListener("dragleave", () => el.classList.remove("drop-hover"));
-    el.addEventListener("drop", async (e) => {
-      e.preventDefault();
-      el.classList.remove("drop-hover");
-      const gid = e.dataTransfer.getData("text/plain");
-      if (!gid) return;
-      // Same confirm-if-destructive + move + #43/#153 panel as the click path.
-      requestMove(gid, el.dataset.drop);
-    });
-  });
-  const dismiss = c.querySelector("[data-conflict-dismiss]");
-  if (dismiss) dismiss.onclick = () => { conflict = null; render(); };
   c.querySelectorAll("[data-publish]").forEach((b) => b.onclick = async () => { await post(`/api/games/${b.dataset.publish}/publish`, {}); toast = "Game published."; await render(); });
   c.querySelectorAll("[data-openroster]").forEach((b) => b.onclick = () => { currentGame = b.dataset.openroster; switchTab("roster"); });
   const picker = document.getElementById("player-picker");
   if (picker) picker.onchange = (e) => { pickedPlayer = e.target.value; toast = ""; render(); };
-  // wizard wiring (#233 B2c: League required, Division optional)
-  // #283 Slice D: the Exhibition toggle switches the game to a Season-scoped
-  // friendly (crosses leagues, no standings), so it resets the competition
-  // scope and team picks; a Season picker replaces the League/Division cascade.
-  const wex = document.getElementById("w-exhibition");
-  if (wex) wex.onchange = (e) => { wizard.exhibition = e.target.checked; wizard.league_id = ""; wizard.division_id = ""; wizard.home_id = null; wizard.away_id = null; render(); };
-  const ws = document.getElementById("w-season");
-  if (ws) ws.onchange = (e) => { wizard.season_id = e.target.value; wizard.home_id = null; wizard.away_id = null; render(); };
-  const wl = document.getElementById("w-league");
-  if (wl) wl.onchange = (e) => { wizard.league_id = e.target.value; wizard.division_id = ""; wizard.home_id = null; wizard.away_id = null; render(); };
-  const wd = document.getElementById("w-div");
-  if (wd) wd.onchange = (e) => { wizard.division_id = e.target.value; wizard.home_id = null; wizard.away_id = null; render(); };
-  const wh = document.getElementById("w-home");
-  if (wh) wh.onchange = (e) => { wizard.home_id = e.target.value; wizard.away_id = null; render(); };
-  const wa = document.getElementById("w-away");
-  if (wa) wa.onchange = (e) => { wizard.away_id = e.target.value; render(); };
-  const wc = c.querySelector("[data-wizcancel]"); if (wc) wc.onclick = () => { wizard = null; render(); };
-  const wcr = c.querySelector("[data-wizcreate]");
-  if (wcr) wcr.onclick = async () => {
-    let body;
-    if (wizard.exhibition) {
-      // #283 Slice D: an Exhibition friendly is Season-scoped with no owning
-      // League/Division — it may pair teams from different Leagues and never
-      // counts toward standings.
-      body = { season_id: wizard.season_id, game_type: "exhibition",
-               home_team_id: wizard.home_id, away_team_id: wizard.away_id,
-               ice_slot_id: wizard.slot_id };
-    } else {
-      // v2: League is REQUIRED (game scope); Division is optional (#233 B2c).
-      // season_id comes from the selected League, not a Division (which may be
-      // unset when the game is league-only).
-      const league = (ov.levels || []).find((lv) => lv.id === wizard.league_id);
-      body = { season_id: league ? league.season_id : (ov.seasons[0] || {}).id,
-               league_id: wizard.league_id, division_id: wizard.division_id || null,
-               home_team_id: wizard.home_id, away_team_id: wizard.away_id,
-               ice_slot_id: wizard.slot_id };
-    }
-    const res = await post("/api/v2/setup/game", body);
-    if (res && !res.error) { toast = wizard.exhibition ? "Exhibition game scheduled." : "Game scheduled."; currentGame = res.id; wizard = null; view = "games"; }
-    render();
-  };
+  // Calendar owns card-scoped versions of the shared publish/roster/picker
+  // controls. Wire it after the legacy cross-view bindings above so the
+  // card-identity guards remain the effective handlers on this surface.
+  wireCalendarCards(c);
   // #345: last thing every render does -- after ALL wiring above, so the
   // dialog's controls exist and are bound before focus lands on one. Also
   // handles the close half: when the render that just ran removed the
@@ -14166,6 +14835,31 @@ async function render() {
   // did. That is the whole difference between waiting for an EVENT and
   // waiting out a CLOCK.
   settleDestinationFocus({ setupHierarchy: hierarchyReadsSettled });
+  // Fire only after this pass has completely painted and wired the shell.
+  // Each card owns its request generation and repaints only its own view;
+  // neither sibling is awaited here, so response order cannot couple them.
+  const operationalLaunchPass = myRenderPass;
+  const operationalLaunchView = view;
+  queueMicrotask(() => {
+    if (renderPass !== operationalLaunchPass || view !== operationalLaunchView)
+      return;
+    // A successful /api/context POST changes server-side read scope before
+    // its response can reconcile contextOptions.selected. Starting a card
+    // read inside that delivery window would label the new tuple's payload
+    // with the old tuple's identity. The accepted switch's final render will
+    // launch the four owners after canonical context reconciliation.
+    if (contextSwitchIntentPending) return;
+    if (operationalLaunchView === "scheduler" && hasPerm("manage_schedule")) {
+      loadSchedulerDraftCard();
+      loadSchedulerReviewCard();
+    } else if (operationalLaunchView === "calendar") {
+      loadCalendarCard();
+      // This is render reconciliation, not a click on Open/Refresh. Labelling
+      // it user-initiated lets its eventual response steal focus from the
+      // context switcher into the Builder after a context change.
+      if (iceBuilder) loadIceBuilderCard();
+    }
+  });
 }
 
 // Per-view page title (#345). A single-page app never reloads, so without
@@ -14791,9 +15485,8 @@ async function restoreContextDeepLink() {
 // against the live DOM at click time (pre-existing belt-and-suspenders, see
 // its own comment below); clearing it here is enough on its own to make that
 // handler bail out with no request sent, however the click landed. Ice
-// Builder's Create gets the identical treatment (clearing iceBuilder.preview,
-// the source of the fingerprint its own handler now refuses to commit
-// without, below).
+// Builder's Create is withdrawn directly and its card identity is invalidated,
+// so no preview fingerprint from the prior context can be committed.
 //
 // An open drawer is different: submitSetup() does not re-verify anything
 // about the drawer before posting, so the only airtight guard is removing
@@ -14836,14 +15529,17 @@ function withdrawContextScopedActionControls() {
   document.querySelectorAll(
     "[data-setup-progress-action],"
     + "[data-setup-landing-actions] button,"
-    + "[data-setup-card-ask],[data-setup-card-confirm-yes],[data-setup-card-confirm-no]"
+    + "[data-setup-card-ask],[data-setup-card-confirm-yes],[data-setup-card-confirm-no],"
+    + "[data-sched-generate],[data-sched-commit],[data-sched-publish],[data-sched-discard],"
+    + "[data-del],.sched-pick,[data-ice-builder-open],[data-ib-preview],[data-ib-commit],"
+    + "[data-slot],[data-game],[data-move-game],[data-move-confirm],"
+    + "[data-addslot],[data-wizcreate]"
   ).forEach((el) => el.remove());
 }
 function invalidateContextScopedMutations() {
   importState.report = null;
   importState.validatedKey = null;
   importState.committed = null;
-  if (iceBuilder) iceBuilder.preview = null;
   withdrawContextScopedActionControls();
   if (drawer) {
     document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
@@ -14906,7 +15602,64 @@ let contextHashIntentPending = false;
 // a reconciliation has actually happened, which is every path that reaches a
 // syncContextHash() (success AND failure), never on the merely-queued path.
 let contextSwitchIntentPending = false;
+let contextSwitchIntentSettlement = Promise.resolve();
+let resolveContextSwitchIntentSettlement = null;
 let contextSwitchQueued = null;  // {programId, seasonId, leagueId, mySeq} -- the one pending switch not yet sent, if any
+
+// An operation response may arrive after the server has accepted a context
+// switch but before the POST echo lets this document adopt the new tuple. In
+// that interval cardIdentityCurrent() still sees the departing tuple and is
+// one boundary too early. Hold the response until the whole switch burst is
+// reconciled, then let the ordinary card identity decide the outcome: a real
+// move has advanced the card generation and is discarded; a refused or
+// same-tuple switch leaves the response admissible.
+function beginContextSwitchIntentSettlement() {
+  if (!contextSwitchIntentPending) {
+    contextSwitchIntentSettlement = new Promise((resolve) => {
+      resolveContextSwitchIntentSettlement = resolve;
+    });
+  }
+  contextSwitchIntentPending = true;
+}
+function releaseContextSwitchIntentSettlement() {
+  contextSwitchIntentPending = false;
+  const resolve = resolveContextSwitchIntentSettlement;
+  resolveContextSwitchIntentSettlement = null;
+  if (resolve) resolve();
+}
+async function finishContextSwitchIntentSettlement() {
+  releaseContextSwitchIntentSettlement();
+  // There are two promise boundaries to flush: the waiting helper resumes on
+  // the first, then resolves the operation's own await on the second. On a
+  // refused switch that lets the still-current operation commit before
+  // render() starts a replacement read; on an accepted switch the advanced
+  // generation/tuple gate still rejects it.
+  await Promise.resolve();
+  await Promise.resolve();
+}
+async function awaitOperationalCardContextSettlement(identity) {
+  while (contextSwitchIntentPending && cardIdentitySamePrincipal(identity)) {
+    const settlement = contextSwitchIntentSettlement;
+    await settlement;
+  }
+}
+
+// Build page chrome from the selected-context authority, never from a card's
+// retained payload. During an accepted switch the old options inventory still
+// contains the newly selected row, while the card payload deliberately remains
+// the earlier tuple so it can be shown inside a clearly labelled STALE card.
+function selectedContextChromeOverview() {
+  const opts = contextOptions || {};
+  const selected = opts.selected || {};
+  const program = (opts.programs || []).find(
+    (row) => row.id === selected.program_id) || null;
+  const season = program && (program.seasons || []).find(
+    (row) => row.id === selected.season_id) || null;
+  return {
+    league: program ? { name: program.name } : null,
+    seasons: season ? [{ name: season.name }] : [],
+  };
+}
 
 // Repaint the context-scoped cards from their HELD models, at the moment the
 // POST has confirmed and contextOptions.selected has moved (#365 owner
@@ -14935,6 +15688,9 @@ function repaintContextScopedCardsAsStale() {
   // is the tuple itself moving, so there is no generation to check -- only
   // the held model and the new tuple, which readCardState() already compares.
   setupWorkflowsFor().forEach((w) => repaintSetupWorkflowCard(w.key, null));
+  const chromeOverview = selectedContextChromeOverview();
+  if (view === "scheduler") repaintSchedulerSurface(null, chromeOverview);
+  if (view === "calendar") repaintCalendarSurface(null, chromeOverview);
 }
 
 // ============ THE IDENTITY BOUNDARY'S OWN DOM PASS (#365 round 8) ==========
@@ -14999,7 +15755,8 @@ function repaintContextScopedCardsAsStale() {
 function blankContextScopedCardSurfaces() {
   withdrawContextScopedActionControls();
   const scoped = "#sp-card-slot,[data-setup-card-slot],[data-setup-landing-actions],"
-    + "[data-setup-hub-progress-slot],[data-setup-workflow-card]";
+    + "[data-setup-hub-progress-slot],[data-setup-workflow-card],"
+    + "[data-operational-card],.wizard,.modal-scrim,.modal";
   const active = document.activeElement;
   if (active && active !== document.body && active.closest
       && active.closest(scoped)) {
@@ -15021,6 +15778,22 @@ function blankContextScopedCardSurfaces() {
   document.querySelectorAll("[data-setup-workflow-card] .swf-status,"
     + "[data-setup-workflow-card] .swf-optional")
     .forEach((chip) => chip.remove());
+  document.querySelectorAll("[data-operational-card]").forEach((card) => {
+    card.dataset.cardState = CARD_STATE.LOADING;
+    card.setAttribute("aria-busy", "true");
+    card.innerHTML = "";
+  });
+  // The schedule-game wizard is a Calendar sub-surface but predates the card
+  // wrapper and renders outside it. Remove it explicitly so the departing
+  // operator's team/rink/time choices cannot survive the post-auth/pre-render
+  // window merely because there was no operational-card ancestor to blank.
+  document.querySelectorAll(".wizard").forEach((surface) => surface.remove());
+  // Dialogs can contain names, reasons and controls read under the departing
+  // identity. Retire the painted overlay in the same synchronous boundary as
+  // its owning card; clearing the model alone would leave private text live
+  // until the arriving identity's first render.
+  document.querySelectorAll(".modal-scrim,.modal")
+    .forEach((surface) => surface.remove());
 }
 
 // Persist a switcher pick, then reflect it in the hash and re-render.
@@ -15039,7 +15812,7 @@ async function setActiveContext(programId, seasonId, leagueId) {
   // Home/Tasks setup CTA may be painted, whatever state any card is holding
   // and whatever repaint runs next. Cleared only once a reconciliation has
   // actually happened -- see the flag's own comment.
-  contextSwitchIntentPending = true;
+  beginContextSwitchIntentSettlement();
   // Invalidate SYNCHRONOUSLY, before anything below (#331 review round 8) --
   // see invalidateContextScopedMutations()'s own comment for why.
   // contextRevision bumps here too, not just after success further down:
@@ -15109,6 +15882,14 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   const r = await post("/api/context",
     { program_id: programId, season_id: seasonId || null, league_id: leagueId || null });
   contextSwitchInFlight = false;
+  const priorConfirmedCardTuple = currentCardTuple();
+  const acceptedCardTuple = r && !r.error ? {
+    program_id: r.program_id || null,
+    season_id: r.season_id || null,
+    league_id: r.league_id || null,
+  } : null;
+  const acceptedContextMoved = !!acceptedCardTuple
+    && cardTupleKey(priorConfirmedCardTuple) !== cardTupleKey(acceptedCardTuple);
   // A newer intent queued while this POST was in flight is strictly more
   // current than whatever this response says -- send it immediately, before
   // doing ANYTHING with this response (including reconciling a failure), so
@@ -15117,6 +15898,11 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   // identity change, so an old identity's pending switch can never fire
   // under a new one.
   if (contextSwitchQueued) {
+    // The server has already committed this echo even though the UI will skip
+    // painting it in favor of the queued intent. That hidden A -> B leg must
+    // still invalidate A's card identities; otherwise a queued B -> A makes a
+    // response from the first visit to A appear current again.
+    if (acceptedContextMoved) invalidateScheduleFacilityCardRequests();
     const next = contextSwitchQueued;
     contextSwitchQueued = null;
     return sendContextSwitch(next.mySeq, next.programId, next.seasonId, next.leagueId);
@@ -15149,16 +15935,17 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
     // deep link, and silently POSTs the persisted context back to it.
     syncContextHash();
     contextHashIntentPending = false;
-    // #365 owner correction: "a failed switch may restore the still-current
-    // tuple only through a fresh render." The tuple never moved, so nothing
-    // went stale and nothing may be repainted as actionable in place -- the
-    // withdrawal is released here and the render() below is the ONE thing
-    // that puts the controls back, rebuilt from the tuple that is still
-    // current rather than resurrected from the DOM they were removed from.
-    contextSwitchIntentPending = false;
+    // #365 owner correction: a failed switch keeps the old tuple current but
+    // may restore it only from fresh/current evidence. Release deferred card
+    // settlements first: their own server responses are current evidence and
+    // retain their pre-attempt identity because no move was accepted. The
+    // render below then rebuilds every remaining control from canonical A;
+    // nothing resurrects the withdrawn DOM merely because the POST failed.
+    await finishContextSwitchIntentSettlement();
     render();
     return;
   }
+  if (acceptedContextMoved) invalidateScheduleFacilityCardRequests();
   // Reflect the canonical selection in the hash IMMEDIATELY from the POST echo,
   // before the options refresh below. The refresh is a second round-trip; if we
   // waited until after it to sync the hash, a very fast reload in that window
@@ -15194,6 +15981,14 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   // actually rebind Import/Ice Builder to it instead of finding its own
   // stamp already "current" (from the first bump) and skipping the reseed.
   contextRevision += 1;
+  // A generation is also a CONFIRMED-context epoch for these four cards.
+  // Tuple equality alone cannot distinguish A -> B -> A: a response started
+  // under the first visit to A would otherwise become current again after the
+  // round trip because its tuple, principal and generation all match. Advance
+  // every owner only when the accepted echo proves a real move. A refused or
+  // same-tuple switch leaves legitimate in-flight responses current.
+  // The advance itself happens as soon as the accepted echo is known above,
+  // including a successful response skipped for a queued follow-up.
   // NOT the primary invalidation, and must not be read as one (#365 owner
   // correction, round 13). Focus work is abandoned at the moment a switch is
   // ATTEMPTED -- see abandonFocusWorkForContextSwitch() at the top of
@@ -15246,8 +16041,8 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   // that is genuinely current. Released immediately before the render() that
   // repaints them, and never on a path that returns early -- a superseded or
   // queued switch leaves it set for its successor to clear.
-  contextSwitchIntentPending = false;
   toast = "";
+  await finishContextSwitchIntentSettlement();
   render();
 }
 // The switcher's flat option list: EVERY authorized Program is Program-only-
@@ -15645,7 +16440,8 @@ function resetTransientUiState() {
   gamesFilter = { division: "all", team: "all", rink: "all", status: "all", from: "", to: "" };
   gamesExpanded = new Set();
   usersSelected = null;
-  schedulerState.selected = new Set();
+  schedulerState.division = null;
+  schedulerState.filters = { division: "all", rink: "all", issue: "all" };
   // playersList (#114) is real player names/teams fetched only for a
   // manage_setup session — the Setup view itself isn't permission-gated
   // (setupCard only hides the "+ New" button), so if it survived an
@@ -15698,6 +16494,11 @@ function resetTransientUiState() {
   importState = { type: "teams_players", seasonId: null, sheetsText: {},
     report: null, validatedKey: null, committed: null, contextRevision: null };
   iceBuilder = null;
+  wizard = null;
+  conflict = null;
+  movingGameId = null;
+  pendingMove = null;
+  modal = null;
   if (drawer) {
     document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
     drawer = null; drawerError = ""; drawerValues = {};
@@ -15878,7 +16679,7 @@ function resetTransientUiState() {
   // permanently. Released here, where the departing identity's whole
   // transient state is; the render() that follows setUser() is what paints
   // the new identity's own controls.
-  contextSwitchIntentPending = false;
+  releaseContextSwitchIntentSettlement();
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

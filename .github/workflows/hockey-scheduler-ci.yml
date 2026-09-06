@@ -268,6 +268,7 @@ jobs:
           node --check hockey-scheduler/e2e/setup-card-write-identity.js
           node --check hockey-scheduler/e2e/setup-state-matrix.js
           node --check hockey-scheduler/e2e/home-tasks-state-matrix.js
+          node --check hockey-scheduler/e2e/scheduler-state-matrix.js
           node --check hockey-scheduler/e2e/breakpoint-contract.js
           node --check hockey-scheduler/e2e/breakpoint-boundaries.js
       - name: Check v1 route contract (#233 B2c)
@@ -317,7 +318,7 @@ jobs:
           - shard: 3
             scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience ice-availability-builder context-switcher league-context-bar league-filtered-data dashboard-season-ceiling role-home-journeys cross-team-substitution-ui role-authorization-matrix home-tasks-state-matrix bootstrap-program-selection"
           - shard: 4
-            scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete coach-scope player-lifecycle home-tasks-hub setup-progress-conflict-attention setup-accessibility-axe-gate setup-prerequisite-floors setup-card-write-identity calendar-today context-scope-truth"
+            scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete coach-scope player-lifecycle home-tasks-hub setup-progress-conflict-attention setup-accessibility-axe-gate setup-prerequisite-floors setup-card-write-identity calendar-today context-scope-truth scheduler-state-matrix"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -330,8 +330,10 @@ async function checkViewport(browser, viewport) {
     if (s.commitDisabled !== false) {
       fail(`race stub: needs an enabled Commit to click: ${JSON.stringify(s)}`);
     }
-    let expectedFingerprint = await page.evaluate(
-      () => schedulerState.preview && schedulerState.preview.draft_fingerprint);
+    let expectedFingerprint = await page.evaluate(() => {
+      const payload = cardDisplayPayload(readCardState(SCHEDULER_DRAFT_CARD));
+      return payload && payload.preview && payload.preview.draft_fingerprint;
+    });
     if (!expectedFingerprint) {
       fail(`race stub: no draft_fingerprint on the Generate response to compare against: ${expectedFingerprint}`);
     }
@@ -360,7 +362,8 @@ async function checkViewport(browser, viewport) {
     await page.click("[data-sched-commit]");
     await page.waitForFunction(
       () => /Mixed 0 vs Mixed 1 is already scheduled as Game game_stub_race/
-        .test((document.querySelector(".toast-msg") || {}).textContent || ""),
+        .test((document.querySelector(
+          '[data-operational-card="scheduler/draft"] .banner.alert') || {}).textContent || ""),
       null, { timeout: 10000 });
     // render() wipes #content to a loading skeleton SYNCHRONOUSLY, then does
     // several awaited fetches before the real content replaces it -- so
@@ -408,8 +411,10 @@ async function checkViewport(browser, viewport) {
     if (s.commitDisabled !== false) {
       fail(`stale-preview stub: needs an enabled Commit to click: ${JSON.stringify(s)}`);
     }
-    expectedFingerprint = await page.evaluate(
-      () => schedulerState.preview && schedulerState.preview.draft_fingerprint);
+    expectedFingerprint = await page.evaluate(() => {
+      const payload = cardDisplayPayload(readCardState(SCHEDULER_DRAFT_CARD));
+      return payload && payload.preview && payload.preview.draft_fingerprint;
+    });
     if (!expectedFingerprint) {
       fail(`stale-preview stub: no draft_fingerprint on the Generate response to compare against: ${expectedFingerprint}`);
     }
@@ -439,7 +444,8 @@ async function checkViewport(browser, viewport) {
     await page.keyboard.press("Enter");
     await page.waitForFunction(
       () => /This preview is out of date/
-        .test((document.querySelector(".toast-msg") || {}).textContent || ""),
+        .test((document.querySelector(
+          '[data-operational-card="scheduler/draft"] .banner.alert') || {}).textContent || ""),
       null, { timeout: 10000 });
     // render() wipes #content to a loading skeleton SYNCHRONOUSLY, then does
     // several awaited fetches before the real content (and the focus-restore
@@ -569,7 +575,7 @@ async function checkViewport(browser, viewport) {
       const F = window.hsFixture;
       // #409: the late registration below is SEASON-OWNED in this Season.
       await F.selectProgramSeason("Program+Season for the late registration",
-        leagueId, seasonId);
+        leagueId, seasonId, "api");
       await F.call("decoy team", "/api/v2/setup/team",
         { club_id: clubId, league_id: levelId, name: "(decoy)" });
       const e2 = await F.create("late team Eligibility 2", "/api/v2/setup/team",
@@ -583,7 +589,8 @@ async function checkViewport(browser, viewport) {
 
     await page.click("[data-sched-commit]");
     await page.waitForFunction(
-      () => /out of date/i.test((document.querySelector(".toast-msg") || {}).textContent || ""),
+      () => /out of date/i.test((document.querySelector(
+        '[data-operational-card="scheduler/draft"] .banner.alert') || {}).textContent || ""),
       null, { timeout: 10000 });
     await page.waitForFunction(
       () => !document.querySelector("[data-sched-commit]")
@@ -619,7 +626,22 @@ async function checkViewport(browser, viewport) {
     }
     console.log(`[${viewport.label}] OK — mixed and all-already-scheduled previews both name already-scheduled pairings distinctly from proposed games and conflicts, both a commit-time race refusal (naming the winning Game) and a stale-preview refusal show an actionable message then require a fresh Generate, and a real (unstubbed) team-registration change between Generate and Commit is refused by the real backend with zero Games created.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    const diagnostic = await page.evaluate(() => ({
+      view: typeof view === "undefined" ? null : view,
+      context: typeof contextOptions === "undefined" ? null : contextOptions,
+      draftCard: typeof readCardState === "function"
+        ? readCardState("scheduler/draft") : null,
+      renderPass: typeof renderPass === "undefined" ? null : renderPass,
+      contextRevision: typeof contextRevision === "undefined" ? null : contextRevision,
+      switchPending: typeof contextSwitchIntentPending === "undefined"
+        ? null : contextSwitchIntentPending,
+      scopedAborts: typeof contextScopedReadAborts === "undefined"
+        ? null : contextScopedReadAborts,
+      html: (document.getElementById("content") || {}).innerHTML || "",
+      content: (document.getElementById("content") || {}).innerText || "",
+    })).catch((e) => ({ diagnosticError: e.message }));
+    throw new Error(`${error.message}\n--- page state ---\n${JSON.stringify(diagnostic)}`
+      + `\n--- demo server output ---\n${serverOutput}`);
   } finally {
     await context.close();
     await stopServer(server);

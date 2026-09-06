@@ -1116,7 +1116,15 @@ async function checkRoleScenarios(browser, viewport) {
   await installContextFixture(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`) });
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    // This matrix deliberately drives handled 4xx/5xx responses to verify
+    // fail-closed card states. Chromium's URL-less network-status line adds
+    // no signal; the response ledger below preserves method/status/URL and
+    // the scenario assertions verify the actual UI outcome.
+    if (/Failed to load resource/i.test(m.text())) return;
+    errors.push(`[console] ${m.text()}`);
+  });
   // Chromium's console entry for a failed request is the bare, useless
   // "Failed to load resource: the server responded with a status of 404 (Not
   // Found)" -- it names neither the URL nor the method, so a stray request
@@ -1132,6 +1140,14 @@ async function checkRoleScenarios(browser, viewport) {
     + (httpFailures.length
       ? `\n--- non-2xx responses seen on this page ---\n${httpFailures.join("\n")}`
       : "");
+  const consumeHttpFailure = (status, method, path) => {
+    const prefix = `${status} ${method} `;
+    const index = httpFailures.findIndex(
+      (row) => row.startsWith(prefix) && row.includes(path));
+    if (index === -1) return false;
+    httpFailures.splice(index, 1);
+    return true;
+  };
   const axeSource = fs.readFileSync(AXE_PATH, "utf8");
   await page.route("**/__axe-core__.js", (route) => route.fulfill({
     status: 200, contentType: "application/javascript", body: axeSource,
@@ -1792,18 +1808,13 @@ async function checkRoleScenarios(browser, viewport) {
     await page.keyboard.press("Escape");
     await page.waitForFunction(() => !document.querySelector(".drawer"),
       null, { timeout: 10000 });
-    // The deliberately-injected hierarchy 500 above is expected to log a
-    // browser resource-load console error the same way checkViewport's own
-    // (9) does for /api/v2/setup/progress -- require at least one, proving
-    // the mock actually fired, then drop every matching message so any
-    // other, genuinely unexpected error still fails the gate below.
-    const unexpectedE1 = errors.filter((e) => !/responded with a status of 500/.test(e));
-    if (unexpectedE1.length === errors.length) {
-      fail("expected the deliberately failed hierarchy request to log a "
-        + `resource error, got:\n${errors.join("\n")}`);
+    // Prove the deliberately-injected failure fired from the response itself.
+    // Chromium's generic console error omits both method and URL, so it cannot
+    // distinguish this expected failure from an unrelated request failure.
+    if (!consumeHttpFailure(500, "GET", "/api/v2/setup/hierarchy")) {
+      fail("expected the deliberately failed hierarchy request in the HTTP "
+        + `failure ledger, got:\n${errorReport()}`);
     }
-    errors.length = 0;
-    errors.push(...unexpectedE1);
     // The successful retry's own goToSetupWorkflow() call switchTab()'d to
     // "setup" to host the drawer (E1's earlier, FAILED attempt never did --
     // it stayed on Home/Tasks) -- Escape only dismisses the drawer overlay,
@@ -2662,21 +2673,11 @@ async function checkRoleScenarios(browser, viewport) {
         + `generic not-found naming ${j.seasonJ4}, got `
         + `${j4Commit.status()} ${JSON.stringify(j4CommitBody)}`);
     }
-    // That deliberate refusal logs exactly one benign Chromium resource
-    // error. Consume THAT one and leave every other error standing — the
-    // console message can lag its own response, so wait for it rather than
-    // reading the list once and racing it.
-    const j4ErrDeadline = Date.now() + 5000;
-    let j4ErrIndex = errors.findIndex((e) => /status of 404/.test(e));
-    while (j4ErrIndex === -1 && Date.now() < j4ErrDeadline) {
-      await new Promise((r) => setTimeout(r, 50));
-      j4ErrIndex = errors.findIndex((e) => /status of 404/.test(e));
+    if (!consumeHttpFailure(
+        404, "POST", "/api/import/commit/teams-players")) {
+      fail("(J3) expected the refused straggling Commit in the exact HTTP "
+        + `failure ledger, got:\n${errorReport()}`);
     }
-    if (j4ErrIndex === -1) {
-      fail("(J3) expected the refused straggling Commit to log one 404 "
-        + `resource error, got:\n${errorReport()}`);
-    }
-    errors.splice(j4ErrIndex, 1);
     if (await page.$(".import-report")) {
       fail("(J3) expected a Commit response straggling in after the "
         + "switch to J5 fully settled to NOT paint a result banner there");
@@ -2743,15 +2744,10 @@ async function checkRoleScenarios(browser, viewport) {
         + "Commit after the NEWER identical-input request had already "
         + "failed");
     }
-    // Same deliberate-500 error-log allowance as (L, failure convergence)
-    // above.
-    const unexpectedJReorder = errors.filter((e) => !/responded with a status of 500/.test(e));
-    if (unexpectedJReorder.length === errors.length) {
+    if (!consumeHttpFailure(500, "POST", "/api/import/dry-run")) {
       fail("(J, same-input reorder) expected the deliberately failed "
-        + `newer Validate to log a resource error, got:\n${errors.join("\n")}`);
+        + `newer Validate in the HTTP failure ledger, got:\n${errorReport()}`);
     }
-    errors.length = 0;
-    errors.push(...unexpectedJReorder);
 
     // ---- (J, commit reorder) Same class as (J, same-input reorder) above,
     // but for Import's Commit instead of Validate (#331 review round 10
@@ -2813,15 +2809,11 @@ async function checkRoleScenarios(browser, viewport) {
         + "(released last) to be discarded and NOT overwrite the NEWER "
         + `Commit's own failure banner, got: ${JSON.stringify(jCommitReorderHeadings)}`);
     }
-    // Same deliberate-500 error-log allowance as (J, same-input reorder)
-    // above.
-    const unexpectedJCommitReorder = errors.filter((e) => !/responded with a status of 500/.test(e));
-    if (unexpectedJCommitReorder.length === errors.length) {
+    if (!consumeHttpFailure(
+        500, "POST", "/api/import/commit/teams-players")) {
       fail("(J, commit reorder) expected the deliberately failed newer "
-        + `Commit to log a resource error, got:\n${errors.join("\n")}`);
+        + `Commit in the HTTP failure ledger, got:\n${errorReport()}`);
     }
-    errors.length = 0;
-    errors.push(...unexpectedJCommitReorder);
 
     // ---- (J, type-switch reorder) A Validate held across a type switch
     // AWAY and back must still be recognized as stale, even though both the
@@ -3556,7 +3548,10 @@ async function checkRoleScenarios(browser, viewport) {
     await page.click("[data-ib-preview]");
     await kRpPreviewResp;
     await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
-    await page.evaluate(() => { iceBuilder.preview.template_fingerprint = "staledeadbeef01"; });
+    await page.evaluate(() => {
+      cardDisplayPayload(readCardState(ICE_BUILDER_CARD))
+        .preview.template_fingerprint = "staledeadbeef01";
+    });
     let releaseRepreviewA;
     const repreviewHoldA = new Promise((resolve) => { releaseRepreviewA = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -3580,20 +3575,11 @@ async function checkRoleScenarios(browser, viewport) {
         + "Commit rejection, released after cancel/reopen into builder B in "
         + "the SAME context -- to NOT paint a preview onto B");
     }
-    // The deliberately-corrupted fingerprint above makes the server refuse
-    // the Commit (preview_mismatch), which _send_api maps to an HTTP 400 --
-    // Chromium logs that as a resource-load console error regardless of app
-    // code handling it gracefully, same as the deliberate-500 cases
-    // elsewhere in this file. Require at least one, proving the mismatch
-    // actually fired, then drop every matching message so any other,
-    // genuinely unexpected error still fails the gate at the end.
-    const unexpectedKRp = errors.filter((e) => !/responded with a status of 400/.test(e));
-    if (unexpectedKRp.length === errors.length) {
+    if (!consumeHttpFailure(
+        400, "POST", "/api/setup/ice-availability/commit")) {
       fail("(K, cancel-reopen re-preview) expected the deliberately "
-        + `mismatched Commit to log a resource error, got:\n${errors.join("\n")}`);
+        + `mismatched Commit in the HTTP failure ledger, got:\n${errorReport()}`);
     }
-    errors.length = 0;
-    errors.push(...unexpectedKRp);
 
     // ---- (K, edit-during-preview) Editing the form while a Preview is in
     // flight must obsolete that Preview even when there was NO existing
@@ -3899,19 +3885,10 @@ async function checkRoleScenarios(browser, viewport) {
         + `rejected POST must never be treated as accepted -- got `
         + `${JSON.stringify(lServerContextAfterFailure)}`);
     }
-    // The deliberately-fulfilled 500 above is expected to log a browser
-    // resource-load console error the same way the hierarchy-fetch-error
-    // scenario's own comment documents further up in this file -- require
-    // at least one, proving the mock actually fired, then drop every
-    // matching message so any other, genuinely unexpected error still
-    // fails the gate at the end of this scenario.
-    const unexpectedL = errors.filter((e) => !/responded with a status of 500/.test(e));
-    if (unexpectedL.length === errors.length) {
+    if (!consumeHttpFailure(500, "POST", "/api/context")) {
       fail("(L, failure convergence) expected the deliberately failed "
-        + `switch to log a resource error, got:\n${errors.join("\n")}`);
+        + `switch in the HTTP failure ledger, got:\n${errorReport()}`);
     }
-    errors.length = 0;
-    errors.push(...unexpectedL);
 
     // ---- (L, queued-then-rejected hash sync) An intermediate switch
     // accepted by the server, with ANOTHER queued behind it, must still
@@ -4034,15 +4011,10 @@ async function checkRoleScenarios(browser, viewport) {
       fail(`(L, hash sync) expected LH2 (${switchToLH2}) to survive a `
         + `hash-INTACT reload, got ${lhReloadedValue}`);
     }
-    // Same deliberate-500 error-log allowance as (L, failure convergence)
-    // above.
-    const unexpectedLH = errors.filter((e) => !/responded with a status of 500/.test(e));
-    if (unexpectedLH.length === errors.length) {
+    if (!consumeHttpFailure(500, "POST", "/api/context")) {
       fail("(L, hash sync) expected the deliberately rejected LH3 switch "
-        + `to log a resource error, got:\n${errors.join("\n")}`);
+        + `in the HTTP failure ledger, got:\n${errorReport()}`);
     }
-    errors.length = 0;
-    errors.push(...unexpectedLH);
 
     // ---- (L, identity supersession) A switch QUEUED (not yet sent to the
     // server, per the coalescing fix above) when an identity change
@@ -4353,7 +4325,7 @@ async function checkRoleScenarios(browser, viewport) {
     await logout(page);
     await loginAs(page, "admin", "demo");
 
-    if (errors.length) {
+    if (errors.length || httpFailures.length) {
       fail(`console/page errors:\n${errorReport()}`);
     }
     console.log(`[${viewport.label}] OK — Register Team stays scoped to the `
