@@ -8274,6 +8274,15 @@ function wireCalendarCards(c) {
   const calendarCurrent = cardIdentityCurrent(calendarEntry.identity)
     && (calendarEntry.state === CARD_STATE.READY
         || calendarEntry.state === CARD_STATE.EMPTY);
+  // A Calendar response repaints this card without returning through
+  // render()'s cross-view wiring pass.  Generic Delete controls rendered by
+  // the board therefore belong in this card-local pass too; otherwise an ice
+  // slot's button remains visible after settlement but has no click handler.
+  // Do not pass a card identity: Calendar uses the ordinary setup delete
+  // endpoint, while an identity here denotes Scheduler Review's draft-discard
+  // transport in wireModal().
+  wireDeleteControls(c.querySelector(
+    `[data-operational-card="${CALENDAR_CARD}"]`));
   const calendarRetry = c.querySelector(
     `[data-card-retry="${CALENDAR_CARD}"]`);
   if (calendarRetry) calendarRetry.onclick = () =>

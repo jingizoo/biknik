@@ -220,16 +220,27 @@ async function checkViewport(browser, viewport) {
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] game cancel non-200`);
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
-    // (4) Scheduler draft game — Scheduler view offers Delete draft.
+    // (4) Scheduler draft game — Scheduler Review offers Delete draft through
+    // the scheduler's own discard contract, not the generic setup-game delete
+    // route.  This keeps the action bound to the independently repainted card
+    // identity while preserving the permanent-game cancellation boundary.
     await page.click('.tab[data-tab="scheduler"]');
     const draftDel = `[data-del="game"][data-del-id="${ids.draft}"]`;
     await page.waitForSelector(draftDel, { timeout: 15000 });
     await page.click(draftDel);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
     resp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/v2/setup/game/${ids.draft}/delete` && r.request().method() === "POST");
+      r.url() === `${base}/api/scheduler/drafts/discard`
+        && r.request().method() === "POST");
     await page.click("[data-del-confirm]");
-    if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] draft delete non-200`);
+    const discardResponse = await resp;
+    const discardBody = discardResponse.request().postDataJSON();
+    if (discardResponse.status() !== 200
+        || JSON.stringify(discardBody && discardBody.game_ids) !== JSON.stringify([ids.draft])) {
+      throw new Error(`[${viewport.label}] draft discard contract mismatch: ${JSON.stringify({
+        status: discardResponse.status(), body: discardBody,
+      })}`);
+    }
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
     // Verify the resulting server state.

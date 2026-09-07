@@ -769,6 +769,92 @@ async function immutableSnapshot(page, cardId) {
   };
 }
 
+// Card-only repainting replaces the control nodes without returning through
+// render()'s cross-view wiring pass.  Derive this oracle from the interactive
+// elements that the card actually rendered rather than from a hand-maintained
+// selector list: every semantic control must retain a matching direct or
+// delegated event handler on its new node.  The init-script listener ledger
+// below makes addEventListener bindings observable without activating (and
+// potentially committing) the controls.
+async function assertCardActionsWired(page, cardId, step) {
+  const observed = await page.evaluate((id) => {
+    const root = document.querySelector(`[data-operational-card="${id}"]`);
+    if (!root) return { exists: false, checked: 0, unwired: [] };
+    const controls = Array.from(root.querySelectorAll(
+      "button,select,input:not([type=hidden]),textarea,[role=button],[draggable=true]"));
+    const descriptor = (node) => {
+      const attrs = Array.from(node.attributes || [])
+        .filter((attr) => attr.name === "id" || attr.name === "type"
+          || attr.name === "role" || attr.name === "aria-label"
+          || attr.name.startsWith("data-"))
+        .map((attr) => `${attr.name}=${JSON.stringify(attr.value)}`)
+        .sort().join(" ");
+      const text = (node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80);
+      return `<${node.tagName.toLowerCase()}${attrs ? ` ${attrs}` : ""}> ${text}`;
+    };
+    const requiredEvents = (node) => {
+      const groups = [];
+      if (node.matches("button,[role=button]")) {
+        groups.push({ alternatives: ["click"], delegated: false });
+      }
+      if (node.matches("select,input[type=checkbox],input[type=radio]")) {
+        groups.push({ alternatives: ["change"], delegated: true });
+      } else if (node.matches("input,textarea")) {
+        groups.push({ alternatives: ["input", "change"], delegated: true });
+      }
+      if (node.matches("[draggable=true]")) {
+        groups.push({ alternatives: ["dragstart"], delegated: false });
+      }
+      return groups;
+    };
+    const unwired = [];
+    let checked = 0;
+    controls.forEach((node) => {
+      requiredEvents(node).forEach((requirement) => {
+        checked += 1;
+        const handlerRoot = requirement.delegated ? root : node;
+        const wired = requirement.alternatives.some((eventName) =>
+          window.__schedulerMatrixHasEventHandler(node, eventName, handlerRoot));
+        if (!wired) unwired.push({
+          control: descriptor(node),
+          alternatives: requirement.alternatives,
+          delegated: requirement.delegated,
+        });
+      });
+    });
+    return { exists: true, checked, unwired };
+  }, cardId);
+  if (!observed.exists || !observed.checked || observed.unwired.length) {
+    fail(`[${step}] ${cardId} independent repaint left action controls unwired: `
+      + JSON.stringify(observed));
+  }
+  return observed.checked;
+}
+
+async function showCalendarDeleteVariant(page, step) {
+  const observed = await page.evaluate((cardId) => {
+    const model = cardDisplayModel(readCardState(cardId));
+    const overview = model && model.payload && model.payload.overview;
+    const candidate = overview && (overview.ice_slots || []).find((slot) =>
+      slot.status === "available" && !slot.game_id && slot.start_time
+        && slot.start_time > new Date().toISOString());
+    if (!candidate) return { candidate: null, deleteControls: 0 };
+    calendarDate = candidate.start_time.slice(0, 10);
+    calendarMode = "day";
+    repaintCalendarSurface(cardId);
+    const root = document.querySelector(`[data-operational-card="${cardId}"]`);
+    return {
+      candidate: candidate.id,
+      deleteControls: root ? root.querySelectorAll(
+        `[data-del="ice-slot"][data-del-id="${candidate.id}"]`).length : 0,
+    };
+  }, CALENDAR_CARD);
+  if (!observed.candidate || observed.deleteControls !== 1) {
+    fail(`[${step}] could not establish one real future-slot Delete control: `
+      + JSON.stringify(observed));
+  }
+}
+
 function assertByteEqual(step, before, after) {
   if (JSON.stringify(before) !== JSON.stringify(after)) {
     fail(`[${step}] stale response mutated the current surface\nBEFORE `
@@ -870,6 +956,44 @@ async function checkViewport(browser, viewport) {
     width: viewport.width, height: viewport.height,
   } });
   const page = await context.newPage();
+  await page.addInitScript(() => {
+    const listeners = new WeakMap();
+    const originalAdd = EventTarget.prototype.addEventListener;
+    const originalRemove = EventTarget.prototype.removeEventListener;
+    EventTarget.prototype.addEventListener = function addTrackedListener(
+      type, listener, options) {
+      if (listener) {
+        let byType = listeners.get(this);
+        if (!byType) {
+          byType = new Map();
+          listeners.set(this, byType);
+        }
+        let registered = byType.get(type);
+        if (!registered) {
+          registered = new Set();
+          byType.set(type, registered);
+        }
+        registered.add(listener);
+      }
+      return originalAdd.call(this, type, listener, options);
+    };
+    EventTarget.prototype.removeEventListener = function removeTrackedListener(
+      type, listener, options) {
+      const byType = listeners.get(this);
+      const registered = byType && byType.get(type);
+      if (registered) registered.delete(listener);
+      return originalRemove.call(this, type, listener, options);
+    };
+    window.__schedulerMatrixHasEventHandler = (node, type, root) => {
+      for (let current = node; current; current = current.parentNode) {
+        if (typeof current[`on${type}`] === "function") return true;
+        const byType = listeners.get(current);
+        if (byType && byType.get(type) && byType.get(type).size) return true;
+        if (current === root) break;
+      }
+      return false;
+    };
+  });
   const tracker = { inFlight: new Set(), sequence: 0 };
   const nonOk = [];
   const requestFailures = [];
@@ -964,6 +1088,8 @@ async function checkViewport(browser, viewport) {
     await waitForReleased(page, channels.draft, draftReleased, `${label}/draft-ready`);
     await assertState(page, coverage, DRAFT_CARD, "ready", `${label}/draft-ready`,
       "Matrix A Ready");
+    await assertCardActionsWired(page, DRAFT_CARD,
+      `${label}/draft-ready-actions`);
 
     // A view change is not a context or identity change. The legacy Scheduler
     // retained its uncommitted proposal across navigation; putting the payload
@@ -1077,6 +1203,8 @@ async function checkViewport(browser, viewport) {
     await waitForCardState(page, REVIEW_CARD, "ready", `${label}/review-ready`);
     await assertState(page, coverage, REVIEW_CARD, "ready", `${label}/review-ready`,
       "Matrix A Ready");
+    await assertCardActionsWired(page, REVIEW_CARD,
+      `${label}/review-ready-actions`);
 
     // A Review checkbox is local interaction state, not durable context data.
     // Select one row, leave Scheduler, and queue A -> B -> A while B's context
@@ -1255,6 +1383,9 @@ async function checkViewport(browser, viewport) {
     await waitForReleased(page, channels.overview, calendarReleased, `${label}/calendar-ready`);
     await assertState(page, coverage, CALENDAR_CARD, "ready", `${label}/calendar-ready`,
       "Matrix A Ice");
+    await showCalendarDeleteVariant(page, `${label}/calendar-delete-variant`);
+    await assertCardActionsWired(page, CALENDAR_CARD,
+      `${label}/calendar-ready-actions`);
 
     const calendarB = armHold(channels.overview);
     await startContextSwitch(page, ids.pb, ids.sb, `${label}/calendar-stale-switch`);
@@ -1307,6 +1438,8 @@ async function checkViewport(browser, viewport) {
     await waitForReleased(page, channels.ice, builderReleased, `${label}/builder-ready`);
     await assertState(page, coverage, BUILDER_CARD, "ready", `${label}/builder-ready`,
       "Matrix A Ice");
+    await assertCardActionsWired(page, BUILDER_CARD,
+      `${label}/builder-ready-actions`);
 
     // Ice Commit owns its own failure branch. A generic 500 must be exposed
     // only through the card alert; reload its options through the scoped Retry
