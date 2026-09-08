@@ -196,6 +196,30 @@ async function checkViewport(browser, viewport) {
     if (shown !== day) fail(`calendar shows ${shown}, ice was booked on ${day}`);
     const slotDel = `.slot-del[data-del="ice-slot"][data-del-id="${ids.slotFree}"]`;
     await page.waitForSelector(slotDel, { timeout: 15000 });
+    // The native Delete button is nested inside a slot card that is itself a
+    // role=button schedule target. Enter and Space must activate the native
+    // child only; the global role-button shim must not promote either key to
+    // the ancestor and open the game wizard first.
+    for (const key of ["Enter", "Space"]) {
+      await page.focus(slotDel);
+      await page.keyboard.press(key);
+      await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
+      const keyboardTarget = await page.evaluate(() => ({
+        type: modal && modal.type,
+        kind: modal && modal.kind,
+        id: modal && modal.id,
+        wizardOpen: !!wizard,
+      }));
+      if (keyboardTarget.type !== "confirm-delete"
+          || keyboardTarget.kind !== "ice-slot"
+          || keyboardTarget.id !== ids.slotFree
+          || keyboardTarget.wizardOpen) {
+        fail(`${key} on nested Calendar Delete activated the wrong target: `
+          + JSON.stringify(keyboardTarget));
+      }
+      await page.locator(".modal button[data-modal-close]").last().click();
+      await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    }
     await page.click(slotDel);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
     resp = page.waitForResponse((r) =>
@@ -220,16 +244,27 @@ async function checkViewport(browser, viewport) {
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] game cancel non-200`);
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
-    // (4) Scheduler draft game — Scheduler view offers Delete draft.
+    // (4) Scheduler draft game — Scheduler Review offers Delete draft through
+    // the scheduler's own discard contract, not the generic setup-game delete
+    // route.  This keeps the action bound to the independently repainted card
+    // identity while preserving the permanent-game cancellation boundary.
     await page.click('.tab[data-tab="scheduler"]');
     const draftDel = `[data-del="game"][data-del-id="${ids.draft}"]`;
     await page.waitForSelector(draftDel, { timeout: 15000 });
     await page.click(draftDel);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
     resp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/v2/setup/game/${ids.draft}/delete` && r.request().method() === "POST");
+      r.url() === `${base}/api/scheduler/drafts/discard`
+        && r.request().method() === "POST");
     await page.click("[data-del-confirm]");
-    if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] draft delete non-200`);
+    const discardResponse = await resp;
+    const discardBody = discardResponse.request().postDataJSON();
+    if (discardResponse.status() !== 200
+        || JSON.stringify(discardBody && discardBody.game_ids) !== JSON.stringify([ids.draft])) {
+      throw new Error(`[${viewport.label}] draft discard contract mismatch: ${JSON.stringify({
+        status: discardResponse.status(), body: discardBody,
+      })}`);
+    }
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
     // Verify the resulting server state.

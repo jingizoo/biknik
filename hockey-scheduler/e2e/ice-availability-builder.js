@@ -374,7 +374,10 @@ async function checkViewport(browser, viewport) {
     await preview(page);
     s = await previewState(page);
     if (s.commitDisabled !== false) fail(`refresh test needs an enabled Create: ${JSON.stringify(s)}`);
-    await page.evaluate(() => { iceBuilder.preview.template_fingerprint = "staledeadbeef00"; });
+    await page.evaluate(() => {
+      cardDisplayPayload(readCardState(ICE_BUILDER_CARD))
+        .preview.template_fingerprint = "staledeadbeef00";
+    });
     await page.click("[data-ib-commit]");
     // The commit is refused and the UI re-previews the current proposal — its
     // toast announces the refresh (only the preview_mismatch branch sets it).
@@ -789,7 +792,8 @@ async function checkViewport(browser, viewport) {
     }
     // Exact UTC duration/tuple: a real 60-minute slot (06:00Z-07:00Z), never
     // the misleading 2h the "01:00-03:00" clock reading alone would suggest.
-    let crossPv = await page.evaluate(() => iceBuilder.preview.slots[0]);
+    let crossPv = await page.evaluate(() =>
+      cardDisplayPayload(readCardState(ICE_BUILDER_CARD)).preview.slots[0]);
     if (crossPv.start_time !== "2027-03-14T06:00:00+00:00"
         || crossPv.end_time !== "2027-03-14T07:00:00+00:00") {
       fail(`unexpected UTC tuple for the spring-crossing slot: ${JSON.stringify(crossPv)}`);
@@ -855,7 +859,8 @@ async function checkViewport(browser, viewport) {
     }
     // Exact UTC duration/tuple: a real 120-minute slot (05:00Z-07:00Z), never
     // the misleading 1h the "01:00-02:00" clock reading alone would suggest.
-    crossPv = await page.evaluate(() => iceBuilder.preview.slots[0]);
+    crossPv = await page.evaluate(() =>
+      cardDisplayPayload(readCardState(ICE_BUILDER_CARD)).preview.slots[0]);
     if (crossPv.start_time !== "2026-11-01T05:00:00+00:00"
         || crossPv.end_time !== "2026-11-01T07:00:00+00:00") {
       fail(`unexpected UTC tuple for the fall-crossing slot: ${JSON.stringify(crossPv)}`);

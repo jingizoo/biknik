@@ -90,7 +90,7 @@ function previewState(page) {
       text: pv.textContent.replace(/\s+/g, " ").trim(),
       // The raw proposal behind the render — asserting the DOM alone could
       // pass on a UI that merely hides an impossible row the API still offers.
-      preview: schedulerState.preview,
+      preview: cardDisplayPayload(readCardState(SCHEDULER_DRAFT_CARD)).preview,
     };
   });
 }
