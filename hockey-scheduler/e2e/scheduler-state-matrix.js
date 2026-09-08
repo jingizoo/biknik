@@ -57,6 +57,8 @@ const DRAFT_CARD = "scheduler/draft";
 const REVIEW_CARD = "scheduler/review";
 const BUILDER_CARD = "facilities/ice-builder";
 const CALENDAR_CARD = "calendar/board";
+const SEMANTIC_CONTROL_SELECTOR =
+  "button,select,input:not([type=hidden]),textarea,[role=button],[draggable=true]";
 
 const DRAFT_RE = /\/api\/scheduler\/draft$/;
 const DRAFT_COMMIT_RE = /\/api\/scheduler\/commit$/;
@@ -64,20 +66,10 @@ const DRAFTS_RE = /\/api\/scheduler\/drafts(?:\?|$)/;
 const PUBLISH_RE = /\/api\/scheduler\/drafts\/publish$/;
 const ICE_PREVIEW_RE = /\/api\/setup\/ice-availability\/preview$/;
 const ICE_COMMIT_RE = /\/api\/setup\/ice-availability\/commit$/;
+const ADD_ICE_RE = /\/api\/demo\/add-ice-slot$/;
 const OVERVIEW_RE = /\/api\/demo\/overview(?:\?|$)/;
 const CONTEXT_OPTIONS_RE = /\/api\/context\/options(?:\?|$)/;
 const CONTEXT_RE = /\/api\/context$/;
-
-const MUTATION_SELECTORS = Object.freeze({
-  // Preview/Generate and row selection are supersedable reads or local
-  // choices.  The loading/stale contract withdraws persisted writes; it does
-  // not make a same-tuple read-only computation artificially single-flight.
-  [DRAFT_CARD]: "[data-sched-commit]",
-  [REVIEW_CARD]: "[data-sched-publish],[data-sched-discard],[data-del]",
-  [BUILDER_CARD]: "[data-ib-commit]",
-  [CALENDAR_CARD]: "[data-addslot],[data-game],[data-move-game],"
-    + "[data-move-confirm],[data-schedule-confirm]",
-});
 
 function fail(message) { throw new Error(message); }
 function trace(message) { console.error(`  · ${message}`); }
@@ -345,10 +337,29 @@ function operationalSelector(cardId) {
 }
 
 async function cardSnapshot(page, cardId) {
-  return page.evaluate(([id, mutationSelector]) => {
+  return page.evaluate(([id, semanticControlSelector]) => {
     const root = Array.from(document.querySelectorAll("[data-operational-card]"))
       .find((node) => node.getAttribute("data-operational-card") === id);
     const plain = (value) => JSON.parse(JSON.stringify(value));
+    const descriptor = (node) => {
+      const attrs = Array.from(node.attributes || [])
+        .filter((attr) => attr.name === "id" || attr.name === "type"
+          || attr.name === "role" || attr.name === "aria-label"
+          || attr.name.startsWith("data-"))
+        .map((attr) => `${attr.name}=${JSON.stringify(attr.value)}`)
+        .sort().join(" ");
+      const text = (node.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80);
+      return `<${node.tagName.toLowerCase()}${attrs ? ` ${attrs}` : ""}> ${text}`;
+    };
+    const semanticControls = root
+      ? Array.from(root.querySelectorAll(semanticControlSelector)) : [];
+    // The read-only contract is fail-closed over every semantic control the
+    // card actually rendered. Only local/supersedable choices and the one
+    // Refresh/Retry escape hatch are explicitly exempt; adding a new button,
+    // input, role-button or draggable automatically joins this inventory.
+    const mutations = semanticControls.filter((node) =>
+      !node.matches("[data-card-retry],[data-card-local-control]")
+        && !node.closest("[data-card-local-controls]"));
     const active = document.activeElement;
     const toastRoot = document.getElementById("toast-root");
     let model = null;
@@ -361,8 +372,7 @@ async function cardSnapshot(page, cardId) {
       role: root ? root.getAttribute("role") : null,
       text: root ? root.textContent.replace(/\s+/g, " ").trim() : "",
       html: root ? root.innerHTML : "",
-      mutations: root && mutationSelector
-        ? root.querySelectorAll(mutationSelector).length : 0,
+      mutations: mutations.map(descriptor),
       buttons: root ? Array.from(root.querySelectorAll("button")).map((b) => ({
         text: b.textContent.replace(/\s+/g, " ").trim(),
         retry: b.getAttribute("data-card-retry"),
@@ -390,7 +400,7 @@ async function cardSnapshot(page, cardId) {
       toast: toastRoot && !toastRoot.hidden
         ? toastRoot.textContent.replace(/\s+/g, " ").trim() : "",
     };
-  }, [cardId, MUTATION_SELECTORS[cardId] || ""]);
+  }, [cardId, SEMANTIC_CONTROL_SELECTOR]);
 }
 
 async function waitForCardState(page, cardId, state, step) {
@@ -433,16 +443,57 @@ async function assertProductionAxes(page, label) {
     cards: typeof SCHEDULE_FACILITY_CARD_IDS === "undefined"
       ? null : Array.from(SCHEDULE_FACILITY_CARD_IDS),
     states: typeof CARD_STATE === "undefined" ? null : Object.values(CARD_STATE),
-    // The owner called out this exact post-await boundary for a mutation
-    // probe. commitCardState() independently repeats the identity check, so
-    // the behavioral race below proves the protection as a whole while this
-    // structural assertion keeps the Generate entry point's own guard from
-    // silently becoming dead documentation.
+    // Every persisted operational-card write must cross one shared settlement
+    // barrier. The owner list is the complete production write surface: its
+    // wrapper count pins all nine current writes, while the raw-call scan keeps
+    // a new branch inside any owner from bypassing the helper.
+    operationalWrites: (() => {
+      const owners = [wireModal, previewIceBuilder, wireCalendarCards,
+        generateSchedulerDraft, wireSchedulerCards];
+      const rows = owners.map((owner) => ({
+        name: owner.name,
+        source: String(owner),
+      }));
+      const rawOwners = rows.filter((row) => /\bpostScoped\s*\(/.test(row.source))
+        .map((row) => row.name);
+      const wrapperCalls = rows.reduce((total, row) => total
+        + (row.source.match(/\bpostOperationalCardScoped\s*\(/g) || []).length, 0);
+      const withdrawnGuards = rows.reduce((total, row) => total
+        + (row.source.match(/=== OPERATIONAL_CARD_WRITE_WITHDRAWN/g) || []).length, 0);
+      const helper = String(postOperationalCardScoped);
+      const intent = helper.indexOf("contextSwitchIntentPending");
+      const preIdentity = helper.indexOf("!cardIdentityCurrent(identity)", intent);
+      const preWithdrawn = helper.indexOf(
+        "return OPERATIONAL_CARD_WRITE_WITHDRAWN", preIdentity);
+      const post = helper.indexOf("await postScoped(path, body)", preWithdrawn);
+      const settle = helper.indexOf(
+        "await awaitOperationalCardContextSettlement(identity)", post);
+      const postIdentity = helper.indexOf("cardIdentityCurrent(identity)", settle);
+      const postWithdrawn = helper.indexOf("OPERATIONAL_CARD_WRITE_WITHDRAWN", postIdentity);
+      const withdrawal = String(withdrawContextScopedActionControls);
+      const withdrawalSelectors = ["[data-publish]", "[data-move-undo]",
+        "[data-del-confirm]"].every((selector) => withdrawal.includes(selector));
+      const cleanup = String(invalidateAcceptedScheduleFacilityContext);
+      const cleanupState = ["wizard", "conflict", "pendingMove", "movingGameId",
+        "modal"].every((name) => cleanup.includes(`${name} = null`));
+      const acceptedCalls = (String(sendContextSwitch).match(
+        /if \(acceptedContextMoved\) invalidateAcceptedScheduleFacilityContext\(\);/g)
+        || []).length;
+      return { rawOwners, wrapperCalls, withdrawnGuards,
+        withdrawalSelectors, cleanupState, acceptedCalls,
+        helperOrdered: intent >= 0 && preIdentity > intent
+          && preWithdrawn > preIdentity && post > preWithdrawn
+          && settle > post && postIdentity > settle
+          && postWithdrawn > postIdentity };
+    })(),
+    // commitCardState() independently repeats the identity check, but keep
+    // Generate's direct outcome guard pinned too: deleting it must not turn
+    // that documented defense-in-depth boundary into dead prose.
     generateGuarded: (() => {
       if (typeof generateSchedulerDraft !== "function") return false;
       const source = String(generateSchedulerDraft);
       const request = source.indexOf(
-        'await postScoped("/api/scheduler/draft", request)');
+        'await postOperationalCardScoped(\n    identity, "/api/scheduler/draft", request)');
       const guard = source.indexOf(
         "if (!cardIdentityCurrent(identity)) return;", request);
       const outcome = source.indexOf("if (result && !result.error)", request);
@@ -458,6 +509,17 @@ async function assertProductionAxes(page, label) {
   if (missingStates.length) {
     fail(`[${label}] production no longer declares the journey's state axis: `
       + `${missingStates.join(", ")}`);
+  }
+  if (!production.operationalWrites.helperOrdered
+      || production.operationalWrites.wrapperCalls !== 9
+      || production.operationalWrites.withdrawnGuards !== 9
+      || !production.operationalWrites.withdrawalSelectors
+      || !production.operationalWrites.cleanupState
+      || production.operationalWrites.acceptedCalls !== 2
+      || production.operationalWrites.rawOwners.length) {
+    fail(`[${label}] operational write settlement axis diverged: expected 9 `
+      + `writes with caller withdrawal guards behind one two-sided helper, got ${JSON.stringify(
+        production.operationalWrites)}`);
   }
   if (!production.generateGuarded) {
     fail(`[${label}] Generate must reject a superseded card identity directly `
@@ -481,8 +543,9 @@ async function assertState(page, coverage, cardId, state, step, marker) {
     if (!/(load|refresh|generat|review|working|waiting)/i.test(got.text)) {
       fail(`[${step}] ${cardId} loading state has no labelled progress text: ${got.text}`);
     }
-    if (got.mutations) {
-      fail(`[${step}] ${cardId} exposes ${got.mutations} mutation control(s) while loading`);
+    if (got.mutations.length) {
+      fail(`[${step}] ${cardId} exposes mutation control(s) while loading: `
+        + JSON.stringify(got.mutations));
     }
   } else if (state === "ready") {
     if (marker && !got.text.includes(marker)) {
@@ -505,8 +568,9 @@ async function assertState(page, coverage, cardId, state, step, marker) {
       fail(`[${step}] ${cardId} STALE must offer exactly its own Refresh, got `
         + `${got.retryCount}`);
     }
-    if (got.mutations) {
-      fail(`[${step}] ${cardId} STALE exposes ${got.mutations} obsolete mutation control(s)`);
+    if (got.mutations.length) {
+      fail(`[${step}] ${cardId} STALE exposes obsolete mutation control(s): `
+        + JSON.stringify(got.mutations));
     }
   } else if (state === "error") {
     if (!got.alertCount) fail(`[${step}] ${cardId} ERROR has no role=alert`);
@@ -517,6 +581,303 @@ async function assertState(page, coverage, cardId, state, step, marker) {
   }
   coverage.mark(cardId, state);
   return got;
+}
+
+async function operationalSiblingSnapshot(page, targetCardId) {
+  return page.evaluate(([ids, target]) => {
+    const plain = (value) => JSON.parse(JSON.stringify(value));
+    return ids.filter((id) => id !== target).map((id) => {
+      const root = document.querySelector(`[data-operational-card="${id}"]`);
+      return {
+        id,
+        generation: cardGenerations[id] || 0,
+        model: plain(readCardState(id)),
+        html: root ? root.innerHTML : null,
+      };
+    });
+  }, [CARD_IDS, targetCardId]);
+}
+
+// Refresh each real EMPTY card through its shipped loader. EMPTY is retained
+// internally because it can carry an authoritative summary or editable local
+// template, but the loading UI must not call that absence "data" or serialize
+// a READY-looking zero-row Review shell. The sibling snapshot also pins the
+// independent-repaint boundary while each target is in flight.
+async function assertEmptyRefresh(page, tracker, ledger, cardId, channel,
+    trigger, step) {
+  await quiesce(page, tracker, `${step}/before`);
+  const before = await cardSnapshot(page, cardId);
+  if (before.state !== "empty") {
+    fail(`[${step}] ${cardId} did not start from EMPTY: ${JSON.stringify(before)}`);
+  }
+  const siblingsBefore = await operationalSiblingSnapshot(page, cardId);
+  const held = armHold(channel);
+  await trigger();
+  const response = await held.captured;
+  if (response.status !== 200) {
+    fail(`[${step}] ${cardId} refresh was not a real successful response: `
+      + JSON.stringify(response));
+  }
+  const loading = await waitForCardState(page, cardId, "loading", `${step}/loading`);
+  if (!loading.model || !loading.model.retained
+      || loading.model.retained.state !== "empty"
+      || !/previous empty result/i.test(loading.text)
+      || /showing (?:the last loaded |read-only )?data/i.test(loading.text)) {
+    fail(`[${step}] ${cardId} misrepresented its retained EMPTY result: `
+      + JSON.stringify(loading));
+  }
+  if (cardId === REVIEW_CARD
+      && (!loading.html.includes('data-card-empty="review"')
+        || loading.text.includes("No draft games match these filters"))) {
+    fail(`[${step}] Review rendered a READY-looking zero-row shell while `
+      + `refreshing EMPTY: ${JSON.stringify(loading)}`);
+  }
+  const siblingsDuring = await operationalSiblingSnapshot(page, cardId);
+  if (JSON.stringify(siblingsDuring) !== JSON.stringify(siblingsBefore)) {
+    fail(`[${step}] ${cardId} refresh mutated a sibling while loading: before `
+      + `${JSON.stringify(siblingsBefore)}, during ${JSON.stringify(siblingsDuring)}`);
+  }
+  const released = channel.released;
+  held.release();
+  await waitForReleased(page, channel, released, `${step}/release`);
+  await waitForCardState(page, cardId, "empty", `${step}/settled`);
+  await quiesce(page, tracker, `${step}/settled`);
+  const siblingsAfter = await operationalSiblingSnapshot(page, cardId);
+  if (JSON.stringify(siblingsAfter) !== JSON.stringify(siblingsBefore)) {
+    fail(`[${step}] ${cardId} refresh mutated a sibling after settlement: before `
+      + `${JSON.stringify(siblingsBefore)}, after ${JSON.stringify(siblingsAfter)}`);
+  }
+  ledger.add(cardId);
+}
+
+function armCardReadAfterSiblings(channel, skippedSiblingReads) {
+  return skippedSiblingReads
+    ? armHoldAfter(channel, skippedSiblingReads) : armHold(channel);
+}
+
+// A tuple round trip can return to the tuple that owns a retained EMPTY while
+// its replacement read is still in flight. The retained display model is then
+// STALE/staleFrom=EMPTY rather than directly EMPTY; that provenance must keep
+// the same truthful "previous empty result" copy across every operational
+// card instead of calling the absence "data" just because the outer model is
+// LOADING. Both holds are real, already-computed responses: the away response
+// is retired while the return intent is pending, then a distinct return read
+// is held so the exact nested model is observable.
+async function assertEmptyRoundTripLoading(page, tracker, cardId, channel,
+    contextChannel, skippedSiblingReads, origin, away, step) {
+  await quiesce(page, tracker, `${step}/origin`);
+  const initial = await cardSnapshot(page, cardId);
+  if (initial.state !== "empty" || !initial.model || !initial.model.payload) {
+    fail(`[${step}] ${cardId} did not begin with a real payload-bearing EMPTY: `
+      + JSON.stringify(initial));
+  }
+
+  const awayRead = armCardReadAfterSiblings(channel, skippedSiblingReads);
+  await startContextSwitch(page, away.programId, away.seasonId,
+    `${step}/away-switch`);
+  const awayResponse = await awayRead.captured;
+  if (awayResponse.status !== 200 || !awayResponse.body) {
+    fail(`[${step}] ${cardId} away replacement was not a real successful read: `
+      + JSON.stringify(awayResponse));
+  }
+  await waitForSelectedTuple(page, away.programId, away.seasonId, true,
+    `${step}/away-selected`);
+  const stale = await waitForCardState(page, cardId, "stale", `${step}/away-stale`);
+  if (!stale.model || !stale.model.retained
+      || stale.model.retained.state !== "stale"
+      || stale.model.retained.staleFrom !== "empty") {
+    fail(`[${step}] ${cardId} did not retain EMPTY provenance while away: `
+      + JSON.stringify(stale));
+  }
+
+  // POST /api/context mutates the server before its response reaches the app.
+  // Hold that return echo, then retire the away read while the return intent
+  // has already invalidated its identity. Only after the channel is free can
+  // the distinct origin replacement be armed.
+  const returnContext = armHold(contextChannel);
+  await startContextSwitch(page, origin.programId, origin.seasonId,
+    `${step}/return-switch`);
+  // The switch pipeline cancels and drains the old scoped read before it is
+  // allowed to POST the new context. Release only after the return intent is
+  // queued, then observe the computed context echo on the far side of that
+  // settlement barrier.
+  const awayReleased = channel.released;
+  awayRead.release();
+  await waitForReleased(page, channel, awayReleased, `${step}/away-release`);
+  const returnEcho = await returnContext.captured;
+  if (returnEcho.status !== 200 || !returnEcho.body
+      || returnEcho.body.program_id !== origin.programId
+      || returnEcho.body.season_id !== origin.seasonId) {
+    fail(`[${step}] ${cardId} return switch was not committed by the server: `
+      + JSON.stringify(returnEcho));
+  }
+
+  const originRead = armCardReadAfterSiblings(channel, skippedSiblingReads);
+  const returnContextReleased = contextChannel.released;
+  returnContext.release();
+  await waitForReleased(page, contextChannel, returnContextReleased,
+    `${step}/return-context-release`);
+  const originResponse = await originRead.captured;
+  if (originResponse.status !== 200 || !originResponse.body) {
+    fail(`[${step}] ${cardId} return replacement was not a real successful read: `
+      + JSON.stringify(originResponse));
+  }
+  await waitForSelectedTuple(page, origin.programId, origin.seasonId, true,
+    `${step}/origin-selected`);
+  await quiesce(page, tracker, `${step}/origin-loading`, 1);
+
+  const siblingsBefore = await operationalSiblingSnapshot(page, cardId);
+  const loading = await waitForCardState(page, cardId, "loading",
+    `${step}/return-loading`);
+  if (!loading.model || !loading.model.retained
+      || loading.model.retained.state !== "stale"
+      || loading.model.retained.staleFrom !== "empty") {
+    fail(`[${step}] ${cardId} did not reach the retained EMPTY return model: `
+      + JSON.stringify(loading));
+  }
+  const representationFailures = [];
+  if (!/previous empty result/i.test(loading.text)
+      || /showing (?:the last loaded |read-only )?data/i.test(loading.text)) {
+    representationFailures.push(`${cardId} called its retained EMPTY data`);
+  }
+  if (cardId === REVIEW_CARD
+      && (!loading.html.includes('data-card-empty="review"')
+        || loading.text.includes("No draft games match these filters"))) {
+    representationFailures.push(
+      "scheduler/review serialized its READY-only zero-row shell");
+  }
+  await page.waitForTimeout(QUIET_WINDOW_MS);
+  const siblingsDuring = await operationalSiblingSnapshot(page, cardId);
+  if (JSON.stringify(siblingsDuring) !== JSON.stringify(siblingsBefore)) {
+    fail(`[${step}] ${cardId} return hold mutated a sibling: before `
+      + `${JSON.stringify(siblingsBefore)}, during ${JSON.stringify(siblingsDuring)}`);
+  }
+
+  const originReleased = channel.released;
+  originRead.release();
+  await waitForReleased(page, channel, originReleased, `${step}/origin-release`);
+  await waitForCardState(page, cardId, "empty", `${step}/origin-empty`);
+  await quiesce(page, tracker, `${step}/origin-settled`);
+  const siblingsAfter = await operationalSiblingSnapshot(page, cardId);
+  if (JSON.stringify(siblingsAfter) !== JSON.stringify(siblingsBefore)) {
+    fail(`[${step}] ${cardId} settlement mutated a sibling: before `
+      + `${JSON.stringify(siblingsBefore)}, after ${JSON.stringify(siblingsAfter)}`);
+  }
+  return representationFailures;
+}
+
+// Review rows may legitimately have no Division (League-wide game) or no
+// resolved Rink (historical/detached slot). Exercise the renderer directly so
+// those nullable DTO fields cannot turn into a blank option that filters its
+// own row away. The foreign-key leg also pins stale local filter state: a key
+// absent from the current Review inventory must behave and render as All.
+async function assertReviewFilterEdges(page, step) {
+  const siblingsBefore = await operationalSiblingSnapshot(page, REVIEW_CARD);
+  const fixture = await page.evaluate((cardId) => {
+    const entry = readCardState(cardId);
+    const drafts = entry && entry.payload && entry.payload.drafts || [];
+    if (entry.state !== CARD_STATE.READY || !drafts.length) {
+      return { installed: false, state: entry && entry.state, drafts: drafts.length };
+    }
+    const gameId = "matrix-review-unassigned-axis";
+    const source = drafts[0];
+    const synthetic = Object.assign({}, source, {
+      game_id: gameId,
+      division_id: null,
+      division_name: null,
+      rink_id: null,
+      rink_name: null,
+      home_team_name: "Matrix Unassigned Home",
+      away_team_name: "Matrix Unassigned Away",
+    });
+    window.__schedulerMatrixReviewFilterOriginal = {
+      entry,
+      filters: Object.assign({}, schedulerState.filters),
+    };
+    cardStates[cardId] = Object.assign({}, entry, {
+      payload: Object.assign({}, entry.payload, {
+        drafts: drafts.concat([synthetic]),
+        selected: new Set(entry.payload.selected || []),
+      }),
+    });
+    schedulerState.filters = { division: "all", rink: "all", issue: "all" };
+    repaintSchedulerSurface(cardId);
+    const options = (selector) => Array.from(
+      document.querySelector(selector).options).filter(
+      (option) => option.value === SCHEDULER_REVIEW_UNASSIGNED_FILTER)
+      .map((option) => ({ value: option.value, label: option.textContent.trim() }));
+    return {
+      installed: true,
+      gameId,
+      sentinel: SCHEDULER_REVIEW_UNASSIGNED_FILTER,
+      sentinelInjective: schedulerReviewFilterValue(
+        SCHEDULER_REVIEW_UNASSIGNED_FILTER) !== SCHEDULER_REVIEW_UNASSIGNED_FILTER,
+      divisionOptions: options("#sched-filter-div"),
+      rinkOptions: options("#sched-filter-rink"),
+    };
+  }, REVIEW_CARD);
+  if (!fixture.installed || !fixture.sentinelInjective
+      || JSON.stringify(fixture.divisionOptions)
+        !== JSON.stringify([{ value: fixture.sentinel, label: "Unassigned" }])
+      || JSON.stringify(fixture.rinkOptions)
+        !== JSON.stringify([{ value: fixture.sentinel, label: "Unassigned" }])) {
+    fail(`[${step}] nullable Review axes were not represented by one explicit, `
+      + `injective Unassigned option: ${JSON.stringify(fixture)}`);
+  }
+
+  const filteredRow = async (selector) => {
+    await page.selectOption(selector, fixture.sentinel);
+    return page.evaluate(([cardId, gameId]) => {
+      const root = document.querySelector(`[data-operational-card="${cardId}"]`);
+      return {
+        rowVisible: !!(root && root.querySelector(
+          `[data-sched-pick="${CSS.escape(gameId)}"]`)),
+        visibleRows: root ? root.querySelectorAll("[data-sched-pick]").length : 0,
+      };
+    }, [REVIEW_CARD, fixture.gameId]);
+  };
+  const byDivision = await filteredRow("#sched-filter-div");
+  await page.selectOption("#sched-filter-div", "all");
+  const byRink = await filteredRow("#sched-filter-rink");
+  if (!byDivision.rowVisible || byDivision.visibleRows !== 1
+      || !byRink.rowVisible || byRink.visibleRows !== 1) {
+    fail(`[${step}] selecting Unassigned hid its own Review row: `
+      + JSON.stringify({ byDivision, byRink }));
+  }
+
+  const absentFilter = await page.evaluate((cardId) => {
+    schedulerState.filters.division = schedulerReviewFilterValue(
+      "matrix-foreign-division");
+    schedulerState.filters.rink = "all";
+    repaintSchedulerSurface(cardId);
+    const entry = readCardState(cardId);
+    const drafts = entry && entry.payload && entry.payload.drafts || [];
+    return {
+      selected: document.querySelector("#sched-filter-div").value,
+      visibleRows: document.querySelectorAll(
+        `[data-operational-card="${cardId}"] [data-sched-pick]`).length,
+      expectedRows: drafts.length,
+    };
+  }, REVIEW_CARD);
+  if (absentFilter.selected !== "all"
+      || absentFilter.visibleRows !== absentFilter.expectedRows
+      || !absentFilter.expectedRows) {
+    fail(`[${step}] an absent prior-tuple filter produced a false empty Review: `
+      + JSON.stringify(absentFilter));
+  }
+
+  await page.evaluate((cardId) => {
+    const original = window.__schedulerMatrixReviewFilterOriginal;
+    cardStates[cardId] = original.entry;
+    schedulerState.filters = original.filters;
+    delete window.__schedulerMatrixReviewFilterOriginal;
+    repaintSchedulerSurface(cardId);
+  }, REVIEW_CARD);
+  const siblingsAfter = await operationalSiblingSnapshot(page, REVIEW_CARD);
+  if (JSON.stringify(siblingsAfter) !== JSON.stringify(siblingsBefore)) {
+    fail(`[${step}] Review filter exercise mutated a sibling: before `
+      + `${JSON.stringify(siblingsBefore)}, after ${JSON.stringify(siblingsAfter)}`);
+  }
 }
 
 async function assertSingleErrorLiveRegion(page, cardId, step) {
@@ -579,7 +940,7 @@ async function assertErrorRepaintIsSilent(page, cardId, step) {
 
 async function assertNeutralLoading(page, cardId, step) {
   const got = await waitForCardState(page, cardId, "loading", step);
-  if (got.busy !== "true" || got.mutations || got.alertCount
+  if (got.busy !== "true" || got.mutations.length || got.alertCount
       || /(earlier|previous|stale|couldn't|failed|forced)/i.test(got.text)) {
     fail(`[${step}] payload-less replacement must be neutral LOADING, not `
       + `fabricated STALE/ERROR: ${JSON.stringify(got)}`);
@@ -777,11 +1138,10 @@ async function immutableSnapshot(page, cardId) {
 // below makes addEventListener bindings observable without activating (and
 // potentially committing) the controls.
 async function assertCardActionsWired(page, cardId, step) {
-  const observed = await page.evaluate((id) => {
+  const observed = await page.evaluate(([id, semanticControlSelector]) => {
     const root = document.querySelector(`[data-operational-card="${id}"]`);
-    if (!root) return { exists: false, checked: 0, unwired: [] };
-    const controls = Array.from(root.querySelectorAll(
-      "button,select,input:not([type=hidden]),textarea,[role=button],[draggable=true]"));
+    if (!root) return { exists: false, checked: 0, unwired: [], nonSemanticActions: [] };
+    const controls = Array.from(root.querySelectorAll(semanticControlSelector));
     const descriptor = (node) => {
       const attrs = Array.from(node.attributes || [])
         .filter((attr) => attr.name === "id" || attr.name === "type"
@@ -822,9 +1182,20 @@ async function assertCardActionsWired(page, cardId, step) {
         });
       });
     });
-    return { exists: true, checked, unwired };
-  }, cardId);
-  if (!observed.exists || !observed.checked || observed.unwired.length) {
+    // Reverse axis: an action node must not evade the inventory merely by
+    // losing its semantic HTML. This is deliberately direct-only; delegated
+    // change/input listeners belong to their descendant controls, not the
+    // container they are registered on.
+    const actionEvents = ["click", "dragstart", "drop"];
+    const nonSemanticActions = Array.from(root.querySelectorAll("*")).filter(
+      (node) => !node.matches(semanticControlSelector)
+        && actionEvents.some((eventName) =>
+          window.__schedulerMatrixHasDirectEventHandler(node, eventName)))
+      .map(descriptor);
+    return { exists: true, checked, unwired, nonSemanticActions };
+  }, [cardId, SEMANTIC_CONTROL_SELECTOR]);
+  if (!observed.exists || !observed.checked || observed.unwired.length
+      || observed.nonSemanticActions.length) {
     fail(`[${step}] ${cardId} independent repaint left action controls unwired: `
       + JSON.stringify(observed));
   }
@@ -853,6 +1224,143 @@ async function showCalendarDeleteVariant(page, step) {
     fail(`[${step}] could not establish one real future-slot Delete control: `
       + JSON.stringify(observed));
   }
+}
+
+function requestCount(tracker, method, pathname) {
+  return tracker.requests.filter((row) => row.method === method
+    && row.pathname === pathname).length;
+}
+
+// Establish two real Calendar-owned writes through the shipped controls: move
+// a published fixture so its live Undo closure exists, then open generic
+// ice-slot Delete so its live confirmation closure owns the Calendar identity
+// while retaining the setup-delete transport.  The two fresh slots are fixture
+// data only; every action under test is a production handler and real request.
+async function prepareCalendarIntentWrites(page, tracker, fixture, step) {
+  const fixtureSlots = await page.evaluate(async (seed) => {
+    const F = window.hsFixture;
+    const create = (what, start, end) => F.create(what, "/api/setup/ice-slot", {
+      rink_id: seed.rink, start_time: start, end_time: end, slot_type: "game",
+    });
+    const source = await create("intent source ice",
+      "2028-03-08T18:00:00+00:00", "2028-03-08T19:00:00+00:00");
+    const move = await create("intent move ice",
+      "2028-03-10T18:00:00+00:00", "2028-03-10T19:00:00+00:00");
+    const remove = await create("intent delete ice",
+      "2028-03-10T20:00:00+00:00", "2028-03-10T21:00:00+00:00");
+    const game = await F.create("intent Calendar game", "/api/v2/setup/game", {
+      season_id: seed.season, league_id: seed.league,
+      division_id: seed.division, home_team_id: seed.home,
+      away_team_id: seed.away, ice_slot_id: source.id,
+    });
+    await F.call("publish intent Calendar game", `/api/games/${game.id}/publish`, {});
+    return { move: move.id, remove: remove.id, game: game.id };
+  }, fixture);
+  await page.evaluate(() => { void loadCalendarCard({ userInitiated: true }); });
+  await waitForCardState(page, CALENDAR_CARD, "ready", `${step}/fixture-refresh`);
+  await quiesce(page, tracker, `${step}/fixture-refresh`);
+
+  const sourceAxis = await page.evaluate(([cardId, gameId]) => {
+    const model = cardDisplayModel(readCardState(cardId));
+    const overview = model && model.payload && model.payload.overview;
+    const game = overview && (overview.schedule || []).find((row) =>
+      row.game_id === gameId && row.ice_slot_id && row.start_time);
+    return {
+      source: game
+        ? { gameId: game.game_id, date: game.start_time.slice(0, 10) } : null,
+      schedule: (overview && overview.schedule || []).map((row) => ({
+        game_id: row.game_id, ice_slot_id: row.ice_slot_id,
+        start_time: row.start_time, published: row.published,
+        keys: Object.keys(row).sort(),
+      })),
+    };
+  }, [CALENDAR_CARD, fixtureSlots.game]);
+  const source = sourceAxis.source;
+  if (!source) fail(`[${step}] no real committed draft game exists for move/undo: `
+    + JSON.stringify(sourceAxis.schedule));
+
+  await page.evaluate(([cardId, date]) => {
+    calendarDate = date; calendarMode = "day";
+    repaintCalendarSurface(cardId);
+  }, [CALENDAR_CARD, source.date]);
+  const moveButton = page.locator(`[data-move-game="${source.gameId}"]`).first();
+  if (await moveButton.count() !== 1) {
+    fail(`[${step}] committed draft has no live Move control`);
+  }
+  await moveButton.click();
+  await page.evaluate((cardId) => {
+    calendarDate = "2028-03-10"; calendarMode = "day";
+    repaintCalendarSurface(cardId);
+  }, CALENDAR_CARD);
+
+  const movePath = `/api/games/${source.gameId}/move`;
+  const moved = page.waitForResponse((response) => response.request().method() === "POST"
+    && new URL(response.url()).pathname === movePath);
+  const target = page.locator(`[data-slot="${fixtureSlots.move}"]`).first();
+  if (await target.count() !== 1) {
+    fail(`[${step}] fresh move target has no live Calendar slot control`);
+  }
+  await target.click();
+  const moveConfirm = page.locator("[data-move-confirm]").first();
+  if (await moveConfirm.count() === 1) await moveConfirm.click();
+  const moveResponse = await moved;
+  let moveBody = null;
+  try { moveBody = await moveResponse.json(); } catch (_) {}
+  if (moveResponse.status() !== 200 || !moveBody || moveBody.error
+      || !moveBody.moved || !moveBody.moved.old_slot_id) {
+    fail(`[${step}] real Calendar move did not produce undo evidence: `
+      + `${moveResponse.status()} ${JSON.stringify(moveBody)}`);
+  }
+  await quiesce(page, tracker, `${step}/move-settled`);
+  await page.evaluate((cardId) => {
+    calendarDate = "2028-03-10"; calendarMode = "day";
+    repaintCalendarSurface(cardId);
+  }, CALENDAR_CARD);
+
+  const deleteButton = page.locator(
+    `[data-del="ice-slot"][data-del-id="${fixtureSlots.remove}"]`).first();
+  if (await deleteButton.count() !== 1) {
+    fail(`[${step}] fresh spare slot has no live generic Delete control`);
+  }
+  await deleteButton.click();
+  await page.waitForSelector("[data-del-confirm]");
+
+  const captured = await page.evaluate(([cardId, gameId, removeId]) => {
+    const root = document.querySelector(`[data-operational-card="${cardId}"]`);
+    const undo = root && root.querySelector("[data-move-undo]");
+    const confirm = document.querySelector("[data-del-confirm]");
+    window.__schedulerMatrixIntentHandlers = { undo, confirm };
+    return {
+      undo: !!undo && typeof undo.onclick === "function",
+      confirm: !!confirm && typeof confirm.onclick === "function",
+      modal: modal && {
+        type: modal.type, kind: modal.kind, id: modal.id,
+        cardId: modal.cardIdentity && modal.cardIdentity.card,
+        deleteTransport: modal.deleteTransport,
+      },
+      conflict: conflict && conflict.undo && {
+        gid: conflict.undo.gid, oldSlotId: conflict.undo.oldSlotId,
+      },
+      paths: {
+        undo: `/api/games/${gameId}/move`,
+        remove: deleteRoute("ice-slot", removeId),
+      },
+    };
+  }, [CALENDAR_CARD, source.gameId, fixtureSlots.remove]);
+  if (!captured.undo || !captured.confirm
+      || !captured.modal || captured.modal.type !== "confirm-delete"
+      || captured.modal.kind !== "ice-slot" || captured.modal.id !== fixtureSlots.remove
+      || captured.modal.cardId !== CALENDAR_CARD
+      || captured.modal.deleteTransport !== "setup-delete"
+      || !captured.conflict || captured.conflict.gid !== source.gameId
+      || !captured.conflict.oldSlotId) {
+    fail(`[${step}] Calendar ownership/transport axis was vacuous: `
+      + JSON.stringify(captured));
+  }
+  captured.moveSlot = fixtureSlots.move;
+  captured.removeSlot = fixtureSlots.remove;
+  captured.gameId = source.gameId;
+  return captured;
 }
 
 function assertByteEqual(step, before, after) {
@@ -897,8 +1405,8 @@ async function seedFixtures(page) {
       });
       return team.id;
     };
-    await makeTeam("Matrix A Ready 1", readyDiv.id);
-    await makeTeam("Matrix A Ready 2", readyDiv.id);
+    const readyTeam1 = await makeTeam("Matrix A Ready 1", readyDiv.id);
+    const readyTeam2 = await makeTeam("Matrix A Ready 2", readyDiv.id);
     await makeTeam("Matrix A Race 1", raceDiv.id);
     await makeTeam("Matrix A Race 2", raceDiv.id);
     const venue = await F.create("matrix Arena", "/api/setup/venue", {
@@ -930,10 +1438,31 @@ async function seedFixtures(page) {
       end_date: "2028-04-30",
     });
     await F.selectProgramSeason("select matrix Program B / Season B", pb.id, sb.id);
+    // B needs its own non-empty option axes. The cross-card Review regression
+    // below deliberately settles Draft under B while Review still retains A;
+    // an empty B overview would let the old sibling-borrowing implementation
+    // fall back to A's Review rows and pass without exercising the defect.
+    const leagueB = await F.create("matrix competition League B", "/api/setup/level", {
+      season_id: sb.id, name: "Matrix Silver",
+    });
+    const divB = await F.create("matrix Division B", "/api/setup/division", {
+      season_id: sb.id, level_id: leagueB.id, name: "Matrix B Division",
+    });
+    const venueB = await F.create("matrix Arena B", "/api/setup/venue", {
+      name: "Matrix B Arena", league_id: pb.id,
+    });
+    await F.call("grant matrix Arena B", `/api/v2/setup/seasons/${sb.id}/venue-access`, {
+      venue_id: venueB.id,
+    });
+    const rinkB = await F.create("matrix rink B", "/api/setup/rink", {
+      venue_id: venueB.id, name: "Matrix B Ice",
+    });
     await F.selectProgramSeason("restore matrix Program A / Season A", pa.id, sa.id);
     return {
       pa: pa.id, sa: sa.id, pb: pb.id, sb: sb.id,
       readyDiv: readyDiv.id, raceDiv: raceDiv.id, rink: rink.id,
+      league: league.id, readyTeam1, readyTeam2,
+      divB: divB.id, rinkB: rinkB.id,
     };
   });
 
@@ -993,14 +1522,23 @@ async function checkViewport(browser, viewport) {
       }
       return false;
     };
+    window.__schedulerMatrixHasDirectEventHandler = (node, type) => {
+      if (typeof node[`on${type}`] === "function") return true;
+      const byType = listeners.get(node);
+      return !!(byType && byType.get(type) && byType.get(type).size);
+    };
   });
-  const tracker = { inFlight: new Set(), sequence: 0 };
+  const tracker = { inFlight: new Set(), sequence: 0, requests: [] };
   const nonOk = [];
   const requestFailures = [];
   const consoleErrors = [];
   page.on("request", (request) => {
     tracker.inFlight.add(request);
     tracker.sequence += 1;
+    tracker.requests.push({
+      method: request.method(),
+      pathname: new URL(request.url()).pathname,
+    });
   });
   page.on("response", (response) => {
     tracker.inFlight.delete(response.request());
@@ -1029,11 +1567,13 @@ async function checkViewport(browser, viewport) {
     publish: makeChannel("scheduler publish", PUBLISH_RE),
     ice: makeChannel("ice preview", ICE_PREVIEW_RE),
     iceCommit: makeChannel("ice commit", ICE_COMMIT_RE),
+    addIce: makeChannel("calendar add ice", ADD_ICE_RE),
     overview: makeChannel("calendar overview", OVERVIEW_RE),
     options: makeChannel("context options", CONTEXT_OPTIONS_RE),
     context: makeChannel("context switch", CONTEXT_RE),
   };
   const coverage = coverageLedger();
+  const emptyRefreshCoverage = new Set();
 
   try {
     for (const channel of Object.values(channels)) await installChannel(page, channel);
@@ -1059,6 +1599,14 @@ async function checkViewport(browser, viewport) {
       `${label}/draft-empty`);
     await assertState(page, coverage, REVIEW_CARD, "empty",
       `${label}/review-empty`);
+    await assertEmptyRefresh(page, tracker, emptyRefreshCoverage,
+      DRAFT_CARD, channels.overview,
+      () => page.evaluate(() => { void loadSchedulerDraftCard({ userInitiated: true }); }),
+      `${label}/draft-empty-refresh`);
+    await assertEmptyRefresh(page, tracker, emptyRefreshCoverage,
+      REVIEW_CARD, channels.drafts,
+      () => page.evaluate(() => { void loadSchedulerReviewCard({ userInitiated: true }); }),
+      `${label}/review-empty-refresh`);
 
     // Create an operation failure under A so its shipped Retry drives the
     // ERROR -> LOADING -> READY state axis below.
@@ -1205,6 +1753,7 @@ async function checkViewport(browser, viewport) {
       "Matrix A Ready");
     await assertCardActionsWired(page, REVIEW_CARD,
       `${label}/review-ready-actions`);
+    await assertReviewFilterEdges(page, `${label}/review-filter-edges`);
 
     // A Review checkbox is local interaction state, not durable context data.
     // Select one row, leave Scheduler, and queue A -> B -> A while B's context
@@ -1293,9 +1842,16 @@ async function checkViewport(browser, viewport) {
     const [draftBPayload, reviewBPayload] = await Promise.all([
       heldBDraft.captured, heldBReview.captured,
     ]);
-    if (draftBPayload.status !== 200 || reviewBPayload.status !== 200) {
+    const draftBDivisions = draftBPayload.body && draftBPayload.body.divisions || [];
+    const draftBRinks = draftBPayload.body && draftBPayload.body.rinks || [];
+    if (draftBPayload.status !== 200 || reviewBPayload.status !== 200
+        || !draftBDivisions.some((row) => row.id === ids.divB
+          && row.name === "Matrix B Division")
+        || !draftBRinks.some((row) => row.id === ids.rinkB
+          && row.name === "Matrix B Ice")) {
       fail(`[${label}/scheduler-stale] B replacement reads were not successful: `
-        + JSON.stringify({ draftBPayload, reviewBPayload }));
+        + JSON.stringify({ draftBPayload, reviewBPayload,
+          expectedBAxes: { division: ids.divB, rink: ids.rinkB } }));
     }
     await waitForSelectedTuple(page, ids.pb, ids.sb, true,
       `${label}/scheduler-stale-selected`);
@@ -1316,17 +1872,9 @@ async function checkViewport(browser, viewport) {
     const draftBReleased = channels.overview.released;
     const reviewBReleased = channels.drafts.released;
     heldBDraft.release();
-    heldBReview.release();
     await waitForCardState(page, DRAFT_CARD, "empty", `${label}/draft-b-empty`);
-    await waitForCardState(page, REVIEW_CARD, "empty", `${label}/review-b-empty`);
     await waitForReleased(page, channels.overview, draftBReleased,
       `${label}/draft-b-empty`);
-    await waitForReleased(page, channels.drafts, reviewBReleased,
-      `${label}/review-b-empty`);
-    await assertContextChrome(page, {
-      programId: ids.pb, seasonId: ids.sb,
-      programName: "Matrix Program B", seasonName: "Matrix Season B",
-    }, `${label}/scheduler-settled-chrome`);
     const settledDraftFocus = await page.evaluate((cardId) => {
       const active = document.activeElement;
       const owner = active && active.closest
@@ -1347,6 +1895,60 @@ async function checkViewport(browser, viewport) {
       fail(`[${label}/scheduler-stale-focus] replacing B data lost Draft's `
         + `same-card semantic focus: ${JSON.stringify(settledDraftFocus)}`);
     }
+
+    // Review is still showing A while Draft has independently settled B.
+    // Exercise Review's own local filter repaint and require both option axes
+    // to equal the ids/names derived from Review's rows exactly. Borrowing the
+    // sibling Draft overview here leaks B names and ids into the retained A
+    // card even though each card's response guard is individually correct.
+    await page.selectOption("#sched-filter-issue", "issues");
+    const reviewFilterAxis = await page.evaluate(([reviewCardId, forbiddenDiv, forbiddenRink]) => {
+      const model = cardDisplayModel(readCardState(reviewCardId));
+      const drafts = model && model.payload && model.payload.drafts || [];
+      const expected = (idKey, nameKey) => Array.from(new Map(drafts.map((row) => {
+        const id = schedulerReviewFilterValue(row[idKey]);
+        return [id, { id, name: id === SCHEDULER_REVIEW_UNASSIGNED_FILTER
+          ? "Unassigned" : (row[nameKey] || row[idKey]) }];
+      })).values()).sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      const actual = (selector) => Array.from(document.querySelectorAll(
+        `${selector} option:not([value="all"])`)).map((option) => ({
+        id: option.value,
+        name: option.textContent.trim(),
+      })).sort((a, b) => String(a.id).localeCompare(String(b.id)));
+      return {
+        reviewState: readCardState(reviewCardId).state,
+        expectedDivisions: expected("division_id", "division_name"),
+        actualDivisions: actual("#sched-filter-div"),
+        expectedRinks: expected("rink_id", "rink_name"),
+        actualRinks: actual("#sched-filter-rink"),
+        borrowedB: document.querySelector(
+          `#sched-filter-div option[value="${CSS.escape(
+            schedulerReviewFilterValue(forbiddenDiv))}"],`
+          + `#sched-filter-rink option[value="${CSS.escape(
+            schedulerReviewFilterValue(forbiddenRink))}"]`) !== null,
+        draftSibling: JSON.parse(JSON.stringify(readCardState("scheduler/draft"))),
+      };
+    }, [REVIEW_CARD, ids.divB, ids.rinkB]);
+    if (reviewFilterAxis.reviewState !== "stale"
+        || JSON.stringify(reviewFilterAxis.actualDivisions)
+          !== JSON.stringify(reviewFilterAxis.expectedDivisions)
+        || JSON.stringify(reviewFilterAxis.actualRinks)
+          !== JSON.stringify(reviewFilterAxis.expectedRinks)
+        || !reviewFilterAxis.expectedDivisions.length
+        || !reviewFilterAxis.expectedRinks.length
+        || reviewFilterAxis.borrowedB
+        || reviewFilterAxis.draftSibling.state !== "empty") {
+      fail(`[${label}/review-filter-axis] Review borrowed a sibling tuple or `
+        + `the oracle was vacuous: ${JSON.stringify(reviewFilterAxis)}`);
+    }
+    heldBReview.release();
+    await waitForCardState(page, REVIEW_CARD, "empty", `${label}/review-b-empty`);
+    await waitForReleased(page, channels.drafts, reviewBReleased,
+      `${label}/review-b-empty`);
+    await assertContextChrome(page, {
+      programId: ids.pb, seasonId: ids.sb,
+      programName: "Matrix Program B", seasonName: "Matrix Season B",
+    }, `${label}/scheduler-settled-chrome`);
     await selectProgramSeason(page, `${label}: return to A`, ids.pa, ids.sa);
     await openView(page, "scheduler", [DRAFT_CARD, REVIEW_CARD], `${label}/scheduler-a-return`);
     await waitForCardState(page, REVIEW_CARD, "ready", `${label}/review-a-return-ready`);
@@ -1387,8 +1989,53 @@ async function checkViewport(browser, viewport) {
     await assertCardActionsWired(page, CALENDAR_CARD,
       `${label}/calendar-ready-actions`);
 
+    // Persist a real Calendar write under A, then withhold its delivery while
+    // the server commits B but the context echo is still pending in the app.
+    // The response must remain a byte-for-byte no-op until that intent settles;
+    // otherwise its follow-up overview GET is answered under B and committed
+    // beneath the still-A card identity.
+    const calendarAddGap = armHold(channels.addIce);
+    await page.click("[data-addslot]");
+    const calendarAddPayload = await calendarAddGap.captured;
+    if (calendarAddPayload.status !== 200 || !calendarAddPayload.body
+        || calendarAddPayload.body.error) {
+      fail(`[${label}/calendar-write-gap] Add ice did not perform a real A `
+        + `write: ${JSON.stringify(calendarAddPayload)}`);
+    }
+    const calendarContextGap = armHold(channels.context);
+    await startContextSwitch(page, ids.pb, ids.sb,
+      `${label}/calendar-write-gap-switch`);
+    const calendarContextPayload = await calendarContextGap.captured;
+    if (calendarContextPayload.status !== 200 || !calendarContextPayload.body
+        || calendarContextPayload.body.program_id !== ids.pb
+        || calendarContextPayload.body.season_id !== ids.sb) {
+      fail(`[${label}/calendar-write-gap] B context did not commit while its `
+        + `echo was held: ${JSON.stringify(calendarContextPayload)}`);
+    }
+    await page.focus("#ctx-select");
+    await resetAnnouncements(page);
+    const calendarBeforeWriteRelease = await immutableSnapshot(page, CALENDAR_CARD);
+    const overviewBeforeWriteRelease = channels.overview.released;
+    const calendarAddReleased = channels.addIce.released;
+    calendarAddGap.release();
+    await waitForReleased(page, channels.addIce, calendarAddReleased,
+      `${label}/calendar-write-gap-release`);
+    await quiesce(page, tracker, `${label}/calendar-write-gap-pending`, 1);
+    const calendarDuringWriteGap = await immutableSnapshot(page, CALENDAR_CARD);
+    assertByteEqual(`${label}/calendar-write-gap`, calendarBeforeWriteRelease,
+      calendarDuringWriteGap);
+    if (channels.overview.released !== overviewBeforeWriteRelease) {
+      fail(`[${label}/calendar-write-gap] Calendar launched a follow-up read `
+        + `before the context echo settled`);
+    }
+
+    // Accepting B invalidates the A write. Hold B's own replacement read so
+    // the existing STALE oracle observes that transition explicitly.
     const calendarB = armHold(channels.overview);
-    await startContextSwitch(page, ids.pb, ids.sb, `${label}/calendar-stale-switch`);
+    const calendarContextReleased = channels.context.released;
+    calendarContextGap.release();
+    await waitForReleased(page, channels.context, calendarContextReleased,
+      `${label}/calendar-write-gap-context-release`);
     await calendarB.captured;
     await waitForSelectedTuple(page, ids.pb, ids.sb, true,
       `${label}/calendar-stale-selected`);
@@ -1401,11 +2048,155 @@ async function checkViewport(browser, viewport) {
     calendarB.release();
     await waitForCardState(page, CALENDAR_CARD, "empty", `${label}/calendar-empty`);
     await assertState(page, coverage, CALENDAR_CARD, "empty", `${label}/calendar-empty`);
+    await assertEmptyRefresh(page, tracker, emptyRefreshCoverage,
+      CALENDAR_CARD, channels.overview,
+      () => page.evaluate(() => { void loadCalendarCard({ userInitiated: true }); }),
+      `${label}/calendar-empty-refresh`);
     await assertContextChrome(page, {
       programId: ids.pb, seasonId: ids.sb,
       programName: "Matrix Program B", seasonName: "Matrix Season B",
     }, `${label}/calendar-settled-chrome`);
     await selectProgramSeason(page, `${label}: calendar return to A`, ids.pa, ids.sa);
+
+    // A context INTENT must close the wire, not merely remove today's nodes.
+    // Create a real move/Undo and a real Calendar-owned generic Delete modal,
+    // retain their shipped handler closures, then invoke those detached
+    // closures while B's successful context echo is held. Neither POST may be
+    // observable. Once B is accepted, the old modal/conflict must be erased
+    // rather than resurfacing when A is visited again.
+    trace(`${label}: Calendar writes are refused before dispatch during context intent`);
+    await waitForCardState(page, CALENDAR_CARD, "ready",
+      `${label}/calendar-intent-a-ready`);
+    await quiesce(page, tracker, `${label}/calendar-intent-a-ready`);
+    const intentWrites = await prepareCalendarIntentWrites(
+      page, tracker, {
+        rink: ids.rink, season: ids.sa, league: ids.league,
+        division: ids.readyDiv, home: ids.readyTeam1, away: ids.readyTeam2,
+      }, `${label}/calendar-intent-prepare`);
+    const intentCounts = {
+      undo: requestCount(tracker, "POST", intentWrites.paths.undo),
+      remove: requestCount(tracker, "POST", intentWrites.paths.remove),
+    };
+
+    const calendarIntent = armHold(channels.context);
+    await startContextSwitch(page, ids.pb, ids.sb,
+      `${label}/calendar-intent-switch`);
+    const calendarIntentEcho = await calendarIntent.captured;
+    if (calendarIntentEcho.status !== 200 || !calendarIntentEcho.body
+        || calendarIntentEcho.body.program_id !== ids.pb
+        || calendarIntentEcho.body.season_id !== ids.sb) {
+      fail(`[${label}/calendar-intent] held echo was not a real accepted B switch: `
+        + JSON.stringify(calendarIntentEcho));
+    }
+    const pendingIntent = await page.evaluate(([cardId, removeId]) => ({
+      intent: contextSwitchIntentPending,
+      liveUndo: document.querySelectorAll("[data-move-undo]").length,
+      liveConfirm: document.querySelectorAll("[data-del-confirm]").length,
+      retainedModal: !!modal && modal.type === "confirm-delete"
+        && modal.id === removeId && modal.deleteTransport === "setup-delete"
+        && modal.cardIdentity && modal.cardIdentity.card === cardId,
+      retainedUndo: !!(conflict && conflict.undo),
+      handlers: !!window.__schedulerMatrixIntentHandlers
+        && !!window.__schedulerMatrixIntentHandlers.undo
+        && !!window.__schedulerMatrixIntentHandlers.confirm,
+    }), [CALENDAR_CARD, intentWrites.removeSlot]);
+    if (!pendingIntent.intent || pendingIntent.liveUndo !== 0
+        || pendingIntent.liveConfirm !== 0 || !pendingIntent.retainedModal
+        || !pendingIntent.retainedUndo || !pendingIntent.handlers) {
+      fail(`[${label}/calendar-intent] intent did not withdraw live controls while `
+        + `preserving state until acceptance: ${JSON.stringify(pendingIntent)}`);
+    }
+
+    await page.evaluate(async () => {
+      const retained = window.__schedulerMatrixIntentHandlers;
+      // Undo's DOM handler deliberately launches its async commit without
+      // returning it. Invoke both closures exactly as detached controls would;
+      // do not await Delete either, because a broken pre-fetch guard would then
+      // correctly wait on context settlement and deadlock the oracle itself.
+      retained.undo.onclick();
+      retained.confirm.onclick();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    await page.waitForTimeout(100);
+    const afterDetachedClicks = {
+      undo: requestCount(tracker, "POST", intentWrites.paths.undo),
+      remove: requestCount(tracker, "POST", intentWrites.paths.remove),
+    };
+    if (JSON.stringify(afterDetachedClicks) !== JSON.stringify(intentCounts)) {
+      fail(`[${label}/calendar-intent] a detached Calendar handler dispatched `
+        + `after intent began: before ${JSON.stringify(intentCounts)}, after `
+        + JSON.stringify(afterDetachedClicks));
+    }
+
+    const calendarIntentB = armHold(channels.overview);
+    const calendarIntentReleased = channels.context.released;
+    calendarIntent.release();
+    await waitForReleased(page, channels.context, calendarIntentReleased,
+      `${label}/calendar-intent-context-release`);
+    const calendarIntentBPayload = await calendarIntentB.captured;
+    if (calendarIntentBPayload.status !== 200 || !calendarIntentBPayload.body) {
+      fail(`[${label}/calendar-intent] replacement B read was not real: `
+        + JSON.stringify(calendarIntentBPayload));
+    }
+    await waitForSelectedTuple(page, ids.pb, ids.sb, true,
+      `${label}/calendar-intent-b-selected`);
+    await waitForCardState(page, CALENDAR_CARD, "stale",
+      `${label}/calendar-intent-b-stale`);
+    const acceptedCleanup = await page.evaluate(() => ({
+      modal: modal,
+      conflict: conflict,
+      wizard: wizard,
+      pendingMove: pendingMove,
+      movingGameId: movingGameId,
+      liveConfirm: document.querySelectorAll("[data-del-confirm]").length,
+      liveUndo: document.querySelectorAll("[data-move-undo]").length,
+      retainedConnected: Object.values(window.__schedulerMatrixIntentHandlers || {})
+        .some((node) => node && node.isConnected),
+    }));
+    if (acceptedCleanup.modal !== null || acceptedCleanup.conflict !== null
+        || acceptedCleanup.wizard !== null || acceptedCleanup.pendingMove !== null
+        || acceptedCleanup.movingGameId !== null
+        || acceptedCleanup.liveConfirm !== 0 || acceptedCleanup.liveUndo !== 0
+        || acceptedCleanup.retainedConnected) {
+      fail(`[${label}/calendar-intent] accepted move retained old Calendar state: `
+        + JSON.stringify(acceptedCleanup));
+    }
+    const calendarIntentBReleased = channels.overview.released;
+    calendarIntentB.release();
+    await waitForReleased(page, channels.overview, calendarIntentBReleased,
+      `${label}/calendar-intent-b-release`);
+    await waitForCardState(page, CALENDAR_CARD, "empty",
+      `${label}/calendar-intent-b-empty`);
+    await selectProgramSeason(page, `${label}: calendar intent return to A`,
+      ids.pa, ids.sa);
+    await waitForCardState(page, CALENDAR_CARD, "ready",
+      `${label}/calendar-intent-a-return`);
+    await quiesce(page, tracker, `${label}/calendar-intent-a-return`);
+    const noResurface = await page.evaluate(([cardId, gameId, moveSlot, removeSlot]) => {
+      const model = cardDisplayModel(readCardState(cardId));
+      const overview = model && model.payload && model.payload.overview;
+      const game = overview && (overview.schedule || []).find(
+        (row) => row.game_id === gameId);
+      const spare = overview && (overview.ice_slots || []).find(
+        (row) => row.id === removeSlot);
+      return {
+        modal: modal,
+        conflict: conflict,
+        liveConfirm: document.querySelectorAll("[data-del-confirm]").length,
+        liveUndo: document.querySelectorAll("[data-move-undo]").length,
+        movedSlot: game && game.ice_slot_id,
+        spareStillExists: !!spare,
+        expectedMoveSlot: moveSlot,
+      };
+    }, [CALENDAR_CARD, intentWrites.gameId, intentWrites.moveSlot,
+      intentWrites.removeSlot]);
+    if (noResurface.modal !== null || noResurface.conflict !== null
+        || noResurface.liveConfirm !== 0 || noResurface.liveUndo !== 0
+        || noResurface.movedSlot !== noResurface.expectedMoveSlot
+        || !noResurface.spareStillExists) {
+      fail(`[${label}/calendar-intent] accepted A -> B -> A resurrected state or `
+        + `a refused write reached storage: ${JSON.stringify(noResurface)}`);
+    }
 
     // Ice Builder: opening a fresh builder is the explicit "no preview yet"
     // EMPTY state. A successful zero-slot preview is still reviewed data (it
@@ -1414,6 +2205,10 @@ async function checkViewport(browser, viewport) {
     trace(`${label}: Ice Builder EMPTY, ERROR, LOADING, READY and STALE`);
     await openBuilder(page, `${label}/builder`);
     await assertState(page, coverage, BUILDER_CARD, "empty", `${label}/builder-empty`);
+    await assertEmptyRefresh(page, tracker, emptyRefreshCoverage,
+      BUILDER_CARD, channels.overview,
+      () => page.evaluate(() => { void loadIceBuilderCard({ userInitiated: true }); }),
+      `${label}/builder-empty-refresh`);
     await configureBuilder(page, ids.rink, [1], "2027-10-05", "2027-10-05");
     await resetAnnouncements(page);
     failOnce(channels.ice);
@@ -1432,12 +2227,61 @@ async function checkViewport(browser, viewport) {
         + JSON.stringify(builderPayload));
     }
     await assertState(page, coverage, BUILDER_CARD, "loading", `${label}/builder-loading`);
+    // A user can move to the persistent context selector while a card write is
+    // in flight. Settlement must respect that connected focus rather than
+    // pulling it back into the card merely because the request was initiated
+    // by the user.
+    await page.focus("#ctx-select");
     const builderReleased = channels.ice.released;
     builderRetry.release();
     await waitForCardState(page, BUILDER_CARD, "ready", `${label}/builder-ready`);
     await waitForReleased(page, channels.ice, builderReleased, `${label}/builder-ready`);
+    const focusAfterIntentionalMove = await page.evaluate(() => ({
+      id: document.activeElement && document.activeElement.id,
+      tag: document.activeElement && document.activeElement.tagName,
+    }));
+    if (focusAfterIntentionalMove.id !== "ctx-select") {
+      fail(`[${label}/builder-focus-preserve] settlement stole intentional `
+        + `context-selector focus: ${JSON.stringify(focusAfterIntentionalMove)}`);
+    }
     await assertState(page, coverage, BUILDER_CARD, "ready", `${label}/builder-ready`,
       "Matrix A Ice");
+
+    // Positive control: when the initiating Preview button is removed and
+    // focus genuinely falls to BODY, settlement restores it inside this card.
+    const builderFocusRestore = armHold(channels.ice);
+    await page.click("[data-ib-preview]");
+    const builderFocusPayload = await builderFocusRestore.captured;
+    if (builderFocusPayload.status !== 200 || !builderFocusPayload.body
+        || !builderFocusPayload.body.totals) {
+      fail(`[${label}/builder-focus-restore] held Preview was vacuous: `
+        + JSON.stringify(builderFocusPayload));
+    }
+    await waitForCardState(page, BUILDER_CARD, "loading",
+      `${label}/builder-focus-restore-loading`);
+    const focusWhileReplaced = await page.evaluate(() =>
+      document.activeElement && document.activeElement.tagName);
+    if (focusWhileReplaced !== "BODY") {
+      fail(`[${label}/builder-focus-restore] initiating control replacement `
+        + `did not strand focus on BODY: ${focusWhileReplaced}`);
+    }
+    const builderFocusReleased = channels.ice.released;
+    builderFocusRestore.release();
+    await waitForReleased(page, channels.ice, builderFocusReleased,
+      `${label}/builder-focus-restore-release`);
+    await waitForCardState(page, BUILDER_CARD, "ready",
+      `${label}/builder-focus-restore-ready`);
+    const focusRestored = await page.evaluate((cardId) => {
+      const active = document.activeElement;
+      const owner = active && active.closest
+        ? active.closest("[data-operational-card]") : null;
+      return { tag: active && active.tagName,
+        card: owner && owner.getAttribute("data-operational-card") };
+    }, BUILDER_CARD);
+    if (focusRestored.card !== BUILDER_CARD || focusRestored.tag === "BODY") {
+      fail(`[${label}/builder-focus-restore] lost focus after the initiating `
+        + `control was replaced: ${JSON.stringify(focusRestored)}`);
+    }
     await assertCardActionsWired(page, BUILDER_CARD,
       `${label}/builder-ready-actions`);
 
@@ -1480,12 +2324,20 @@ async function checkViewport(browser, viewport) {
       `${label}/builder-stale-selected`);
     await assertState(page, coverage, BUILDER_CARD, "stale", `${label}/builder-stale`,
       "Matrix A Ice");
+    await assertContextChrome(page, {
+      programId: ids.pb, seasonId: ids.sb,
+      programName: "Matrix Program B", seasonName: "Matrix Season B",
+    }, `${label}/builder-stale-chrome`);
     await page.focus("#ctx-select");
     const builderBReleased = channels.overview.released;
     builderB.release();
     await waitForReleased(page, channels.overview, builderBReleased,
       `${label}/builder-stale-release`);
     await quiesce(page, tracker, `${label}/builder-stale-settled`);
+    await assertContextChrome(page, {
+      programId: ids.pb, seasonId: ids.sb,
+      programName: "Matrix Program B", seasonName: "Matrix Season B",
+    }, `${label}/builder-settled-chrome`);
     const builderSettlementFocus = await page.evaluate(() => ({
       id: document.activeElement && document.activeElement.id,
       tag: document.activeElement && document.activeElement.tagName,
@@ -2016,7 +2868,8 @@ async function checkViewport(browser, viewport) {
       fail(`[${label}/epoch-race] re-login did not invalidate all four card models: `
         + JSON.stringify(invalidated));
     }
-    if (insideEpochWindow.text.includes("Matrix A Race") || insideEpochWindow.mutations) {
+    if (insideEpochWindow.text.includes("Matrix A Race")
+        || insideEpochWindow.mutations.length) {
       fail(`[${label}/epoch-race] departing payload/control survived the identity boundary: `
         + JSON.stringify(insideEpochWindow));
     }
@@ -2155,7 +3008,134 @@ async function checkViewport(browser, viewport) {
         + JSON.stringify(publishedEmpty));
     }
 
+    // EMPTY can retain authoritative history. Both later retained states must
+    // keep presenting it as EMPTY rather than serializing the READY-only
+    // zero-row table and claiming that no rows match local filters.
+    failOnce(channels.drafts);
+    await page.evaluate(() => {
+      void loadSchedulerReviewCard({ userInitiated: true });
+    });
+    await waitForCardState(page, REVIEW_CARD, "error",
+      `${label}/review-empty-error`);
+    const errorRetainedEmpty = await cardSnapshot(page, REVIEW_CARD);
+    if (!errorRetainedEmpty.html.includes('data-card-empty="review"')
+        || errorRetainedEmpty.text.includes("No draft games match these filters")
+        || !errorRetainedEmpty.text.includes(
+          `${publishedSummary.published_count} published`)) {
+      fail(`[${label}/review-empty-error] ERROR misrepresented retained EMPTY: `
+        + JSON.stringify(errorRetainedEmpty));
+    }
+    await activateRetryWithKeyboard(page, REVIEW_CARD,
+      `${label}/review-empty-error-retry`);
+    await waitForCardState(page, REVIEW_CARD, "empty",
+      `${label}/review-empty-error-recovered`);
+
+    const retainedEmptyB = armHold(channels.drafts);
+    await startContextSwitch(page, ids.pb, ids.sb,
+      `${label}/review-empty-stale-switch`);
+    const retainedEmptyBPayload = await retainedEmptyB.captured;
+    if (retainedEmptyBPayload.status !== 200 || !retainedEmptyBPayload.body) {
+      fail(`[${label}/review-empty-stale] B replacement read was not real: `
+        + JSON.stringify(retainedEmptyBPayload));
+    }
+    await waitForSelectedTuple(page, ids.pb, ids.sb, true,
+      `${label}/review-empty-stale-selected`);
+    await waitForCardState(page, REVIEW_CARD, "stale",
+      `${label}/review-empty-stale`);
+    const staleRetainedEmpty = await cardSnapshot(page, REVIEW_CARD);
+    if (!staleRetainedEmpty.html.includes('data-card-empty="review"')
+        || staleRetainedEmpty.text.includes("No draft games match these filters")
+        || !staleRetainedEmpty.text.includes(
+          `${publishedSummary.published_count} published`)) {
+      fail(`[${label}/review-empty-stale] STALE misrepresented retained EMPTY: `
+        + JSON.stringify(staleRetainedEmpty));
+    }
+    const retainedEmptyBReleased = channels.drafts.released;
+    retainedEmptyB.release();
+    await waitForReleased(page, channels.drafts, retainedEmptyBReleased,
+      `${label}/review-empty-stale-release`);
+    await waitForCardState(page, REVIEW_CARD, "empty",
+      `${label}/review-empty-stale-settled`);
+
+    // Exercise the nested EMPTY provenance that only exists on a real tuple
+    // round trip: origin EMPTY -> away STALE while its read is held -> origin
+    // LOADING retaining that STALE/staleFrom=EMPTY model. Derive the complete
+    // target axis from production so a fifth card cannot silently miss this
+    // boundary. Program B is the origin for this block because its Scheduler
+    // and Calendar reads are authoritatively empty; "origin/away" describe
+    // the transition roles, independently of fixture letter names.
+    trace(`${label}: every EMPTY card remains truthful across A → B → A`);
+    const emptyRoundTripCards = await page.evaluate(() =>
+      Array.from(SCHEDULE_FACILITY_CARD_IDS));
+    const emptyRoundTripPlans = new Map([
+      [DRAFT_CARD, {
+        channel: channels.overview, skippedSiblingReads: 0,
+        open: () => openView(page, "scheduler", [DRAFT_CARD, REVIEW_CARD],
+          `${label}/empty-aba-draft-open`),
+      }],
+      [REVIEW_CARD, {
+        channel: channels.drafts, skippedSiblingReads: 0,
+        open: () => openView(page, "scheduler", [DRAFT_CARD, REVIEW_CARD],
+          `${label}/empty-aba-review-open`),
+      }],
+      [BUILDER_CARD, {
+        channel: channels.overview, skippedSiblingReads: 1,
+        open: () => openBuilder(page, `${label}/empty-aba-builder-open`),
+      }],
+      [CALENDAR_CARD, {
+        channel: channels.overview, skippedSiblingReads: 0,
+        open: () => openView(page, "calendar", [CALENDAR_CARD],
+          `${label}/empty-aba-calendar-open`),
+      }],
+    ]);
+    const plannedEmptyRoundTripCards = Array.from(emptyRoundTripPlans.keys()).sort();
+    if (JSON.stringify(emptyRoundTripCards.slice().sort())
+        !== JSON.stringify(plannedEmptyRoundTripCards)) {
+      fail(`[${label}/empty-aba] production card axis has no exact test plan: `
+        + `${JSON.stringify(emptyRoundTripCards)}`);
+    }
+    const emptyOrigin = { programId: ids.pb, seasonId: ids.sb };
+    const emptyAway = { programId: ids.pa, seasonId: ids.sa };
+    const emptyRoundTripRepresentationFailures = [];
+    for (const cardId of emptyRoundTripCards) {
+      const plan = emptyRoundTripPlans.get(cardId);
+      await selectProgramSeason(page, `${label}: ${cardId} EMPTY origin`,
+        emptyOrigin.programId, emptyOrigin.seasonId);
+      await plan.open();
+      await quiesce(page, tracker, `${label}/empty-aba-${cardId}/prepared`);
+      await waitForCardState(page, cardId, "empty",
+        `${label}/empty-aba-${cardId}/prepared-empty`);
+      const representationFailures = await assertEmptyRoundTripLoading(
+        page, tracker, cardId, plan.channel,
+        channels.context, plan.skippedSiblingReads, emptyOrigin, emptyAway,
+        `${label}/empty-aba-${cardId}`);
+      emptyRoundTripRepresentationFailures.push(...representationFailures);
+      if (cardId === BUILDER_CARD) {
+        const cancel = page.locator("[data-ib-cancel]");
+        if (await cancel.count() !== 1) {
+          fail(`[${label}/empty-aba-builder] settled Builder has no Back control`);
+        }
+        await cancel.click();
+        await page.waitForSelector(operationalSelector(CALENDAR_CARD), {
+          timeout: 15000,
+        });
+        await quiesce(page, tracker, `${label}/empty-aba-builder/closed`);
+      }
+    }
+    if (emptyRoundTripRepresentationFailures.length) {
+      fail(`[${label}/empty-aba] retained EMPTY presentation failed on `
+        + `${emptyRoundTripRepresentationFailures.length}/${emptyRoundTripCards.length} `
+        + `card legs: ${emptyRoundTripRepresentationFailures.join("; ")}`);
+    }
+
     const checked = coverage.assertComplete(label);
+    const emptyRefreshAxis = Array.from(emptyRefreshCoverage).sort();
+    const expectedEmptyRefreshAxis = CARD_IDS.slice().sort();
+    if (JSON.stringify(emptyRefreshAxis) !== JSON.stringify(expectedEmptyRefreshAxis)) {
+      fail(`[${label}] EMPTY-refresh axis shrank: expected `
+        + `${JSON.stringify(expectedEmptyRefreshAxis)}, got `
+        + JSON.stringify(emptyRefreshAxis));
+    }
 
     // Reconcile forced failures exactly.  A deliberate 500 excuses only the
     // matching method+URL+status response and its browser resource line.

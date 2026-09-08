@@ -1319,6 +1319,11 @@ const SCHEDULER_DRAFT_CARD = "scheduler/draft";
 const SCHEDULER_REVIEW_CARD = "scheduler/review";
 const ICE_BUILDER_CARD = "facilities/ice-builder";
 const CALENDAR_CARD = "calendar/board";
+const SCHEDULER_REVIEW_UNASSIGNED_FILTER = "none:";
+function schedulerReviewFilterValue(value) {
+  return value == null || value === ""
+    ? SCHEDULER_REVIEW_UNASSIGNED_FILTER : `id:${String(value)}`;
+}
 // The production-owned #393 axis. The state-matrix journey reads this tuple
 // from app.js, so adding/removing a card cannot silently shrink its sweep.
 const SCHEDULE_FACILITY_CARD_IDS = Object.freeze([
@@ -1331,6 +1336,19 @@ function invalidateScheduleFacilityCardRequests() {
   SCHEDULE_FACILITY_CARD_IDS.forEach((cardId) => {
     cardGenerations[cardId] = (cardGenerations[cardId] || 0) + 1;
   });
+}
+// A confirmed tuple move invalidates more than responses. Calendar's wizard,
+// move/undo panels and either operational card's open modal all close over ids
+// and copy from the tuple being left. Clear them at ACCEPTANCE (including a
+// hidden accepted leg in a queued A -> B -> A burst), never at intent, so a
+// refused or same-tuple switch preserves the operator's in-progress work.
+function invalidateAcceptedScheduleFacilityContext() {
+  invalidateScheduleFacilityCardRequests();
+  wizard = null;
+  conflict = null;
+  pendingMove = null;
+  movingGameId = null;
+  modal = null;
 }
 function setupWorkflowCardId(key) { return `setup/${key}`; }
 
@@ -1899,6 +1917,11 @@ function cardDisplayPayload(entry) {
   const model = cardDisplayModel(entry);
   return model ? model.payload : null;
 }
+function cardModelIsEmpty(model) {
+  return !!model && (model.state === CARD_STATE.EMPTY
+    || (model.state === CARD_STATE.STALE
+      && model.staleFrom === CARD_STATE.EMPTY));
+}
 function retainableCardModel(entry) {
   // ERROR/LOADING can hold the last-good model one level down in `retained`.
   // Normalize to that payload-bearing model before starting the next request
@@ -2008,8 +2031,12 @@ function restoreOperationalRetryFocus(cardId) {
   if (!root) return;
   const retry = Array.from(root.querySelectorAll("[data-card-retry]"))
     .find((button) => button.dataset.cardRetry === cardId);
-  const target = retry || root.querySelector(".sched-empty-lead,h2,.section-title")
-    || root;
+  // querySelector() chooses document order across a comma list, not selector
+  // order. Prefer the card's explicit EMPTY explanation before a generic
+  // section title so a stale Refresh that resolves empty lands on the outcome
+  // the operator needs to understand.
+  const target = retry || root.querySelector(".sched-empty-lead")
+    || root.querySelector("h2,.section-title") || root;
   if (target.tabIndex < 0) target.setAttribute("tabindex", "-1");
   target.focus({ preventScroll: true });
 }
@@ -2018,7 +2045,9 @@ function operationalLoadingCopy(entry, noun) {
   if (held) {
     return `<div class="banner neutral operational-stale-note" role="status">
       <h2>Loading ${esc(noun)}</h2>
-      <p>${cardTupleCurrent(held.identity)
+      <p>${cardModelIsEmpty(held)
+        ? "Refreshing the previous empty result. No new data has loaded yet."
+        : cardTupleCurrent(held.identity)
         ? "Showing the last loaded data read-only until the refresh arrives."
         : "Showing read-only data from your earlier selection until the current one arrives."}</p></div>`;
   }
@@ -2120,6 +2149,18 @@ function focusCardTarget(identity, el) {
   }
   el.focus();
   return true;
+}
+
+// Operational cards replace the initiating control while their request is in
+// flight. Restore focus only when that replacement actually stranded it on the
+// document; a person who deliberately moved to the persistent context selector
+// (or any other connected control) owns focus now and must not be pulled back
+// into a card by a late settlement.
+function focusOperationalCardTarget(identity, el) {
+  const active = document.activeElement;
+  if (active && active !== document.body && active !== document.documentElement
+      && active.isConnected) return false;
+  return focusCardTarget(identity, el);
 }
 
 // Structural optionality for Workflow 6 (Decision 9 / #365). `optional` is a
@@ -3991,7 +4032,7 @@ function delBtn(kind, id, name, label) {
     title="${esc(aria)}" aria-label="${esc(aria)}">${ICONS.trash}</button>`;
 }
 
-function wireDeleteControls(root, cardIdentity) {
+function wireDeleteControls(root, cardIdentity, deleteTransport) {
   if (!root) return;
   root.querySelectorAll("[data-del]").forEach((button) => {
     button.onclick = (event) => {
@@ -4000,10 +4041,12 @@ function wireDeleteControls(root, cardIdentity) {
       event.stopPropagation();
       modal = { type: "confirm-delete", kind: button.dataset.del,
                 id: button.dataset.delId, name: button.dataset.delName,
-                cardIdentity: cardIdentity || null };
-      // A Scheduler Review confirmation is part of that card. Opening it must
-      // not launch a full render (and thereby supersede the very identity the
-      // confirmation is bound to); paint only the overlay. Generic Setup
+                cardIdentity: cardIdentity || null,
+                deleteTransport: deleteTransport
+                  || (cardIdentity ? "draft-discard" : "setup-delete") };
+      // An operational-card confirmation is part of that card. Opening it
+      // must not launch a full render (and thereby supersede the very identity
+      // the confirmation is bound to); paint only the overlay. Unowned Setup
       // deletes retain their established full-render path.
       if (cardIdentity) repaintModalOnly();
       else render();
@@ -4079,11 +4122,14 @@ const SUBTREE_ROOT_BY_DEL_KIND = {
 // frontend kind tokens map to canonical v2 route segments (league→program,
 // level→league), others 1:1. Shared by the initial confirm and the blocked
 // modal's retry-after-retiring-a-dependency flow (#232 review 6).
-async function attemptDelete(kind, id) {
+function deleteRoute(kind, id) {
   const v2Kind = DEL_ROUTE_V2[kind];
   return v2Kind
-    ? await post(`/api/v2/setup/${v2Kind}/${id}/delete`, {})
-    : await post(`/api/setup/${kind}/${id}/delete`, {});
+    ? `/api/v2/setup/${v2Kind}/${id}/delete`
+    : `/api/setup/${kind}/${id}/delete`;
+}
+async function attemptDelete(kind, id) {
+  return post(deleteRoute(kind, id), {});
 }
 
 function renderModal() {
@@ -4544,14 +4590,18 @@ function wireModal(c) {
       }
       delConfirm.disabled = true;
       toast = "";
-      // A draft row belongs to Scheduler Review and uses that card's own
-      // discard contract/transport. postScoped says nothing globally until
-      // the captured identity has been rechecked after the await.
+      // Ownership and transport are separate facts. Scheduler Review uses its
+      // draft-discard contract; Calendar keeps the generic setup-delete route,
+      // but both are card-owned and must survive the same identity boundary.
       const res = cardIdentity
-        ? await postScoped("/api/scheduler/drafts/discard", { game_ids: [m.id] })
+        ? await postOperationalCardScoped(cardIdentity,
+            m.deleteTransport === "draft-discard"
+              ? "/api/scheduler/drafts/discard" : deleteRoute(m.kind, m.id),
+            m.deleteTransport === "draft-discard" ? { game_ids: [m.id] } : {})
         : await attemptDelete(m.kind, m.id);
+      if (res === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
       if (cardIdentity && !cardIdentityCurrent(cardIdentity)) return;
-      if (cardIdentity) {
+      if (cardIdentity && m.deleteTransport === "draft-discard") {
         modal = null;
         if (res && res.error) {
           announceCardStatus(cardIdentity,
@@ -4564,11 +4614,20 @@ function wireModal(c) {
         loadSchedulerReviewCard({ userInitiated: true, preserveAnnouncement: true });
         return;
       }
+      // postOperationalCardScoped is deliberately silent while the Calendar
+      // delete is in flight. Restore generic delete's page-level error only
+      // after this card identity has survived both sides of the await.
+      if (cardIdentity && res && res.error) {
+        toast = res.error.message;
+        toastIsError = true;
+      }
       if (res && res.error && res.error.code === "has_dependencies") {
         modal = { type: "blocked", kind: m.kind, id: m.id, name: m.name, error: res.error };
         return render();
       }
-      if (res && res.error) { modal = null; return render(); }  // post() set the toast
+      // The unowned path gets its toast from post(); the card-owned Calendar
+      // path restored it above only after the identity survived settlement.
+      if (res && res.error) { modal = null; return render(); }
       modal = null;
       // A Division delete may have cleared inactive, game-free registrations
       // pointing at it (#233 D1 bundled fix, #248) — surface that count so
@@ -8140,7 +8199,7 @@ async function loadCalendarCard(opts) {
   if (!iceBuilder) repaintCalendarSurface(CALENDAR_CARD);
   if (identity.userInitiated) {
     const root = document.querySelector(`[data-operational-card="${CALENDAR_CARD}"]`);
-    focusCardTarget(identity, root && (root.querySelector("[data-ice-builder-open]")
+    focusOperationalCardTarget(identity, root && (root.querySelector("[data-ice-builder-open]")
       || root.querySelector("h2,.cal-date,.sched-empty-lead")));
   }
 }
@@ -8197,7 +8256,7 @@ async function loadIceBuilderCard(opts) {
   if (identity.userInitiated) {
     const root = document.querySelector(
       `[data-operational-card="${ICE_BUILDER_CARD}"]`);
-    focusCardTarget(identity, root && (root.querySelector("[data-ib-preview]")
+    focusOperationalCardTarget(identity, root && (root.querySelector("[data-ib-preview]")
       || root.querySelector("h2,.section-title")));
   }
   return identity;
@@ -8213,8 +8272,9 @@ async function previewIceBuilder(requestForm, opts) {
     ICE_BUILDER_CARD, { userInitiated: true });
   if (!identity) return;
   repaintCalendarSurface(ICE_BUILDER_CARD);
-  const result = await postScoped("/api/setup/ice-availability/preview", form);
-  await awaitOperationalCardContextSettlement(identity);
+  const result = await postOperationalCardScoped(
+    identity, "/api/setup/ice-availability/preview", form);
+  if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
   if (!iceBuilder || requestOp !== iceOperationSeq
       || !cardIdentityCurrent(identity)) return;
   if (result && !result.error) {
@@ -8255,7 +8315,7 @@ async function previewIceBuilder(requestForm, opts) {
   repaintCalendarSurface(ICE_BUILDER_CARD);
   const root = document.querySelector(
     `[data-operational-card="${ICE_BUILDER_CARD}"]`);
-  focusCardTarget(identity, root && (root.querySelector("[data-ib-commit]")
+  focusOperationalCardTarget(identity, root && (root.querySelector("[data-ib-commit]")
     || root.querySelector("[data-ib-preview]")
     || root.querySelector("h2,.section-title")));
 }
@@ -8278,11 +8338,12 @@ function wireCalendarCards(c) {
   // render()'s cross-view wiring pass.  Generic Delete controls rendered by
   // the board therefore belong in this card-local pass too; otherwise an ice
   // slot's button remains visible after settlement but has no click handler.
-  // Do not pass a card identity: Calendar uses the ordinary setup delete
-  // endpoint, while an identity here denotes Scheduler Review's draft-discard
-  // transport in wireModal().
+  // Ownership and transport are separate facts. Calendar keeps the ordinary
+  // setup-delete endpoint, but carries its card identity so a context intent
+  // can refuse an already-open confirmation before anything reaches the wire.
   wireDeleteControls(c.querySelector(
-    `[data-operational-card="${CALENDAR_CARD}"]`));
+    `[data-operational-card="${CALENDAR_CARD}"]`),
+    calendarEntry.identity, "setup-delete");
   const calendarRetry = c.querySelector(
     `[data-card-retry="${CALENDAR_CARD}"]`);
   if (calendarRetry) calendarRetry.onclick = () =>
@@ -8305,9 +8366,10 @@ function wireCalendarCards(c) {
   const commitMove = async (gid, slotId) => {
     if (!calendarCurrent) return;
     const identity = calendarEntry.identity;
-    const result = await postScoped(`/api/games/${gid}/move`, {
+    const result = await postOperationalCardScoped(identity, `/api/games/${gid}/move`, {
       ice_slot_id: slotId, reason: "Moved on arena calendar",
     });
+    if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
     if (!cardIdentityCurrent(identity)) return;
     conflict = buildConflict(result, ov, gid, slotId);
     pendingMove = null; movingGameId = null;
@@ -8359,9 +8421,10 @@ function wireCalendarCards(c) {
     button.onclick = async () => {
       if (!calendarCurrent) return;
       const identity = calendarEntry.identity;
-      await postScoped("/api/demo/add-ice-slot", {
+      const result = await postOperationalCardScoped(identity, "/api/demo/add-ice-slot", {
         rink_id: button.dataset.addslot, date: calendarDate,
       });
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
       if (cardIdentityCurrent(identity)) refreshCalendar({ userInitiated: true });
     };
   });
@@ -8481,10 +8544,11 @@ function wireCalendarCards(c) {
       ICE_BUILDER_CARD, { userInitiated: true });
     if (!identity) return;
     rerender();
-    const result = await postScoped("/api/setup/ice-availability/commit", {
+    const result = await postOperationalCardScoped(
+      identity, "/api/setup/ice-availability/commit", {
       ...form, template_fingerprint: fingerprint,
     });
-    await awaitOperationalCardContextSettlement(identity);
+    if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
     if (!iceBuilder || requestOp !== iceOperationSeq
         || !cardIdentityCurrent(identity)) return;
     const reason = result && result.error && result.error.details
@@ -8531,17 +8595,6 @@ function wireCalendarCards(c) {
     };
   });
 
-  const publish = c.querySelectorAll("[data-publish]");
-  publish.forEach((button) => {
-    button.onclick = async () => {
-      const identity = calendarEntry.identity;
-      const result = await postScoped(`/api/games/${button.dataset.publish}/publish`, {});
-      if (cardIdentityCurrent(identity) && result && !result.error) {
-        announceCardStatus(identity, "Game published.", false);
-        refreshCalendar({ userInitiated: true });
-      }
-    };
-  });
   c.querySelectorAll("[data-openroster]").forEach((button) => {
     button.onclick = () => {
       currentGame = button.dataset.openroster; switchTab("roster");
@@ -8594,7 +8647,9 @@ function wireCalendarCards(c) {
         ice_slot_id: wizard.slot_id };
     }
     const identity = calendarEntry.identity;
-    const result = await postScoped("/api/v2/setup/game", body);
+    const result = await postOperationalCardScoped(
+      identity, "/api/v2/setup/game", body);
+    if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
     if (!cardIdentityCurrent(identity)) return;
     if (result && !result.error) {
       announceCardStatus(identity,
@@ -8630,7 +8685,8 @@ function renderDay(ov, ctx, rinks, actionable) {
     // controls — so operators use the real, attributed "＋ Add Ice" drawer
     // (/api/v2/setup/ice-slot) instead of hitting a 403 (#305/#303 follow-up).
     const addIce = (canArena && isDemo())
-      ? `<div class="slot-card available" data-addslot="${esc(r.id)}"><div class="t">＋</div><div class="s">Add ice</div></div>` : "";
+      ? `<div class="slot-card available" data-addslot="${esc(r.id)}"
+          role="button" tabindex="0" aria-label="Add ice at ${esc(r.name)}"><div class="t">＋</div><div class="s">Add ice</div></div>` : "";
     return `<div class="cal-row"><div class="cal-rink">${esc(r.name)}</div>
       <div class="cal-slots">${cards}${addIce}</div></div>`;
   }).join("");
@@ -8871,7 +8927,7 @@ function renderIceBuilder(ov) {
     ? `<div class="ib-hint">Season runs ${esc(ibDateOnly(season.start_date))} → ${esc(ibDateOnly(season.end_date))}. Leave the date range blank to cover the whole Season. Times are in the Season's local timezone; Season dates are never changed here.</div>`
     : `<div class="ib-hint">Select a Season — slots generate in its local timezone.</div>`;
 
-  const formHtml = actionable ? `<div class="card ib-form">
+  const formHtml = actionable ? `<div class="card ib-form" data-card-local-controls>
       <label class="ib-field"><span>Season</span>
         <select id="ib-season">${seasonOpts || `<option value="">No seasons yet</option>`}</select></label>
       ${seasonHint}
@@ -8909,7 +8965,7 @@ function renderIceBuilder(ov) {
   }
   const body = `<div class="ib-wrap">
     <div class="ib-head"><h2>🧊 Build recurring ice</h2>
-      <button class="act ghost" data-ib-cancel>← Back to calendar</button></div>
+      <button class="act ghost" data-ib-cancel data-card-local-control>← Back to calendar</button></div>
     <p class="ib-lead">Generate a draft ice inventory from a recurring weekly block, preview every slot,
       then create the Available Game ice. Nothing is scheduled here.</p>
     ${formHtml}${stateHtml}
@@ -10979,18 +11035,35 @@ function renderScheduler(ov) {
   const reviewActionable = reviewEntry.state === CARD_STATE.READY
     && cardIdentityCurrent(reviewEntry.identity) && !contextSwitchIntentPending;
   const f = schedulerState.filters;
-  const draftDivs = divs.length ? divs : Array.from(new Map(allDrafts.map((g) =>
-    [g.division_id, { id: g.division_id, name: g.division_name || g.division_id }])).values());
-  const draftRinks = (schedulerOv.rinks || []).length ? schedulerOv.rinks
-    : Array.from(new Map(allDrafts.map((g) =>
-      [g.rink_id, { id: g.rink_id, name: g.rink_name || g.rink_id }])).values());
+  // Review owns its own filter inventory. Borrowing Draft's overview lets a
+  // retained/sibling response put another tuple's names and ids into this
+  // independently-current card; the rows themselves are the authoritative,
+  // self-contained axis for both filters.
+  const reviewAxis = (idKey, nameKey) => Array.from(new Map(allDrafts.map((g) => {
+    const id = schedulerReviewFilterValue(g[idKey]);
+    return [id, { id, name: id === SCHEDULER_REVIEW_UNASSIGNED_FILTER
+      ? "Unassigned" : (g[nameKey] || g[idKey]) }];
+  })).values());
+  const draftDivs = reviewAxis("division_id", "division_name");
+  const draftRinks = reviewAxis("rink_id", "rink_name");
+  // Filter values belong to the Review tuple too. If the selected key came
+  // from a previous tuple and is absent here, the native <select> would LOOK
+  // like All while the row predicate still applied the invisible old key.
+  // Resolve that mismatch locally to All so the rendered control and rows
+  // always describe the same effective filter.
+  const effectiveDivisionFilter = (f.division === "all"
+    || draftDivs.some((row) => row.id === f.division)) ? f.division : "all";
+  const effectiveRinkFilter = (f.rink === "all"
+    || draftRinks.some((row) => row.id === f.rink)) ? f.rink : "all";
   const divOptions = (selectedId) => draftDivs.map((d) =>
     `<option value="${esc(d.id)}" ${d.id === selectedId ? "selected" : ""}>${esc(d.name)}</option>`).join("");
   const rinkOpts = draftRinks.map((r) =>
-    `<option value="${esc(r.id)}" ${r.id === f.rink ? "selected" : ""}>${esc(r.name)}</option>`).join("");
+    `<option value="${esc(r.id)}" ${r.id === effectiveRinkFilter ? "selected" : ""}>${esc(r.name)}</option>`).join("");
   const drafts = allDrafts.filter((g) => {
-    if (f.division !== "all" && g.division_id !== f.division) return false;
-    if (f.rink !== "all" && g.rink_id !== f.rink) return false;
+    if (effectiveDivisionFilter !== "all"
+        && schedulerReviewFilterValue(g.division_id) !== effectiveDivisionFilter) return false;
+    if (effectiveRinkFilter !== "all"
+        && schedulerReviewFilterValue(g.rink_id) !== effectiveRinkFilter) return false;
     if (f.issue === "issues" && !g.issues.length) return false;
     if (f.issue === "clean" && g.issues.length) return false;
     return true;
@@ -11002,8 +11075,8 @@ function renderScheduler(ov) {
       By division: ${Object.entries(summary.by_division || {}).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
       &nbsp;·&nbsp; By rink: ${Object.entries(summary.by_rink || {}).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
     </div>` : "";
-  const filterBlock = allDrafts.length ? `<div class="dq-actions">
-    <select id="sched-filter-div"><option value="all">All divisions</option>${divOptions(f.division === "all" ? null : f.division)}</select>
+  const filterBlock = allDrafts.length ? `<div class="dq-actions" data-card-local-controls>
+    <select id="sched-filter-div"><option value="all">All divisions</option>${divOptions(effectiveDivisionFilter === "all" ? null : effectiveDivisionFilter)}</select>
     <select id="sched-filter-rink"><option value="all">All rinks</option>${rinkOpts}</select>
     <select id="sched-filter-issue"><option value="all" ${f.issue === "all" ? "selected" : ""}>All</option>
       <option value="issues" ${f.issue === "issues" ? "selected" : ""}>With issues</option>
@@ -11022,19 +11095,25 @@ function renderScheduler(ov) {
       <button class="act ghost danger" data-sched-discard ${selectedCount ? "" : "disabled"}
         >Discard ${selectedCount} of ${allDrafts.length}</button></div>`;
   }
+  const reviewEmptyHtml = `<div class="card sched-empty" data-card-empty="review">
+      <div class="sched-empty-lead">No draft games in this selection.</div>
+      <p>Generate and commit a proposal to create drafts for review.</p></div>`;
+  const displayedReview = cardDisplayModel(reviewEntry);
+  const reviewDisplayIsEmpty = cardModelIsEmpty(displayedReview);
+  const retainedReview = reviewDisplayIsEmpty
+    ? summaryBlock + reviewEmptyHtml : reviewData;
   let reviewBody;
   if (reviewEntry.state === CARD_STATE.LOADING) {
     reviewBody = operationalLoadingCopy(reviewEntry, "draft review")
-      + (allDrafts.length || summary ? reviewData : "");
+      + (displayedReview ? retainedReview : "");
   } else if (reviewEntry.state === CARD_STATE.ERROR) {
     reviewBody = operationalErrorCopy(SCHEDULER_REVIEW_CARD, "Draft review", reviewEntry)
-      + (allDrafts.length || summary ? reviewData : "");
+      + (displayedReview ? retainedReview : "");
   } else if (reviewEntry.state === CARD_STATE.STALE) {
-    reviewBody = operationalStaleCopy(SCHEDULER_REVIEW_CARD, "Draft review") + reviewData;
+    reviewBody = operationalStaleCopy(SCHEDULER_REVIEW_CARD, "Draft review")
+      + (displayedReview ? retainedReview : "");
   } else if (reviewEntry.state === CARD_STATE.EMPTY) {
-    reviewBody = `${summaryBlock}<div class="card sched-empty" data-card-empty="review">
-      <div class="sched-empty-lead">No draft games in this selection.</div>
-      <p>Generate and commit a proposal to create drafts for review.</p></div>`;
+    reviewBody = retainedReview;
   } else {
     reviewBody = reviewData;
   }
@@ -11132,7 +11211,7 @@ async function loadSchedulerDraftCard(opts) {
   repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
   if (identity.userInitiated) {
     const root = document.querySelector(`[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
-    focusCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
+    focusOperationalCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
       || root.querySelector("h2,.section-title")));
   }
 }
@@ -11177,7 +11256,7 @@ async function loadSchedulerReviewCard(opts) {
   repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
   if (identity.userInitiated) {
     const root = document.querySelector(`[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
-    focusCardTarget(identity, root && (root.querySelector("[data-sched-publish]")
+    focusOperationalCardTarget(identity, root && (root.querySelector("[data-sched-publish]")
       || root.querySelector("h2,.section-title,.sched-empty-lead")));
   }
 }
@@ -11188,8 +11267,9 @@ async function generateSchedulerDraft(request) {
   const identity = beginOperationalCardLoad(SCHEDULER_DRAFT_CARD, { userInitiated: true });
   if (!identity) return;
   repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
-  const result = await postScoped("/api/scheduler/draft", request);
-  await awaitOperationalCardContextSettlement(identity);
+  const result = await postOperationalCardScoped(
+    identity, "/api/scheduler/draft", request);
+  if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
   if (!cardIdentityCurrent(identity)) return;
   if (result && !result.error) {
     commitCardState(identity, {
@@ -11218,7 +11298,7 @@ async function generateSchedulerDraft(request) {
   }
   repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
   const root = document.querySelector(`[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
-  focusCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
+  focusOperationalCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
     || root.querySelector("h2,.section-title")));
 }
 
@@ -11297,7 +11377,7 @@ function wireSchedulerCards(c) {
       SCHEDULER_DRAFT_CARD, { userInitiated: true });
     if (!identity) return;
     repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
-    const result = await postScoped("/api/scheduler/commit", {
+    const result = await postOperationalCardScoped(identity, "/api/scheduler/commit", {
       division_id: schedulerState.division,
       ...(preview.games_per_team != null
         ? { games_per_team: preview.games_per_team }
@@ -11305,7 +11385,7 @@ function wireSchedulerCards(c) {
       constraints: { min_turnaround_minutes: preview.min_turnaround_minutes || 0 },
       draft_fingerprint: preview.draft_fingerprint,
     });
-    await awaitOperationalCardContextSettlement(identity);
+    if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
     if (!cardIdentityCurrent(identity)) return;
     if (result && !result.error) {
       commitCardState(identity, {
@@ -11338,7 +11418,7 @@ function wireSchedulerCards(c) {
     repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
     const root = document.querySelector(
       `[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
-    focusCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
+    focusOperationalCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
       || root.querySelector("h2,.section-title")));
   };
 
@@ -11393,8 +11473,8 @@ function wireSchedulerCards(c) {
       SCHEDULER_REVIEW_CARD, { userInitiated: true });
     if (!identity) return;
     repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
-    const result = await postScoped(path, { game_ids: ids });
-    await awaitOperationalCardContextSettlement(identity);
+    const result = await postOperationalCardScoped(identity, path, { game_ids: ids });
+    if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
     if (!cardIdentityCurrent(identity)) return;
     if (result && !result.error) {
       announceCardStatus(identity,
@@ -13267,7 +13347,8 @@ async function render() {
     // already put on screen with an error for a question nobody is still
     // asking, and would settle its focus intent on this pass's behalf.
     if (renderPass !== myRenderPass) return;
-    setChrome(ov);
+    setChrome(view === "scheduler" || view === "calendar"
+      ? selectedContextChromeOverview() : ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
       <p>The backend may not be running. ${esc(e.message || e)}</p></div>
       <div class="actions"><button class="act primary" id="retry-btn">Retry</button></div>`;
@@ -13297,7 +13378,8 @@ async function render() {
   // one that paints, so standing down here leaves the newest state on screen
   // instead of overwriting it with this pass's older data.
   if (renderPass !== myRenderPass) return;
-  setChrome(ov);
+  setChrome(view === "scheduler" || view === "calendar"
+    ? selectedContextChromeOverview() : ov);
   updateNotifBadge();
   // Keep the header demo control's Load↔Reset label in step with the actual
   // data (#215): the demo boots empty and can be populated by the demo Load, a
@@ -15541,8 +15623,8 @@ function withdrawContextScopedActionControls() {
     + "[data-setup-card-ask],[data-setup-card-confirm-yes],[data-setup-card-confirm-no],"
     + "[data-sched-generate],[data-sched-commit],[data-sched-publish],[data-sched-discard],"
     + "[data-del],.sched-pick,[data-ice-builder-open],[data-ib-preview],[data-ib-commit],"
-    + "[data-slot],[data-game],[data-move-game],[data-move-confirm],"
-    + "[data-addslot],[data-wizcreate]"
+    + "[data-slot],[data-game],[data-move-game],[data-move-confirm],[data-move-undo],"
+    + "[data-addslot],[data-wizcreate],[data-publish],[data-del-confirm]"
   ).forEach((el) => el.remove());
 }
 function invalidateContextScopedMutations() {
@@ -15651,6 +15733,24 @@ async function awaitOperationalCardContextSettlement(identity) {
     const settlement = contextSwitchIntentSettlement;
     await settlement;
   }
+}
+
+const OPERATIONAL_CARD_WRITE_WITHDRAWN = Object.freeze({ withdrawn: true });
+
+// Every persisted write owned by an operational card crosses one shared,
+// two-sided intent boundary. A handler reached after intent is refused before
+// fetch (including a detached node whose closure was already bound); a write
+// already on the wire waits for reconciliation before its result can mutate
+// card state. The caller receives a sentinel so it cannot mistake withdrawal
+// for a transport failure and paint an ERROR under the departing tuple.
+async function postOperationalCardScoped(identity, path, body) {
+  if (contextSwitchIntentPending || !cardIdentityCurrent(identity)) {
+    return OPERATIONAL_CARD_WRITE_WITHDRAWN;
+  }
+  const result = await postScoped(path, body);
+  await awaitOperationalCardContextSettlement(identity);
+  return cardIdentityCurrent(identity)
+    ? result : OPERATIONAL_CARD_WRITE_WITHDRAWN;
 }
 
 // Build page chrome from the selected-context authority, never from a card's
@@ -15911,7 +16011,7 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
     // painting it in favor of the queued intent. That hidden A -> B leg must
     // still invalidate A's card identities; otherwise a queued B -> A makes a
     // response from the first visit to A appear current again.
-    if (acceptedContextMoved) invalidateScheduleFacilityCardRequests();
+    if (acceptedContextMoved) invalidateAcceptedScheduleFacilityContext();
     const next = contextSwitchQueued;
     contextSwitchQueued = null;
     return sendContextSwitch(next.mySeq, next.programId, next.seasonId, next.leagueId);
@@ -15954,7 +16054,7 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
     render();
     return;
   }
-  if (acceptedContextMoved) invalidateScheduleFacilityCardRequests();
+  if (acceptedContextMoved) invalidateAcceptedScheduleFacilityContext();
   // Reflect the canonical selection in the hash IMMEDIATELY from the POST echo,
   // before the options refresh below. The refresh is a second round-trip; if we
   // waited until after it to sync the hash, a very fast reload in that window
@@ -16314,6 +16414,12 @@ document.addEventListener("keydown", (e) => {
 // render already bound, rather than duplicating that logic here.
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Enter" && e.key !== " ") return;
+  // Native controls already implement keyboard activation. In particular, a
+  // Calendar Delete <button> can be nested inside a role=button slot card;
+  // promoting its keydown to the ancestor would schedule the slot before the
+  // button's own click opens its confirmation.
+  if (e.target.closest(
+      'button,a[href],input,select,textarea,summary,[contenteditable="true"]')) return;
   const el = e.target.closest('[role="button"]');
   if (!el) return;
   e.preventDefault();

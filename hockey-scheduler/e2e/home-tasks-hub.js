@@ -1131,14 +1131,40 @@ async function checkRoleScenarios(browser, viewport) {
   // could not be identified at all from the failure text. Record the real
   // responses alongside it and print them with the errors.
   const httpFailures = [];
+  const requestFailures = [];
+  const clientCancelledRequests = [];
   page.on("response", (r) => {
     if (r.status() >= 400) {
       httpFailures.push(`${r.status()} ${r.request().method()} ${r.url()}`);
     }
   });
+  // A transport failure has no Response and therefore never reaches the HTTP
+  // ledger above. Keep method, URL and Chromium's reason before filtering the
+  // generic URL-less console line, so DNS/reset/abort failures cannot vanish.
+  page.on("requestfailed", (request) => {
+    const reason = request.failure() && request.failure().errorText
+      || "unknown failure";
+    const row = `${request.method()} ${request.url()} :: ${reason}`;
+    // net::ERR_ABORTED on a GET is Chromium's client-cancellation result:
+    // navigation withdraws the old document's reads, and the app deliberately
+    // aborts context-scoped reads before switching. Keep those visible in their
+    // own ledger without calling them transport outages. An aborted write, and
+    // every other no-response result (DNS, refusal/reset, timeout), stays fatal.
+    if (request.method() === "GET" && reason === "net::ERR_ABORTED") {
+      clientCancelledRequests.push(row);
+    } else {
+      requestFailures.push(row);
+    }
+  });
   const errorReport = () => errors.join("\n")
     + (httpFailures.length
       ? `\n--- non-2xx responses seen on this page ---\n${httpFailures.join("\n")}`
+      : "")
+    + (requestFailures.length
+      ? `\n--- requests failed before a response ---\n${requestFailures.join("\n")}`
+      : "")
+    + (clientCancelledRequests.length
+      ? `\n--- requests cancelled by the client ---\n${clientCancelledRequests.join("\n")}`
       : "");
   const consumeHttpFailure = (status, method, path) => {
     const prefix = `${status} ${method} `;
@@ -1146,6 +1172,14 @@ async function checkRoleScenarios(browser, viewport) {
       (row) => row.startsWith(prefix) && row.includes(path));
     if (index === -1) return false;
     httpFailures.splice(index, 1);
+    return true;
+  };
+  const consumeRequestFailure = (method, path) => {
+    const prefix = `${method} `;
+    const index = requestFailures.findIndex(
+      (row) => row.startsWith(prefix) && row.includes(path));
+    if (index === -1) return false;
+    requestFailures.splice(index, 1);
     return true;
   };
   const axeSource = fs.readFileSync(AXE_PATH, "utf8");
@@ -1165,6 +1199,22 @@ async function checkRoleScenarios(browser, viewport) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
     await reachDashboard(page);  // signed in as the auto-provisioned League Admin
+    // Falsify the request-failure ledger itself. A failed transport has no
+    // response row and Chromium emits only the generic console line filtered
+    // above; removing page.on("requestfailed") must therefore make this exact
+    // consume fail instead of letting the abort disappear.
+    const requestFailureProbePath = "/api/health?request-failure-ledger=1";
+    const requestFailureEvent = page.waitForEvent("requestfailed", (request) =>
+      request.method() === "GET" && request.url().includes(requestFailureProbePath));
+    await page.route(`**${requestFailureProbePath}`,
+      (route) => route.abort("connectionrefused"));
+    await page.evaluate((path_) => fetch(path_, { credentials: "same-origin" })
+      .catch(() => null), requestFailureProbePath);
+    const failedProbe = await requestFailureEvent;
+    await page.unroute(`**${requestFailureProbePath}`);
+    if (!failedProbe || !consumeRequestFailure("GET", requestFailureProbePath)) {
+      fail(`transport failure did not enter the request-failure ledger:\n${errorReport()}`);
+    }
     // A fresh boot only seeds the "admin" account -- "arena" (and the other
     // demo personas) are UserAccount rows /api/demo/load builds, same as
     // permanent-teams.js's own Arena Manager coverage. Harmless alongside
@@ -1174,7 +1224,14 @@ async function checkRoleScenarios(browser, viewport) {
     const loadStatus = await page.evaluate(() => fetch("/api/demo/load", {
       method: "POST", credentials: "same-origin",
       headers: { "Content-Type": "application/json" }, body: "{}",
-    }).then((r) => r.status));
+    }).then(async (r) => {
+      // Drain the successful write before this long journey starts navigating.
+      // Reading only the status leaves its response stream alive, so a later
+      // document replacement reports the already-accepted POST as ERR_ABORTED
+      // and correctly trips the failed-write ledger above.
+      await r.text();
+      return r.status;
+    }));
     if (loadStatus !== 200) fail(`demo load (as admin) failed (status ${loadStatus})`);
 
     // ---- (A) Program A: two Seasons sharing one permanent League (#331
@@ -4325,7 +4382,7 @@ async function checkRoleScenarios(browser, viewport) {
     await logout(page);
     await loginAs(page, "admin", "demo");
 
-    if (errors.length || httpFailures.length) {
+    if (errors.length || httpFailures.length || requestFailures.length) {
       fail(`console/page errors:\n${errorReport()}`);
     }
     console.log(`[${viewport.label}] OK — Register Team stays scoped to the `

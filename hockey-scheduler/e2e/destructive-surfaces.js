@@ -196,6 +196,30 @@ async function checkViewport(browser, viewport) {
     if (shown !== day) fail(`calendar shows ${shown}, ice was booked on ${day}`);
     const slotDel = `.slot-del[data-del="ice-slot"][data-del-id="${ids.slotFree}"]`;
     await page.waitForSelector(slotDel, { timeout: 15000 });
+    // The native Delete button is nested inside a slot card that is itself a
+    // role=button schedule target. Enter and Space must activate the native
+    // child only; the global role-button shim must not promote either key to
+    // the ancestor and open the game wizard first.
+    for (const key of ["Enter", "Space"]) {
+      await page.focus(slotDel);
+      await page.keyboard.press(key);
+      await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
+      const keyboardTarget = await page.evaluate(() => ({
+        type: modal && modal.type,
+        kind: modal && modal.kind,
+        id: modal && modal.id,
+        wizardOpen: !!wizard,
+      }));
+      if (keyboardTarget.type !== "confirm-delete"
+          || keyboardTarget.kind !== "ice-slot"
+          || keyboardTarget.id !== ids.slotFree
+          || keyboardTarget.wizardOpen) {
+        fail(`${key} on nested Calendar Delete activated the wrong target: `
+          + JSON.stringify(keyboardTarget));
+      }
+      await page.locator(".modal button[data-modal-close]").last().click();
+      await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    }
     await page.click(slotDel);
     await page.waitForSelector(".modal.danger [data-del-confirm]", { timeout: 10000 });
     resp = page.waitForResponse((r) =>
