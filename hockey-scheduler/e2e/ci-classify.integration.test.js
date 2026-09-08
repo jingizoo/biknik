@@ -10,8 +10,9 @@
 //   B. a merge-base (three-dot) diff must exclude changes the base branch
 //      advanced with after the fork (two-dot pulls them in and can force a
 //      wrong full matrix);
-// plus C. a guard that the workflow trigger does NOT path-filter (which would
-//      re-introduce the fail-open bypass this PR removes); and
+// plus C. guards that the workflow trigger does NOT path-filter (which would
+//      re-introduce the fail-open bypass this PR removes), and that the cheap
+//      operational-card source oracle runs before browser installation; and
 //      D. a falsified workflow contract proving the live PR-body gate is in
 //      its own edited-aware workflow rather than the gated front-end job; and
 //      E. the real CLI writes the routing decision GitHub Actions consumes.
@@ -140,6 +141,55 @@ function assertBodyWorkflowContract(mainWorkflow, bodyWorkflow) {
     "frontend-check must not retain a second, classifier-gated body invocation");
 }
 
+function assertOperationalWriteOwnerWorkflowContract(workflow, packageManifest) {
+  const jobStart = workflow.indexOf("\n  frontend-check:\n");
+  const jobEnd = workflow.indexOf("\n  browser-smoke:\n", jobStart + 1);
+  assert.ok(jobStart >= 0 && jobEnd > jobStart,
+    "frontend-check must remain a distinct job before browser-smoke");
+  const job = workflow.slice(jobStart, jobEnd);
+  assert.deepStrictEqual(job.split("\n").map((line) => line.trim())
+    .filter((line) => line.startsWith("needs:")),
+  ["needs: changes"],
+  "frontend-check must depend only on the always-running classifier");
+  assert.deepStrictEqual(job.split("\n").map((line) => line.trim())
+    .filter((line) => line.startsWith("if:")),
+  ["if: needs.changes.outputs.frontend_check == 'true'"],
+  "frontend-check must be gated only by the classifier's frontend output");
+  assert.ok(!/^\s*continue-on-error\s*:/m.test(job),
+    "frontend-check must never turn a source-oracle failure into success");
+  const stepLines = (name) => {
+    const marker = `      - name: ${name}\n`;
+    const start = job.indexOf(marker);
+    assert.ok(start >= 0, `frontend-check is missing ${name}`);
+    const next = job.indexOf("\n      - ", start + marker.length);
+    return job.slice(start, next < 0 ? undefined : next).split("\n")
+      .map((line) => line.trim()).filter(Boolean);
+  };
+  const installName = "Install operational-card source-oracle dependency";
+  const oracleName = "Check operational-card write ownership (#455 follow-up)";
+  assert.deepStrictEqual(stepLines(installName), [
+    `- name: ${installName}`,
+    "working-directory: hockey-scheduler/e2e",
+    "run: npm ci --ignore-scripts",
+  ], "the dependency install must be exact, unconditional, and failure-fatal");
+  assert.deepStrictEqual(stepLines(oracleName), [
+    `- name: ${oracleName}`,
+    "working-directory: hockey-scheduler/e2e",
+    "run: npm run scheduler-write-owner-oracle",
+  ], "the source oracle must be exact, unconditional, and failure-fatal");
+  assert.ok(job.indexOf(`- name: ${installName}`)
+      < job.indexOf(`- name: ${oracleName}`),
+  "frontend-check must install Acorn before running the source oracle");
+  assert.strictEqual(
+    (workflow.match(/npm run scheduler-write-owner-oracle/g) || []).length,
+    1,
+    "the cheap source oracle must have one explicit workflow invocation");
+  assert.strictEqual(
+    packageManifest.scripts && packageManifest.scripts["scheduler-write-owner-oracle"],
+    "node scheduler-state-matrix.js --source-oracle-only",
+    "the workflow command must resolve to the source-only oracle, not a browser journey");
+}
+
 let passed = 0;
 const cleanup = [];
 try {
@@ -218,6 +268,8 @@ try {
   {
     const wfPath = path.resolve(__dirname, "..", "..", ".github", "workflows", "hockey-scheduler-ci.yml");
     const wf = fs.readFileSync(wfPath, "utf8");
+    const packageManifest = JSON.parse(fs.readFileSync(
+      path.resolve(__dirname, "package.json"), "utf8"));
     const onStart = wf.indexOf("\non:");
     const jobsStart = wf.indexOf("\njobs:");
     assert.ok(onStart >= 0 && jobsStart > onStart, "workflow has an on: block before jobs:");
@@ -231,8 +283,61 @@ try {
     assert.ok(/\.\.\.\$\{?HEAD_SHA\}?|\$\{?BASE_SHA\}?\.\.\.|BASE_SHA\.\.\.HEAD_SHA/.test(wf)
       || /\$BASE_SHA\.\.\.\$HEAD_SHA/.test(wf),
       "the changes job uses a three-dot merge-base diff");
+    assertOperationalWriteOwnerWorkflowContract(wf, packageManifest);
+    assert.throws(
+      () => assertOperationalWriteOwnerWorkflowContract(
+        wf.replace("npm run scheduler-write-owner-oracle", "node --check scheduler-state-matrix.js"),
+        packageManifest),
+      /source oracle must be exact|explicit workflow invocation/,
+      "removing only the source-oracle invocation must fail the workflow contract");
+    assert.throws(
+      () => assertOperationalWriteOwnerWorkflowContract(
+        wf.replace(
+          "        run: npm run scheduler-write-owner-oracle",
+          "        if: false\n        run: npm run scheduler-write-owner-oracle"),
+        packageManifest),
+      /source oracle must be exact|gated only by the classifier/,
+      "conditionally disabling the source oracle must fail the workflow contract");
+    assert.throws(
+      () => assertOperationalWriteOwnerWorkflowContract(
+        wf.replace(
+          "if: needs.changes.outputs.frontend_check == 'true'",
+          "if: needs.changes.outputs.frontend_check == 'true' && false"),
+        packageManifest),
+      /gated only by the classifier/,
+      "disabling the whole frontend job must fail the workflow contract");
+    assert.throws(
+      () => assertOperationalWriteOwnerWorkflowContract(
+        wf.replace(
+          "  frontend-check:\n    needs: changes",
+          "  frontend-check:\n    needs: [changes, test]"),
+        packageManifest),
+      /depend only on the always-running classifier/,
+      "depending on a classifier-skipped job must fail the workflow contract");
+    assert.throws(
+      () => assertOperationalWriteOwnerWorkflowContract(
+        wf.replace("  frontend-check:\n", "  frontend-check:\n    continue-on-error: true\n"),
+        packageManifest),
+      /never turn a source-oracle failure into success/,
+      "making the whole frontend job non-fatal must fail the workflow contract");
+    assert.throws(
+      () => assertOperationalWriteOwnerWorkflowContract(
+        wf.replace(
+          "        run: npm run scheduler-write-owner-oracle",
+          "        run: npm run scheduler-write-owner-oracle\n        continue-on-error: true"),
+        packageManifest),
+      /source oracle must be exact|never turn a source-oracle failure into success/,
+      "making the source oracle failure non-fatal must fail the workflow contract");
+    assert.throws(
+      () => assertOperationalWriteOwnerWorkflowContract(wf, {
+        ...packageManifest,
+        scripts: { ...packageManifest.scripts,
+          "scheduler-write-owner-oracle": "node scheduler-state-matrix.js" },
+      }),
+      /source-only oracle/,
+      "routing the fast gate through the browser journey must fail the contract");
     passed += 1;
-    console.log("  ok  C. workflow trigger does not path-filter; changes job uses merge-base + --no-renames");
+    console.log("  ok  C. workflow trigger and fast source-oracle gate are structurally pinned");
   }
 
   // --- D. the live PR-body gate must not hide under a heavy job ------------

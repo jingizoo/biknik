@@ -28,7 +28,9 @@
 // stores are read only as supplementary evidence; states are reached through
 // shipped controls and forced transport outcomes.
 const { chromium } = require("playwright");
+const acorn = require("acorn");
 const { spawn } = require("child_process");
+const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const {
@@ -38,6 +40,7 @@ const {
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
+const APP_JS = path.resolve(BACKEND_DIR, "hockey_scheduler", "web", "static", "app.js");
 const READY_TIMEOUT_MS = 15000;
 const QUIET_WINDOW_MS = 300;
 const QUIESCE_TIMEOUT_MS = 30000;
@@ -60,6 +63,64 @@ const CALENDAR_CARD = "calendar/board";
 const SEMANTIC_CONTROL_SELECTOR =
   "button,select,input:not([type=hidden]),textarea,[role=button],[draggable=true]";
 
+// Direct access to postScoped is deliberately rarer than card ownership.
+// These are the complete, independently-fenced AST shapes that may touch the
+// silent transport without going through postOperationalCardScoped. The
+// operational-card OWNER axis is derived below from all of app.js; this narrow
+// list records only the intentionally different settlement contracts.
+const SCOPED_POST_BOUNDARIES = Object.freeze({
+  "operational-card-settlement": Object.freeze({
+    owner: "postOperationalCardScoped",
+    functionDepth: 1,
+    shape: "direct",
+    result: "result",
+    settlement: "operational",
+    arguments: /^\s*\(\s*path\s*,\s*body\s*\)/,
+  }),
+  "season-reopen-ledger": Object.freeze({
+    owner: "reopenSelectedSeasonFromCard",
+    functionDepth: 1,
+    shape: "direct",
+    result: "r",
+    settlement: "season",
+    cardOwnedException: true,
+    arguments: /^\s*\(\s*`\/api\/v2\/setup\/seasons\/\$\{seasonId\}\/reopen`\s*,/,
+  }),
+  "substitute-home-ledger": Object.freeze({
+    owner: "render",
+    functionDepth: 3,
+    shape: "direct",
+    result: "r",
+    settlement: "substitute",
+    arguments: /^\s*\(\s*`\/api\/me\/substitute-opportunities\/\$\{encodeURIComponent\(gid\)\}\/\$\{verb\}`\s*,\s*body\s*\)/,
+  }),
+  "substitute-detail-ledger": Object.freeze({
+    owner: "render",
+    functionDepth: 3,
+    shape: "operation-choice",
+    result: "r",
+    settlement: "substitute",
+    arguments: /^\s*\(\s*`\/api\/me\/substitute-opportunities\/\$\{encodeURIComponent\(gid\)\}\/\$\{verb\}`\s*,\s*body\s*\)/,
+  }),
+});
+
+// The generic confirm-delete modal serves both card-owned and ordinary setup
+// deletes.  Its false branch is deliberately outside the operational-card
+// boundary because `cardIdentity` is absent there.  This is an executable,
+// single-use description of that exact split -- not a general waiver for any
+// conditional that happens to put a wrapped write beside a raw helper.
+const UNOWNED_RAW_HELPER_BOUNDARIES = Object.freeze({
+  "generic-modal-delete": Object.freeze({
+    owner: "wireModal",
+    functionDepth: 2,
+    target: "attemptDelete",
+    result: "res",
+    identity: "cardIdentity",
+    identityObject: "m",
+    arguments: /^\s*\(\s*m\.kind\s*,\s*m\.id\s*\)/,
+  }),
+});
+
 const DRAFT_RE = /\/api\/scheduler\/draft$/;
 const DRAFT_COMMIT_RE = /\/api\/scheduler\/commit$/;
 const DRAFTS_RE = /\/api\/scheduler\/drafts(?:\?|$)/;
@@ -73,6 +134,1807 @@ const CONTEXT_RE = /\/api\/context$/;
 
 function fail(message) { throw new Error(message); }
 function trace(message) { console.error(`  · ${message}`); }
+
+const FUNCTION_NODE_TYPES = new Set([
+  "FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression",
+]);
+const DECLARED_TRANSPORTS = new Set([
+  "post", "postScoped", "postOperationalCardScoped",
+]);
+const DYNAMIC_TRANSPORTS = new Set([...DECLARED_TRANSPORTS, "fetch"]);
+const SETTLEMENT_HELPERS = new Set([
+  "awaitOperationalCardContextSettlement",
+  "settleCardWrite",
+  "settleSubstituteOptInWrite",
+]);
+const WITHDRAWN_SENTINEL = "OPERATIONAL_CARD_WRITE_WITHDRAWN";
+
+function walkAst(node, ancestors, visit) {
+  if (!node || typeof node !== "object" || typeof node.type !== "string") return;
+  visit(node, ancestors);
+  const lineage = ancestors.concat(node);
+  Object.entries(node).forEach(([key, value]) => {
+    if (["type", "start", "end", "loc", "range"].includes(key)) return;
+    if (Array.isArray(value)) {
+      value.forEach((child) => walkAst(child, lineage, visit));
+    } else {
+      walkAst(value, lineage, visit);
+    }
+  });
+}
+
+function functionName(node, ancestors) {
+  if (node.id && node.id.type === "Identifier") return node.id.name;
+  const index = ancestors.indexOf(node);
+  const parent = index > 0 ? ancestors[index - 1] : null;
+  if (parent && parent.type === "VariableDeclarator"
+      && parent.id.type === "Identifier" && parent.init === node) {
+    return parent.id.name;
+  }
+  if (parent && parent.type === "AssignmentExpression"
+      && parent.left.type === "Identifier" && parent.right === node) {
+    return parent.left.name;
+  }
+  if (parent && (parent.type === "Property" || parent.type === "MethodDefinition")) {
+    if (!parent.computed && parent.key.type === "Identifier") return parent.key.name;
+    if (parent.key.type === "Literal") return String(parent.key.value);
+  }
+  return `<anonymous@${node.loc.start.line}:${node.loc.start.column + 1}>`;
+}
+
+function ownerFor(ancestors) {
+  const functions = ancestors.filter((node) => FUNCTION_NODE_TYPES.has(node.type));
+  if (!functions.length) return { name: "<top-level>", functionDepth: 0 };
+  return { name: functionName(functions[0], ancestors),
+    functionDepth: functions.length };
+}
+
+function staticString(node) {
+  if (!node) return null;
+  if (node.type === "Literal" && typeof node.value === "string") return node.value;
+  if (node.type === "TemplateLiteral") {
+    let value = node.quasis[0].value.cooked;
+    for (let index = 0; index < node.expressions.length; index += 1) {
+      const expression = staticString(node.expressions[index]);
+      if (expression == null) return null;
+      value += expression + node.quasis[index + 1].value.cooked;
+    }
+    return value;
+  }
+  if (node.type === "BinaryExpression" && node.operator === "+") {
+    const left = staticString(node.left);
+    const right = staticString(node.right);
+    return left == null || right == null ? null : left + right;
+  }
+  return null;
+}
+
+function staticMemberPath(node) {
+  if (!node) return null;
+  if (node.type === "Identifier") return node.name;
+  if (node.type !== "MemberExpression") return null;
+  const object = staticMemberPath(node.object);
+  const property = node.computed
+    ? (node.property.type === "Literal"
+      && ["string", "number"].includes(typeof node.property.value)
+      ? String(node.property.value) : staticString(node.property))
+    : (node.property.type === "Identifier" ? node.property.name : null);
+  return object == null || property == null ? null : `${object}.${property}`;
+}
+
+function callableAliasTarget(node) {
+  if (!node) return null;
+  if (node.type === "Identifier" || node.type === "MemberExpression") {
+    return staticMemberPath(node);
+  }
+  if (node.type !== "CallExpression"
+      || node.callee.type !== "MemberExpression") return null;
+  const property = node.callee.computed ? staticString(node.callee.property)
+    : (node.callee.property.type === "Identifier"
+      ? node.callee.property.name : null);
+  return property === "bind" ? staticMemberPath(node.callee.object) : null;
+}
+
+function boundIdentifiers(pattern, found = []) {
+  if (!pattern) return found;
+  if (pattern.type === "Identifier") {
+    found.push(pattern);
+  } else if (pattern.type === "RestElement") {
+    boundIdentifiers(pattern.argument, found);
+  } else if (pattern.type === "AssignmentPattern") {
+    boundIdentifiers(pattern.left, found);
+  } else if (pattern.type === "ObjectPattern") {
+    pattern.properties.forEach((property) => {
+      boundIdentifiers(property.type === "RestElement"
+        ? property.argument : property.value, found);
+    });
+  } else if (pattern.type === "ArrayPattern") {
+    pattern.elements.forEach((element) => boundIdentifiers(element, found));
+  }
+  return found;
+}
+
+function trackedComputedAccess(node) {
+  if (!node || node.type !== "MemberExpression") return null;
+  const property = node.computed ? staticString(node.property)
+    : (node.property.type === "Identifier" ? node.property.name : null);
+  return DYNAMIC_TRANSPORTS.has(property) ? property : null;
+}
+
+function fetchOptionsMethod(options) {
+  if (!options) return { kind: "absent", method: null };
+  if (options.type !== "ObjectExpression") {
+    return { kind: "unknown", method: null };
+  }
+  const methods = options.properties.flatMap((property) => {
+    if (property.type !== "Property" || property.computed) return [null];
+    const key = property.key.type === "Identifier"
+      ? property.key.name : String(property.key.value);
+    const method = key === "method" ? staticString(property.value) : null;
+    return key === "method" ? [method && method.toUpperCase()] : [];
+  });
+  if (!methods.length) return { kind: "absent", method: null };
+  if (methods.length !== 1 || !methods[0]) {
+    return { kind: "unknown", method: null };
+  }
+  return { kind: "static", method: methods[0] };
+}
+
+function fetchTransport(call) {
+  if (!call || call.type !== "CallExpression" || call.callee.type !== "Identifier"
+      || call.callee.name !== "fetch") return null;
+  const outer = fetchOptionsMethod(call.arguments[1]);
+  if (outer.kind === "static") return `fetch:${outer.method}`;
+  if (outer.kind === "unknown") return "fetch:unknown";
+
+  // A one-argument fetch is GET only when its input is visibly URL-like.
+  // Request carries its own method, so treating fetch(new Request(...)) as GET
+  // would let a POST evade this oracle merely by changing Fetch API syntax.
+  const input = call.arguments[0];
+  if (input && input.type === "NewExpression"
+      && input.callee.type === "Identifier" && input.callee.name === "Request") {
+    const inner = fetchOptionsMethod(input.arguments[1]);
+    if (inner.kind === "static") return `fetch:${inner.method}`;
+    if (inner.kind !== "absent") return "fetch:unknown";
+    const requestInput = input.arguments[0];
+    const visiblyUrlLike = staticString(requestInput) != null
+      || (requestInput && requestInput.type === "NewExpression"
+        && requestInput.callee.type === "Identifier"
+        && requestInput.callee.name === "URL");
+    return visiblyUrlLike ? "fetch:GET" : "fetch:unknown";
+  }
+  if (!call.arguments[1] && staticString(input) == null
+      && !(input && input.type === "NewExpression"
+        && input.callee.type === "Identifier" && input.callee.name === "URL")) {
+    return "fetch:unknown";
+  }
+  return "fetch:GET";
+}
+
+function assignmentForAwaitedCall(call, ancestors) {
+  const awaited = ancestors.at(-1);
+  if (!awaited || awaited.type !== "AwaitExpression" || awaited.argument !== call) {
+    return null;
+  }
+  const assignment = ancestors.at(-2);
+  if (assignment && assignment.type === "VariableDeclarator"
+      && assignment.init === awaited && assignment.id.type === "Identifier") {
+    const declaration = ancestors.at(-3);
+    if (!declaration || declaration.type !== "VariableDeclaration"
+        || declaration.declarations.length !== 1) return null;
+    return { binding: assignment.id.name, statement: declaration };
+  }
+  if (assignment && assignment.type === "AssignmentExpression"
+      && assignment.operator === "=" && assignment.right === awaited
+      && assignment.left.type === "Identifier") {
+    const statement = ancestors.at(-3);
+    if (!statement || statement.type !== "ExpressionStatement") return null;
+    return { binding: assignment.left.name, statement };
+  }
+  if (assignment && assignment.type === "ConditionalExpression") {
+    const declaration = ancestors.at(-3);
+    const statement = ancestors.at(-4);
+    if ((assignment.consequent !== awaited && assignment.alternate !== awaited)
+        || !declaration || declaration.type !== "VariableDeclarator"
+        || declaration.init !== assignment || declaration.id.type !== "Identifier"
+        || !statement || statement.type !== "VariableDeclaration"
+        || statement.declarations.length !== 1) return null;
+    return { binding: declaration.id.name, statement };
+  }
+  return null;
+}
+
+function nextStatement(ancestors, statement) {
+  for (let index = ancestors.length - 1; index >= 0; index -= 1) {
+    const block = ancestors[index];
+    if (block.type !== "BlockStatement" && block.type !== "Program") continue;
+    const statementIndex = block.body.indexOf(statement);
+    if (statementIndex >= 0 && statementIndex + 1 < block.body.length) {
+      return block.body[statementIndex + 1];
+    }
+  }
+  return null;
+}
+
+function isWithdrawnGuard(node, binding) {
+  if (!node || node.type !== "IfStatement") return false;
+  const test = node.test;
+  if (!test || test.type !== "BinaryExpression" || test.operator !== "===") return false;
+  const left = test.left.type === "Identifier" ? test.left.name : null;
+  const right = test.right.type === "Identifier" ? test.right.name : null;
+  if (left !== binding || right !== "OPERATIONAL_CARD_WRITE_WITHDRAWN") return false;
+  const consequent = node.consequent;
+  if (consequent.type === "ReturnStatement") return consequent.argument == null;
+  return consequent.type === "BlockStatement" && consequent.body.length === 1
+    && consequent.body[0].type === "ReturnStatement"
+    && consequent.body[0].argument == null;
+}
+
+function isNegatedBindingReturn(node, binding) {
+  if (!node || node.type !== "IfStatement" || node.alternate) return false;
+  const test = node.test;
+  if (!test || test.type !== "UnaryExpression" || test.operator !== "!"
+      || test.argument.type !== "Identifier" || test.argument.name !== binding) {
+    return false;
+  }
+  const consequent = node.consequent;
+  if (consequent.type === "ReturnStatement") return consequent.argument == null;
+  return consequent.type === "BlockStatement" && consequent.body.length === 1
+    && consequent.body[0].type === "ReturnStatement"
+    && consequent.body[0].argument == null;
+}
+
+function directCallNamed(node, name, argumentNames) {
+  if (!node || node.type !== "CallExpression" || node.callee.type !== "Identifier"
+      || node.callee.name !== name || node.arguments.length !== argumentNames.length) {
+    return false;
+  }
+  return node.arguments.every((argument, index) => argument.type === "Identifier"
+    && argument.name === argumentNames[index]);
+}
+
+function boundarySettlementHolds(contract, call, ancestors, assignment) {
+  if (contract.settlement === "operational") {
+    const next = nextStatement(ancestors, assignment.statement);
+    return !!next && next.type === "ExpressionStatement"
+      && next.expression.type === "AwaitExpression"
+      && directCallNamed(next.expression.argument,
+        "awaitOperationalCardContextSettlement", ["identity"]);
+  }
+  if (contract.settlement === "season") {
+    const settlement = nextStatement(ancestors, assignment.statement);
+    if (!settlement || settlement.type !== "VariableDeclaration"
+        || settlement.declarations.length !== 1
+        || settlement.declarations[0].id.type !== "Identifier"
+        || settlement.declarations[0].id.name !== "settled"
+        || !directCallNamed(settlement.declarations[0].init,
+          "settleCardWrite", ["identity"])) return false;
+    return isNegatedBindingReturn(
+      nextStatement(ancestors, settlement), "settled");
+  }
+  if (contract.settlement === "substitute") {
+    const enclosingTry = ancestors.slice().reverse().find((node) =>
+      node.type === "TryStatement" && node.block.start < call.start
+      && call.end < node.block.end);
+    if (!enclosingTry || !enclosingTry.finalizer) return false;
+    const body = enclosingTry.finalizer.body;
+    return body.length === 1 && body[0].type === "ExpressionStatement"
+      && directCallNamed(body[0].expression,
+        "settleSubstituteOptInWrite", ["operation"]);
+  }
+  return false;
+}
+
+function operationalCardBindings(ast) {
+  const declarations = [];
+  const valueDeclarations = new Map();
+  walkAst(ast, [], (node, ancestors) => {
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier"
+        && node.init && node.init.type === "Literal"
+        && typeof node.init.value === "string") {
+      const declaration = ancestors.at(-1);
+      const topLevel = !ancestors.some((candidate) =>
+        FUNCTION_NODE_TYPES.has(candidate.type));
+      if (declaration && declaration.type === "VariableDeclaration"
+          && declaration.kind === "const" && topLevel) {
+        if (!valueDeclarations.has(node.id.name)) {
+          valueDeclarations.set(node.id.name, []);
+        }
+        valueDeclarations.get(node.id.name).push({ node, value: node.init.value });
+      }
+    }
+    if (node.type !== "VariableDeclarator" || node.id.type !== "Identifier"
+        || node.id.name !== "SCHEDULE_FACILITY_CARD_IDS") return;
+    const init = node.init;
+    const array = init && init.type === "CallExpression"
+      && init.callee.type === "MemberExpression" && !init.callee.computed
+      && init.callee.object.type === "Identifier"
+      && init.callee.object.name === "Object"
+      && init.callee.property.type === "Identifier"
+      && init.callee.property.name === "freeze"
+      && init.arguments.length === 1 && init.arguments[0].type === "ArrayExpression"
+      ? init.arguments[0] : null;
+    declarations.push(array && array.elements.every((element) =>
+      element && element.type === "Identifier")
+      ? array.elements.map((element) => element.name) : null);
+  });
+  if (declarations.length !== 1 || !declarations[0]
+      || new Set(declarations[0]).size !== declarations[0].length
+      || declarations[0].length === 0) return null;
+  const bindings = new Set(declarations[0]);
+  const values = new Set();
+  for (const name of bindings) {
+    const candidates = valueDeclarations.get(name) || [];
+    if (candidates.length !== 1 || values.has(candidates[0].value)) return null;
+    values.add(candidates[0].value);
+  }
+  return { bindings, values };
+}
+
+function hasExactAbsentCardIdentityBinding(functionNode, contract) {
+  let matches = 0;
+  let declarations = 0;
+  let mutations = 0;
+  walkAst(functionNode.body, [functionNode], (node, ancestors) => {
+    const functions = ancestors.filter((candidate) =>
+      FUNCTION_NODE_TYPES.has(candidate.type));
+    if (functions.at(-1) !== functionNode) return;
+    if (node.type === "AssignmentExpression") {
+      mutations += boundIdentifiers(node.left)
+        .filter((identifier) => identifier.name === contract.identity).length;
+    }
+    if (node.type === "UpdateExpression"
+        && node.argument.type === "Identifier"
+        && node.argument.name === contract.identity) {
+      mutations += 1;
+    }
+    if (node.type === "CatchClause") {
+      declarations += boundIdentifiers(node.param)
+        .filter((identifier) => identifier.name === contract.identity).length;
+      return;
+    }
+    if (node.type !== "VariableDeclarator") {
+      return;
+    }
+    const declared = boundIdentifiers(node.id)
+      .filter((identifier) => identifier.name === contract.identity);
+    declarations += declared.length;
+    if (node.id.type !== "Identifier" || node.id.name !== contract.identity) return;
+    const declaration = ancestors.at(-1);
+    const init = node.init;
+    if (declaration && declaration.type === "VariableDeclaration"
+        && declaration.kind === "const" && declaration.declarations.length === 1
+        && init && init.type === "LogicalExpression" && init.operator === "||"
+        && init.left.type === "MemberExpression" && !init.left.computed
+        && init.left.object.type === "Identifier"
+        && init.left.object.name === contract.identityObject
+        && init.left.property.type === "Identifier"
+        && init.left.property.name === "cardIdentity"
+        && init.right.type === "Literal" && init.right.value === null) {
+      matches += 1;
+    }
+  });
+  const parameterCollision = functionNode.params.some((parameter) =>
+    boundIdentifiers(parameter).some((identifier) =>
+      identifier.name === contract.identity));
+  return matches === 1 && declarations === 1 && mutations === 0
+    && !parameterCollision;
+}
+
+function unownedRawHelperBoundaryHolds(contract, call, ancestors, source) {
+  const owner = ownerFor(ancestors);
+  const awaited = ancestors.at(-1);
+  const conditional = ancestors.at(-2);
+  const assignment = assignmentForAwaitedCall(call, ancestors);
+  if (owner.name !== contract.owner
+      || owner.functionDepth !== contract.functionDepth
+      || call.callee.type !== "Identifier" || call.callee.name !== contract.target
+      || !assignment || assignment.binding !== contract.result
+      || !awaited || awaited.type !== "AwaitExpression"
+      || !conditional || conditional.type !== "ConditionalExpression"
+      || conditional.alternate !== awaited
+      || conditional.test.type !== "Identifier"
+      || conditional.test.name !== contract.identity
+      || !contract.arguments.test(source.slice(call.callee.end, call.end))) {
+    return false;
+  }
+  const wrappedAwait = conditional.consequent;
+  const wrapped = wrappedAwait && wrappedAwait.type === "AwaitExpression"
+    ? wrappedAwait.argument : null;
+  if (!wrapped || wrapped.type !== "CallExpression"
+      || wrapped.callee.type !== "Identifier"
+      || wrapped.callee.name !== "postOperationalCardScoped"
+      || !wrapped.arguments[0] || wrapped.arguments[0].type !== "Identifier"
+      || wrapped.arguments[0].name !== contract.identity) {
+    return false;
+  }
+  const lexicalFunction = ancestors.filter((candidate) =>
+    FUNCTION_NODE_TYPES.has(candidate.type)).at(-1);
+  return !!lexicalFunction
+    && hasExactAbsentCardIdentityBinding(lexicalFunction, contract);
+}
+
+function operationalWriteSourceInventory(
+  source, approvedBoundaries, approvedHelperBoundaries,
+) {
+  const ast = acorn.parse(source, {
+    ecmaVersion: "latest", sourceType: "script", locations: true,
+    allowHashBang: true,
+  });
+  const boundaryNames = Object.keys(approvedBoundaries);
+  const helperBoundaryNames = Object.keys(approvedHelperBoundaries);
+  const violations = [];
+  const cardBindings = operationalCardBindings(ast);
+  if (!cardBindings) {
+    violations.push("SCHEDULE_FACILITY_CARD_IDS is not one unique frozen identifier axis");
+  }
+  const wrapperCalls = [];
+  const rawCalls = [];
+  const sensitiveDeclarations = new Map(
+    Array.from(DECLARED_TRANSPORTS, (name) => [name, []]));
+  const allowedSensitiveIdentifiers = new Set();
+  const allSensitiveIdentifiers = [];
+  const indirectFetchIdentifiers = [];
+  const allWithdrawnGuards = [];
+  const dynamicAccesses = [];
+  const cardOwnershipRoots = new Set();
+  const cardIdentifierUses = [];
+  const transportCalls = [];
+  const functionDefinitions = new Map();
+  const functionParents = new Map();
+  const callEdges = [];
+  const helperAliases = new Map();
+  const bindingRecords = new Map();
+  const settlementBindings = new Map(
+    Array.from(SETTLEMENT_HELPERS, (name) => [name, []]));
+  const settlementMutations = new Map(
+    Array.from(SETTLEMENT_HELPERS, (name) => [name, []]));
+  const withdrawnSentinelBindings = [];
+  const withdrawnSentinelMutations = [];
+
+  const recordDefinition = (name, fn) => {
+    if (!functionDefinitions.has(name)) functionDefinitions.set(name, []);
+    functionDefinitions.get(name).push(fn);
+  };
+  const recordAlias = (name, target) => {
+    if (name === target) return;
+    if (!helperAliases.has(name)) helperAliases.set(name, new Set());
+    helperAliases.get(name).add(target);
+  };
+  const recordBinding = (name, binding) => {
+    if (!bindingRecords.has(name)) bindingRecords.set(name, []);
+    bindingRecords.get(name).push(binding);
+  };
+  const nearestBindingScope = (ancestors, kind) => {
+    for (let index = ancestors.length - 1; index >= 0; index -= 1) {
+      const candidate = ancestors[index];
+      if (candidate.type === "Program"
+          || (kind === "var" && FUNCTION_NODE_TYPES.has(candidate.type))
+          || (kind !== "var" && candidate.type === "BlockStatement")) {
+        return candidate;
+      }
+    }
+    return ast;
+  };
+
+  walkAst(ast, [], (node, ancestors) => {
+    if (FUNCTION_NODE_TYPES.has(node.type)) {
+      functionParents.set(node, ancestors.filter((candidate) =>
+        FUNCTION_NODE_TYPES.has(candidate.type)));
+    }
+    if (node.type === "FunctionDeclaration" && node.id) {
+      recordDefinition(node.id.name, node);
+      recordBinding(node.id.name, {
+        node: node.id,
+        scope: nearestBindingScope(ancestors, "lexical"),
+        valueFunction: node,
+        aliasTarget: null,
+      });
+      if (SETTLEMENT_HELPERS.has(node.id.name)) {
+        settlementBindings.get(node.id.name).push(node);
+      }
+      if (node.id.name === WITHDRAWN_SENTINEL) {
+        withdrawnSentinelBindings.push({ node, ancestors });
+      }
+    }
+    if (node.type === "ClassDeclaration" && node.id
+        && node.id.name === WITHDRAWN_SENTINEL) {
+      withdrawnSentinelBindings.push({ node, ancestors });
+    }
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier"
+        && FUNCTION_NODE_TYPES.has(node.init && node.init.type)) {
+      recordDefinition(node.id.name, node.init);
+    }
+    if (node.type === "VariableDeclarator") {
+      boundIdentifiers(node.id).forEach((identifier) => {
+        if (SETTLEMENT_HELPERS.has(identifier.name)) {
+          settlementBindings.get(identifier.name).push(node);
+        }
+        if (identifier.name === WITHDRAWN_SENTINEL) {
+          withdrawnSentinelBindings.push({ node, ancestors });
+        }
+      });
+    }
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier") {
+      const declaration = ancestors.at(-1);
+      const kind = declaration && declaration.type === "VariableDeclaration"
+        ? declaration.kind : "lexical";
+      const aliasTarget = callableAliasTarget(node.init);
+      recordBinding(node.id.name, {
+        node: node.id,
+        scope: nearestBindingScope(ancestors, kind),
+        valueFunction: FUNCTION_NODE_TYPES.has(node.init && node.init.type)
+          ? node.init : null,
+        aliasTarget,
+      });
+      if (node.init && node.init.type === "ObjectExpression") {
+        node.init.properties.forEach((property) => {
+          if (property.type !== "Property"
+              || !FUNCTION_NODE_TYPES.has(property.value && property.value.type)) {
+            return;
+          }
+          const key = property.computed ? staticString(property.key)
+            : (property.key.type === "Identifier"
+              ? property.key.name : String(property.key.value));
+          if (key != null) {
+            recordDefinition(node.id.name + "." + key, property.value);
+          }
+        });
+      }
+      if (node.init && node.init.type === "ArrayExpression") {
+        node.init.elements.forEach((element, index) => {
+          if (FUNCTION_NODE_TYPES.has(element && element.type)) {
+            recordDefinition(node.id.name + "." + index, element);
+          }
+        });
+      }
+    }
+    if (node.type === "VariableDeclarator"
+        && node.id.type === "ObjectPattern"
+        && node.init && node.init.type === "Identifier") {
+      const declaration = ancestors.at(-1);
+      const kind = declaration && declaration.type === "VariableDeclaration"
+        ? declaration.kind : "lexical";
+      node.id.properties.forEach((property) => {
+        if (property.type === "RestElement"
+            && property.argument.type === "Identifier") {
+          recordAlias(property.argument.name, node.init.name);
+          recordBinding(property.argument.name, {
+            node: property.argument,
+            scope: nearestBindingScope(ancestors, kind),
+            valueFunction: null,
+            aliasTarget: node.init.name,
+          });
+          return;
+        }
+        if (property.type !== "Property") return;
+        const key = property.computed ? staticString(property.key)
+          : (property.key.type === "Identifier"
+            ? property.key.name : String(property.key.value));
+        const value = property.value.type === "AssignmentPattern"
+          ? property.value.left : property.value;
+        if (key == null || value.type !== "Identifier") return;
+        const target = node.init.name + "." + key;
+        recordAlias(value.name, target);
+        recordBinding(value.name, {
+          node: value,
+          scope: nearestBindingScope(ancestors, kind),
+          valueFunction: null,
+          aliasTarget: target,
+        });
+      });
+    }
+    if (node.type === "VariableDeclarator"
+        && node.id.type === "ArrayPattern"
+        && node.init
+        && ["Identifier", "ArrayExpression"].includes(node.init.type)) {
+      const declaration = ancestors.at(-1);
+      const kind = declaration && declaration.type === "VariableDeclaration"
+        ? declaration.kind : "lexical";
+      node.id.elements.forEach((pattern, index) => {
+        const target = node.init.type === "Identifier" ? node.init.name
+          : callableAliasTarget(node.init.elements[index]);
+        if (!target) return;
+        boundIdentifiers(pattern).forEach((identifier) => {
+          recordAlias(identifier.name, target);
+          recordBinding(identifier.name, {
+            node: identifier,
+            scope: nearestBindingScope(ancestors, kind),
+            valueFunction: null,
+            aliasTarget: target,
+          });
+        });
+      });
+    }
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier") {
+      const target = callableAliasTarget(node.init);
+      if (target) recordAlias(node.id.name, target);
+    }
+    if (FUNCTION_NODE_TYPES.has(node.type)) {
+      node.params.forEach((parameter) => {
+        boundIdentifiers(parameter).forEach((identifier) => {
+          recordBinding(identifier.name, {
+            node: identifier, scope: node, valueFunction: null, aliasTarget: null,
+          });
+          if (SETTLEMENT_HELPERS.has(identifier.name)) {
+            settlementBindings.get(identifier.name).push(parameter);
+          }
+          if (identifier.name === WITHDRAWN_SENTINEL) {
+            withdrawnSentinelBindings.push({ node: parameter, ancestors });
+          }
+        });
+      });
+    }
+    if (node.type === "CatchClause") {
+      boundIdentifiers(node.param).forEach((identifier) => {
+        if (SETTLEMENT_HELPERS.has(identifier.name)) {
+          settlementBindings.get(identifier.name).push(node);
+        }
+        if (identifier.name === WITHDRAWN_SENTINEL) {
+          withdrawnSentinelBindings.push({ node, ancestors });
+        }
+      });
+    }
+    if (node.type === "AssignmentExpression") {
+      boundIdentifiers(node.left).forEach((identifier) => {
+        if (SETTLEMENT_HELPERS.has(identifier.name)) {
+          settlementMutations.get(identifier.name).push(node);
+        }
+        if (identifier.name === WITHDRAWN_SENTINEL) {
+          withdrawnSentinelMutations.push(node);
+        }
+      });
+      if (node.left.type === "MemberExpression") {
+        const property = node.left.computed ? staticString(node.left.property)
+          : (node.left.property.type === "Identifier"
+            ? node.left.property.name : null);
+        if (SETTLEMENT_HELPERS.has(property)) {
+          settlementMutations.get(property).push(node);
+        }
+      }
+    }
+    if (node.type === "AssignmentExpression" && node.operator === "="
+        && node.left.type === "Identifier") {
+      const target = callableAliasTarget(node.right);
+      if (target) recordAlias(node.left.name, target);
+      if (FUNCTION_NODE_TYPES.has(node.right && node.right.type)) {
+        recordDefinition(node.left.name, node.right);
+      }
+    }
+    if (node.type === "UpdateExpression" && node.argument.type === "Identifier"
+        && node.argument.name === WITHDRAWN_SENTINEL) {
+      withdrawnSentinelMutations.push(node);
+    }
+    if (node.type === "AssignmentExpression" && node.operator === "="
+        && ["ArrayPattern", "ObjectPattern"].includes(node.left.type)) {
+      const target = callableAliasTarget(node.right);
+      if (target) {
+        boundIdentifiers(node.left).forEach((identifier) =>
+          recordAlias(identifier.name, target));
+      }
+    }
+    if (node.type === "AssignmentExpression" && node.operator === "="
+        && node.left.type === "MemberExpression"
+        && node.left.object.type === "Identifier"
+        && FUNCTION_NODE_TYPES.has(node.right && node.right.type)) {
+      const key = node.left.computed ? staticString(node.left.property)
+        : (node.left.property.type === "Identifier" ? node.left.property.name : null);
+      if (key != null) {
+        recordDefinition(node.left.object.name + "." + key, node.right);
+      }
+    }
+    if (node.type === "FunctionDeclaration" && node.id
+        && DECLARED_TRANSPORTS.has(node.id.name)) {
+      sensitiveDeclarations.get(node.id.name).push(node);
+      allowedSensitiveIdentifiers.add(node.id);
+    }
+    if (node.type === "VariableDeclarator" && node.id.type === "Identifier"
+        && DECLARED_TRANSPORTS.has(node.id.name)
+        && FUNCTION_NODE_TYPES.has(node.init && node.init.type)) {
+      sensitiveDeclarations.get(node.id.name).push(node);
+      allowedSensitiveIdentifiers.add(node.id);
+    }
+    if (node.type === "Identifier" && DECLARED_TRANSPORTS.has(node.name)) {
+      allSensitiveIdentifiers.push(node);
+    }
+    if (node.type === "Identifier" && node.name === "fetch") {
+      const parent = ancestors.at(-1);
+      const directCall = parent && parent.type === "CallExpression"
+        && parent.callee === node;
+      const nonReferenceProperty = parent
+        && ((parent.type === "MemberExpression" && !parent.computed
+            && parent.property === node)
+          || ((parent.type === "Property" || parent.type === "MethodDefinition")
+            && !parent.computed && parent.key === node && !parent.shorthand));
+      if (!directCall && !nonReferenceProperty) indirectFetchIdentifiers.push(node);
+    }
+    if (node.type === "IfStatement") {
+      const test = node.test;
+      if (test && test.type === "BinaryExpression" && test.operator === "==="
+          && test.right.type === "Identifier"
+          && test.right.name === "OPERATIONAL_CARD_WRITE_WITHDRAWN") {
+        allWithdrawnGuards.push(node);
+      }
+    }
+    if (node.type === "CallExpression" && node.callee.type === "Identifier"
+        && DECLARED_TRANSPORTS.has(node.callee.name)) {
+      allowedSensitiveIdentifiers.add(node.callee);
+      const row = { call: node, ancestors, owner: ownerFor(ancestors),
+        shape: "direct" };
+      if (node.callee.name === "postOperationalCardScoped") wrapperCalls.push(row);
+      else if (node.callee.name === "postScoped") rawCalls.push(row);
+    }
+    if (node.type === "CallExpression"
+        && node.callee.type === "ConditionalExpression"
+        && node.callee.test.type === "Identifier"
+        && node.callee.test.name === "operation"
+        && node.callee.consequent.type === "Identifier"
+        && node.callee.consequent.name === "postScoped"
+        && node.callee.alternate.type === "Identifier"
+        && node.callee.alternate.name === "post") {
+      // The opportunity-detail writer deliberately selects the silent
+      // transport only while its identity ledger is active. Treat this exact
+      // syntax as a raw boundary without permitting aliases or computed access.
+      allowedSensitiveIdentifiers.add(node.callee.consequent);
+      allowedSensitiveIdentifiers.add(node.callee.alternate);
+      rawCalls.push({ call: node, ancestors, owner: ownerFor(ancestors),
+        shape: "operation-choice" });
+    }
+    if (node.type === "CallExpression") {
+      const functions = ancestors.filter((candidate) =>
+        FUNCTION_NODE_TYPES.has(candidate.type));
+      const lexicalFunction = functions.at(-1) || null;
+      if (node.callee.type === "Identifier"
+          && node.callee.name === "cardIdentityCurrent" && lexicalFunction) {
+        cardOwnershipRoots.add(lexicalFunction);
+      }
+      const directTransport = node.callee.type === "Identifier"
+        && DECLARED_TRANSPORTS.has(node.callee.name);
+      const directFetch = node.callee.type === "Identifier"
+        && node.callee.name === "fetch";
+      if (lexicalFunction && (directTransport || directFetch)) {
+        transportCalls.push({ call: node, ancestors, functions, lexicalFunction,
+          transport: directTransport ? node.callee.name
+            : fetchTransport(node),
+          owner: ownerFor(ancestors) });
+      }
+      if (lexicalFunction && node.callee.type === "Identifier"
+          && !DECLARED_TRANSPORTS.has(node.callee.name)
+          && node.callee.name !== "fetch") {
+        callEdges.push({ call: node, ancestors, from: lexicalFunction,
+          targetName: node.callee.name });
+      }
+      if (lexicalFunction && node.callee.type === "MemberExpression"
+          && node.callee.object.type === "Identifier") {
+        const key = node.callee.computed
+          ? (node.callee.property.type === "Literal"
+            && ["string", "number"].includes(typeof node.callee.property.value)
+            ? String(node.callee.property.value) : staticString(node.callee.property))
+          : (node.callee.property.type === "Identifier"
+            ? node.callee.property.name : null);
+        if (key != null) {
+          callEdges.push({ call: node, ancestors, from: lexicalFunction,
+            targetName: node.callee.object.name + "." + key });
+        }
+      }
+    }
+    if (node.type === "NewExpression" && node.callee.type === "Identifier"
+        && node.callee.name === "Request") {
+      const functions = ancestors.filter((candidate) =>
+        FUNCTION_NODE_TYPES.has(candidate.type));
+      const lexicalFunction = functions.at(-1) || null;
+      const method = fetchOptionsMethod(node.arguments[1]);
+      if (lexicalFunction && (method.kind === "unknown"
+          || (method.kind === "static" && method.method !== "GET"))) {
+        transportCalls.push({ call: node, ancestors, functions, lexicalFunction,
+          transport: method.kind === "static"
+            ? "request:" + method.method : "request:unknown",
+          owner: ownerFor(ancestors) });
+      }
+    }
+    if (cardBindings && node.type === "Identifier"
+        && (node.name === "SCHEDULE_FACILITY_CARD_IDS"
+          || cardBindings.bindings.has(node.name))) {
+      const functions = ancestors.filter((candidate) =>
+        FUNCTION_NODE_TYPES.has(candidate.type));
+      if (functions.length) cardOwnershipRoots.add(functions.at(-1));
+    }
+    if (cardBindings && node.type === "Identifier") {
+      const functions = ancestors.filter((candidate) =>
+        FUNCTION_NODE_TYPES.has(candidate.type));
+      if (functions.length) {
+        cardIdentifierUses.push({ name: node.name, fn: functions.at(-1) });
+      }
+    }
+    const cardLiteral = cardBindings
+      && ["Literal", "TemplateLiteral", "BinaryExpression"].includes(node.type)
+      ? staticString(node) : null;
+    if (cardLiteral != null && cardBindings.values.has(cardLiteral)) {
+      const parent = ancestors.at(-1);
+      const parentLiteral = parent
+        && ["Literal", "TemplateLiteral", "BinaryExpression"].includes(parent.type)
+        ? staticString(parent) : null;
+      if (parentLiteral === cardLiteral) return;
+      const canonicalDeclaration = parent
+        && parent.type === "VariableDeclarator" && parent.init === node
+        && parent.id.type === "Identifier"
+        && cardBindings.bindings.has(parent.id.name);
+      if (!canonicalDeclaration) {
+        violations.push(`operational card id literal ${JSON.stringify(cardLiteral)} at ${
+          node.loc.start.line}:${node.loc.start.column + 1} must reference its axis binding`);
+      }
+    }
+    if (node.type === "MemberExpression"
+        && (node.computed ? staticString(node.property) === "cardIdentity"
+          : node.property.type === "Identifier"
+            && node.property.name === "cardIdentity")) {
+      const functions = ancestors.filter((candidate) =>
+        FUNCTION_NODE_TYPES.has(candidate.type));
+      if (functions.length) cardOwnershipRoots.add(functions.at(-1));
+    }
+    if (node.type === "MemberExpression") {
+      const sensitive = trackedComputedAccess(node);
+      if (sensitive) dynamicAccesses.push({ sensitive, node });
+    }
+    if (node.type === "Property" && node.computed) {
+      const sensitive = staticString(node.key);
+      if (DYNAMIC_TRANSPORTS.has(sensitive)) {
+        dynamicAccesses.push({ sensitive: `computed property ${sensitive}`, node });
+      }
+    }
+    if (node.type === "CallExpression" && node.callee.type === "MemberExpression"
+        && node.callee.object.type === "Identifier"
+        && node.callee.object.name === "Reflect"
+        && (node.callee.computed
+          ? staticString(node.callee.property) === "get"
+          : node.callee.property.type === "Identifier"
+            && node.callee.property.name === "get")) {
+      const sensitive = staticString(node.arguments[1]);
+      if (DYNAMIC_TRANSPORTS.has(sensitive)) {
+        dynamicAccesses.push({ sensitive: `Reflect.get(${sensitive})`, node });
+      }
+    }
+    if (node.type === "CallExpression" && node.callee.type === "Identifier"
+        && ["eval", "Function"].includes(node.callee.name)) {
+      dynamicAccesses.push({ sensitive: node.callee.name, node });
+    }
+  });
+
+  const targetNameReachesCard = (name, seen = new Set()) => {
+    if (seen.has(name)) return false;
+    seen.add(name);
+    if (name === "SCHEDULE_FACILITY_CARD_IDS"
+        || (cardBindings && cardBindings.bindings.has(name))) return true;
+    return Array.from(helperAliases.get(name) || [])
+      .some((target) => targetNameReachesCard(target, new Set(seen)));
+  };
+  cardIdentifierUses.forEach(({ name, fn }) => {
+    if (targetNameReachesCard(name)) cardOwnershipRoots.add(fn);
+  });
+  const functionsForTargetName = (name, seen = new Set()) => {
+    if (seen.has(name)) return new Set();
+    seen.add(name);
+    const found = new Set(functionDefinitions.get(name) || []);
+    Array.from(helperAliases.get(name) || []).forEach((target) => {
+      functionsForTargetName(target, new Set(seen)).forEach((fn) => found.add(fn));
+    });
+    const separator = name.indexOf(".");
+    if (separator >= 0) {
+      const objectName = name.slice(0, separator);
+      const member = name.slice(separator);
+      Array.from(helperAliases.get(objectName) || []).forEach((target) => {
+        functionsForTargetName(target + member, new Set(seen))
+          .forEach((fn) => found.add(fn));
+      });
+    }
+    return found;
+  };
+  const expressionReachesCard = (expression) => {
+    let reaches = false;
+    walkAst(expression, [], (node) => {
+      if (node.type === "Identifier" && targetNameReachesCard(node.name)) {
+        reaches = true;
+      }
+      const value = ["Literal", "TemplateLiteral", "BinaryExpression"]
+        .includes(node.type) ? staticString(node) : null;
+      if (value != null && cardBindings && cardBindings.values.has(value)) {
+        reaches = true;
+      }
+    });
+    return reaches;
+  };
+  // A callback passed beside a production card binding is itself card-owned.
+  // This covers explicit handler registration without assuming that every
+  // callback installed by a card renderer executes synchronously.
+  walkAst(ast, [], (node) => {
+    if (node.type !== "CallExpression") return;
+    const callbackTargets = (argument) => {
+      if (FUNCTION_NODE_TYPES.has(argument && argument.type)) {
+        return new Set([argument]);
+      }
+      const name = argument && argument.type === "Identifier" ? argument.name
+        : staticMemberPath(argument);
+      return name ? functionsForTargetName(name) : new Set();
+    };
+    const callbacks = node.arguments.filter((argument) =>
+      callbackTargets(argument).size);
+    if (!callbacks.length) return;
+    const cardArgument = node.arguments.some((argument) =>
+      !callbacks.includes(argument) && expressionReachesCard(argument));
+    if (!cardArgument) return;
+    callbacks.forEach((callback) => {
+      callbackTargets(callback).forEach((fn) => cardOwnershipRoots.add(fn));
+    });
+  });
+  const functionOwned = (fn) => [ ...(functionParents.get(fn) || []), fn ]
+    .some((owner) => cardOwnershipRoots.has(owner));
+
+  for (const name of DECLARED_TRANSPORTS) {
+    const declarations = sensitiveDeclarations.get(name);
+    if (declarations.length !== 1) {
+      violations.push(`expected one ${name} declaration, got ${declarations.length}`);
+    }
+  }
+  for (const name of SETTLEMENT_HELPERS) {
+    const bindings = settlementBindings.get(name);
+    const canonical = bindings.length === 1
+      && bindings[0].type === "FunctionDeclaration"
+      && (functionParents.get(bindings[0]) || []).length === 0;
+    if (!canonical || settlementMutations.get(name).length) {
+      violations.push(`settlement helper ${name} must have one immutable `
+        + `top-level function binding (bindings=${bindings.length}, mutations=${
+          settlementMutations.get(name).length})`);
+    }
+  }
+  const sentinel = withdrawnSentinelBindings.length === 1
+    ? withdrawnSentinelBindings[0] : null;
+  const sentinelDeclaration = sentinel && sentinel.ancestors.at(-1);
+  const sentinelInit = sentinel && sentinel.node.type === "VariableDeclarator"
+    ? sentinel.node.init : null;
+  const canonicalSentinel = sentinel
+    && sentinel.node.type === "VariableDeclarator"
+    && sentinel.node.id.type === "Identifier"
+    && sentinelDeclaration && sentinelDeclaration.type === "VariableDeclaration"
+    && sentinelDeclaration.kind === "const"
+    && !sentinel.ancestors.some((candidate) =>
+      FUNCTION_NODE_TYPES.has(candidate.type))
+    && sentinelInit && sentinelInit.type === "CallExpression"
+    && sentinelInit.callee.type === "MemberExpression"
+    && !sentinelInit.callee.computed
+    && sentinelInit.callee.object.type === "Identifier"
+    && sentinelInit.callee.object.name === "Object"
+    && sentinelInit.callee.property.type === "Identifier"
+    && sentinelInit.callee.property.name === "freeze"
+    && sentinelInit.arguments.length === 1
+    && sentinelInit.arguments[0].type === "ObjectExpression";
+  if (!canonicalSentinel || withdrawnSentinelMutations.length) {
+    violations.push(`withdrawn sentinel must have one immutable top-level `
+      + `Object.freeze binding (bindings=${withdrawnSentinelBindings.length}, `
+      + `mutations=${withdrawnSentinelMutations.length})`);
+  }
+  allSensitiveIdentifiers.forEach((identifier) => {
+    if (!allowedSensitiveIdentifiers.has(identifier)) {
+      violations.push(`${identifier.name} at ${identifier.loc.start.line}:${
+        identifier.loc.start.column + 1} is an indirect reference`);
+    } else if (source.slice(identifier.start, identifier.end) !== identifier.name) {
+      violations.push(`${identifier.name} uses an escaped identifier spelling at ${
+        identifier.loc.start.line}:${identifier.loc.start.column + 1}`);
+    }
+  });
+  indirectFetchIdentifiers.forEach((identifier) => {
+    violations.push(`fetch at ${identifier.loc.start.line}:${
+      identifier.loc.start.column + 1} is an indirect reference`);
+  });
+  dynamicAccesses.forEach(({ sensitive, node }) => {
+    violations.push(`dynamic access through ${sensitive} is forbidden at ${
+      node.loc.start.line}:${node.loc.start.column + 1}`);
+  });
+
+  const consumedGuards = new Set();
+  wrapperCalls.forEach(({ call, ancestors }) => {
+    const assignment = assignmentForAwaitedCall(call, ancestors);
+    if (!assignment) {
+      violations.push(`wrapped write at ${call.loc.start.line}:${
+        call.loc.start.column + 1} is not the complete awaited assignment value`);
+      return;
+    }
+    const guard = nextStatement(ancestors, assignment.statement);
+    if (!isWithdrawnGuard(guard, assignment.binding)) {
+      violations.push(`wrapped write assigned to ${assignment.binding} at ${
+        call.loc.start.line}:${call.loc.start.column + 1} is not immediately `
+        + "withdrawn through that same binding");
+      return;
+    }
+    consumedGuards.add(guard);
+  });
+  if (allWithdrawnGuards.length !== consumedGuards.size
+      || consumedGuards.size !== wrapperCalls.length) {
+    violations.push(`wrapped write/paired guard/all guard count diverged: ${
+      wrapperCalls.length}/${consumedGuards.size}/${allWithdrawnGuards.length}`);
+  }
+
+  const consumedBoundaries = new Map();
+  const rawBoundaryByCall = new Map();
+  rawCalls.forEach(({ call, ancestors, owner, shape }) => {
+    const assignment = assignmentForAwaitedCall(call, ancestors);
+    const callTail = source.slice(call.callee.end, call.end);
+    // Parentheses required around a conditional callee sit outside Acorn's
+    // callee range, so its tail starts with `)(` rather than `(`.
+    const argumentSource = shape === "operation-choice"
+      ? callTail.replace(/^\s*\)/, "") : callTail;
+    const matches = Object.entries(approvedBoundaries).filter(([, contract]) =>
+      shape === contract.shape && assignment
+      && assignment.binding === contract.result
+      && owner.name === contract.owner
+      && owner.functionDepth === contract.functionDepth
+      && contract.arguments.test(argumentSource)
+      && boundarySettlementHolds(contract, call, ancestors, assignment));
+    if (matches.length !== 1) {
+      violations.push(`postScoped use at ${call.loc.start.line}:${
+        call.loc.start.column + 1} matched ${matches.length} approved boundary `
+        + `shapes (owner=${owner.name}, depth=${owner.functionDepth}, result=${
+          assignment && assignment.binding}, shape=${shape})`);
+      return;
+    }
+    const boundary = matches[0][0];
+    rawBoundaryByCall.set(call, boundary);
+    consumedBoundaries.set(boundary, (consumedBoundaries.get(boundary) || 0) + 1);
+  });
+  boundaryNames.forEach((boundary) => {
+    const uses = consumedBoundaries.get(boundary) || 0;
+    if (uses !== 1) {
+      violations.push(`boundary ${boundary} must be consumed once, got ${uses}`);
+    }
+  });
+
+  // Derive card ownership independently from the transport helper. A lexical
+  // scope joins when it references a binding from the production-owned frozen
+  // SCHEDULE_FACILITY_CARD_IDS axis, reads modal.cardIdentity, or directly
+  // re-checks cardIdentityCurrent; nested handlers inherit that provenance.
+  // A wrapper -> post downgrade therefore stays on the same axis even when its
+  // sentinel guard and direct identity check disappear together. The wrapper
+  // implementation is excluded by declaration identity, never by owner name.
+  const wrapperDeclaration = sensitiveDeclarations
+    .get("postOperationalCardScoped")[0];
+  const wrapperFunction = wrapperDeclaration
+    && wrapperDeclaration.type === "VariableDeclarator"
+    ? wrapperDeclaration.init : wrapperDeclaration;
+  const directUnsafeFunctions = new Set();
+  transportCalls.forEach((row) => {
+    if (row.transport === "postOperationalCardScoped"
+        || row.transport === "fetch:GET") return;
+    if (row.transport === "postScoped") {
+      const boundary = rawBoundaryByCall.get(row.call);
+      const contract = boundary && approvedBoundaries[boundary];
+      if (contract && contract.cardOwnedException) return;
+    }
+    directUnsafeFunctions.add(row.lexicalFunction);
+  });
+  // Conditional raw transports are recorded by the boundary scanner rather
+  // than transportCalls, so seed them explicitly too.
+  rawCalls.forEach((row) => {
+    const functions = row.ancestors.filter((candidate) =>
+      FUNCTION_NODE_TYPES.has(candidate.type));
+    const lexicalFunction = functions.at(-1);
+    const boundary = rawBoundaryByCall.get(row.call);
+    const contract = boundary && approvedBoundaries[boundary];
+    if (lexicalFunction && !(contract && contract.cardOwnedException)) {
+      directUnsafeFunctions.add(lexicalFunction);
+    }
+  });
+
+  // Compute same-execution local helper reachability to a fixed point. Nested
+  // callbacks do not become callees merely because their installer was called,
+  // but an ordinary helper chain of any length cannot hide a raw write.
+  const rawReachableFunctions = new Set(directUnsafeFunctions);
+  const rawReachableAliases = new Set();
+  const targetNameReachesRaw = (name, seen = new Set()) => {
+    if (seen.has(name)) return false;
+    seen.add(name);
+    if (rawReachableAliases.has(name)
+        || (functionDefinitions.get(name) || [])
+          .some((target) => rawReachableFunctions.has(target))) {
+      return true;
+    }
+    const separator = name.indexOf(".");
+    if (separator < 0) return false;
+    const objectName = name.slice(0, separator);
+    const member = name.slice(separator);
+    return Array.from(helperAliases.get(objectName) || [])
+      .some((target) => targetNameReachesRaw(target + member, new Set(seen)));
+  };
+  let callGraphChanged = true;
+  while (callGraphChanged) {
+    callGraphChanged = false;
+    helperAliases.forEach((targets, alias) => {
+      if (!rawReachableAliases.has(alias)
+          && Array.from(targets).some((target) => targetNameReachesRaw(target))) {
+        rawReachableAliases.add(alias);
+        callGraphChanged = true;
+      }
+    });
+    callEdges.forEach((edge) => {
+      if (!rawReachableFunctions.has(edge.from)
+          && targetNameReachesRaw(edge.targetName)) {
+        rawReachableFunctions.add(edge.from);
+        callGraphChanged = true;
+      }
+    });
+  }
+  // Preserve ownership across extraction into helpers whose reachable
+  // transport surface is wrapper/GET-only. Do not paint generic write helpers
+  // as card-owned merely because one card happens to call them.
+  const wrapperReachableFunctions = new Set(transportCalls
+    .filter((row) => row.transport === "postOperationalCardScoped")
+    .map((row) => row.lexicalFunction));
+  let wrapperGraphChanged = true;
+  while (wrapperGraphChanged) {
+    wrapperGraphChanged = false;
+    callEdges.forEach((edge) => {
+      if (wrapperReachableFunctions.has(edge.from)) return;
+      if (Array.from(functionsForTargetName(edge.targetName))
+        .some((target) => wrapperReachableFunctions.has(target))) {
+        wrapperReachableFunctions.add(edge.from);
+        wrapperGraphChanged = true;
+      }
+    });
+  }
+  let safeOwnershipChanged = true;
+  while (safeOwnershipChanged) {
+    safeOwnershipChanged = false;
+    callEdges.forEach((edge) => {
+      if (!functionOwned(edge.from)) return;
+      functionsForTargetName(edge.targetName).forEach((target) => {
+        if (cardOwnershipRoots.has(target)
+            || !wrapperReachableFunctions.has(target)
+            || rawReachableFunctions.has(target)) return;
+        cardOwnershipRoots.add(target);
+        safeOwnershipChanged = true;
+      });
+    });
+  }
+  const identifierBindingReachesRaw = (identifier, ancestors) => {
+    let deepestScope = -1;
+    let nearest = [];
+    (bindingRecords.get(identifier.name) || []).forEach((binding) => {
+      const depth = ancestors.lastIndexOf(binding.scope);
+      if (depth < 0 || depth < deepestScope) return;
+      if (depth > deepestScope) {
+        deepestScope = depth;
+        nearest = [];
+      }
+      nearest.push(binding);
+    });
+    if (!nearest.length) return targetNameReachesRaw(identifier.name);
+    return nearest.some((binding) =>
+      (binding.valueFunction
+        && rawReachableFunctions.has(binding.valueFunction))
+      || (binding.aliasTarget && targetNameReachesRaw(binding.aliasTarget)));
+  };
+
+  // Pin the sole legitimate card-identity/wrapped/ordinary-delete split to its
+  // exact source shape. Every waiver must exist exactly once and still point at
+  // one helper definition that reaches raw transport.
+  const consumedHelperBoundaries = new Map();
+  const helperBoundaryByEdge = new Map();
+  callEdges.forEach((edge) => {
+    const targets = functionDefinitions.get(edge.targetName) || [];
+    if (targets.length !== 1 || !rawReachableFunctions.has(targets[0])) return;
+    const matches = Object.entries(approvedHelperBoundaries)
+      .filter(([, contract]) => unownedRawHelperBoundaryHolds(
+        contract, edge.call, edge.ancestors, source));
+    if (!matches.length) return;
+    if (matches.length !== 1 || !functionOwned(edge.from)) {
+      violations.push("raw-helper use at " + edge.call.loc.start.line + ":"
+        + (edge.call.loc.start.column + 1) + " matched " + matches.length
+        + " approved unowned boundary shapes without one card-owned source");
+      return;
+    }
+    const boundary = matches[0][0];
+    helperBoundaryByEdge.set(edge, boundary);
+    consumedHelperBoundaries.set(boundary,
+      (consumedHelperBoundaries.get(boundary) || 0) + 1);
+  });
+  helperBoundaryNames.forEach((boundary) => {
+    const uses = consumedHelperBoundaries.get(boundary) || 0;
+    if (uses !== 1) {
+      violations.push("raw-helper boundary " + boundary
+        + " must be consumed once, got " + uses);
+    }
+  });
+
+  const cardOwnedTransports = transportCalls.filter((row) =>
+    functionOwned(row.lexicalFunction)
+    && !row.functions.includes(wrapperFunction));
+  const cardOwnedWrapperCalls = new Set();
+  const cardOwnedRawExceptions = new Set();
+  cardOwnedTransports.forEach((row) => {
+    if (row.transport === "postOperationalCardScoped") {
+      cardOwnedWrapperCalls.add(row.call);
+      return;
+    }
+    if (row.transport === "fetch:GET") return;
+    const boundary = rawBoundaryByCall.get(row.call);
+    const contract = boundary && approvedBoundaries[boundary];
+    if (row.transport === "postScoped" && contract
+        && contract.cardOwnedException) {
+      cardOwnedRawExceptions.add(row.call);
+      return;
+    }
+    violations.push(`card-owned write in ${row.owner.name} bypasses the operational `
+      + `settlement boundary through ${row.transport} at ${row.call.loc.start.line}:${
+        row.call.loc.start.column + 1}`);
+  });
+  wrapperCalls.forEach(({ call, owner }) => {
+    if (!cardOwnedWrapperCalls.has(call)) {
+      violations.push(`wrapped write in ${owner.name} has no independent `
+        + `operational-card ownership proof at ${call.loc.start.line}:${
+          call.loc.start.column + 1}`);
+    }
+  });
+  Object.entries(approvedBoundaries).forEach(([boundary, contract]) => {
+    if (!contract.cardOwnedException) return;
+    const calls = rawCalls.filter((row) => rawBoundaryByCall.get(row.call) === boundary);
+    if (calls.length !== 1 || !cardOwnedRawExceptions.has(calls[0].call)) {
+      violations.push(`card-owned raw boundary ${boundary} is not present on the `
+        + "independently derived ownership axis");
+    }
+  });
+
+  // Check the first edge from independently-proven card ownership into the
+  // fixed-point raw graph. This catches one-hop and multi-hop extraction while
+  // avoiding the false claim that calling a renderer executes every callback
+  // that renderer installs.
+  callEdges.forEach((edge) => {
+    if (!functionOwned(edge.from) || helperBoundaryByEdge.has(edge)) return;
+    if (targetNameReachesRaw(edge.targetName)) {
+      violations.push(`card-owned write reaches raw transport through helper ${
+        edge.targetName} at ${edge.call.loc.start.line}:${
+        edge.call.loc.start.column + 1}`);
+    }
+  });
+
+  // A raw-reachable local helper may only be declared or called directly.
+  // Passing it as a callback, storing it on an object, or binding/aliasing it
+  // would leave the direct-call graph while preserving executable write
+  // behaviour. Fail closed rather than attempting arbitrary JavaScript
+  // callable-value dataflow.
+  walkAst(ast, [], (node, ancestors) => {
+    if (node.type !== "Identifier" || DECLARED_TRANSPORTS.has(node.name)
+        || !identifierBindingReachesRaw(node, ancestors)) return;
+    const parent = ancestors.at(-1);
+    const declaration = parent
+      && ((FUNCTION_NODE_TYPES.has(parent.type) && parent.id === node)
+        || (parent.type === "VariableDeclarator" && parent.id === node));
+    const directCall = parent && parent.type === "CallExpression"
+      && parent.callee === node;
+    const nonReferenceProperty = parent
+      && ((parent.type === "MemberExpression" && !parent.computed
+          && parent.property === node)
+        || ((parent.type === "Property" || parent.type === "MethodDefinition")
+          && !parent.computed && parent.key === node && !parent.shorthand));
+    if (!declaration && !directCall && !nonReferenceProperty) {
+      violations.push(`raw-reachable helper ${node.name} is used indirectly at ${
+        node.loc.start.line}:${node.loc.start.column + 1}`);
+    }
+  });
+
+  const ownerCounts = new Map();
+  wrapperCalls.forEach(({ owner }) => {
+    ownerCounts.set(owner.name, (ownerCounts.get(owner.name) || 0) + 1);
+  });
+  return {
+    wrapperCalls: wrapperCalls.length,
+    sentinelGuards: consumedGuards.size,
+    rawUses: rawCalls.length,
+    cardOwnedCalls: cardOwnedTransports.length,
+    owners: Array.from(ownerCounts, ([name, calls]) => ({ name, calls }))
+      .sort((left, right) => left.name.localeCompare(right.name)),
+    boundaries: Array.from(consumedBoundaries.keys()).sort(),
+    violations,
+  };
+}
+
+function selfTestOperationalWriteSourceInventory() {
+  const boundaries = {
+    "operational-card": {
+      owner: "postOperationalCardScoped", functionDepth: 1, shape: "direct",
+      result: "result",
+      settlement: "operational",
+      arguments: /^\s*\(\s*path\s*,\s*body\s*\)/,
+    },
+    "independent-ledger": {
+      owner: "independent", functionDepth: 1, shape: "direct",
+      result: "response",
+      settlement: "season",
+      cardOwnedException: true,
+      arguments: /^\s*\(\s*"\/api\/y"\s*,/,
+    },
+    "substitute-ledger": {
+      owner: "substitute", functionDepth: 1, shape: "operation-choice",
+      result: "r",
+      settlement: "substitute",
+      arguments: /^\s*\(\s*"\/api\/sub"\s*,/,
+    },
+  };
+  const fixture = `
+    const OWNER_CARD = "owner/card";
+    const SCHEDULE_FACILITY_CARD_IDS = Object.freeze([OWNER_CARD]);
+    const OPERATIONAL_CARD_WRITE_WITHDRAWN = Object.freeze({ withdrawn: true });
+    async function post(path, body) { return { path, body }; }
+    async function postScoped(path, body) { return { path, body }; }
+    async function postOperationalCardScoped(identity, path, body) {
+      const result = await postScoped(path, body);
+      await awaitOperationalCardContextSettlement(identity);
+      return identity ? result : OPERATIONAL_CARD_WRITE_WITHDRAWN;
+    }
+    async function awaitOperationalCardContextSettlement(identity) {
+      return identity;
+    }
+    function settleCardWrite(identity) { return !!identity; }
+    function settleSubstituteOptInWrite(operation) { return !!operation; }
+    async function owner(identity) {
+      const ready = currentReadyCard(OWNER_CARD);
+      if (!ready) return;
+      const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;
+    }
+    async function independent() {
+      const response = await postScoped("/api/y", {});
+      const settled = settleCardWrite(identity);
+      if (!settled) return;
+      if (!cardIdentityCurrent(identity)) return;
+      return response;
+    }
+    async function substitute(operation) {
+      let r;
+      try {
+        r = await (operation ? postScoped : post)("/api/sub", {});
+      } finally {
+        settleSubstituteOptInWrite(operation);
+      }
+      return r;
+    }
+    const decoy = "postScoped('/not-code')";
+    // postOperationalCardScoped(identity, "/not-code", {});
+  `;
+  const inspect = (source) =>
+    operationalWriteSourceInventory(source, boundaries, {});
+  const clean = inspect(fixture);
+  if (clean.violations.length || clean.wrapperCalls !== 1 || clean.rawUses !== 3
+      || JSON.stringify(clean.owners) !== JSON.stringify([{ name: "owner", calls: 1 }])) {
+    fail(`write-owner oracle rejected its clean fixture: ${JSON.stringify(clean)}`);
+  }
+  const mixedBoundary = {
+    "fixture-generic-delete": {
+      owner: "mixed", functionDepth: 1, target: "attemptDelete",
+      result: "mixedResult", identity: "cardIdentity", identityObject: "m",
+      arguments: /^\s*\(\s*m\.kind\s*,\s*m\.id\s*\)/,
+    },
+  };
+  const mixedFixture = `${fixture}
+    async function attemptDelete(kind, id) {
+      return post("/api/delete/" + kind + "/" + id, {});
+    }
+    async function mixed(m) {
+      const ready = currentReadyCard(OWNER_CARD);
+      if (!ready) return;
+      const cardIdentity = m.cardIdentity || null;
+      const mixedResult = cardIdentity
+        ? await postOperationalCardScoped(cardIdentity, "/api/mixed", {})
+        : await attemptDelete(m.kind, m.id);
+      if (mixedResult === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      return mixedResult;
+    }`;
+  const cleanMixed = operationalWriteSourceInventory(
+    mixedFixture, boundaries, mixedBoundary);
+  if (cleanMixed.violations.length || cleanMixed.wrapperCalls !== 2) {
+    fail(`write-owner oracle rejected its exact mixed boundary: ${
+      JSON.stringify(cleanMixed)}`);
+  }
+  const reboundMixed = mixedFixture.replace(
+    "const cardIdentity = m.cardIdentity || null;",
+    "let cardIdentity = m.cardIdentity || null; cardIdentity = null;");
+  if (!operationalWriteSourceInventory(
+    reboundMixed, boundaries, mixedBoundary).violations.length) {
+    fail("write-owner oracle accepted a rebound mixed-boundary identity");
+  }
+  const shadowedMixed = mixedFixture.replace(
+    `      const mixedResult = cardIdentity
+        ? await postOperationalCardScoped(cardIdentity, "/api/mixed", {})
+        : await attemptDelete(m.kind, m.id);
+      if (mixedResult === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      return mixedResult;`,
+    `      {
+        const { cardIdentity } = { cardIdentity: null };
+        var mixedResult = cardIdentity
+          ? await postOperationalCardScoped(cardIdentity, "/api/mixed", {})
+          : await attemptDelete(m.kind, m.id);
+        if (mixedResult === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      }
+      return mixedResult;`);
+  if (!operationalWriteSourceInventory(
+    shadowedMixed, boundaries, mixedBoundary).violations.length) {
+    fail("write-owner oracle accepted a shadowed mixed-boundary identity");
+  }
+  const downgraded = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;`,
+    `const result = await post("/api/x", {});`);
+  const collapsed = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await post("/api/x", {});`);
+  const extractedRawHelper = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await ownerTransport("/api/x", {});`)
+    + `\nasync function ownerTransport(path, body) {
+      return await post(path, body);
+    }`;
+  const extractedTwoHopHelper = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await ownerTransport("/api/x", {});`)
+    + `\nasync function ownerTransport(path, body) {
+      return await sendOwnerTransport(path, body);
+    }
+    async function sendOwnerTransport(path, body) {
+      return await post(path, body);
+    }`;
+  const genericConditionalWaiver = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const fake = null;
+      const result = fake
+        ? await postOperationalCardScoped(fake, "/api/x", {})
+        : await ownerTransport("/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;`)
+    + `\nasync function ownerTransport(path, body) {
+      return await post(path, body);
+    }`;
+  const requestObjectWrite = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await ownerTransport("/api/x", {});`)
+    + `\nasync function ownerTransport(path, body) {
+      return await fetch(new Request(path, {
+        method: "POST", body: JSON.stringify(body),
+      }));
+    }`;
+  const requestVariableWrite = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await ownerTransport("/api/x", {});`)
+    + `\nasync function ownerTransport(path, body) {
+      const request = new Request(path, {
+        method: "POST", body: JSON.stringify(body),
+      });
+      return await fetch(request, { credentials: "same-origin" });
+    }`;
+  const clonedRequestWrite = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await ownerTransport();`)
+    + `\nconst existingPostRequest = new Request("/api/write", {
+      method: "POST", body: "{}",
+    });
+    async function ownerTransport() {
+      return await fetch(new Request(existingPostRequest));
+    }`;
+  const aliasedRawHelper = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const firstSend = ownerTransport;
+      const send = firstSend;
+      const result = await send("/api/x", {});`)
+    + `\nasync function ownerTransport(path, body) {
+      return await post(path, body);
+    }`;
+  const boundRawHelper = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const send = ownerTransport.bind(null);
+      const result = await send("/api/x", {});`)
+    + `\nasync function ownerTransport(path, body) {
+      return await post(path, body);
+    }`;
+  const callbackRawHelper = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await invokeTransport(ownerTransport, "/api/x", {});`)
+    + `\nasync function invokeTransport(transport, path, body) {
+      return await transport(path, body);
+    }
+    async function ownerTransport(path, body) {
+      return await post(path, body);
+    }`;
+  const objectMethodRawHelper = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await ownerTransports.send("/api/x", {});`)
+    + `\nconst ownerTransports = {
+      async send(path, body) { return await post(path, body); },
+    };`;
+  const objectAliasRawHelper = objectMethodRawHelper.replace(
+    `const result = await ownerTransports.send("/api/x", {});`,
+    `const transports = ownerTransports;
+      const result = await transports.send("/api/x", {});`);
+  const destructuredRawHelper = objectMethodRawHelper.replace(
+    `const result = await ownerTransports.send("/api/x", {});`,
+    `const { send } = ownerTransports;
+      const result = await send("/api/x", {});`);
+  const extractedMemberRawHelper = objectMethodRawHelper.replace(
+    `const result = await ownerTransports.send("/api/x", {});`,
+    `const send = ownerTransports.send;
+      const result = await send("/api/x", {});`);
+  const boundMemberRawHelper = objectMethodRawHelper.replace(
+    `const result = await ownerTransports.send("/api/x", {});`,
+    `const send = ownerTransports.send.bind(ownerTransports);
+      const result = await send("/api/x", {});`);
+  const arrayMemberRawHelper = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await ownerTransports[0]("/api/x", {});`)
+    + `\nconst ownerTransports = [
+      async (path, body) => post(path, body),
+    ];`;
+  const assignedRawHelper = fixture.replace(
+    `const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `const result = await assignedOwnerTransport("/api/x", {});`)
+    + `\nlet assignedOwnerTransport;
+    assignedOwnerTransport = async (path, body) => post(path, body);`;
+  const destructuredSettlementShadow = fixture.replace(
+    `async function postOperationalCardScoped(identity, path, body) {
+      const result = await postScoped(path, body);`,
+    `async function postOperationalCardScoped(identity, path, body) {
+      const { awaitOperationalCardContextSettlement } = {
+        awaitOperationalCardContextSettlement: async () => {},
+      };
+      const result = await postScoped(path, body);`);
+  const mutants = [
+    ["sixth raw owner", `${fixture}\nasync function sixth() { return postScoped("/api/z", {}); }`],
+    ["sixth card-axis owner", `${fixture}\nasync function sixth() {
+      const ready = currentReadyCard(OWNER_CARD);
+      if (!ready) return;
+      return post("/api/z", {});
+    }`],
+    ["boundary silently shrank", downgraded],
+    ["boundary and direct identity proof shrank together", collapsed],
+    ["raw transport extracted one helper away", extractedRawHelper],
+    ["raw transport extracted two helpers away", extractedTwoHopHelper],
+    ["generic wrapped-or-raw conditional is not a waiver", genericConditionalWaiver],
+    ["Fetch Request object retains its write method", requestObjectWrite],
+    ["Fetch Request binding retains its write method", requestVariableWrite],
+    ["cloned Request retains its source method", clonedRequestWrite],
+    ["raw helper alias chain", aliasedRawHelper],
+    ["bound raw helper", boundRawHelper],
+    ["raw helper passed as callback", callbackRawHelper],
+    ["raw object method", objectMethodRawHelper],
+    ["raw object-method owner alias", objectAliasRawHelper],
+    ["destructured raw object method", destructuredRawHelper],
+    ["extracted raw object method", extractedMemberRawHelper],
+    ["bound raw object method", boundMemberRawHelper],
+    ["raw array member", arrayMemberRawHelper],
+    ["assignment-defined raw helper", assignedRawHelper],
+    ["hard-coded operational card id", fixture.replace(
+      "currentReadyCard(OWNER_CARD)", "currentReadyCard(\"owner/card\")")],
+    ["template operational card id", fixture.replace(
+      "currentReadyCard(OWNER_CARD)", "currentReadyCard(`owner/card`)")],
+    ["concatenated operational card id", fixture.replace(
+      "currentReadyCard(OWNER_CARD)", "currentReadyCard(\"owner/\" + \"card\")")],
+    ["aliased operational card binding", `${fixture}\n`
+      + `const OWNER_CARD_ALIAS = OWNER_CARD;
+    async function sixth() {
+      const ready = currentReadyCard(OWNER_CARD_ALIAS);
+      if (!ready) return;
+      return post("/api/z", {});
+    }`],
+    ["array-destructured operational card binding", `${fixture}\n`
+      + `const [OWNER_CARD_ALIAS] = SCHEDULE_FACILITY_CARD_IDS;
+    async function sixth() {
+      const ready = currentReadyCard(OWNER_CARD_ALIAS);
+      if (!ready) return;
+      return post("/api/z", {});
+    }`],
+    ["literal-array-destructured operational card binding", `${fixture}\n`
+      + `const [OWNER_CARD_ALIAS] = [OWNER_CARD];
+    async function sixth() {
+      const ready = currentReadyCard(OWNER_CARD_ALIAS);
+      if (!ready) return;
+      return post("/api/z", {});
+    }`],
+    ["registered operational-card callback", `${fixture}\n`
+      + `registerOperationalCardHandler(OWNER_CARD, async () => {
+      return post("/api/z", {});
+    });`],
+    ["registered operational-card member callback", `${fixture}\n`
+      + `const ownerHandlers = {
+      async write() { return post("/api/z", {}); },
+    };
+    registerOperationalCardHandler(OWNER_CARD, ownerHandlers.write);`],
+    ["production card axis removed", fixture.replace(
+      "const SCHEDULE_FACILITY_CARD_IDS = Object.freeze([OWNER_CARD]);",
+      "const SCHEDULE_FACILITY_CARD_IDS = Object.freeze([]);")],
+    ["season settlement removed", fixture.replace(
+      "const settled = settleCardWrite(identity);", "const settled = true;")],
+    ["season settlement result ignored", fixture.replace(
+      "if (!settled) return;", "if (!cardIdentityCurrent(identity)) return;")],
+    ["substitute settlement conditional", fixture.replace(
+      "settleSubstituteOptInWrite(operation);",
+      "if (false) settleSubstituteOptInWrite(operation);")],
+    ["substitute settlement swallowed", fixture.replace(
+      "settleSubstituteOptInWrite(operation);",
+      "try { settleSubstituteOptInWrite(operation); } catch (_) {}")],
+    ["operational settlement helper shadowed", fixture.replace(
+      "async function owner(identity) {",
+      "async function owner(identity) { const awaitOperationalCardContextSettlement = async () => {};")],
+    ["operational settlement helper destructured shadow", destructuredSettlementShadow],
+    ["season settlement helper global reassignment", `${fixture}\n`
+      + "globalThis.settleCardWrite = () => true;"],
+    ["escaped raw identifier", `${fixture}\nasync function sixth() {
+      const response = await post\\u0053coped("/api/z", {}); return response;
+    }`],
+    ["raw alias", `${fixture}\nconst rawAlias = postScoped;`],
+    ["ordinary post alias", `${fixture}\nconst ordinaryAlias = post;`],
+    ["wrapper alias", `${fixture}\nconst alias = postOperationalCardScoped;`],
+    ["computed raw", `${fixture}\nasync function sixth() {
+      return globalThis["post" + "Scoped"]("/api/z", {});
+    }`],
+    ["this-computed raw", `${fixture}\nasync function sixth() {
+      return this["postScoped"]("/api/z", {});
+    }`],
+    ["template-computed raw", `${fixture}\nasync function sixth() {
+      return globalThis[\`post\${"Scoped"}\`]("/api/z", {});
+    }`],
+    ["computed destructured raw", `${fixture}\nconst {
+      ["po" + "stScoped"]: send
+    } = globalThis;`],
+    ["computed ordinary post", `${fixture}\nasync function sixth(identity) {
+      const result = await globalThis["post"]("/api/z", {});
+      if (!cardIdentityCurrent(identity)) return;
+      return result;
+    }`],
+    ["fetch alias", `${fixture}\nconst request = fetch;`],
+    ["computed fetch", `${fixture}\nasync function sixth(identity) {
+      const result = await window["fetch"]("/api/z", { method: "POST" });
+      if (!cardIdentityCurrent(identity)) return;
+      return result;
+    }`],
+    ["lowercase fetch post", `${fixture}\nasync function sixth(identity) {
+      const result = await fetch("/api/z", { method: "post" });
+      if (!cardIdentityCurrent(identity)) return;
+      return result;
+    }`],
+    ["computed wrapper", `${fixture}\nasync function sixth(identity) {
+      return globalThis["postOperationalCardScoped"](identity, "/api/z", {});
+    }`],
+    ["reflected raw", `${fixture}\nasync function sixth() {
+      return Reflect.get(globalThis, "postScoped")("/api/z", {});
+    }`],
+    ["computed reflected raw", `${fixture}\nasync function sixth() {
+      return Reflect["get"](globalThis, "postScoped")("/api/z", {});
+    }`],
+    ["dynamic eval", `${fixture}\neval("postScoped('/api/z', {})");`],
+    ["comment-forged await", fixture.replace(
+      "const result = await postOperationalCardScoped",
+      "const result = /* await */ postOperationalCardScoped")],
+    ["wrong comma declarator", fixture.replace(
+      "const result = await postOperationalCardScoped",
+      "const wrong = null, result = await postOperationalCardScoped")],
+    ["discarded awaited result", fixture.replace(
+      "const result = await postOperationalCardScoped(identity, \"/api/x\", {});",
+      "const result = (await postOperationalCardScoped(identity, \"/api/x\", {}), null);")],
+    ["unrelated withdrawal guard", fixture.replace(
+      "if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;",
+      "if (unrelated === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;")],
+    ["withdrawn sentinel shadowed", fixture.replace(
+      "async function owner(identity) {",
+      `async function owner(identity) {
+      const OPERATIONAL_CARD_WRITE_WITHDRAWN = Object.freeze({});`)],
+    ["withdrawn sentinel function-shadowed", fixture.replace(
+      "async function owner(identity) {",
+      `async function owner(identity) {
+      function OPERATIONAL_CARD_WRITE_WITHDRAWN() {}`)],
+  ];
+  mutants.forEach(([name, source]) => {
+    let rejected;
+    try { rejected = inspect(source).violations.length > 0; }
+    catch (error) {
+      fail(`write-owner mutant ${name} did not execute its oracle: ${error.message}`);
+    }
+    if (!rejected) fail(`write-owner oracle did not reject mutant: ${name}`);
+  });
+  const wrappedSixth = inspect(`${fixture}
+    const sixth = async (identity) => {
+      const ready = currentReadyCard(OWNER_CARD);
+      if (!ready) return;
+      const result = await postOperationalCardScoped(identity, "/api/z", {});
+      // Comments between the value and guard are harmless trivia.
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+    };`);
+  if (wrappedSixth.violations.length || wrappedSixth.wrapperCalls !== 2
+      || !wrappedSixth.owners.some((owner) => owner.name === "sixth")) {
+    fail(`write-owner oracle rejected a correctly wrapped lexical owner: ${
+      JSON.stringify(wrappedSixth)}`);
+  }
+  const extractedWrappedOwner = inspect(fixture.replace(
+    `      const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      if (!cardIdentityCurrent(identity)) return;`,
+    `      const result = await runOperationalCardWrite(identity);
+      if (!result) return;`)
+    + `\nasync function runOperationalCardWrite(identity) {
+      const result = await postOperationalCardScoped(identity, "/api/x", {});
+      if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+      return result;
+    }`);
+  if (extractedWrappedOwner.violations.length
+      || extractedWrappedOwner.wrapperCalls !== 1
+      || !extractedWrappedOwner.owners.some((owner) =>
+        owner.name === "runOperationalCardWrite")) {
+    fail(`write-owner oracle rejected a directly extracted safe wrapper: ${
+      JSON.stringify(extractedWrappedOwner)}`);
+  }
+  const arrowHelper = inspect(fixture.replace(
+    `async function postOperationalCardScoped(identity, path, body) {
+      const result = await postScoped(path, body);
+      await awaitOperationalCardContextSettlement(identity);
+      return identity ? result : OPERATIONAL_CARD_WRITE_WITHDRAWN;
+    }`,
+    `const postOperationalCardScoped = async (identity, path, body) => {
+      const result = await postScoped(path, body);
+      await awaitOperationalCardContextSettlement(identity);
+      return identity ? result : OPERATIONAL_CARD_WRITE_WITHDRAWN;
+    };`));
+  if (arrowHelper.violations.length || arrowHelper.wrapperCalls !== 1) {
+    fail(`write-owner oracle rejected an arrow-function transport declaration: ${
+      JSON.stringify(arrowHelper)}`);
+  }
+  const readHelper = inspect(`${fixture}
+    async function loadOwner(path) {
+      return fetch(path, { method: "GET", credentials: "same-origin" });
+    }
+    async function readOnlyOwner() {
+      const ready = currentReadyCard(OWNER_CARD);
+      if (!ready) return;
+      return loadOwner("/api/read");
+    }`);
+  if (readHelper.violations.length) {
+    fail(`write-owner oracle rejected a card-owned GET helper: ${
+      JSON.stringify(readHelper)}`);
+  }
+  const requestReadHelper = inspect(`${fixture}
+    async function requestReadOnlyOwner() {
+      const ready = currentReadyCard(OWNER_CARD);
+      if (!ready) return;
+      return fetch(new Request("/api/read"));
+    }`);
+  if (requestReadHelper.violations.length) {
+    fail(`write-owner oracle rejected a visibly URL-like Request GET: ${
+      JSON.stringify(requestReadHelper)}`);
+  }
+  const transplanted = fixture.replace(
+    "async function independent()", "async function wrongOwner()");
+  if (!inspect(transplanted).violations.length) {
+    fail("write-owner oracle did not reject a transplanted boundary waiver");
+  }
+}
 
 function waitForServer(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -438,34 +2300,21 @@ function coverageLedger() {
   };
 }
 
-async function assertProductionAxes(page, label) {
+async function assertProductionAxes(page, label, sourceInventory) {
   const production = await page.evaluate(() => ({
     cards: typeof SCHEDULE_FACILITY_CARD_IDS === "undefined"
       ? null : Array.from(SCHEDULE_FACILITY_CARD_IDS),
     states: typeof CARD_STATE === "undefined" ? null : Object.values(CARD_STATE),
-    // Every persisted operational-card write must cross one shared settlement
-    // barrier. The owner list is the complete production write surface: its
-    // wrapper count pins all nine current writes, while the raw-call scan keeps
-    // a new branch inside any owner from bypassing the helper.
+    // The AST inventory owns call-site and owner completeness. Keep this
+    // runtime check focused on the helper's two-sided ordering and on the
+    // accepted-switch cleanup that makes its withdrawal meaningful.
     operationalWrites: (() => {
-      const owners = [wireModal, previewIceBuilder, wireCalendarCards,
-        generateSchedulerDraft, wireSchedulerCards];
-      const rows = owners.map((owner) => ({
-        name: owner.name,
-        source: String(owner),
-      }));
-      const rawOwners = rows.filter((row) => /\bpostScoped\s*\(/.test(row.source))
-        .map((row) => row.name);
-      const wrapperCalls = rows.reduce((total, row) => total
-        + (row.source.match(/\bpostOperationalCardScoped\s*\(/g) || []).length, 0);
-      const withdrawnGuards = rows.reduce((total, row) => total
-        + (row.source.match(/=== OPERATIONAL_CARD_WRITE_WITHDRAWN/g) || []).length, 0);
       const helper = String(postOperationalCardScoped);
       const intent = helper.indexOf("contextSwitchIntentPending");
       const preIdentity = helper.indexOf("!cardIdentityCurrent(identity)", intent);
       const preWithdrawn = helper.indexOf(
         "return OPERATIONAL_CARD_WRITE_WITHDRAWN", preIdentity);
-      const post = helper.indexOf("await postScoped(path, body)", preWithdrawn);
+      const post = helper.indexOf("postScoped(", preWithdrawn);
       const settle = helper.indexOf(
         "await awaitOperationalCardContextSettlement(identity)", post);
       const postIdentity = helper.indexOf("cardIdentityCurrent(identity)", settle);
@@ -479,8 +2328,7 @@ async function assertProductionAxes(page, label) {
       const acceptedCalls = (String(sendContextSwitch).match(
         /if \(acceptedContextMoved\) invalidateAcceptedScheduleFacilityContext\(\);/g)
         || []).length;
-      return { rawOwners, wrapperCalls, withdrawnGuards,
-        withdrawalSelectors, cleanupState, acceptedCalls,
+      return { withdrawalSelectors, cleanupState, acceptedCalls,
         helperOrdered: intent >= 0 && preIdentity > intent
           && preWithdrawn > preIdentity && post > preWithdrawn
           && settle > post && postIdentity > settle
@@ -510,16 +2358,19 @@ async function assertProductionAxes(page, label) {
     fail(`[${label}] production no longer declares the journey's state axis: `
       + `${missingStates.join(", ")}`);
   }
+  if (sourceInventory.violations.length) {
+    fail(`[${label}] source-wide operational write inventory failed: ${
+      sourceInventory.violations.join("; ")}`);
+  }
   if (!production.operationalWrites.helperOrdered
-      || production.operationalWrites.wrapperCalls !== 9
-      || production.operationalWrites.withdrawnGuards !== 9
       || !production.operationalWrites.withdrawalSelectors
       || !production.operationalWrites.cleanupState
-      || production.operationalWrites.acceptedCalls !== 2
-      || production.operationalWrites.rawOwners.length) {
-    fail(`[${label}] operational write settlement axis diverged: expected 9 `
-      + `writes with caller withdrawal guards behind one two-sided helper, got ${JSON.stringify(
-        production.operationalWrites)}`);
+      || production.operationalWrites.acceptedCalls !== 2) {
+    fail(`[${label}] operational write settlement axis diverged: source found ${
+      sourceInventory.wrapperCalls} wrapped writes with ${
+      sourceInventory.sentinelGuards} guards and ${sourceInventory.rawUses} `
+      + `owner-bound raw boundaries; runtime globals got ${JSON.stringify(
+        production.operationalWrites)}; owners ${JSON.stringify(sourceInventory.owners)}`);
   }
   if (!production.generateGuarded) {
     fail(`[${label}] Generate must reject a superseded card identity directly `
@@ -1469,7 +3320,7 @@ async function seedFixtures(page) {
   return ids;
 }
 
-async function checkViewport(browser, viewport) {
+async function checkViewport(browser, viewport, sourceInventory) {
   const label = viewport.label;
   const base = `http://${HOST}:${viewport.port}`;
   const server = spawn(
@@ -1587,7 +3438,7 @@ async function checkViewport(browser, viewport) {
     await installContextFixture(page);
     await armAnnouncements(page);
     await quiesce(page, tracker, `${label}/boot`);
-    await assertProductionAxes(page, `${label}/axes`);
+    await assertProductionAxes(page, `${label}/axes`, sourceInventory);
 
     // Scheduler starts honestly empty: no proposal has been generated and no
     // draft Game has been committed.
@@ -3194,9 +5045,28 @@ async function checkViewport(browser, viewport) {
 async function main() {
   let browser;
   try {
+    selfTestOperationalWriteSourceInventory();
+    const sourceInventory = operationalWriteSourceInventory(
+      fs.readFileSync(APP_JS, "utf8"), SCOPED_POST_BOUNDARIES,
+      UNOWNED_RAW_HELPER_BOUNDARIES);
+    if (sourceInventory.violations.length) {
+      fail(`app.js operational write source inventory failed: ${
+        sourceInventory.violations.join("; ")}`);
+    }
+    if (process.argv.includes("--source-oracle-only")) {
+      console.log(`Operational write source oracle passed: ${JSON.stringify({
+        calls: sourceInventory.wrapperCalls,
+        guards: sourceInventory.sentinelGuards,
+        owners: sourceInventory.owners,
+        rawBoundaries: sourceInventory.boundaries,
+      })}`);
+      return;
+    }
     browser = await chromium.launch(process.env.SMOKE_CHROMIUM_PATH
       ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
-    for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
+    for (const viewport of VIEWPORTS) {
+      await checkViewport(browser, viewport, sourceInventory);
+    }
     console.log("Scheduler operational-card state matrix passed.");
   } catch (error) {
     console.error("Scheduler operational-card state matrix FAILED.");

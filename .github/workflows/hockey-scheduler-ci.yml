@@ -199,6 +199,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - name: Install operational-card source-oracle dependency
+        working-directory: hockey-scheduler/e2e
+        run: npm ci --ignore-scripts
+      - name: Check operational-card write ownership (#455 follow-up)
+        working-directory: hockey-scheduler/e2e
+        run: npm run scheduler-write-owner-oracle
       - name: Syntax-check browser scripts
         run: |
           node --check hockey-scheduler/backend/hockey_scheduler/web/static/app.js

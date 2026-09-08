@@ -44,6 +44,7 @@
     "setup-state-matrix": "node setup-state-matrix.js",
     "home-tasks-state-matrix": "node home-tasks-state-matrix.js",
     "scheduler-state-matrix": "node scheduler-state-matrix.js",
+    "scheduler-write-owner-oracle": "node scheduler-state-matrix.js --source-oracle-only",
     "allowed-venues": "node allowed-venues.js",
     "venue-access-cleanup": "node venue-access-cleanup.js",
     "venue-sharing": "node venue-sharing.js",
@@ -72,6 +73,7 @@
     "breakpoint-boundaries": "node breakpoint-boundaries.js"
   },
   "devDependencies": {
+    "acorn": "^8.18.0",
     "axe-core": "^4.12.1",
     "playwright": "^1.48.0"
   }
