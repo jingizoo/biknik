@@ -137,6 +137,25 @@ async function waitForSel(page, label, selector, options) {
   }
 }
 
+// Node-side counterpart to the labelled browser waits above. Interception
+// promises otherwise have no deadline: a mutant that suppresses the request
+// under test hangs until the whole CI job times out instead of failing at the
+// missing transition with a useful name.
+async function waitForPromise(promise, label, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(
+          `timed out waiting for: ${label}`)), timeoutMs || 10000);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // Read the rendered Home/Tasks card into a plain object for assertions.
 function cardState(page) {
   return page.evaluate((headings) => {
@@ -3394,10 +3413,33 @@ async function checkRoleScenarios(browser, viewport) {
       requiredSelectors: [".ib-form"],
       absentSelectors: [".ib-preview", "[data-ib-commit]"],
     });
+    // Make K5 observably owned before K4 settles. A tuple guard accidentally
+    // replaced with a principal-only guard would issue a fresh overview load
+    // here; without an edited field that reload looked identical to the
+    // untouched default form and the stale-response test passed vacuously.
+    await page.fill("#ib-playable", "65");
+    const k5OwnerBefore = await page.evaluate(() => {
+      const cardId = ICE_BUILDER_CARD;
+      const entry = readCardState(cardId);
+      window.__k3K5Identity = entry.identity;
+      return {
+        generation: cardGenerations[cardId],
+        playable: (document.getElementById("ib-playable") || {}).value || null,
+      };
+    });
+    let k3OverviewRequests = 0;
+    const trackK3Overview = (request) => {
+      if (request.method() === "GET"
+          && new URL(request.url()).pathname === "/api/demo/overview") {
+        k3OverviewRequests += 1;
+      }
+    };
+    page.on("request", trackK3Overview);
     // Delivery was held across the switch; release it now, under K5.
     releaseCommitK4();
     await page.unroute("**/api/setup/ice-availability/commit");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    page.off("request", trackK3Overview);
     if (!(await page.$(".ib-form"))) {
       fail("(K3) expected the Ice Builder to remain open under K5 after a "
         + "stale K4 Commit response landed -- it must never null out a "
@@ -3416,6 +3458,216 @@ async function checkRoleScenarios(browser, viewport) {
       fail(`(K3) expected no stale "Created" toast to appear under K5 `
         + `after a straggling K4 Commit response, got: `
         + `${JSON.stringify(k3ToastAfter)}`);
+    }
+    const k5OwnerAfter = await page.evaluate(() => {
+      const cardId = ICE_BUILDER_CARD;
+      const entry = readCardState(cardId);
+      return {
+        sameIdentity: entry.identity === window.__k3K5Identity,
+        generation: cardGenerations[cardId],
+        playable: (document.getElementById("ib-playable") || {}).value || null,
+      };
+    });
+    await page.evaluate(() => { delete window.__k3K5Identity; });
+    if (k5OwnerBefore.playable !== "65" || k5OwnerAfter.playable !== "65"
+        || !k5OwnerAfter.sameIdentity
+        || k5OwnerAfter.generation !== k5OwnerBefore.generation
+        || k3OverviewRequests !== 0) {
+      fail("(K3) K4 settlement changed K5's independently owned Builder; "
+        + `before=${JSON.stringify(k5OwnerBefore)} `
+        + `after=${JSON.stringify(k5OwnerAfter)} `
+        + `overviewRequests=${k3OverviewRequests}`);
+    }
+
+    // ---- (K, same user/new session) The serialization lease is a server
+    // operation fact and therefore survives sign-out, but its UI identity is
+    // epoch-scoped. Hold a real successful Create after commit, sign out and
+    // back in as the SAME username on the SAME persisted tuple, then reopen
+    // Builder. The new session must see a neutral, non-actionable PENDING
+    // card until the old delivery settles; settlement must then reconcile
+    // fresh truth even though cardIdentitySamePrincipal(oldIdentity) is false.
+    // This pins the intentional tuple-only reconciliation guard. Adding a
+    // principal check strands the new session on PENDING forever.
+    const kSession = await page.evaluate(async (seasonId) => {
+      const post = (path, body) => window.hsFixture.auto(path, body);
+      const venue = await post("/api/v2/setup/venue",
+        { name: "VK Session Epoch", organization_id: null });
+      const rink = await post("/api/v2/setup/rink",
+        { venue_id: venue.id, name: "RK Session Epoch" });
+      await post(`/api/v2/setup/seasons/${seasonId}/venue-access`,
+        { venue_id: venue.id });
+      return { rinkId: rink.id };
+    }, k.seasonK5);
+    await page.click("[data-ib-cancel]");
+    await page.waitForFunction(() => !document.querySelector(".ib-form"),
+      null, { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForFunction(
+      (seasonId) => (document.getElementById("ib-season") || {}).value === seasonId,
+      k.seasonK5, { timeout: 10000 });
+    await page.check(`.ib-rink[value="${kSession.rinkId}"]`);
+    await page.fill("#ib-playable", "55");
+    const kSessionPreviewResponse = page.waitForResponse((response) =>
+      response.url() === `${base}/api/setup/ice-availability/preview`
+        && response.request().method() === "POST");
+    await page.click("[data-ib-preview]");
+    await kSessionPreviewResponse;
+    await page.waitForSelector("[data-ib-commit]:not([disabled])",
+      { timeout: 10000 });
+
+    let releaseSessionCommit;
+    let markSessionCommitFetched;
+    let markSessionCommitDelivered;
+    const sessionCommitHold = new Promise(
+      (resolve) => { releaseSessionCommit = resolve; });
+    const sessionCommitFetched = new Promise(
+      (resolve) => { markSessionCommitFetched = resolve; });
+    const sessionCommitDelivered = new Promise(
+      (resolve) => { markSessionCommitDelivered = resolve; });
+    let sessionCommitStatus = null;
+    let sessionCommitMatches = 0;
+    await page.route("**/api/setup/ice-availability/commit", async (route) => {
+      sessionCommitMatches += 1;
+      const response = await route.fetch();
+      sessionCommitStatus = response.status();
+      markSessionCommitFetched();
+      await sessionCommitHold;
+      try { await route.fulfill({ response }); } catch (e) { /* session moved on */ }
+      markSessionCommitDelivered();
+    });
+    await page.evaluate(() => { window.__kSessionOldEpoch = uiIdentityEpoch; });
+    await page.click("[data-ib-commit]");
+    await waitForPromise(sessionCommitFetched,
+      "(K, same user/new session) held Create to commit server-side", 10000);
+    if (sessionCommitStatus !== 200 || sessionCommitMatches !== 1) {
+      fail("(K, same user/new session) expected one successful held Create, "
+        + `got status=${sessionCommitStatus} matches=${sessionCommitMatches}`);
+    }
+    const kSessionCommitted = (await apiGet(page, "/api/demo/overview").catch(
+      () => ({ ice_slots: [] }))).ice_slots || [];
+    const kSessionCommittedCount = kSessionCommitted.filter(
+      (slot) => slot.rink_id === kSession.rinkId).length;
+    if (!kSessionCommittedCount) {
+      fail("(K, same user/new session) held Create returned 200 but its rink "
+        + "has no committed slots, so the settlement test is vacuous");
+    }
+
+    // Use the app's real sign-out and persona sign-in paths. Raw auth helpers
+    // bypass setUser()/resetTransientUiState() and would not advance the UI
+    // identity epoch this regression is specifically proving.
+    await page.click("#signout-btn");
+    await waitForSel(page,
+      "(K, same user/new session) admin persona after sign-out",
+      '[data-persona="admin"]', { state: "visible" });
+    await page.click('[data-persona="admin"]');
+    await waitFor(page,
+      "(K, same user/new session) same admin sign-in",
+      () => (document.getElementById("user-name") || {}).textContent === "admin",
+      null, 10000);
+    await waitForSel(page,
+      "(K, same user/new session) current Calendar after sign-in",
+      "[data-ice-builder-open]", { state: "visible" });
+    await page.click("[data-ice-builder-open]");
+    await page.waitForFunction(() => {
+      const root = document.querySelector(
+        '[data-operational-card="facilities/ice-builder"]');
+      const held = currentCardWrite(ICE_BUILDER_CARD);
+      return uiIdentityEpoch > window.__kSessionOldEpoch
+        && held && !cardIdentitySamePrincipal(held.identity)
+        && root && root.dataset.cardState === "pending"
+        && root.getAttribute("aria-busy") === "true"
+        && /waiting on the server/i.test(root.textContent || "")
+        && !root.querySelector(".ib-form,[data-ib-preview],[data-ib-commit]");
+    }, null, { timeout: 10000 });
+
+    // Back is a newer, exact card-local focus choice. Hold the reconciliation
+    // read so both paints are observable: Back must survive PENDING -> LOADING
+    // and LOADING -> settled. The separate cancel/reopen leg below starts on
+    // the heading, so together they pin both generic focus-plan paths.
+    await page.focus(
+      '[data-operational-card="facilities/ice-builder"] [data-ib-cancel]');
+    let releaseSessionOverview;
+    let markSessionOverviewFetched;
+    let markSessionOverviewDelivered;
+    const sessionOverviewHold = new Promise(
+      (resolve) => { releaseSessionOverview = resolve; });
+    const sessionOverviewFetched = new Promise(
+      (resolve) => { markSessionOverviewFetched = resolve; });
+    const sessionOverviewDelivered = new Promise(
+      (resolve) => { markSessionOverviewDelivered = resolve; });
+    let sessionOverviewStatus = null;
+    await page.route("**/api/demo/overview", async (route) => {
+      const response = await route.fetch();
+      sessionOverviewStatus = response.status();
+      markSessionOverviewFetched();
+      await sessionOverviewHold;
+      try { await route.fulfill({ response }); } catch (e) { /* page moved on */ }
+      markSessionOverviewDelivered();
+    });
+    releaseSessionCommit();
+    await waitForPromise(sessionCommitDelivered,
+      "(K, same user/new session) held Create response delivery", 10000);
+    await page.unroute("**/api/setup/ice-availability/commit");
+    await waitForPromise(sessionOverviewFetched,
+      "(K, same user/new session) fresh reconciliation overview", 10000);
+    if (sessionOverviewStatus !== 200) {
+      fail("(K, same user/new session) reconciliation overview answered "
+        + `${sessionOverviewStatus}, expected 200`);
+    }
+    const kSessionLoadingFocus = await page.evaluate(() => {
+      const root = document.querySelector(
+        '[data-operational-card="facilities/ice-builder"]');
+      const active = document.activeElement;
+      return {
+        state: root && root.dataset.cardState,
+        connected: !!(active && active.isConnected),
+        inside: !!(root && active && root.contains(active)),
+        back: !!(active && active.matches
+          && active.matches("[data-ib-cancel]")),
+      };
+    });
+    if (kSessionLoadingFocus.state !== "loading"
+        || !kSessionLoadingFocus.connected || !kSessionLoadingFocus.inside
+        || !kSessionLoadingFocus.back) {
+      fail("(K, same user/new session) Back focus did not survive the fresh "
+        + `LOADING repaint: ${JSON.stringify(kSessionLoadingFocus)}`);
+    }
+    releaseSessionOverview();
+    await waitForPromise(sessionOverviewDelivered,
+      "(K, same user/new session) reconciliation overview delivery", 10000);
+    await page.unroute("**/api/demo/overview");
+    await page.waitForFunction((seasonId) => {
+      const cardId = ICE_BUILDER_CARD;
+      const root = document.querySelector(
+        `[data-operational-card="${cardId}"]`);
+      const season = document.getElementById("ib-season");
+      const entry = readCardState(cardId);
+      return !currentCardWrite(cardId) && root
+        && root.dataset.cardState !== "pending"
+        && root.getAttribute("aria-busy") === "false"
+        && !!root.querySelector(".ib-form [data-ib-preview]")
+        && season && season.value === seasonId
+        && cardIdentityCurrent(entry.identity);
+    }, k.seasonK5, { timeout: 30000 }).catch((error) => fail(
+      "(K, same user/new session) old settlement did not rebuild a fresh "
+        + `current Builder: ${error.message}`));
+    const kSessionAfter = await page.evaluate((committedRink) => ({
+      playable: (document.getElementById("ib-playable") || {}).value || null,
+      reusedCommittedRink: Array.from(document.querySelectorAll(".ib-rink:checked"))
+        .some((input) => input.value === committedRink),
+      staleCreatedToast: /created\s+\d+\s+ice slot/i.test(String(toast || ""))
+        || Array.from(document.querySelectorAll(".toast-msg"))
+          .some((node) => /created\s+\d+\s+ice slot/i.test(node.textContent || "")),
+      backFocused: !!(document.activeElement && document.activeElement.matches
+        && document.activeElement.matches("[data-ib-cancel]")),
+    }), kSession.rinkId);
+    await page.evaluate(() => { delete window.__kSessionOldEpoch; });
+    if (kSessionAfter.playable === "55" || kSessionAfter.reusedCommittedRink
+        || kSessionAfter.staleCreatedToast || !kSessionAfter.backFocused
+        || sessionCommitMatches !== 1) {
+      fail("(K, same user/new session) departing session state escaped into "
+        + `the fresh Builder: ${JSON.stringify(kSessionAfter)} `
+        + `matches=${sessionCommitMatches}`);
     }
 
     // ---- (K, cancel-reopen preview) Response ownership is
@@ -3485,16 +3737,104 @@ async function checkRoleScenarios(browser, viewport) {
       null, { timeout: 10000 });
     await page.click("[data-ice-builder-open]");  // builder B, same context
     await page.waitForFunction(
-      (v) => (document.getElementById("ib-season") || {}).value === v,
-      k.seasonK5, { timeout: 10000 });
+      () => {
+        const root = document.querySelector(
+          '[data-operational-card="facilities/ice-builder"]');
+        return root && root.dataset.cardState === "pending"
+          && root.getAttribute("aria-busy") === "true"
+          && /creating ice slots/i.test(root.textContent || "")
+          && !root.querySelector(".ib-form,[data-ib-preview],[data-ib-commit]");
+      }, null, { timeout: 10000 });
+    const pendingFocus = await page.evaluate(() => {
+      const root = document.querySelector(
+        '[data-operational-card="facilities/ice-builder"]');
+      const active = document.activeElement;
+      return {
+        connected: !!(active && active.isConnected),
+        inside: !!(root && active && root.contains(active)),
+        heading: !!(active && active.matches && active.matches(".ib-head h2")),
+        body: active === document.body || active === document.documentElement,
+      };
+    });
+    if (!pendingFocus.connected || !pendingFocus.inside
+        || !pendingFocus.heading || pendingFocus.body) {
+      fail("(K, cancel-reopen commit) reopening the PENDING Builder did not "
+        + `land focus on its connected heading: ${JSON.stringify(pendingFocus)}`);
+    }
+
+    // Hold only the fresh reconciliation read's DELIVERY. Releasing A first
+    // must carry the reopened Builder heading into its LOADING repaint; a
+    // deliberate move to Back during that wait must then survive the settled
+    // repaint exactly, rather than being stranded on BODY.
+    let releaseReconcileOverview;
+    let markReconcileOverviewFetched;
+    const reconcileOverviewHold = new Promise(
+      (resolve) => { releaseReconcileOverview = resolve; });
+    const reconcileOverviewFetched = new Promise(
+      (resolve) => { markReconcileOverviewFetched = resolve; });
+    let reconcileOverviewStatus = null;
+    await page.route("**/api/demo/overview", async (route) => {
+      const response = await route.fetch();
+      reconcileOverviewStatus = response.status();
+      markReconcileOverviewFetched();
+      await reconcileOverviewHold;
+      try { await route.fulfill({ response }); } catch (e) { /* page moved on */ }
+    });
     releaseCommitA();
     await page.unroute("**/api/setup/ice-availability/commit");
-    await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    await reconcileOverviewFetched;
+    if (reconcileOverviewStatus !== 200) {
+      fail("(K, cancel-reopen commit) fresh reconciliation overview answered "
+        + `${reconcileOverviewStatus}, expected 200`);
+    }
+    const loadingFocus = await page.evaluate(() => {
+      const root = document.querySelector(
+        '[data-operational-card="facilities/ice-builder"]');
+      const active = document.activeElement;
+      return {
+        state: root && root.dataset.cardState,
+        connected: !!(active && active.isConnected),
+        inside: !!(root && active && root.contains(active)),
+        heading: !!(active && active.matches && active.matches(".ib-head h2")),
+        body: active === document.body || active === document.documentElement,
+      };
+    });
+    if (loadingFocus.state !== "loading" || !loadingFocus.connected
+        || !loadingFocus.inside || !loadingFocus.heading || loadingFocus.body) {
+      fail("(K, cancel-reopen commit) reconciliation did not carry the pending "
+        + `heading into its loading repaint: ${JSON.stringify(loadingFocus)}`);
+    }
+    await page.focus(
+      '[data-operational-card="facilities/ice-builder"] [data-ib-cancel]');
+    releaseReconcileOverview();
+    await page.unroute("**/api/demo/overview");
+    // Builder B cannot become actionable while A's write outcome is unknown.
+    // Once A settles, its stale handler may not consume that response into B;
+    // it must release the lease and rebuild B from fresh server truth.
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
     if (!(await page.$(".ib-form"))) {
       fail("(K, cancel-reopen commit) expected builder B to remain open "
         + "after builder A's held Commit response, released post "
         + "cancel/reopen in the SAME context, landed -- it must never "
         + "null out a DIFFERENT builder instance");
+    }
+    const settledFocus = await page.evaluate(() => {
+      const root = document.querySelector(
+        '[data-operational-card="facilities/ice-builder"]');
+      const active = document.activeElement;
+      return {
+        connected: !!(active && active.isConnected),
+        inside: !!(root && active && root.contains(active)),
+        back: !!(active && active.matches && active.matches("[data-ib-cancel]")),
+        body: active === document.body || active === document.documentElement,
+      };
+    });
+    if (!settledFocus.connected || !settledFocus.inside
+        || !settledFocus.back || settledFocus.body) {
+      fail("(K, cancel-reopen commit) settled reconciliation did not preserve "
+        + `the newer Back focus choice: ${JSON.stringify(settledFocus)}`);
     }
     const kCrToastAfter = await page.evaluate(() =>
       (document.querySelector("#toast-root .toast-msg") || {}).textContent || "");

@@ -1600,9 +1600,10 @@ function currentCardWrite(cardId) {
   return ledger[cardTupleKey(currentCardTuple())] || null;
 }
 
-// Open the ledger entry for `identity`'s operation, holding the PENDING model
-// it committed. Called from commitCardState alone, so "the card is PENDING"
-// and "an operation is registered" are the same event and cannot disagree.
+// Open the ledger entry for `identity`'s operation, holding the exact PENDING
+// model the write owns. Every registered write arrives here through
+// commitCardState's synchronous PENDING commit, before an ordinary render can
+// issue a replacement generation.
 function registerCardWrite(identity, model) {
   const ledger = cardWrites[identity.card] || (cardWrites[identity.card] = {});
   ledger[cardTupleKey(identity)] = {
@@ -1813,13 +1814,12 @@ function commitCardState(identity, next) {
   // `identity` last, so a `next` cloned from a previous entry can never carry
   // that entry's older identity through into the new commit.
   cardStates[identity.card] = Object.assign({}, next, { identity: identity });
-  // Committing PENDING is what REGISTERS the unresolved operation, here rather
-  // than at the writer, so the operation-level state and the card-level state
-  // can never disagree about whether a write is outstanding: a card is
-  // PENDING exactly when there is a registered operation for it, by
-  // construction. The model just stored travels into the ledger, because it is
-  // what the card has to be REBUILT as if the operator leaves this tuple and
-  // comes back — by then cardStates holds the other tuple's model instead.
+  // Committing PENDING is what REGISTERS the unresolved operation, here
+  // rather than at an individual writer, so the operation-level state and the
+  // card-level state cannot disagree. The model just stored travels into the
+  // ledger, because it is what the card has to be REBUILT as if the operator
+  // leaves this tuple and comes back — by then cardStates holds the other
+  // tuple's model instead.
   if (next && next.state === CARD_STATE.PENDING) {
     registerCardWrite(identity, cardStates[identity.card]);
   }
@@ -2007,6 +2007,7 @@ function operationalCardFrame(cardId, entry, body) {
   // start their own request, so `refreshing` is not guaranteed to be set on
   // the stale entry even though the replacement pipeline is still active.
   const busy = entry.state === CARD_STATE.LOADING
+    || entry.state === CARD_STATE.PENDING
     || entry.state === CARD_STATE.STALE || entry.refreshing ? "true" : "false";
   return `<section class="operational-card" data-operational-card="${esc(cardId)}"
       data-card-state="${esc(entry.state)}" aria-busy="${busy}">${body}</section>`;
@@ -2044,7 +2045,7 @@ function operationalLoadingCopy(entry, noun) {
   const held = cardDisplayModel(entry);
   if (held) {
     return `<div class="banner neutral operational-stale-note" role="status">
-      <h2>Loading ${esc(noun)}</h2>
+      <h2 data-operational-status-heading>Loading ${esc(noun)}</h2>
       <p>${cardModelIsEmpty(held)
         ? "Refreshing the previous empty result. No new data has loaded yet."
         : cardTupleCurrent(held.identity)
@@ -2055,7 +2056,7 @@ function operationalLoadingCopy(entry, noun) {
 }
 function operationalStaleCopy(cardId, noun) {
   return `<div class="banner neutral operational-stale-note" role="status">
-    <h2>${esc(noun)} — showing earlier data</h2>
+    <h2 data-operational-status-heading>${esc(noun)} — showing earlier data</h2>
     <p>This belongs to the program, season and league you had selected earlier.</p>
     <div class="actions"><button class="act ghost" data-card-retry="${esc(cardId)}"
       >Refresh ${esc(noun.toLowerCase())}</button></div></div>`;
@@ -2324,17 +2325,17 @@ function finishCalendarDateFocusCarry(renderTicket) {
 }
 
 // A same-tuple full render can replace an operational card while one of its
-// own requests is still LOADING. The focused loading heading is detached by
-// the page skeleton before the queued card reconciliation starts, so the
-// card's ordinary settlement guard can no longer distinguish that owned
-// orphan from an unfocused/programmatic load. Carry only a loading heading,
+// own requests is still LOADING or PENDING. The focused wait heading is
+// detached by the page skeleton before the queued card reconciliation starts,
+// so the card's ordinary settlement guard can no longer distinguish that
+// owned orphan from an unfocused/programmatic load. Carry only a wait heading,
 // scoped to this render and the same principal + tuple. Any newer connected
 // focus event supersedes the claim, exactly as for Calendar's date carry.
 //
 // This is deliberately separate from `userInitiated`: a render reconciliation
 // is not a click and must not gain all user-initiated semantics. Its one bit of
-// inherited authority is that the replacement LOADING/settled heading may
-// receive the focus the previous LOADING heading already owned.
+// inherited authority is that the replacement wait/settled heading may
+// receive the focus the previous wait heading already owned.
 function operationalLoadingFocusClaim(container) {
   const active = document.activeElement;
   if (!active || !container || !active.matches || !active.isConnected
@@ -2344,7 +2345,7 @@ function operationalLoadingFocusClaim(container) {
   const cardId = root.dataset.operationalCard;
   if (cardId !== CALENDAR_CARD && cardId !== ICE_BUILDER_CARD) return null;
   const entry = readCardState(cardId);
-  if (entry.state !== CARD_STATE.LOADING
+  if (![CARD_STATE.LOADING, CARD_STATE.PENDING].includes(entry.state)
       || !cardIdentityCurrent(entry.identity)) return null;
   let targetKind = null;
   if (active.matches(".operational-stale-note h2")) {
@@ -2422,7 +2423,7 @@ function finishOperationalLoadingFocusCarry(renderTicket) {
   const entry = readCardState(carry.cardId);
   let target = null;
   if (carry.cardId === ICE_BUILDER_CARD) {
-    target = entry.state === CARD_STATE.LOADING
+    target = [CARD_STATE.LOADING, CARD_STATE.PENDING].includes(entry.state)
       ? root && (carry.targetKind === "status"
         ? root.querySelector(".operational-stale-note h2")
         : root.querySelector(".ib-head h2"))
@@ -8519,6 +8520,31 @@ function reconcileIceBuilderForm(form, overview) {
   return next;
 }
 
+function iceBuilderLoadFocusTarget(root, targetKind) {
+  if (!root) return null;
+  if (targetKind === "status") {
+    return root.querySelector("[data-operational-status-heading]")
+      || root.querySelector("[data-ib-heading]");
+  }
+  return root.querySelector("[data-ib-heading]")
+    || root.querySelector(".operational-stale-note h2");
+}
+
+// A withdrawn Create can release the lease while its replacement Builder is
+// already visible. Carry focus only when that card owns it; persistent chrome
+// or another surface is a newer user choice and must not be pulled back. The
+// generic plan records a stable selector for Back or either labelled heading;
+// this avoids another hand-maintained list of card controls at the exact
+// boundary whose owner oracle was just made derived.
+function iceBuilderReconciliationFocusPlan() {
+  const root = document.querySelector(
+    `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+  const active = document.activeElement;
+  if (!root || !active || !active.isConnected || !root.contains(active)
+      || !active.matches) return null;
+  return captureOperationalSettlementFocus(root, null, false);
+}
+
 // Ice Builder owns its option inventory rather than borrowing Calendar's last
 // payload. The two cards share an endpoint but not an identity or a paint
 // boundary: an early Home/Tasks navigation can open Builder before Calendar
@@ -8530,6 +8556,7 @@ async function loadIceBuilderCard(opts) {
     && Object.prototype.hasOwnProperty.call(opts, "focusLoading")
     ? !!opts.focusLoading : null;
   const loadingFocusTargetKind = opts && opts.focusTargetKind;
+  const entryFocusPlan = opts && opts.entryFocusPlan || null;
   const freshInstance = !!(opts && opts.fresh) || !iceBuilder.form;
   const before = readCardState(ICE_BUILDER_CARD);
   const priorModel = cardDisplayModel(before);
@@ -8540,19 +8567,43 @@ async function loadIceBuilderCard(opts) {
     : (!freshInstance && sameTuple ? iceFormSnapshot(iceBuilder.form) : null);
   const identity = beginOperationalCardLoad(ICE_BUILDER_CARD,
     Object.assign({}, opts || {}, { retain: !freshInstance }));
-  if (!identity) return null;
+  if (!identity) {
+    // An unresolved Create owns this tuple's Builder generation. Reopening
+    // Builder must still paint that non-actionable pending model instead of
+    // leaving Calendar standing or fabricating a second editable form.
+    repaintCalendarSurface(ICE_BUILDER_CARD);
+    if (loadingFocus === true) {
+      const root = document.querySelector(
+        `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+      const target = iceBuilderLoadFocusTarget(root, loadingFocusTargetKind);
+      focusLocalCardNavigationTarget(target);
+    }
+    return null;
+  }
   const renderedEpoch = contextEpoch;
   repaintCalendarSurface(ICE_BUILDER_CARD);
   let loadingFocusTarget = null;
-  if (loadingFocus === true) {
+  if (entryFocusPlan) {
     const root = document.querySelector(
       `[data-operational-card="${ICE_BUILDER_CARD}"]`);
-    const target = root && (loadingFocusTargetKind === "status"
-      ? root.querySelector(".operational-stale-note h2")
-        || root.querySelector(".ib-head h2")
-      : root.querySelector(".ib-head h2")
-        || root.querySelector(".operational-stale-note h2"));
-    if (focusOperationalCardTarget(identity, target)) loadingFocusTarget = target;
+    const target = iceBuilderLoadFocusTarget(root, loadingFocusTargetKind);
+    if (restoreOperationalSettlementFocus(
+        identity, entryFocusPlan, root, target)) {
+      const active = document.activeElement;
+      // Headings represent the transition destination and should advance to
+      // the settled primary action. A control such as Back is an exact newer
+      // choice, so leave loadingFocusTarget null and re-capture its selector.
+      if (active && active.matches && active.matches("h2")) {
+        loadingFocusTarget = active;
+      }
+    }
+  } else if (loadingFocus === true) {
+    const root = document.querySelector(
+      `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+    const target = iceBuilderLoadFocusTarget(root, loadingFocusTargetKind);
+    if (focusOperationalCardTarget(identity, target)) {
+      loadingFocusTarget = target;
+    }
   }
   const result = await getJSONContextScoped("/api/demo/overview", renderedEpoch);
   if (result === CONTEXT_READ_ABORTED) return null;
@@ -8575,7 +8626,8 @@ async function loadIceBuilderCard(opts) {
   }
   const beforeSettle = document.querySelector(
     `[data-operational-card="${ICE_BUILDER_CARD}"]`);
-  const focusPlan = (identity.userInitiated || loadingFocus === true)
+  const focusPlan = (identity.userInitiated || loadingFocus === true
+      || !!entryFocusPlan)
     ? captureOperationalSettlementFocus(
       beforeSettle, loadingFocusTarget, loadingFocus === null)
     : null;
@@ -8586,6 +8638,27 @@ async function loadIceBuilderCard(opts) {
     root && (root.querySelector("[data-ib-preview]")
       || root.querySelector("h2,.section-title")));
   return identity;
+}
+
+// A serialized Create may settle after an accepted A -> B -> A round trip or
+// after the initiating principal has left and another principal has opened the
+// same tuple's Builder. Its response is correctly withdrawn, but settlement
+// has also released the operation lease that refused the replacement read.
+// Reconcile from fresh server truth only when that exact target tuple is back
+// on Calendar: reopen Builder from a fresh read when it is visible, or refresh
+// Calendar when the operator used Back. Never reuse the departing operation's
+// form or response.
+function reconcileSettledIceBuilderWrite(identity) {
+  if (contextSwitchIntentPending || !cardTupleCurrent(identity)) {
+    return;
+  }
+  if (iceBuilder) {
+    const entryFocusPlan = iceBuilderReconciliationFocusPlan();
+    loadIceBuilderCard(Object.assign({ fresh: true }, entryFocusPlan
+      ? { entryFocusPlan: entryFocusPlan } : {}));
+  } else if (view === "calendar") {
+    loadCalendarCard({ preserveAnnouncement: true });
+  }
 }
 
 async function previewIceBuilder(requestForm, opts) {
@@ -8950,6 +9023,14 @@ function wireCalendarCards(c) {
     const identity = beginOperationalCardLoad(
       ICE_BUILDER_CARD, { userInitiated: true });
     if (!identity) return;
+    const loading = readCardState(ICE_BUILDER_CARD);
+    if (!commitCardState(identity, {
+      state: CARD_STATE.PENDING,
+      status: CARD_STATUS.UNKNOWN,
+      pendingNote: "Creating ice slots…",
+      retained: loading.retained || null,
+      retainedCurrentAtStart: !!loading.retainedCurrentAtStart,
+    })) return;
     rerender();
     // Create replaces its own focused button before the write even reaches
     // the wire. Give that source-owned transition a truthful destination for
@@ -8967,10 +9048,16 @@ function wireCalendarCards(c) {
     const result = await postOperationalCardScoped(
       identity, "/api/setup/ice-availability/commit", {
       ...form, template_fingerprint: fingerprint,
+    }, {
+      serializeCard: true,
+      onWithdrawn: reconcileSettledIceBuilderWrite,
     });
     if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
     if (!iceBuilder || requestOp !== iceOperationSeq
-        || !cardIdentityCurrent(identity)) return;
+        || !cardIdentityCurrent(identity)) {
+      reconcileSettledIceBuilderWrite(identity);
+      return;
+    }
     const reason = result && result.error && result.error.details
       && result.error.details.reason;
     if (result && !result.error) {
@@ -9400,6 +9487,11 @@ function renderIceBuilder(ov) {
   if (entry.state === CARD_STATE.LOADING) {
     stateHtml = operationalLoadingCopy(entry, "ice-builder preview")
       + (preview ? renderIcePreview(preview, false) : "");
+  } else if (entry.state === CARD_STATE.PENDING) {
+    stateHtml = `<div class="banner neutral operational-stale-note" role="status">
+      <h2 tabindex="-1" data-operational-status-heading>${esc(entry.pendingNote || "Creating ice slots…")}</h2>
+      <p>The request is still running. This template stays read-only until the server answers.</p></div>`
+      + (preview ? renderIcePreview(preview, false) : "");
   } else if (entry.state === CARD_STATE.STALE) {
     stateHtml = operationalStaleCopy(ICE_BUILDER_CARD, "Ice-builder preview")
       + (preview ? renderIcePreview(preview, false)
@@ -9413,7 +9505,7 @@ function renderIceBuilder(ov) {
     stateHtml = renderIcePreview(preview, actionable);
   }
   const body = `<div class="ib-wrap">
-    <div class="ib-head"><h2>🧊 Build recurring ice</h2>
+    <div class="ib-head"><h2 data-ib-heading>🧊 Build recurring ice</h2>
       <button class="act ghost" data-ib-cancel data-card-local-control>← Back to calendar</button></div>
     <p class="ib-lead">Generate a draft ice inventory from a recurring weekly block, preview every slot,
       then create the Available Game ice. Nothing is scheduled here.</p>
@@ -16213,14 +16305,48 @@ const OPERATIONAL_CARD_WRITE_WITHDRAWN = Object.freeze({ withdrawn: true });
 // already on the wire waits for reconciliation before its result can mutate
 // card state. The caller receives a sentinel so it cannot mistake withdrawal
 // for a transport failure and paint an ERROR under the departing tuple.
-async function postOperationalCardScoped(identity, path, body) {
+async function postOperationalCardScoped(identity, path, body, opts) {
+  // Ice Builder Create commits PENDING before it repaints or reaches this
+  // boundary. That synchronous commit also opens its unresolved-operation
+  // lease, so the waiting presentation and the serialization fact cannot
+  // disagree. Keep this opt-in narrow — READY Calendar/Scheduler cards need
+  // different presentation and foreign-principal reconciliation semantics
+  // before they can use it.
+  const serializeCard = !!(opts && opts.serializeCard);
+  // Reconciliation is owner-specific: the shared transport boundary only
+  // reports withdrawal, while an opt-in owner decides which fresh surface to
+  // rebuild after this request's exact lease is released (or after a refused
+  // registration proves there is no matching lease to release). Invoke that
+  // hook before returning the sentinel so every caller can keep the immediate
+  // bare-return guard enforced by the source-wide write oracle.
+  const onWithdrawn = opts && typeof opts.onWithdrawn === "function"
+    ? opts.onWithdrawn : null;
+  if (serializeCard) {
+    const registered = currentCardWrite(identity.card);
+    if (!registered || registered.identity !== identity
+        || !registered.model || registered.model.state !== CARD_STATE.PENDING) {
+      if (onWithdrawn) onWithdrawn(identity);
+      return OPERATIONAL_CARD_WRITE_WITHDRAWN;
+    }
+  }
   if (contextSwitchIntentPending || !cardIdentityCurrent(identity)) {
+    if (serializeCard) settleCardWrite(identity);
+    if (onWithdrawn) onWithdrawn(identity);
     return OPERATIONAL_CARD_WRITE_WITHDRAWN;
   }
   const result = await postScoped(path, body);
   await awaitOperationalCardContextSettlement(identity);
-  return cardIdentityCurrent(identity)
-    ? result : OPERATIONAL_CARD_WRITE_WITHDRAWN;
+  // Settlement belongs to the request, not to whichever tuple or principal is
+  // now on screen, so release the exact ledger entry before the final identity
+  // decision. The owner handles a withdrawn sentinel by reconciling fresh
+  // truth without consuming the stale response.
+  const settled = !serializeCard || !!settleCardWrite(identity);
+  const current = settled && cardIdentityCurrent(identity);
+  if (!current) {
+    if (onWithdrawn) onWithdrawn(identity);
+    return OPERATIONAL_CARD_WRITE_WITHDRAWN;
+  }
+  return result;
 }
 
 // Build page chrome from the selected-context authority, never from a card's

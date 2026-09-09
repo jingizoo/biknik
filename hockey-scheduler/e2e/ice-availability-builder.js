@@ -10,9 +10,12 @@
 //   * opening Builder and successfully creating ice keep keyboard focus on an
 //     exact semantic target through each held loading paint and settlement,
 //     while programmatic activation preserves the context selector;
-//   * a same-tuple full render carries that exact loading target through an
+//   * a same-tuple full render carries that exact wait target through an
 //     overlapping render, a request that settles during the render, and the
 //     queued card successor without overriding a newer external focus choice;
+//   * a successful Create held after its server commit stays serialized across
+//     A -> B -> A, returns as non-actionable PENDING under the original lease,
+//     then reconciles a fresh Builder without consuming the stale success;
 //   * the builder previews the correct slot count for a Tue/Thu block in the
 //     selected date range, and reports rinks whose Venue lacks SeasonVenueAccess
 //     for the previewed Season (never generating ice for them) — re-checking
@@ -147,6 +150,7 @@ async function holdNextRealResponse(page, pattern, requestLabel, label, skip = 0
     releaseGate();
   };
   return {
+    matchesSeen: () => matchesSeen,
     async waitCaptured(expectedStatus = 200) {
       const status = await deadline(captured,
         `${label}: real ${requestLabel} was never captured`, 30000);
@@ -176,6 +180,175 @@ async function holdNextRealResponse(page, pattern, requestLabel, label, skip = 0
       await page.unroute(pattern, handler);
     },
   };
+}
+
+// Hold a real successful Create after its server transaction commits, leave
+// the selected Program/Season, and return before that response reaches its
+// initiating handler. The operation lease must rebuild A as non-actionable
+// PENDING, and settlement must then reconcile a fresh Builder rather than
+// consuming A's stale success response into the revisited context.
+async function assertHeldCreateContextRoundTrip(
+    page, fail, cardIds, contextIds, rinkId, expectedCount) {
+  const label = "held Create A -> B -> A";
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  const primaryValue = `${contextIds.primaryProgram}|${contextIds.primarySeason}`;
+  const alternateValue = `${contextIds.alternateProgram}|${contextIds.alternateSeason}`;
+  const commitHold = await holdNextIceCommit(page, label);
+  let commitFinished = false;
+
+  const waitForTuple = async (value, programId, seasonId, tupleLabel) => {
+    await page.waitForFunction(({ wanted, program, season }) => {
+      const selected = document.getElementById("ctx-select");
+      const tuple = currentCardTuple();
+      return !contextSwitchIntentPending && selected && selected.value === wanted
+        && tuple.program_id === program && tuple.season_id === season;
+    }, { wanted: value, program: programId, season: seasonId },
+    { timeout: 30000 }).catch((error) => fail(
+      `${label}: ${tupleLabel} did not settle: ${error.message}`));
+  };
+
+  const countRows = () => page.evaluate(async (rink) => {
+    const response = await fetch("/api/demo/overview", {
+      credentials: "same-origin",
+    });
+    const body = await response.json();
+    return (body.ice_slots || []).filter((slot) => slot.rink_id === rink).length;
+  }, rinkId);
+
+  try {
+    const beforeCount = await countRows();
+    if (beforeCount !== 0) {
+      fail(`${label}: needs a fresh rink, found ${beforeCount} existing slot(s)`);
+    }
+    const commit = page.locator(`${builderCard} [data-ib-commit]`);
+    const source = await commit.evaluate((button) => ({
+      disabled: button.disabled,
+      count: document.querySelectorAll("[data-ib-commit]").length,
+    })).catch(() => null);
+    if (!source || source.disabled || source.count !== 1) {
+      fail(`${label}: needs exactly one enabled Create: ${JSON.stringify(source)}`);
+    }
+
+    await commit.click();
+    await commitHold.waitCaptured();
+    await page.waitForFunction((builderId) => {
+      const held = currentCardWrite(builderId);
+      const root = document.querySelector(
+        `[data-operational-card="${builderId}"]`);
+      return held && held.model && held.model.state === "pending"
+        && root && root.dataset.cardState === "pending"
+        && root.getAttribute("aria-busy") === "true";
+    }, cardIds.builder, { timeout: 10000 });
+    await page.evaluate((builderId) => {
+      window.__heldCreateRoundTripIdentity = currentCardWrite(builderId).identity;
+    }, cardIds.builder);
+
+    await page.selectOption("#ctx-select", alternateValue);
+    await waitForTuple(alternateValue, contextIds.alternateProgram,
+      contextIds.alternateSeason, "alternate tuple B");
+    await page.selectOption("#ctx-select", primaryValue);
+    await waitForTuple(primaryValue, contextIds.primaryProgram,
+      contextIds.primarySeason, "returned tuple A");
+
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(
+        `[data-operational-card="${builderId}"]`);
+      const held = currentCardWrite(builderId);
+      return root && root.dataset.cardState === "pending"
+        && root.getAttribute("aria-busy") === "true"
+        && held && held.identity === window.__heldCreateRoundTripIdentity;
+    }, cardIds.builder, { timeout: 10000 });
+    const returned = await page.evaluate((builderId) => {
+      const root = document.querySelector(
+        `[data-operational-card="${builderId}"]`);
+      const held = currentCardWrite(builderId);
+      const original = window.__heldCreateRoundTripIdentity;
+      return {
+        pending: !!held && held.identity === original
+          && held.model && held.model.state === "pending",
+        tupleCurrent: cardTupleCurrent(original),
+        originalCurrent: cardIdentityCurrent(original),
+        originalGeneration: original && original.generation,
+        currentGeneration: cardGenerations[builderId],
+        mutationControls: root && root.querySelectorAll(
+          ".ib-form,[data-ib-preview],[data-ib-commit]").length,
+        pendingCopy: root && /creating ice slots/i.test(root.textContent || ""),
+      };
+    }, cardIds.builder);
+    if (!returned.pending || !returned.tupleCurrent || returned.originalCurrent
+        || !(returned.currentGeneration > returned.originalGeneration)
+        || returned.mutationControls !== 0 || !returned.pendingCopy) {
+      fail(`${label}: A did not return as the original non-actionable PENDING `
+        + `lease: ${JSON.stringify(returned)}`);
+    }
+    if (commitHold.matchesSeen() !== 1) {
+      fail(`${label}: expected one Create POST before settlement, saw `
+        + commitHold.matchesSeen());
+    }
+    const committedWhileHeld = await countRows();
+    if (committedWhileHeld !== expectedCount) {
+      fail(`${label}: route.fetch completed but server truth has `
+        + `${committedWhileHeld}/${expectedCount} committed slots`);
+    }
+
+    commitHold.release();
+    await commitHold.finish();
+    commitFinished = true;
+    await page.waitForFunction(({ builderId, seasonId }) => {
+      const root = document.querySelector(
+        `[data-operational-card="${builderId}"]`);
+      const season = document.getElementById("ib-season");
+      const entry = readCardState(builderId);
+      return !currentCardWrite(builderId) && root
+        && root.dataset.cardState !== "pending"
+        && root.getAttribute("aria-busy") === "false"
+        && !!root.querySelector(".ib-form [data-ib-preview]")
+        && season && season.value === seasonId
+        && cardIdentityCurrent(entry.identity);
+    }, { builderId: cardIds.builder, seasonId: contextIds.primarySeason },
+    { timeout: 30000 }).catch((error) => fail(
+      `${label}: settlement did not rebuild a fresh current Builder: ${error.message}`));
+    const reconciled = await page.evaluate(({ builderId, committedRink }) => {
+      const root = document.querySelector(
+        `[data-operational-card="${builderId}"]`);
+      const selectedRinks = Array.from(root.querySelectorAll(".ib-rink:checked"))
+        .map((input) => input.value);
+      const endTimes = Array.from(root.querySelectorAll(".ib-wd-end"))
+        .map((input) => input.value);
+      return {
+        writeHeld: currentCardWrite(builderId) !== null,
+        createdToast: /created\s+\d+\s+ice slot/i.test(String(toast || ""))
+          || Array.from(document.querySelectorAll(".toast-msg"))
+            .some((node) => /created\s+\d+\s+ice slot/i.test(node.textContent || "")),
+        reusedCommittedRink: selectedRinks.includes(committedRink),
+        reusedEditedWindow: endTimes.includes("22:05"),
+      };
+    }, { builderId: cardIds.builder, committedRink: rinkId });
+    if (reconciled.writeHeld || reconciled.createdToast
+        || reconciled.reusedCommittedRink || reconciled.reusedEditedWindow) {
+      fail(`${label}: stale success escaped withdrawal: ${JSON.stringify(reconciled)}`);
+    }
+    if (commitHold.matchesSeen() !== 1) {
+      fail(`${label}: reconciliation issued another Create POST; saw `
+        + commitHold.matchesSeen());
+    }
+    const finalCount = await countRows();
+    if (finalCount !== expectedCount) {
+      fail(`${label}: reconciliation changed committed rows: `
+        + `${finalCount}/${expectedCount}`);
+    }
+
+    await page.click(`${builderCard} [data-ib-cancel]`);
+    await page.waitForFunction((calendarId) => {
+      const root = document.querySelector(
+        `[data-operational-card="${calendarId}"]`);
+      return root && !!root.querySelector("[data-ice-builder-open]")
+        && cardIdentityCurrent(readCardState(calendarId).identity);
+    }, cardIds.calendar, { timeout: 10000 });
+  } finally {
+    if (!commitFinished) await commitHold.cleanup();
+    await page.evaluate(() => { delete window.__heldCreateRoundTripIdentity; });
+  }
 }
 
 const holdNextOverview = (page, label) => holdNextRealResponse(
@@ -1657,7 +1830,7 @@ async function assertCreateLoadingFocus(
     : "orphaned programmatic Create no-steal";
   const builderCard = `[data-operational-card="${cardIds.builder}"]`;
   const commitHold = await holdNextIceCommit(page, label);
-  const overviewHold = await holdNextOverview(page, label);
+  let overviewHold = null;
   let commitFinished = false;
   let overviewFinished = false;
   try {
@@ -1697,15 +1870,15 @@ async function assertCreateLoadingFocus(
     await commitHold.waitCaptured();
     await page.waitForFunction((builderId) => {
       const root = document.querySelector(`[data-operational-card="${builderId}"]`);
-      return root && root.dataset.cardState === "loading"
+      return root && root.dataset.cardState === "pending"
         && root.getAttribute("aria-busy") === "true"
         && !!root.querySelector(".operational-stale-note h2");
     }, cardIds.builder, { timeout: 10000 });
     const pending = await navigationLoadingFocusState(page, cardIds);
     const pendingWrong = pending.oldSourceConnected || !pending.builderPresent
-      || pending.calendarPresent || pending.builderState !== "loading"
+      || pending.calendarPresent || pending.builderState !== "pending"
       || pending.builderBusy !== "true" || !pending.builderCurrent
-      || !/loading ice-builder preview/i.test(pending.builderLoadingText || "")
+      || !/creating ice slots/i.test(pending.builderLoadingText || "")
       || (bodyOwned
         ? !pending.activeIsBody
         : backOwned
@@ -1727,6 +1900,86 @@ async function assertCreateLoadingFocus(
           + JSON.stringify(superseding));
       }
     }
+
+    // The backend has committed before holdNextIceCommit exposes this window,
+    // but the successful response has not reached the card handler yet. A
+    // same-tuple full render must not let its queued Builder reconciliation
+    // issue a newer generation and thereby turn that real success into a
+    // withdrawn response. Save the exact operation identity, run the real
+    // render, and prove the card is still waiting under that same identity.
+    // The ordinary created-slot assertion immediately after this helper makes
+    // the held success non-vacuous.
+    if (focusMode === "keyboard") {
+      const beforeRender = await page.evaluate((builderId) => {
+        const entry = readCardState(builderId);
+        window.__createWriteRenderRaceIdentity = entry.identity;
+        return {
+          state: entry.state,
+          generation: entry.identity && entry.identity.generation,
+          current: cardIdentityCurrent(entry.identity),
+        };
+      }, cardIds.builder);
+      const renderResult = await page.evaluate(async () => {
+        const before = renderPass;
+        try {
+          await render();
+          // render() queues operational reconciliation in a microtask. Cross
+          // one more promise boundary so that call has synchronously reached
+          // beginCardRequest before the identity is inspected below.
+          await Promise.resolve();
+          return { before, after: renderPass, error: "" };
+        } catch (error) {
+          return { before, after: renderPass,
+            error: String(error && error.message || error) };
+        }
+      });
+      const afterRender = await page.evaluate((builderId) => {
+        const entry = readCardState(builderId);
+        const root = document.querySelector(
+          `[data-operational-card="${builderId}"]`);
+        const saved = window.__createWriteRenderRaceIdentity;
+        const active = document.activeElement;
+        return {
+          state: entry.state,
+          busy: root && root.getAttribute("aria-busy"),
+          sameIdentity: entry.identity === saved,
+          originalCurrent: cardIdentityCurrent(saved),
+          generation: entry.identity && entry.identity.generation,
+          hasLoadingHeading: !!(root
+            && root.querySelector(".operational-stale-note h2")),
+          mutationControls: root && root.querySelectorAll(
+            ".ib-form,[data-ib-preview],[data-ib-commit]").length,
+          activeIsPendingHeading: !!(active && active.matches
+            && active.matches(".operational-stale-note h2")),
+          activeIsBody: active === document.body
+            || active === document.documentElement,
+          activeConnected: !!(active && active.isConnected),
+        };
+      }, cardIds.builder);
+      if (renderResult.error || renderResult.after <= renderResult.before
+          || beforeRender.state !== "pending" || !beforeRender.current
+          || afterRender.state !== "pending" || afterRender.busy !== "true"
+          || !afterRender.sameIdentity || !afterRender.originalCurrent
+          || afterRender.generation !== beforeRender.generation
+          || !afterRender.hasLoadingHeading || afterRender.mutationControls !== 0
+          || !afterRender.activeIsPendingHeading || afterRender.activeIsBody
+          || !afterRender.activeConnected) {
+        fail(`${label}: same-tuple render superseded an undelivered successful `
+          + `Create response: ${JSON.stringify({ beforeRender, renderResult,
+            afterRender })}`);
+      }
+      // Let the render's independent Calendar reconciliation finish before
+      // arming the hold for Create's own success refresh. Otherwise the hold
+      // could capture the wrong overview request and make the oracle depend on
+      // network timing rather than operation ownership.
+      await page.waitForFunction((calendarId) => {
+        const entry = readCardState(calendarId);
+        return entry && entry.state !== "loading"
+          && cardIdentityCurrent(entry.identity);
+      }, cardIds.calendar, { timeout: 10000 });
+    }
+
+    overviewHold = await holdNextOverview(page, label);
 
     commitHold.release();
     await commitHold.finish();
@@ -1851,12 +2104,18 @@ async function assertCreateLoadingFocus(
       fail(`${label}: final Calendar settlement misplaced focus: `
         + JSON.stringify(settled));
     }
+    const writeStillHeld = await page.evaluate((builderId) =>
+      currentCardWrite(builderId) !== null, cardIds.builder);
+    if (writeStillHeld) {
+      fail(`${label}: Create settlement left its Builder write lease registered`);
+    }
   } finally {
     if (!commitFinished) await commitHold.cleanup();
-    if (!overviewFinished) await overviewHold.cleanup();
+    if (overviewHold && !overviewFinished) await overviewHold.cleanup();
     await page.evaluate(() => {
       delete window.__loadingFocusSource;
       delete window.__loadingFocusBack;
+      delete window.__createWriteRenderRaceIdentity;
     });
   }
 }
@@ -1921,7 +2180,7 @@ async function assertCreateErrorFocus(page, fail, cardIds) {
     }
     await page.waitForFunction((builderId) => {
       const root = document.querySelector(`[data-operational-card="${builderId}"]`);
-      return root && root.dataset.cardState === "loading"
+      return root && root.dataset.cardState === "pending"
         && root.getAttribute("aria-busy") === "true"
         && !!root.querySelector(".operational-stale-note h2");
     }, cardIds.builder, { timeout: 10000 });
@@ -1930,7 +2189,7 @@ async function assertCreateErrorFocus(page, fail, cardIds) {
         || pending.activeTag !== "H2" || pending.activeTabIndex !== -1
         || !pending.activeConnected || !pending.activeVisible
         || pending.activeIsBody || pending.activeCard !== cardIds.builder
-        || !/loading ice-builder preview/i.test(pending.builderLoadingText || "")) {
+        || !/creating ice slots/i.test(pending.builderLoadingText || "")) {
       fail(`failed Create did not own its held PENDING heading: `
         + JSON.stringify(pending));
     }
@@ -1966,7 +2225,7 @@ async function assertCreateErrorFocus(page, fail, cardIds) {
 }
 
 // A preview mismatch is a two-response failure recovery: the rejected Create
-// is followed immediately by a replacement Preview. Keep the original loading
+// is followed immediately by a replacement Preview. Keep the original pending
 // heading truthful, then prove a newer Back focus choice is re-found through
 // both replacement paints instead of collapsing to BODY or the default Create.
 async function assertPreviewMismatchFocus(page, fail, cardIds) {
@@ -1989,7 +2248,7 @@ async function assertPreviewMismatchFocus(page, fail, cardIds) {
     await commitHold.waitCaptured(400);
     await page.waitForFunction((builderId) => {
       const root = document.querySelector(`[data-operational-card="${builderId}"]`);
-      return root && root.dataset.cardState === "loading"
+      return root && root.dataset.cardState === "pending"
         && root.getAttribute("aria-busy") === "true"
         && !!root.querySelector(".operational-stale-note h2")
         && !!root.querySelector("[data-ib-cancel]");
@@ -1999,8 +2258,8 @@ async function assertPreviewMismatchFocus(page, fail, cardIds) {
         || state.activeTag !== "H2" || state.activeTabIndex !== -1
         || !state.activeConnected || !state.activeVisible || state.activeIsBody
         || state.activeCard !== cardIds.builder
-        || !/loading ice-builder preview/i.test(state.builderLoadingText || "")) {
-      fail(`preview mismatch did not hold the Create loading heading: `
+        || !/creating ice slots/i.test(state.builderLoadingText || "")) {
+      fail(`preview mismatch did not hold the Create pending heading: `
         + JSON.stringify(state));
     }
 
@@ -2422,8 +2681,12 @@ async function checkViewport(browser, viewport) {
     }
     if (refreshed.commitDisabled !== false) fail("Create should be enabled after the refresh");
     // The refreshed token (for the 22:05 window) now commits exactly those slots.
-    await page.click("[data-ib-commit]");
-    await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+    await assertHeldCreateContextRoundTrip(page, fail, cardIds, {
+      primaryProgram: ids.league,
+      primarySeason: ids.season,
+      alternateProgram: ids.alternateLeague,
+      alternateSeason: ids.alternateSeason,
+    }, rink6b, before.new);
     const editCommitted = await page.evaluate(async (rink) => {
       const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
       return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
@@ -2431,7 +2694,7 @@ async function checkViewport(browser, viewport) {
     if (editCommitted !== before.new) {
       fail(`the re-previewed edit should commit its ${before.new} slots, got ${editCommitted}`);
     }
-    // The successful commit closed the builder; reopen it so the next step starts
+    // The round-trip helper returned through Back; reopen Builder so the next step starts
     // from the shared "builder open" invariant (each step cancels the open builder
     // then reopens with a fresh rink).
     await page.click("[data-ice-builder-open]");
