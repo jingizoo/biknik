@@ -2163,6 +2163,51 @@ function focusOperationalCardTarget(identity, el) {
   return focusCardTarget(identity, el);
 }
 
+// An async navigation paints twice: first the destination's LOADING state,
+// then its settled state. Record who owns focus BEFORE the second paint. If
+// the operator stayed on the loading destination, advance to the settled
+// destination; if they moved to another control in the same card, re-find
+// that exact control after repaint; and if they moved outside the card, leave
+// them alone. Looking only at activeElement after repaint is too late because
+// replacing a newly focused card-local control parks focus on <body> and makes
+// that deliberate move indistinguishable from the original orphaned source.
+function captureOperationalSettlementFocus(root, loadingTarget, orphanedIsOwned) {
+  const active = document.activeElement;
+  if (loadingTarget && active === loadingTarget) {
+    return { destination: true, selector: null, inside: true };
+  }
+  if (active && root && active.isConnected && root.contains(active)) {
+    return { destination: false, selector: triggerSelector(active), inside: true };
+  }
+  return {
+    destination: !!orphanedIsOwned && focusIsOrphaned(),
+    selector: null,
+    inside: false,
+  };
+}
+
+function restoreOperationalSettlementFocus(identity, plan, root, destination) {
+  if (!plan || !root) return false;
+  if (plan.selector) {
+    let matches;
+    try {
+      matches = root.querySelectorAll(plan.selector);
+    } catch (err) {
+      matches = null;
+    }
+    if (matches && matches.length === 1 && isUsableTarget(matches[0])
+        && !matches[0].disabled) {
+      return focusOperationalCardTarget(identity, matches[0]);
+    }
+  }
+  // Some legitimate card controls (checkbox axes are the important case)
+  // have no unique id/data-* selector. Their explicit in-card focus still
+  // belongs to this transition; if exact restoration is impossible, use the
+  // card's semantic settled destination rather than stranding focus on BODY.
+  return plan.destination || plan.inside
+    ? focusOperationalCardTarget(identity, destination) : false;
+}
+
 // A synchronous, card-local navigation is not an async response and must not
 // be judged by the response identity it happened to replace. In particular,
 // Ice Builder's Back action remains available on a STALE card after a context
@@ -2210,11 +2255,15 @@ function restoreCalendarDateFocus(shouldRestore) {
 // if the older pass already detached its source; every other newer render
 // cancels it. Principal + tuple checks keep it from crossing a boundary.
 let calendarDateFocusCarry = null;
+let operationalLoadingFocusCarry = null;
 
 document.addEventListener("focusin", (event) => {
-  const carry = calendarDateFocusCarry;
   const target = event.target;
-  if (carry && target && target.isConnected) carry.superseded = true;
+  if (!target || !target.isConnected) return;
+  if (calendarDateFocusCarry) calendarDateFocusCarry.superseded = true;
+  if (operationalLoadingFocusCarry) {
+    operationalLoadingFocusCarry.superseded = true;
+  }
 }, true);
 
 function cancelCalendarDateFocusCarry(renderTicket) {
@@ -2272,6 +2321,122 @@ function finishCalendarDateFocusCarry(renderTicket) {
       || carry.season_id !== tuple.season_id
       || carry.league_id !== tuple.league_id) return false;
   return restoreCalendarDateFocus(true);
+}
+
+// A same-tuple full render can replace an operational card while one of its
+// own requests is still LOADING. The focused loading heading is detached by
+// the page skeleton before the queued card reconciliation starts, so the
+// card's ordinary settlement guard can no longer distinguish that owned
+// orphan from an unfocused/programmatic load. Carry only a loading heading,
+// scoped to this render and the same principal + tuple. Any newer connected
+// focus event supersedes the claim, exactly as for Calendar's date carry.
+//
+// This is deliberately separate from `userInitiated`: a render reconciliation
+// is not a click and must not gain all user-initiated semantics. Its one bit of
+// inherited authority is that the replacement LOADING/settled heading may
+// receive the focus the previous LOADING heading already owned.
+function operationalLoadingFocusClaim(container) {
+  const active = document.activeElement;
+  if (!active || !container || !active.matches || !active.isConnected
+      || !container.contains(active)) return null;
+  const root = active.closest("[data-operational-card]");
+  if (!root) return null;
+  const cardId = root.dataset.operationalCard;
+  if (cardId !== CALENDAR_CARD && cardId !== ICE_BUILDER_CARD) return null;
+  const entry = readCardState(cardId);
+  if (entry.state !== CARD_STATE.LOADING
+      || !cardIdentityCurrent(entry.identity)) return null;
+  let targetKind = null;
+  if (active.matches(".operational-stale-note h2")) {
+    targetKind = "status";
+  } else if (cardId === ICE_BUILDER_CARD && active.matches(".ib-head h2")) {
+    targetKind = "builder-heading";
+  }
+  return targetKind ? { cardId, targetKind, identity: entry.identity } : null;
+}
+
+function cancelOperationalLoadingFocusCarry(renderTicket) {
+  const carry = operationalLoadingFocusCarry;
+  if (!carry
+      || (renderTicket !== undefined && carry.renderTicket !== renderTicket)) {
+    return false;
+  }
+  operationalLoadingFocusCarry = null;
+  return true;
+}
+
+function operationalLoadingCarryCurrent(carry) {
+  const tuple = currentCardTuple();
+  const entry = readCardState(carry.cardId);
+  return !carry.superseded && view === "calendar"
+    && carry.epoch === uiIdentityEpoch
+    && carry.principal === cardPrincipalId()
+    && carry.program_id === tuple.program_id
+    && carry.season_id === tuple.season_id
+    && carry.league_id === tuple.league_id
+    // The request may legitimately settle while the full render is awaiting
+    // another page read. Follow that exact generation across its state change,
+    // but never transfer the claim to an unrelated newer same-tuple load.
+    && entry.identity === carry.identity
+    && cardIdentityCurrent(carry.identity);
+}
+
+function beginOperationalLoadingFocusCarry(renderTicket, container) {
+  const existing = operationalLoadingFocusCarry;
+  if (existing) {
+    if (operationalLoadingCarryCurrent(existing)) {
+      // A newer same-tuple pass may start after the older pass detached its
+      // source. Transfer the still-live claim to the pass that can paint it.
+      existing.renderTicket = renderTicket;
+      return existing.cardId;
+    }
+    cancelOperationalLoadingFocusCarry();
+  }
+  if (view !== "calendar") return null;
+  const claim = operationalLoadingFocusClaim(container);
+  if (!claim) return null;
+  const tuple = currentCardTuple();
+  operationalLoadingFocusCarry = {
+    renderTicket,
+    cardId: claim.cardId,
+    targetKind: claim.targetKind,
+    identity: claim.identity,
+    epoch: uiIdentityEpoch,
+    principal: cardPrincipalId(),
+    program_id: tuple.program_id,
+    season_id: tuple.season_id,
+    league_id: tuple.league_id,
+    superseded: false,
+  };
+  return claim.cardId;
+}
+
+function finishOperationalLoadingFocusCarry(renderTicket) {
+  const carry = operationalLoadingFocusCarry;
+  if (!carry || carry.renderTicket !== renderTicket) return null;
+  const current = operationalLoadingCarryCurrent(carry);
+  cancelOperationalLoadingFocusCarry(renderTicket);
+  if (!current || openOverlayElement()) return null;
+  const root = document.querySelector(
+    `[data-operational-card="${carry.cardId}"]`);
+  const entry = readCardState(carry.cardId);
+  let target = null;
+  if (carry.cardId === ICE_BUILDER_CARD) {
+    target = entry.state === CARD_STATE.LOADING
+      ? root && (carry.targetKind === "status"
+        ? root.querySelector(".operational-stale-note h2")
+        : root.querySelector(".ib-head h2"))
+      : root && (root.querySelector("[data-ib-preview]")
+        || root.querySelector(".banner.alert h2")
+        || root.querySelector("h2,.section-title"));
+  } else {
+    target = entry.state === CARD_STATE.LOADING
+      ? root && root.querySelector(".operational-stale-note h2")
+      : root && (root.querySelector("[data-ice-builder-open]")
+        || root.querySelector("h2,.cal-date,.sched-empty-lead"));
+  }
+  return focusOperationalCardTarget(entry.identity, target)
+    ? { cardId: carry.cardId, targetKind: carry.targetKind } : null;
 }
 
 // Structural optionality for Workflow 6 (Decision 9 / #365). `optional` is a
@@ -3367,6 +3532,7 @@ function abandonFocusWorkForContextSwitch() {
   newFocusRequest();
   destinationFocusIntent = null;
   cancelCalendarDateFocusCarry();
+  cancelOperationalLoadingFocusCarry();
 }
 
 // THE settlement. `proof` names what the concluding render pass actually
@@ -8287,6 +8453,14 @@ function repaintCalendarSurface(cardId, chromeOverview) {
 }
 
 async function loadCalendarCard(opts) {
+  // Tri-state by design. Absent preserves legacy Retry/refresh settlement
+  // focus; true belongs to focus inside the departing source surface that the
+  // LOADING repaint replaces; false is an explicit programmatic/unfocused or
+  // externally focused activation and must not acquire focus merely because
+  // the repaint leaves <body> active.
+  const loadingFocus = opts
+    && Object.prototype.hasOwnProperty.call(opts, "focusLoading")
+    ? !!opts.focusLoading : null;
   const identity = beginOperationalCardLoad(CALENDAR_CARD, opts);
   if (!identity) return;
   const renderedEpoch = contextEpoch;
@@ -8294,7 +8468,17 @@ async function loadCalendarCard(opts) {
   // belongs to ICE_BUILDER_CARD, so a Calendar request may update only its
   // hidden model while the Builder is open; repainting here would let the
   // sibling's response destroy Builder focus and re-announce its status.
-  if (!iceBuilder) repaintCalendarSurface(CALENDAR_CARD);
+  let loadingFocusTarget = null;
+  if (!iceBuilder) {
+    repaintCalendarSurface(CALENDAR_CARD);
+    if (loadingFocus === true) {
+      const root = document.querySelector(
+        `[data-operational-card="${CALENDAR_CARD}"]`);
+      const target = root && (root.querySelector(".operational-stale-note h2")
+        || root.querySelector(".cal-date") || root);
+      if (focusOperationalCardTarget(identity, target)) loadingFocusTarget = target;
+    }
+  }
   const result = await getJSONContextScoped("/api/demo/overview", renderedEpoch);
   if (result === CONTEXT_READ_ABORTED) return;
   if (result && result.error) {
@@ -8310,11 +8494,19 @@ async function loadCalendarCard(opts) {
       payload: { overview: result || {} },
     })) return;
   }
-  if (!iceBuilder) repaintCalendarSurface(CALENDAR_CARD);
-  if (identity.userInitiated) {
-    const root = document.querySelector(`[data-operational-card="${CALENDAR_CARD}"]`);
-    focusOperationalCardTarget(identity, root && (root.querySelector("[data-ice-builder-open]")
-      || root.querySelector("h2,.cal-date,.sched-empty-lead")));
+  if (!iceBuilder) {
+    const before = document.querySelector(
+      `[data-operational-card="${CALENDAR_CARD}"]`);
+    const focusPlan = (identity.userInitiated || loadingFocus === true)
+      ? captureOperationalSettlementFocus(
+        before, loadingFocusTarget, loadingFocus === null)
+      : null;
+    repaintCalendarSurface(CALENDAR_CARD);
+    const root = document.querySelector(
+      `[data-operational-card="${CALENDAR_CARD}"]`);
+    restoreOperationalSettlementFocus(identity, focusPlan, root,
+      root && (root.querySelector("[data-ice-builder-open]")
+        || root.querySelector("h2,.cal-date,.sched-empty-lead")));
   }
 }
 
@@ -8334,6 +8526,10 @@ function reconcileIceBuilderForm(form, overview) {
 // Calendar response rewriting its DOM or focus.
 async function loadIceBuilderCard(opts) {
   if (!iceBuilder) return null;
+  const loadingFocus = opts
+    && Object.prototype.hasOwnProperty.call(opts, "focusLoading")
+    ? !!opts.focusLoading : null;
+  const loadingFocusTargetKind = opts && opts.focusTargetKind;
   const freshInstance = !!(opts && opts.fresh) || !iceBuilder.form;
   const before = readCardState(ICE_BUILDER_CARD);
   const priorModel = cardDisplayModel(before);
@@ -8347,6 +8543,17 @@ async function loadIceBuilderCard(opts) {
   if (!identity) return null;
   const renderedEpoch = contextEpoch;
   repaintCalendarSurface(ICE_BUILDER_CARD);
+  let loadingFocusTarget = null;
+  if (loadingFocus === true) {
+    const root = document.querySelector(
+      `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+    const target = root && (loadingFocusTargetKind === "status"
+      ? root.querySelector(".operational-stale-note h2")
+        || root.querySelector(".ib-head h2")
+      : root.querySelector(".ib-head h2")
+        || root.querySelector(".operational-stale-note h2"));
+    if (focusOperationalCardTarget(identity, target)) loadingFocusTarget = target;
+  }
   const result = await getJSONContextScoped("/api/demo/overview", renderedEpoch);
   if (result === CONTEXT_READ_ABORTED) return null;
   if (!iceBuilder || !cardIdentityCurrent(identity)) return null;
@@ -8366,18 +8573,39 @@ async function loadIceBuilderCard(opts) {
     iceBuilder.form = iceFormSnapshot(form);
     iceBuilder.contextRevision = contextRevision;
   }
+  const beforeSettle = document.querySelector(
+    `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+  const focusPlan = (identity.userInitiated || loadingFocus === true)
+    ? captureOperationalSettlementFocus(
+      beforeSettle, loadingFocusTarget, loadingFocus === null)
+    : null;
   repaintCalendarSurface(ICE_BUILDER_CARD);
-  if (identity.userInitiated) {
-    const root = document.querySelector(
-      `[data-operational-card="${ICE_BUILDER_CARD}"]`);
-    focusOperationalCardTarget(identity, root && (root.querySelector("[data-ib-preview]")
+  const root = document.querySelector(
+    `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+  restoreOperationalSettlementFocus(identity, focusPlan, root,
+    root && (root.querySelector("[data-ib-preview]")
       || root.querySelector("h2,.section-title")));
-  }
   return identity;
 }
 
 async function previewIceBuilder(requestForm, opts) {
   if (!iceBuilder) return;
+  const loadingFocus = opts
+    && Object.prototype.hasOwnProperty.call(opts, "focusLoading")
+    ? !!opts.focusLoading : null;
+  const beforeLoad = document.querySelector(
+    `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+  // Preview-mismatch recovery stays inside Builder. Preserve a newer exact
+  // card-local choice (Back is the important case) across the first LOADING
+  // repaint instead of collapsing all in-card ownership to one boolean.
+  // A normal Preview leaves this option absent and keeps its established
+  // flow (settlement advances to Create). Only an explicitly carried recovery
+  // transition participates in this first-paint plan, so this fix cannot
+  // silently turn ordinary Preview into a stay-on-Preview interaction.
+  const entryFocusPlan = loadingFocus !== null
+    ? captureOperationalSettlementFocus(
+      beforeLoad, null, loadingFocus === true)
+    : null;
   const form = iceFormSnapshot(requestForm || iceBuilder.form);
   if (!form) return;
   const priorPayload = cardDisplayPayload(readCardState(ICE_BUILDER_CARD)) || {};
@@ -8386,6 +8614,16 @@ async function previewIceBuilder(requestForm, opts) {
     ICE_BUILDER_CARD, { userInitiated: true });
   if (!identity) return;
   repaintCalendarSurface(ICE_BUILDER_CARD);
+  let loadingFocusTarget = null;
+  const loadingRoot = document.querySelector(
+    `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+  const loadingTarget = loadingRoot
+    && loadingRoot.querySelector(".operational-stale-note h2");
+  if (restoreOperationalSettlementFocus(
+      identity, entryFocusPlan, loadingRoot, loadingTarget)
+      && document.activeElement === loadingTarget) {
+    loadingFocusTarget = loadingTarget;
+  }
   const result = await postOperationalCardScoped(
     identity, "/api/setup/ice-availability/preview", form);
   if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
@@ -8426,12 +8664,17 @@ async function previewIceBuilder(requestForm, opts) {
     // The ERROR repaint inserts this message in the card's role=alert.
     // Publishing it to the sitewide live region too would speak it twice.
   }
+  const beforeSettle = document.querySelector(
+    `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+  const focusPlan = captureOperationalSettlementFocus(
+    beforeSettle, loadingFocusTarget, loadingFocus === null);
   repaintCalendarSurface(ICE_BUILDER_CARD);
   const root = document.querySelector(
     `[data-operational-card="${ICE_BUILDER_CARD}"]`);
-  focusOperationalCardTarget(identity, root && (root.querySelector("[data-ib-commit]")
-    || root.querySelector("[data-ib-preview]")
-    || root.querySelector("h2,.section-title")));
+  restoreOperationalSettlementFocus(identity, focusPlan, root,
+    root && (root.querySelector("[data-ib-commit]")
+      || root.querySelector("[data-ib-preview]")
+      || root.querySelector("h2,.section-title")));
 }
 
 // Calendar and Ice Builder use the same overview data but have independent
@@ -8629,10 +8872,20 @@ function wireCalendarCards(c) {
   const ibOpen = c.querySelector("[data-ice-builder-open]");
   if (ibOpen) ibOpen.onclick = () => {
     if (!calendarCurrent) return;
+    const calendarRoot = ibOpen.closest(
+      `[data-operational-card="${CALENDAR_CARD}"]`);
+    const active = document.activeElement;
+    // A synthetic activation can leave a different Calendar control focused.
+    // That control disappears with the card just as surely as the Build button,
+    // so its focus also belongs to the semantic Builder transition. Persistent
+    // chrome outside the departing card remains authoritative and is untouched.
+    const focusLoading = active === ibOpen
+      || !!(active && calendarRoot && active.isConnected
+        && calendarRoot.contains(active));
     iceOperationSeq += 1;
     iceBuilder = { form: null, contextRevision: null };
     toast = "";
-    loadIceBuilderCard({ userInitiated: true, fresh: true });
+    loadIceBuilderCard({ userInitiated: true, fresh: true, focusLoading });
   };
   const ibCancel = c.querySelector("[data-ib-cancel]");
   if (ibCancel) ibCancel.onclick = () => {
@@ -8681,6 +8934,16 @@ function wireCalendarCards(c) {
     const preview = ready && ready.payload && ready.payload.preview;
     const fingerprint = preview && preview.template_fingerprint;
     if (!ready || !fingerprint) return;
+    const commitOwnedFocus = document.activeElement === ibCommit;
+    const beforeCommit = document.querySelector(
+      `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+    const activeBeforeCommit = document.activeElement;
+    const commitEntryFocusPlan = commitOwnedFocus
+      || !!(activeBeforeCommit && beforeCommit && activeBeforeCommit.isConnected
+        && beforeCommit.contains(activeBeforeCommit))
+      ? captureOperationalSettlementFocus(
+        beforeCommit, commitOwnedFocus ? ibCommit : null, commitOwnedFocus)
+      : null;
     iceBuilder.form = readIceBuilderForm(c);
     const form = iceFormSnapshot(iceBuilder.form);
     const requestOp = ++iceOperationSeq;
@@ -8688,6 +8951,19 @@ function wireCalendarCards(c) {
       ICE_BUILDER_CARD, { userInitiated: true });
     if (!identity) return;
     rerender();
+    // Create replaces its own focused button before the write even reaches
+    // the wire. Give that source-owned transition a truthful destination for
+    // the whole wait, not only after the later Calendar refresh begins.
+    const commitLoadingRoot = document.querySelector(
+      `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+    const commitLoadingTarget = commitLoadingRoot
+      && commitLoadingRoot.querySelector(".operational-stale-note h2");
+    let commitLoadingFocusTarget = null;
+    if (restoreOperationalSettlementFocus(
+        identity, commitEntryFocusPlan, commitLoadingRoot, commitLoadingTarget)
+        && document.activeElement === commitLoadingTarget) {
+      commitLoadingFocusTarget = commitLoadingTarget;
+    }
     const result = await postOperationalCardScoped(
       identity, "/api/setup/ice-availability/commit", {
       ...form, template_fingerprint: fingerprint,
@@ -8700,8 +8976,20 @@ function wireCalendarCards(c) {
     if (result && !result.error) {
       announceCardStatus(identity,
         `Created ${result.totals.created} ice slot(s).`, false);
+      // A successful commit deliberately replaces Builder with Calendar. A
+      // focus choice outside Builder supersedes the original Create intent;
+      // focus still inside the departing card (or orphaned by its PENDING
+      // repaint) needs a semantic destination on Calendar instead.
+      const active = document.activeElement;
+      const builderRoot = document.querySelector(
+        `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+      const focusLoading = (!!commitLoadingFocusTarget
+        && active === commitLoadingFocusTarget)
+        || !!(active && builderRoot && active.isConnected
+          && builderRoot.contains(active));
       iceBuilder = null;
-      refreshCalendar({ userInitiated: true, preserveAnnouncement: true });
+      refreshCalendar({ userInitiated: true, preserveAnnouncement: true,
+        focusLoading });
       return;
     }
     if (reason === "preview_mismatch") {
@@ -8709,15 +8997,32 @@ function wireCalendarCards(c) {
       // arrives. Announcing before this fast second request let its generic
       // "preview updated" sentence overwrite the reason before a person or
       // assistive technology could perceive it.
+      const active = document.activeElement;
+      const builderRoot = document.querySelector(
+        `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+      const focusLoading = (!!commitLoadingFocusTarget
+        && active === commitLoadingFocusTarget)
+        || !!(active && builderRoot && active.isConnected
+          && builderRoot.contains(active));
       previewIceBuilder(form, {
         successMessage: "The schedule changed since preview. Review the updated proposal before creating.",
         successIsError: true,
+        focusLoading,
       });
       return;
     }
+    const beforeError = document.querySelector(
+      `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+    const errorFocusPlan = captureOperationalSettlementFocus(
+      beforeError, commitLoadingFocusTarget, false);
     operationalCardError(identity, result, "The ice slots could not be created.");
     // operationalErrorCopy owns the one assertive announcement for ERROR.
     rerender();
+    const errorRoot = document.querySelector(
+      `[data-operational-card="${ICE_BUILDER_CARD}"]`);
+    restoreOperationalSettlementFocus(identity, errorFocusPlan, errorRoot,
+      errorRoot && (errorRoot.querySelector(".banner.alert h2")
+        || errorRoot.querySelector("h2,.section-title")));
   };
   const ibExclAdd = c.querySelector("[data-ib-excl-add]");
   if (ibExclAdd) ibExclAdd.onclick = () => {
@@ -12788,6 +13093,7 @@ async function render() {
   // nothing, and the intent waits for the pass that actually read.
   let hierarchyReadsSettled = false;
   beginCalendarDateFocusCarry(myRenderPass, c);
+  beginOperationalLoadingFocusCarry(myRenderPass, c);
   try {
     // #365 owner correction — the render LIFECYCLE, not just the card model.
     // This line used to blank #content unconditionally, and every card was
@@ -13493,6 +13799,7 @@ async function render() {
     // asking, and would settle its focus intent on this pass's behalf.
     if (renderPass !== myRenderPass) return;
     cancelCalendarDateFocusCarry(myRenderPass);
+    cancelOperationalLoadingFocusCarry(myRenderPass);
     setChrome(view === "scheduler" || view === "calendar"
       ? selectedContextChromeOverview() : ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -15063,6 +15370,8 @@ async function render() {
   // Overlay open/close owns focus first. This restoration refuses any target
   // that lifecycle just focused, so Calendar cannot steal dialog focus or
   // suppress a just-closed dialog's trigger return.
+  const carriedOperationalLoadingFocus =
+    finishOperationalLoadingFocusCarry(myRenderPass);
   finishCalendarDateFocusCarry(myRenderPass);
   // #365 review round 11: THE settlement, and the last thing of all. After
   // the paint and after every wiring pass, so a control this intent is
@@ -15094,11 +15403,22 @@ async function render() {
       loadSchedulerDraftCard();
       loadSchedulerReviewCard();
     } else if (operationalLaunchView === "calendar") {
-      loadCalendarCard();
+      loadCalendarCard(carriedOperationalLoadingFocus
+          && carriedOperationalLoadingFocus.cardId === CALENDAR_CARD
+        ? { focusLoading: true }
+        : undefined);
       // This is render reconciliation, not a click on Open/Refresh. Labelling
       // it user-initiated lets its eventual response steal focus from the
-      // context switcher into the Builder after a context change.
-      if (iceBuilder) loadIceBuilderCard();
+      // context switcher into the Builder after a context change. A narrowly
+      // carried loading-focus claim is passed separately and does not broaden
+      // the request's identity semantics.
+      if (iceBuilder) {
+        loadIceBuilderCard(carriedOperationalLoadingFocus
+            && carriedOperationalLoadingFocus.cardId === ICE_BUILDER_CARD
+          ? { focusLoading: true,
+              focusTargetKind: carriedOperationalLoadingFocus.targetKind }
+          : undefined);
+      }
     }
   });
 }
@@ -16687,6 +17007,7 @@ function resetTransientUiState() {
   // renderPass and can write the private data straight back after this reset.
   renderPass += 1;
   cancelCalendarDateFocusCarry();
+  cancelOperationalLoadingFocusCarry();
   checkoutConfirm = null; oppDetailGame = null; oppDetailTeam = null; oppDetail = null;
   substituteOptInWrites.clear();
   substituteOptInNotices.clear();

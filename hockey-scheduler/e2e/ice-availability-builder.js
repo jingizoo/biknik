@@ -7,6 +7,12 @@
 //   * every Month day and Ice Builder's Back action preserve keyboard focus
 //     on the selected Calendar destination after replacing their source node,
 //     without stealing focus for a programmatic, unfocused activation;
+//   * opening Builder and successfully creating ice keep keyboard focus on an
+//     exact semantic target through each held loading paint and settlement,
+//     while programmatic activation preserves the context selector;
+//   * a same-tuple full render carries that exact loading target through an
+//     overlapping render, a request that settles during the render, and the
+//     queued card successor without overriding a newer external focus choice;
 //   * the builder previews the correct slot count for a Tue/Thu block in the
 //     selected date range, and reports rinks whose Venue lacks SeasonVenueAccess
 //     for the previewed Season (never generating ice for them) — re-checking
@@ -54,6 +60,7 @@ const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8283 },
   { label: "phone", width: 390, height: 844, port: 8284 },
 ];
+const CREATE_FOCUS_MODES = Object.freeze(["keyboard", "context", "body", "back"]);
 
 function waitForServer(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -102,6 +109,87 @@ function deadline(promise, label, timeoutMs = 15000) {
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
+
+// Hold the next matching real response only after the backend has answered.
+// That makes the loading window deterministic without replacing the response
+// with a fixture, while the one-shot arm prevents later overview reads from
+// being accidentally captured by the same assertion.
+async function holdNextRealResponse(page, pattern, requestLabel, label, skip = 0) {
+  let armed = true;
+  let released = false;
+  let started = false;
+  let markCaptured;
+  let markDelivered;
+  let releaseGate;
+  const captured = new Promise((resolve) => { markCaptured = resolve; });
+  const delivered = new Promise((resolve) => { markDelivered = resolve; });
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+  let matchesSeen = 0;
+  const handler = async (route) => {
+    matchesSeen += 1;
+    if (matchesSeen <= skip) return route.fallback();
+    if (!armed) return route.fallback();
+    armed = false;
+    started = true;
+    try {
+      const response = await route.fetch();
+      markCaptured(response.status());
+      await gate;
+      await route.fulfill({ response });
+    } finally {
+      markDelivered();
+    }
+  };
+  await page.route(pattern, handler);
+  const release = () => {
+    if (released) return;
+    released = true;
+    releaseGate();
+  };
+  return {
+    async waitCaptured(expectedStatus = 200) {
+      const status = await deadline(captured,
+        `${label}: real ${requestLabel} was never captured`, 30000);
+      if (status !== expectedStatus) {
+        throw new Error(`${label}: ${requestLabel} answered ${status}, expected ${expectedStatus}`);
+      }
+      return status;
+    },
+    release,
+    async finish() {
+      release();
+      await deadline(delivered,
+        `${label}: held ${requestLabel} was not delivered`, 10000);
+      await page.unroute(pattern, handler);
+    },
+    async cleanup() {
+      release();
+      // Removing a handler while its held route is still live makes Playwright
+      // auto-handle that route; the resumed handler then throws "already
+      // handled" and masks the assertion that caused cleanup. Let an entered
+      // handler finish first, but never wait when the action failed before the
+      // matching request began.
+      if (started) {
+        await deadline(delivered,
+          `${label}: held ${requestLabel} did not finish during cleanup`, 10000);
+      }
+      await page.unroute(pattern, handler);
+    },
+  };
+}
+
+const holdNextOverview = (page, label) => holdNextRealResponse(
+  page, /\/api\/demo\/overview(?:\?|$)/, "/api/demo/overview", label);
+const holdSecondOverview = (page, label) => holdNextRealResponse(
+  page, /\/api\/demo\/overview(?:\?|$)/, "/api/demo/overview", label, 1);
+const holdNextNotifications = (page, label) => holdNextRealResponse(
+  page, /\/api\/notifications(?:\?|$)/, "/api/notifications", label);
+const holdNextIceCommit = (page, label) => holdNextRealResponse(
+  page, /\/api\/setup\/ice-availability\/commit(?:\?|$)/,
+  "/api/setup/ice-availability/commit", label);
+const holdNextIcePreview = (page, label) => holdNextRealResponse(
+  page, /\/api\/setup\/ice-availability\/preview(?:\?|$)/,
+  "/api/setup/ice-availability/preview", label);
 
 function previewState(page) {
   return page.evaluate(() => {
@@ -622,6 +710,1364 @@ async function assertCalendarNavigationFocus(page, fail, contextIds) {
   await resetMonth();
   await page.evaluate(() => { delete window.__calendarNavigationFocusSource; });
   await assertHeldContextBackFocus(page, fail, cardIds, contextIds);
+  return cardIds;
+}
+
+function navigationLoadingFocusState(page, cardIds) {
+  return page.evaluate(({ calendarId, builderId }) => {
+    const active = document.activeElement;
+    const activeRoot = active && active.closest
+      ? active.closest("[data-operational-card]") : null;
+    const calendarRoot = document.querySelector(
+      `[data-operational-card="${calendarId}"]`);
+    const builderRoot = document.querySelector(
+      `[data-operational-card="${builderId}"]`);
+    const builderHeading = builderRoot && builderRoot.querySelector(".ib-head h2");
+    const builderLoadingHeading = builderRoot
+      && builderRoot.querySelector(".operational-stale-note h2");
+    const builderErrorHeading = builderRoot
+      && builderRoot.querySelector(".banner.alert h2");
+    const calendarLoadingHeading = calendarRoot
+      && calendarRoot.querySelector(".operational-stale-note h2");
+    const builderBack = builderRoot && builderRoot.querySelector("[data-ib-cancel]");
+    const builderPreview = builderRoot && builderRoot.querySelector("[data-ib-preview]");
+    const builderCommit = builderRoot && builderRoot.querySelector("[data-ib-commit]");
+    const builderRink = builderRoot && builderRoot.querySelector(".ib-rink");
+    const calendarOpen = calendarRoot
+      && calendarRoot.querySelector("[data-ice-builder-open]");
+    const calendarDateTarget = calendarRoot && calendarRoot.querySelector(".cal-date");
+    const calendarEntry = readCardState(calendarId);
+    const builderEntry = readCardState(builderId);
+    return {
+      activeTag: active && active.tagName,
+      activeId: active && active.id,
+      activeText: active && String(active.textContent || "").trim(),
+      activeTabIndex: active && active.tabIndex,
+      activeConnected: !!(active && active.isConnected),
+      activeVisible: !!(active && (active.offsetParent !== null
+        || active.getClientRects().length > 0)),
+      activeIsBody: active === document.body || active === document.documentElement,
+      activeCard: activeRoot && activeRoot.dataset.operationalCard,
+      activeIsBuilderHeading: !!active && active === builderHeading,
+      activeIsBuilderLoadingHeading: !!active && active === builderLoadingHeading,
+      activeIsBuilderErrorHeading: !!active && active === builderErrorHeading,
+      activeIsCalendarLoadingHeading: !!active && active === calendarLoadingHeading,
+      activeIsBuilderBack: !!active && active === builderBack,
+      activeIsBuilderPreview: !!active && active === builderPreview,
+      activeIsBuilderCommit: !!active && active === builderCommit,
+      activeIsBuilderRink: !!active && active === builderRink,
+      activeIsCalendarOpen: !!active && active === calendarOpen,
+      activeIsCalendarDate: !!active && active === calendarDateTarget,
+      builderHeadingText: builderHeading
+        && String(builderHeading.textContent || "").trim(),
+      builderLoadingText: builderLoadingHeading
+        && String(builderLoadingHeading.textContent || "").trim(),
+      builderErrorText: builderErrorHeading
+        && String(builderErrorHeading.textContent || "").trim(),
+      calendarLoadingText: calendarLoadingHeading
+        && String(calendarLoadingHeading.textContent || "").trim(),
+      builderPresent: !!builderRoot,
+      builderState: builderRoot && builderRoot.dataset.cardState,
+      builderModelState: builderEntry && builderEntry.state,
+      builderBusy: builderRoot && builderRoot.getAttribute("aria-busy"),
+      builderCurrent: !!(builderEntry && builderEntry.identity
+        && cardIdentityCurrent(builderEntry.identity)),
+      builderForm: !!(builderRoot && builderRoot.querySelector(".ib-form")),
+      calendarPresent: !!calendarRoot,
+      calendarState: calendarRoot && calendarRoot.dataset.cardState,
+      calendarBusy: calendarRoot && calendarRoot.getAttribute("aria-busy"),
+      calendarCurrent: !!(calendarEntry && calendarEntry.identity
+        && cardIdentityCurrent(calendarEntry.identity)),
+      calendarOpen: !!calendarOpen,
+      oldSourceConnected: !!(window.__loadingFocusSource
+        && window.__loadingFocusSource.isConnected),
+      oldBackConnected: !!(window.__loadingFocusBack
+        && window.__loadingFocusBack.isConnected),
+      oldRinkConnected: !!(window.__loadingFocusRink
+        && window.__loadingFocusRink.isConnected),
+      oldLoadingHeadingConnected: !!(window.__loadingFocusHeading
+        && window.__loadingFocusHeading.isConnected),
+      renderPass: typeof renderPass === "number" ? renderPass : null,
+      sameTupleRenderError: window.__sameTupleRenderError || "",
+    };
+  }, { calendarId: cardIds.calendar, builderId: cardIds.builder });
+}
+
+// Opening Builder is an async navigation whose source surface disappears on
+// the first loading paint. Focus inside that departing Calendar owns a semantic
+// destination immediately, while a synthetic activation from BODY owns none
+// and persistent external focus stays authoritative. The keyboard leg also
+// moves from the loading heading to Back before settlement, proving the final
+// repaint carries that newer card-local choice to Back's replacement.
+async function assertCalendarBuilderLoadingFocus(page, fail, cardIds) {
+  const calendarCard = `[data-operational-card="${cardIds.calendar}"]`;
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  const waitForBuilderLoading = () => page.waitForFunction((builderId) => {
+    const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+    return root && root.dataset.cardState === "loading"
+      && root.getAttribute("aria-busy") === "true"
+      && !!root.querySelector(".ib-head h2")
+      && !!root.querySelector("[data-ib-cancel]");
+  }, cardIds.builder, { timeout: 10000 });
+  const waitForBuilderSettled = () => page.waitForFunction((builderId) => {
+    const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+    return root && root.dataset.cardState !== "loading"
+      && root.getAttribute("aria-busy") === "false"
+      && !!root.querySelector(".ib-form")
+      && cardIdentityCurrent(readCardState(builderId).identity);
+  }, cardIds.builder, { timeout: 10000 });
+  const waitForCalendar = () => page.waitForFunction((calendarId) => {
+    const root = document.querySelector(`[data-operational-card="${calendarId}"]`);
+    return root && !!root.querySelector(".cal-date")
+      && cardIdentityCurrent(readCardState(calendarId).identity);
+  }, cardIds.calendar, { timeout: 10000 });
+
+  let hold = await holdNextOverview(page, "keyboard Build ice loading focus");
+  let finished = false;
+  try {
+    const opener = page.locator(`${calendarCard} [data-ice-builder-open]`);
+    if (await opener.count() !== 1) fail("keyboard Build ice needs one live opener");
+    await opener.focus();
+    await page.evaluate((selector) => {
+      window.__loadingFocusSource = document.querySelector(selector);
+      window.__loadingFocusBack = null;
+    }, `${calendarCard} [data-ice-builder-open]`);
+    await page.keyboard.press("Enter");
+    await hold.waitCaptured();
+    await waitForBuilderLoading();
+    const loading = await navigationLoadingFocusState(page, cardIds);
+    if (loading.oldSourceConnected || loading.calendarPresent
+        || !loading.builderPresent || loading.builderState !== "loading"
+        || loading.builderBusy !== "true" || !loading.builderCurrent
+        || !loading.activeIsBuilderHeading || loading.activeTag !== "H2"
+        || loading.activeTabIndex !== -1 || !loading.activeConnected
+        || !loading.activeVisible || loading.activeIsBody
+        || loading.activeCard !== cardIds.builder
+        || !/build recurring ice/i.test(loading.builderHeadingText || "")) {
+      fail(`keyboard Build ice stranded or misdirected loading focus: `
+        + JSON.stringify(loading));
+    }
+
+    const back = page.locator(`${builderCard} [data-ib-cancel]`);
+    await back.focus();
+    await page.evaluate((selector) => {
+      window.__loadingFocusBack = document.querySelector(selector);
+    }, `${builderCard} [data-ib-cancel]`);
+    const moved = await navigationLoadingFocusState(page, cardIds);
+    if (!moved.activeIsBuilderBack || !moved.activeConnected
+        || !moved.activeVisible || moved.activeIsBody) {
+      fail(`could not establish Back focus inside the held Builder: `
+        + JSON.stringify(moved));
+    }
+
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await waitForBuilderSettled();
+    const settled = await navigationLoadingFocusState(page, cardIds);
+    if (settled.oldBackConnected || !settled.activeIsBuilderBack
+        || !settled.activeConnected || !settled.activeVisible
+        || settled.activeIsBody || settled.activeCard !== cardIds.builder
+        || settled.builderState === "loading" || settled.builderBusy !== "false"
+        || !settled.builderCurrent || !settled.builderForm) {
+      fail(`Builder settlement did not carry focus to Back's replacement: `
+        + JSON.stringify(settled));
+    }
+  } finally {
+    if (!finished) await hold.cleanup();
+  }
+
+  await page.keyboard.press("Enter");
+  await waitForCalendar();
+  const returned = await navigationLoadingFocusState(page, cardIds);
+  if (!returned.activeIsCalendarDate || !returned.activeConnected
+      || !returned.activeVisible || returned.activeCard !== cardIds.calendar
+      || !returned.calendarCurrent || returned.builderPresent) {
+    fail(`held Builder Back did not settle on Calendar: ${JSON.stringify(returned)}`);
+  }
+
+  // A full same-tuple render is a third replacement boundary: it first
+  // detaches Builder for the page skeleton, then queues a programmatic card
+  // reconciliation after the shell is painted. Hold both the original card
+  // read and render's real notifications read so the otherwise-transient
+  // post-skeleton window is observable. Start a second same-tuple render while
+  // that first pass still owns the detached source: only explicit carry
+  // transfer lets the newer pass inherit a claim it can no longer recapture
+  // from DOM. Focus must cross that successor render and card settlement; the
+  // stale first render and original response must not reclaim it afterwards.
+  hold = await holdNextOverview(page,
+    "Builder loading focus across a same-tuple full render");
+  let notificationsHold = await holdNextNotifications(page,
+    "same-tuple full render loading-focus carry");
+  let renderDone = null;
+  finished = false;
+  let notificationsFinished = false;
+  try {
+    const opener = page.locator(`${calendarCard} [data-ice-builder-open]`);
+    await opener.focus();
+    await page.keyboard.press("Enter");
+    await hold.waitCaptured();
+    await waitForBuilderLoading();
+    const beforeRender = await page.evaluate(() => {
+      window.__loadingFocusHeading = document.activeElement;
+      window.__sameTupleRenderError = "";
+      return {
+        renderPass,
+        headingConnected: !!(window.__loadingFocusHeading
+          && window.__loadingFocusHeading.isConnected),
+      };
+    });
+    if (!beforeRender.headingConnected) {
+      fail(`same-tuple carry could not capture its live loading heading: `
+        + JSON.stringify(beforeRender));
+    }
+    renderDone = page.evaluate(async () => {
+      const before = renderPass;
+      try {
+        await render();
+        return { before, after: renderPass, error: "" };
+      } catch (error) {
+        window.__sameTupleRenderError = String(error && error.message || error);
+        return { before, after: renderPass, error: window.__sameTupleRenderError };
+      }
+    });
+    await notificationsHold.waitCaptured();
+    const duringRender = await navigationLoadingFocusState(page, cardIds);
+    if (duringRender.oldLoadingHeadingConnected || !duringRender.activeIsBody
+        || duringRender.renderPass <= beforeRender.renderPass
+        || duringRender.builderModelState !== "loading"
+        || duringRender.sameTupleRenderError) {
+      fail(`full render did not expose the detached owned-loading window: `
+        + JSON.stringify({ beforeRender, duringRender }));
+    }
+    const successorRenderResult = await page.evaluate(async () => {
+      const before = renderPass;
+      try {
+        await render();
+        return { before, after: renderPass, error: "" };
+      } catch (error) {
+        return { before, after: renderPass,
+          error: String(error && error.message || error) };
+      }
+    });
+    if (successorRenderResult.error
+        || successorRenderResult.after <= successorRenderResult.before) {
+      fail(`overlapping same-tuple successor render did not complete cleanly: `
+        + JSON.stringify(successorRenderResult));
+    }
+    await waitForBuilderSettled();
+    let settled = await navigationLoadingFocusState(page, cardIds);
+    if (settled.oldLoadingHeadingConnected || !settled.activeIsBuilderPreview
+        || !settled.activeConnected || !settled.activeVisible
+        || settled.activeIsBody || settled.activeCard !== cardIds.builder
+        || settled.builderState === "loading" || settled.builderBusy !== "false"
+        || !settled.builderCurrent || !settled.builderForm) {
+      fail(`same-tuple successor lost Builder focus after settlement: `
+        + JSON.stringify(settled));
+    }
+    notificationsHold.release();
+    await notificationsHold.finish();
+    notificationsFinished = true;
+    const staleRenderResult = await renderDone;
+    if (staleRenderResult.error
+        || staleRenderResult.after <= staleRenderResult.before) {
+      fail(`stale overlapping render did not retire cleanly: `
+        + JSON.stringify(staleRenderResult));
+    }
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await page.waitForTimeout(50);
+    settled = await navigationLoadingFocusState(page, cardIds);
+    if (!settled.activeIsBuilderPreview || !settled.activeConnected
+        || !settled.activeVisible || settled.activeIsBody
+        || settled.builderState === "loading" || !settled.builderCurrent) {
+      fail(`stale predecessor changed focus after the same-tuple successor: `
+        + JSON.stringify(settled));
+    }
+  } finally {
+    if (!notificationsFinished) await notificationsHold.cleanup();
+    if (!finished) await hold.cleanup();
+  }
+  await page.locator(`${builderCard} [data-ib-cancel]`).focus();
+  await page.keyboard.press("Enter");
+  await waitForCalendar();
+
+  // The source request may settle while the full render is still awaiting an
+  // unrelated page read. The carry is earned while the source is LOADING; it
+  // must not expire merely because the model advances before the render can
+  // paint its replacement. Release the original overview first, prove the
+  // state advanced while focus remained orphaned, then let render finish.
+  hold = await holdNextOverview(page,
+    "Builder settlement during a same-tuple full render");
+  notificationsHold = await holdNextNotifications(page,
+    "same-tuple render held past Builder settlement");
+  renderDone = null;
+  finished = false;
+  notificationsFinished = false;
+  try {
+    const opener = page.locator(`${calendarCard} [data-ice-builder-open]`);
+    await opener.focus();
+    await page.keyboard.press("Enter");
+    await hold.waitCaptured();
+    await waitForBuilderLoading();
+    const beforeRender = await page.evaluate(() => {
+      window.__loadingFocusHeading = document.activeElement;
+      window.__sameTupleRenderError = "";
+      return renderPass;
+    });
+    renderDone = page.evaluate(async () => {
+      const before = renderPass;
+      try {
+        await render();
+        return { before, after: renderPass, error: "" };
+      } catch (error) {
+        window.__sameTupleRenderError = String(error && error.message || error);
+        return { before, after: renderPass, error: window.__sameTupleRenderError };
+      }
+    });
+    await notificationsHold.waitCaptured();
+    let state = await navigationLoadingFocusState(page, cardIds);
+    if (state.oldLoadingHeadingConnected || !state.activeIsBody
+        || state.renderPass <= beforeRender
+        || state.builderModelState !== "loading") {
+      fail(`settle-during-render probe missed its detached loading window: `
+        + JSON.stringify({ beforeRender, state }));
+    }
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await waitForBuilderSettled();
+    state = await navigationLoadingFocusState(page, cardIds);
+    if (!state.activeIsBody || state.builderState === "loading"
+        || state.builderModelState === "loading" || !state.builderCurrent
+        || !state.builderForm || state.oldLoadingHeadingConnected) {
+      fail(`Builder did not settle behind the held render without stealing focus: `
+        + JSON.stringify(state));
+    }
+    notificationsHold.release();
+    await notificationsHold.finish();
+    notificationsFinished = true;
+    const renderResult = await renderDone;
+    if (renderResult.error || renderResult.after <= renderResult.before) {
+      fail(`render held past Builder settlement did not complete cleanly: `
+        + JSON.stringify(renderResult));
+    }
+    await waitForBuilderSettled();
+    state = await navigationLoadingFocusState(page, cardIds);
+    if (!state.activeIsBuilderPreview || !state.activeConnected
+        || !state.activeVisible || state.activeIsBody
+        || state.activeCard !== cardIds.builder
+        || state.builderState === "loading" || state.builderBusy !== "false"
+        || !state.builderCurrent || !state.builderForm) {
+      fail(`settled-before-finish carry missed the successor destination: `
+        + JSON.stringify(state));
+    }
+  } finally {
+    if (!notificationsFinished) await notificationsHold.cleanup();
+    if (!finished) await hold.cleanup();
+  }
+  await page.locator(`${builderCard} [data-ib-cancel]`).focus();
+  await page.keyboard.press("Enter");
+  await waitForCalendar();
+
+  // The inverse chooses a newer persistent control only AFTER the carry was
+  // captured and the full render detached its source. That connected focus
+  // event invalidates the carry; neither the final shell paint, the queued
+  // Builder successor, nor the stale predecessor may pull focus back.
+  hold = await holdNextOverview(page,
+    "same-tuple full render newer-focus inverse");
+  notificationsHold = await holdNextNotifications(page,
+    "same-tuple full render newer-focus inverse window");
+  renderDone = null;
+  finished = false;
+  notificationsFinished = false;
+  try {
+    const opener = page.locator(`${calendarCard} [data-ice-builder-open]`);
+    await opener.focus();
+    await page.keyboard.press("Enter");
+    await hold.waitCaptured();
+    await waitForBuilderLoading();
+    const beforeRender = await page.evaluate(() => {
+      window.__loadingFocusHeading = document.activeElement;
+      window.__sameTupleRenderError = "";
+      return renderPass;
+    });
+    renderDone = page.evaluate(async () => {
+      const before = renderPass;
+      try {
+        await render();
+        return { before, after: renderPass, error: "" };
+      } catch (error) {
+        window.__sameTupleRenderError = String(error && error.message || error);
+        return { before, after: renderPass, error: window.__sameTupleRenderError };
+      }
+    });
+    await notificationsHold.waitCaptured();
+    let state = await navigationLoadingFocusState(page, cardIds);
+    if (state.oldLoadingHeadingConnected || !state.activeIsBody
+        || state.renderPass <= beforeRender
+        || state.builderModelState !== "loading") {
+      fail(`inverse did not reach the post-skeleton carry window: `
+        + JSON.stringify({ beforeRender, state }));
+    }
+    await page.locator("#ctx-select").focus();
+    state = await navigationLoadingFocusState(page, cardIds);
+    if (state.activeId !== "ctx-select" || !state.activeConnected
+        || !state.activeVisible || state.activeIsBody) {
+      fail(`inverse could not establish newer context-selector focus: `
+        + JSON.stringify(state));
+    }
+    notificationsHold.release();
+    await notificationsHold.finish();
+    notificationsFinished = true;
+    const renderResult = await renderDone;
+    if (renderResult.error || renderResult.after <= renderResult.before) {
+      fail(`inverse full render did not complete cleanly: `
+        + JSON.stringify(renderResult));
+    }
+    await waitForBuilderSettled();
+    state = await navigationLoadingFocusState(page, cardIds);
+    if (state.activeId !== "ctx-select" || !state.activeConnected
+        || !state.activeVisible || state.activeIsBody
+        || state.builderState === "loading" || state.builderBusy !== "false"
+        || !state.builderCurrent || !state.builderForm) {
+      fail(`same-tuple successor stole newer context-selector focus: `
+        + JSON.stringify(state));
+    }
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await page.waitForTimeout(50);
+    state = await navigationLoadingFocusState(page, cardIds);
+    if (state.activeId !== "ctx-select" || !state.activeConnected
+        || !state.activeVisible || state.activeIsBody || !state.builderCurrent) {
+      fail(`stale predecessor stole newer focus after full-render inverse: `
+        + JSON.stringify(state));
+    }
+  } finally {
+    if (!notificationsFinished) await notificationsHold.cleanup();
+    if (!finished) await hold.cleanup();
+  }
+  await page.evaluate(() => {
+    const back = document.querySelector("[data-ib-cancel]");
+    if (back) back.click();
+  });
+  await waitForCalendar();
+  const fullRenderInverseReturned = await navigationLoadingFocusState(page, cardIds);
+  if (fullRenderInverseReturned.activeId !== "ctx-select"
+      || !fullRenderInverseReturned.activeConnected
+      || !fullRenderInverseReturned.activeVisible
+      || fullRenderInverseReturned.builderPresent
+      || !fullRenderInverseReturned.calendarCurrent) {
+    fail(`same-tuple inverse return stole context-selector focus: `
+      + JSON.stringify(fullRenderInverseReturned));
+  }
+
+  // A synthetic click on Build ice may still be owned by the operator when
+  // their focus is on another control inside the Calendar card. Today is the
+  // stable, keyboard-reachable representative: the departing card detaches it,
+  // so the transition must advance semantically rather than strand BODY. This
+  // is distinct from the persistent #ctx-select inverse below, which lives
+  // outside the departing card and therefore must retain focus.
+  hold = await holdNextOverview(page,
+    "Calendar-owned synthetic Build ice loading focus");
+  finished = false;
+  try {
+    const today = page.locator(`${calendarCard} [data-cal="0"]`);
+    const opener = page.locator(`${calendarCard} [data-ice-builder-open]`);
+    if (await today.count() !== 1 || await opener.count() !== 1) {
+      fail("Calendar-owned synthetic Build ice needs one Today and one opener");
+    }
+    await today.focus();
+    await page.evaluate((selector) => {
+      window.__loadingFocusSource = document.querySelector(selector);
+      window.__loadingFocusBack = null;
+    }, `${calendarCard} [data-cal="0"]`);
+    await page.evaluate((selector) => {
+      document.querySelector(selector).click();
+    }, `${calendarCard} [data-ice-builder-open]`);
+    await hold.waitCaptured();
+    await waitForBuilderLoading();
+    const loading = await navigationLoadingFocusState(page, cardIds);
+    if (loading.oldSourceConnected || loading.calendarPresent
+        || !loading.builderPresent || loading.builderState !== "loading"
+        || loading.builderBusy !== "true" || !loading.builderCurrent
+        || !loading.activeIsBuilderHeading || loading.activeTag !== "H2"
+        || loading.activeTabIndex !== -1 || !loading.activeConnected
+        || !loading.activeVisible || loading.activeIsBody
+        || loading.activeCard !== cardIds.builder
+        || !/build recurring ice/i.test(loading.builderHeadingText || "")) {
+      fail(`Calendar-owned synthetic Build ice misplaced loading focus: `
+        + JSON.stringify(loading));
+    }
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await waitForBuilderSettled();
+    const settled = await navigationLoadingFocusState(page, cardIds);
+    if (!settled.activeIsBuilderPreview || !settled.activeConnected
+        || !settled.activeVisible || settled.activeIsBody
+        || settled.activeCard !== cardIds.builder
+        || settled.builderState === "loading" || settled.builderBusy !== "false"
+        || !settled.builderCurrent || !settled.builderForm) {
+      fail(`Calendar-owned synthetic Build ice missed settled Preview focus: `
+        + JSON.stringify(settled));
+    }
+  } finally {
+    if (!finished) await hold.cleanup();
+  }
+  await page.locator(`${builderCard} [data-ib-cancel]`).focus();
+  await page.keyboard.press("Enter");
+  await waitForCalendar();
+  const syntheticOwnedReturned = await navigationLoadingFocusState(page, cardIds);
+  if (!syntheticOwnedReturned.activeIsCalendarDate
+      || !syntheticOwnedReturned.activeConnected
+      || !syntheticOwnedReturned.activeVisible
+      || syntheticOwnedReturned.builderPresent
+      || !syntheticOwnedReturned.calendarCurrent) {
+    fail(`Calendar-owned synthetic Build ice did not return to Calendar: `
+      + JSON.stringify(syntheticOwnedReturned));
+  }
+
+  hold = await holdNextOverview(page, "keyboard Build ice late no-steal");
+  finished = false;
+  try {
+    const opener = page.locator(`${calendarCard} [data-ice-builder-open]`);
+    await opener.focus();
+    await page.evaluate((selector) => {
+      const source = document.querySelector(selector);
+      window.__loadingFocusSource = source;
+      window.__loadingFocusBack = null;
+    }, `${calendarCard} [data-ice-builder-open]`);
+    await page.keyboard.press("Enter");
+    await hold.waitCaptured();
+    await waitForBuilderLoading();
+    let loading = await navigationLoadingFocusState(page, cardIds);
+    if (loading.oldSourceConnected || !loading.activeIsBuilderHeading
+        || !loading.activeConnected || !loading.activeVisible
+        || loading.activeIsBody || !loading.builderPresent
+        || loading.builderState !== "loading" || loading.builderBusy !== "true"
+        || !loading.builderCurrent || !loading.builderHeadingText) {
+      fail(`keyboard Build ice missed its initial loading heading: `
+        + JSON.stringify(loading));
+    }
+    await page.locator("#ctx-select").focus();
+    loading = await navigationLoadingFocusState(page, cardIds);
+    if (loading.activeId !== "ctx-select" || !loading.activeConnected
+        || !loading.activeVisible || loading.activeIsBody) {
+      fail(`could not establish newer context-selector focus during Builder load: `
+        + JSON.stringify(loading));
+    }
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await waitForBuilderSettled();
+    const settled = await navigationLoadingFocusState(page, cardIds);
+    if (settled.activeId !== "ctx-select" || !settled.activeConnected
+        || !settled.activeVisible || settled.activeIsBody
+        || settled.builderState === "loading" || !settled.builderCurrent
+        || !settled.builderForm) {
+      fail(`Builder settlement stole newer context-selector focus: `
+        + JSON.stringify(settled));
+    }
+  } finally {
+    if (!finished) await hold.cleanup();
+  }
+
+  await page.evaluate(() => {
+    const back = document.querySelector("[data-ib-cancel]");
+    if (back) back.click();
+  });
+  await waitForCalendar();
+  const inverseReturned = await navigationLoadingFocusState(page, cardIds);
+  if (inverseReturned.activeId !== "ctx-select"
+      || !inverseReturned.activeConnected || !inverseReturned.activeVisible
+      || inverseReturned.builderPresent || !inverseReturned.calendarCurrent) {
+    fail(`programmatic Builder return stole context-selector focus: `
+      + JSON.stringify(inverseReturned));
+  }
+
+  // The explicit-false path must remain unfocused for the whole request, not
+  // merely for its first paint. Keep BODY authoritative through the real
+  // response and final replacement before separately testing a later in-card
+  // focus choice below.
+  hold = await holdNextOverview(page,
+    "orphaned programmatic Build ice through settlement");
+  finished = false;
+  try {
+    const orphaned = await page.evaluate(() => {
+      const active = document.activeElement;
+      if (active && active.blur) active.blur();
+      return document.activeElement === document.body
+        || document.activeElement === document.documentElement;
+    });
+    if (!orphaned) fail("could not establish BODY for the full no-source probe");
+    const invoked = await page.evaluate((selector) => {
+      const source = document.querySelector(selector);
+      if (!source) return false;
+      window.__loadingFocusSource = source;
+      window.__loadingFocusBack = null;
+      source.click();
+      return true;
+    }, `${calendarCard} [data-ice-builder-open]`);
+    if (!invoked) fail("full no-source Build ice could not find its source");
+    await hold.waitCaptured();
+    await waitForBuilderLoading();
+    let state = await navigationLoadingFocusState(page, cardIds);
+    if (!state.activeIsBody || state.builderState !== "loading"
+        || state.builderBusy !== "true" || !state.builderCurrent
+        || state.oldSourceConnected) {
+      fail(`no-source Build ice acquired focus during loading: `
+        + JSON.stringify(state));
+    }
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await waitForBuilderSettled();
+    state = await navigationLoadingFocusState(page, cardIds);
+    if (!state.activeIsBody || state.builderState === "loading"
+        || state.builderBusy !== "false" || !state.builderCurrent
+        || !state.builderForm) {
+      fail(`no-source Build ice acquired focus at settlement: `
+        + JSON.stringify(state));
+    }
+  } finally {
+    if (!finished) await hold.cleanup();
+  }
+  await page.evaluate(() => {
+    const back = document.querySelector("[data-ib-cancel]");
+    if (back) back.click();
+  });
+  await waitForCalendar();
+  const bodyReturned = await navigationLoadingFocusState(page, cardIds);
+  if (!bodyReturned.activeIsBody || bodyReturned.builderPresent
+      || !bodyReturned.calendarCurrent) {
+    fail(`no-source Builder return acquired focus: ${JSON.stringify(bodyReturned)}`);
+  }
+
+  // Explicit false suppresses inheritance from the unfocused source; it does
+  // not freeze ownership for the whole request. A later focus choice inside
+  // the loading destination is real operator intent and must survive settle.
+  hold = await holdNextOverview(page,
+    "orphaned programmatic Build ice with later Back ownership");
+  finished = false;
+  try {
+    const orphaned = await page.evaluate(() => {
+      const active = document.activeElement;
+      if (active && active.blur) active.blur();
+      return document.activeElement === document.body
+        || document.activeElement === document.documentElement;
+    });
+    if (!orphaned) fail("could not establish BODY before no-source Build ice");
+    const invoked = await page.evaluate((selector) => {
+      const source = document.querySelector(selector);
+      if (!source) return false;
+      window.__loadingFocusSource = source;
+      window.__loadingFocusBack = null;
+      source.click();
+      return true;
+    }, `${calendarCard} [data-ice-builder-open]`);
+    if (!invoked) fail("later-ownership Build ice could not find its source");
+    await hold.waitCaptured();
+    await waitForBuilderLoading();
+    let loading = await navigationLoadingFocusState(page, cardIds);
+    if (!loading.activeIsBody || loading.builderState !== "loading"
+        || !loading.builderCurrent || loading.oldSourceConnected) {
+      fail(`no-source Build ice acquired focus before later ownership: `
+        + JSON.stringify(loading));
+    }
+    await page.locator(`${builderCard} [data-ib-cancel]`).focus();
+    await page.evaluate((selector) => {
+      window.__loadingFocusBack = document.querySelector(selector);
+    }, `${builderCard} [data-ib-cancel]`);
+    loading = await navigationLoadingFocusState(page, cardIds);
+    if (!loading.activeIsBuilderBack || !loading.activeConnected
+        || !loading.activeVisible || loading.activeIsBody) {
+      fail(`could not establish later Back ownership: ${JSON.stringify(loading)}`);
+    }
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await waitForBuilderSettled();
+    const settled = await navigationLoadingFocusState(page, cardIds);
+    if (settled.oldBackConnected || !settled.activeIsBuilderBack
+        || !settled.activeConnected || !settled.activeVisible
+        || settled.activeIsBody || settled.activeCard !== cardIds.builder
+        || settled.builderState === "loading" || !settled.builderCurrent
+        || !settled.builderForm) {
+      fail(`later Back ownership did not survive Builder settlement: `
+        + JSON.stringify(settled));
+    }
+  } finally {
+    if (!finished) await hold.cleanup();
+  }
+  await page.keyboard.press("Enter");
+  await waitForCalendar();
+  const laterReturned = await navigationLoadingFocusState(page, cardIds);
+  if (!laterReturned.activeIsCalendarDate || !laterReturned.activeConnected
+      || !laterReturned.activeVisible || laterReturned.builderPresent
+      || !laterReturned.calendarCurrent) {
+    fail(`later-owned Back did not return to Calendar: `
+      + JSON.stringify(laterReturned));
+  }
+
+  // Builder has two distinct loading headings once retained data exists: its
+  // stable card title and the status heading describing the in-flight read.
+  // Drive a real weekday-change refresh, focus that status, then hold the
+  // SECOND overview launched by full-render reconciliation (Calendar owns the
+  // first). This makes target-kind propagation observable: collapsing the
+  // carry to a bare card id moves focus to the title instead of retaining the
+  // status through the queued Builder successor.
+  await page.click(`${calendarCard} [data-ice-builder-open]`);
+  await waitForBuilderSettled();
+  hold = await holdNextOverview(page,
+    "retained Builder status before same-tuple render");
+  const successorHold = await holdSecondOverview(page,
+    "queued Builder status after same-tuple render");
+  notificationsHold = await holdNextNotifications(page,
+    "retained Builder status full-render window");
+  finished = false;
+  let successorFinished = false;
+  notificationsFinished = false;
+  try {
+    await page.locator(`${builderCard} .ib-day`).first().click();
+    await hold.waitCaptured();
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "loading"
+        && !!root.querySelector(".operational-stale-note h2");
+    }, cardIds.builder, { timeout: 10000 });
+    const focusedStatus = await page.evaluate((selector) => {
+      const heading = document.querySelector(selector);
+      if (!heading) return false;
+      heading.setAttribute("tabindex", "-1");
+      heading.focus();
+      window.__loadingFocusHeading = heading;
+      return document.activeElement === heading;
+    }, `${builderCard} .operational-stale-note h2`);
+    if (!focusedStatus) fail("could not focus retained Builder's loading status");
+    const renderResult = page.evaluate(async () => {
+      const before = renderPass;
+      await render();
+      return { before, after: renderPass };
+    });
+    await notificationsHold.waitCaptured();
+    const during = await navigationLoadingFocusState(page, cardIds);
+    if (during.oldLoadingHeadingConnected || !during.activeIsBody
+        || during.builderModelState !== "loading") {
+      fail(`retained-status carry missed its detached full-render window: `
+        + JSON.stringify(during));
+    }
+    notificationsHold.release();
+    await notificationsHold.finish();
+    notificationsFinished = true;
+    const completedRender = await renderResult;
+    if (completedRender.after <= completedRender.before) {
+      fail(`retained-status full render did not advance: `
+        + JSON.stringify(completedRender));
+    }
+    await successorHold.waitCaptured();
+    const successorLoading = await navigationLoadingFocusState(page, cardIds);
+    if (!successorLoading.activeIsBuilderLoadingHeading
+        || successorLoading.activeIsBuilderHeading
+        || !successorLoading.activeConnected || !successorLoading.activeVisible
+        || successorLoading.activeIsBody
+        || successorLoading.activeCard !== cardIds.builder
+        || successorLoading.builderState !== "loading"
+        || successorLoading.builderBusy !== "true"
+        || !successorLoading.builderCurrent) {
+      fail(`queued Builder successor collapsed status focus to its title: `
+        + JSON.stringify(successorLoading));
+    }
+    successorHold.release();
+    await successorHold.finish();
+    successorFinished = true;
+    await waitForBuilderSettled();
+    let settled = await navigationLoadingFocusState(page, cardIds);
+    if (!settled.activeIsBuilderPreview || !settled.activeConnected
+        || !settled.activeVisible || settled.activeIsBody
+        || settled.builderState === "loading" || !settled.builderCurrent) {
+      fail(`queued status-owned Builder did not settle on Preview: `
+        + JSON.stringify(settled));
+    }
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await page.waitForTimeout(50);
+    settled = await navigationLoadingFocusState(page, cardIds);
+    if (!settled.activeIsBuilderPreview || settled.activeIsBody
+        || !settled.builderCurrent) {
+      fail(`stale retained-options response reclaimed status-owned focus: `
+        + JSON.stringify(settled));
+    }
+  } finally {
+    if (!notificationsFinished) await notificationsHold.cleanup();
+    if (!successorFinished) await successorHold.cleanup();
+    if (!finished) await hold.cleanup();
+  }
+  await page.locator(`${builderCard} [data-ib-cancel]`).focus();
+  await page.keyboard.press("Enter");
+  await waitForCalendar();
+  await page.evaluate(() => {
+    delete window.__loadingFocusSource;
+    delete window.__loadingFocusBack;
+    delete window.__loadingFocusHeading;
+  });
+}
+
+// Retry is the retained-form sibling of a fresh Builder open. Its LOADING
+// surface remains editable, so a person can move from Retry to a checkbox
+// before the real response settles. Rink checkboxes deliberately have no id or
+// data-* identity; after replacement, their focus claim must fall back to the
+// settled Preview action instead of becoming indistinguishable from BODY.
+async function assertBuilderRetryFocusFallback(page, fail, cardIds) {
+  const calendarCard = `[data-operational-card="${cardIds.calendar}"]`;
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  await page.click(`${calendarCard} [data-ice-builder-open]`);
+  await page.waitForSelector(`${builderCard} .ib-form`, { timeout: 10000 });
+
+  const failurePattern = /\/api\/demo\/overview(?:\?|$)/;
+  let failureCount = 0;
+  const failOneOptionsRead = async (route) => {
+    if (failureCount) return route.fallback();
+    failureCount += 1;
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ error: {
+        code: "held_retry_setup",
+        message: "Deliberate options failure before the retry focus probe.",
+      } }),
+    });
+  };
+  await page.route(failurePattern, failOneOptionsRead);
+  try {
+    // The visible label drives the real Builder change listener. A weekday
+    // change asks for fresh options while retaining the editable form.
+    await page.locator(`${builderCard} .ib-day`).first().click();
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "error"
+        && !!root.querySelector(`[data-card-retry="${builderId}"]`)
+        && !!root.querySelector(".ib-form .ib-rink");
+    }, cardIds.builder, { timeout: 10000 });
+  } finally {
+    await page.unroute(failurePattern, failOneOptionsRead);
+  }
+  if (failureCount !== 1) {
+    fail(`Builder retry setup must fail exactly one options read, got ${failureCount}`);
+  }
+
+  const hold = await holdNextOverview(page, "retained Builder retry focus fallback");
+  let finished = false;
+  try {
+    const retry = page.locator(
+      `${builderCard} [data-card-retry="${cardIds.builder}"]`);
+    if (await retry.count() !== 1) fail("retained Builder retry needs one Retry action");
+    await retry.focus();
+    await page.keyboard.press("Enter");
+    await hold.waitCaptured();
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "loading"
+        && root.getAttribute("aria-busy") === "true"
+        && !!root.querySelector(".ib-form .ib-rink");
+    }, cardIds.builder, { timeout: 10000 });
+
+    const rink = page.locator(`${builderCard} .ib-rink`).first();
+    await rink.focus();
+    const unselectable = await rink.evaluate((checkbox) => ({
+      id: checkbox.id,
+      dataAttributes: Array.from(checkbox.attributes)
+        .map((attribute) => attribute.name)
+        .filter((name) => name.startsWith("data-")),
+      active: document.activeElement === checkbox,
+      connected: checkbox.isConnected,
+      visible: checkbox.offsetParent !== null || checkbox.getClientRects().length > 0,
+    }));
+    if (unselectable.id || unselectable.dataAttributes.length
+        || !unselectable.active || !unselectable.connected || !unselectable.visible) {
+      fail(`retry probe did not establish an unselectable in-card checkbox: `
+        + JSON.stringify(unselectable));
+    }
+    await page.evaluate((selector) => {
+      window.__loadingFocusRink = document.querySelector(selector);
+    }, `${builderCard} .ib-rink`);
+    const held = await navigationLoadingFocusState(page, cardIds);
+    if (!held.activeIsBuilderRink || !held.activeConnected || !held.activeVisible
+        || held.activeIsBody || held.builderState !== "loading"
+        || held.builderBusy !== "true" || !held.builderCurrent || !held.builderForm) {
+      fail(`retained Builder retry did not hold the checkbox focus window: `
+        + JSON.stringify(held));
+    }
+
+    hold.release();
+    await hold.finish();
+    finished = true;
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "empty"
+        && root.getAttribute("aria-busy") === "false"
+        && !!root.querySelector(".ib-form [data-ib-preview]")
+        && cardIdentityCurrent(readCardState(builderId).identity);
+    }, cardIds.builder, { timeout: 10000 });
+    const settled = await navigationLoadingFocusState(page, cardIds);
+    if (settled.oldRinkConnected || !settled.activeIsBuilderPreview
+        || !settled.activeConnected || !settled.activeVisible
+        || settled.activeIsBody || settled.activeCard !== cardIds.builder
+        || settled.builderState !== "empty" || settled.builderBusy !== "false"
+        || !settled.builderCurrent || !settled.builderForm) {
+      fail(`retained Builder retry did not fall back to settled Preview focus: `
+        + JSON.stringify(settled));
+    }
+  } finally {
+    if (!finished) await hold.cleanup();
+  }
+
+  await page.click(`${builderCard} [data-ib-cancel]`);
+  await page.waitForFunction((calendarId) => {
+    const root = document.querySelector(`[data-operational-card="${calendarId}"]`);
+    return root && !!root.querySelector(".cal-date")
+      && cardIdentityCurrent(readCardState(calendarId).identity);
+  }, cardIds.calendar, { timeout: 10000 });
+  await page.evaluate(() => { delete window.__loadingFocusRink; });
+}
+
+// A successful Create has two distinct async loading paints: Builder becomes
+// PENDING while the real write is in flight, then Calendar becomes LOADING
+// while its real overview refresh is in flight. Keyboard activation must own
+// each semantic loading heading and the established settled action. A later
+// move to the persistent context selector supersedes that intent; a synthetic
+// activation from BODY remains unfocused; and card-local focus transfers to a
+// semantic destination when the Builder itself departs.
+async function assertCreateLoadingFocus(
+    page, fail, cardIds, focusMode, focusModeCounts) {
+  if (!CREATE_FOCUS_MODES.includes(focusMode)) {
+    fail(`unknown Create focus mode: ${JSON.stringify(focusMode)}`);
+  }
+  focusModeCounts.set(focusMode, (focusModeCounts.get(focusMode) || 0) + 1);
+  const contextOwned = focusMode === "context";
+  const backOwned = focusMode === "back";
+  const bodyOwned = focusMode === "body";
+  const programmatic = backOwned || bodyOwned;
+  const label = focusMode === "keyboard" ? "keyboard Create focus"
+    : contextOwned ? "keyboard Create with later context-selector ownership"
+    : backOwned ? "programmatic Create with Back ownership"
+    : "orphaned programmatic Create no-steal";
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  const commitHold = await holdNextIceCommit(page, label);
+  const overviewHold = await holdNextOverview(page, label);
+  let commitFinished = false;
+  let overviewFinished = false;
+  try {
+    const commit = page.locator(`${builderCard} [data-ib-commit]`);
+    const source = await commit.evaluate((button) => ({
+      disabled: button.disabled,
+      count: document.querySelectorAll("[data-ib-commit]").length,
+    })).catch(() => null);
+    if (!source || source.disabled || source.count !== 1) {
+      fail(`${label}: needs exactly one enabled real Create: ${JSON.stringify(source)}`);
+    }
+    if (backOwned) {
+      await page.locator(`${builderCard} [data-ib-cancel]`).focus();
+      await page.evaluate((selector) => {
+        window.__loadingFocusBack = document.querySelector(selector);
+      }, `${builderCard} [data-ib-cancel]`);
+    }
+    else if (bodyOwned) {
+      const orphaned = await page.evaluate(() => {
+        const active = document.activeElement;
+        if (active && active.blur) active.blur();
+        return document.activeElement === document.body
+          || document.activeElement === document.documentElement;
+      });
+      if (!orphaned) fail(`${label}: could not establish BODY before activation`);
+    } else await commit.focus();
+    await page.evaluate((selector) => {
+      window.__loadingFocusSource = document.querySelector(selector);
+    }, `${builderCard} [data-ib-commit]`);
+    if (programmatic) {
+      await page.evaluate((selector) => document.querySelector(selector).click(),
+        `${builderCard} [data-ib-commit]`);
+    } else {
+      await page.keyboard.press("Enter");
+    }
+
+    await commitHold.waitCaptured();
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "loading"
+        && root.getAttribute("aria-busy") === "true"
+        && !!root.querySelector(".operational-stale-note h2");
+    }, cardIds.builder, { timeout: 10000 });
+    const pending = await navigationLoadingFocusState(page, cardIds);
+    const pendingWrong = pending.oldSourceConnected || !pending.builderPresent
+      || pending.calendarPresent || pending.builderState !== "loading"
+      || pending.builderBusy !== "true" || !pending.builderCurrent
+      || !/loading ice-builder preview/i.test(pending.builderLoadingText || "")
+      || (bodyOwned
+        ? !pending.activeIsBody
+        : backOwned
+        ? pending.oldBackConnected || !pending.activeIsBuilderBack
+          || !pending.activeConnected || !pending.activeVisible
+          || pending.activeCard !== cardIds.builder
+        : !pending.activeIsBuilderLoadingHeading || pending.activeTag !== "H2"
+          || pending.activeTabIndex !== -1 || !pending.activeConnected
+          || !pending.activeVisible || pending.activeCard !== cardIds.builder);
+    if (pendingWrong || (!bodyOwned && pending.activeIsBody)) {
+      fail(`${label}: Builder PENDING paint misplaced focus: ${JSON.stringify(pending)}`);
+    }
+    if (contextOwned) {
+      await page.locator("#ctx-select").focus();
+      const superseding = await navigationLoadingFocusState(page, cardIds);
+      if (superseding.activeId !== "ctx-select" || !superseding.activeConnected
+          || !superseding.activeVisible || superseding.activeIsBody) {
+        fail(`${label}: could not establish the newer context-selector focus: `
+          + JSON.stringify(superseding));
+      }
+    }
+
+    commitHold.release();
+    await commitHold.finish();
+    commitFinished = true;
+    await overviewHold.waitCaptured();
+    await page.waitForFunction((calendarId) => {
+      const root = document.querySelector(`[data-operational-card="${calendarId}"]`);
+      return root && root.dataset.cardState === "loading"
+        && root.getAttribute("aria-busy") === "true"
+        && !!root.querySelector(".operational-stale-note h2");
+    }, cardIds.calendar, { timeout: 10000 });
+    const calendarLoading = await navigationLoadingFocusState(page, cardIds);
+    const calendarWrong = calendarLoading.builderPresent
+      || !calendarLoading.calendarPresent || calendarLoading.calendarState !== "loading"
+      || calendarLoading.calendarBusy !== "true" || !calendarLoading.calendarCurrent
+      || !/loading arena calendar/i.test(calendarLoading.calendarLoadingText || "")
+      || (contextOwned
+        ? calendarLoading.activeId !== "ctx-select"
+          || !calendarLoading.activeConnected || !calendarLoading.activeVisible
+        : bodyOwned
+        ? !calendarLoading.activeIsBody
+        : !calendarLoading.activeIsCalendarLoadingHeading
+          || calendarLoading.activeTag !== "H2"
+          || calendarLoading.activeTabIndex !== -1
+          || !calendarLoading.activeConnected || !calendarLoading.activeVisible
+          || calendarLoading.activeCard !== cardIds.calendar);
+    if (calendarWrong || (!bodyOwned && calendarLoading.activeIsBody)) {
+      fail(`${label}: Calendar LOADING paint misplaced focus: `
+        + JSON.stringify(calendarLoading));
+    }
+
+    // Exercise the Calendar half of the render carry once. Keep the original
+    // post-Create refresh held while a full same-tuple render detaches its
+    // focused loading status; the queued successor must own the final Build
+    // ice destination, and the stale predecessor released below must not undo
+    // it. The other three modes remain focused on their distinct no-steal and
+    // card-local ownership contracts.
+    if (focusMode === "keyboard") {
+      const renderHold = await holdNextNotifications(page,
+        "Calendar loading focus across a same-tuple full render");
+      let renderHoldFinished = false;
+      let calendarRenderDone = null;
+      try {
+        const beforeRender = await page.evaluate(() => {
+          window.__loadingFocusHeading = document.activeElement;
+          window.__sameTupleRenderError = "";
+          return renderPass;
+        });
+        calendarRenderDone = page.evaluate(async () => {
+          const before = renderPass;
+          try {
+            await render();
+            return { before, after: renderPass, error: "" };
+          } catch (error) {
+            window.__sameTupleRenderError = String(error && error.message || error);
+            return { before, after: renderPass,
+              error: window.__sameTupleRenderError };
+          }
+        });
+        await renderHold.waitCaptured();
+        const duringRender = await navigationLoadingFocusState(page, cardIds);
+        if (duringRender.oldLoadingHeadingConnected
+            || !duringRender.activeIsBody
+            || duringRender.renderPass <= beforeRender
+            || duringRender.calendarState !== null
+            || duringRender.sameTupleRenderError) {
+          fail(`Create successor did not expose Calendar's detached loading window: `
+            + JSON.stringify({ beforeRender, duringRender }));
+        }
+        renderHold.release();
+        await renderHold.finish();
+        renderHoldFinished = true;
+        const renderResult = await calendarRenderDone;
+        if (renderResult.error || renderResult.after <= renderResult.before) {
+          fail(`Calendar same-tuple render did not complete cleanly: `
+            + JSON.stringify(renderResult));
+        }
+        await page.waitForFunction((calendarId) => {
+          const root = document.querySelector(
+            `[data-operational-card="${calendarId}"]`);
+          return root && root.dataset.cardState !== "loading"
+            && root.getAttribute("aria-busy") === "false"
+            && !!root.querySelector("[data-ice-builder-open]")
+            && cardIdentityCurrent(readCardState(calendarId).identity);
+        }, cardIds.calendar, { timeout: 10000 });
+        const carried = await navigationLoadingFocusState(page, cardIds);
+        if (!carried.activeIsCalendarOpen || !carried.activeConnected
+            || !carried.activeVisible || carried.activeIsBody
+            || carried.activeCard !== cardIds.calendar
+            || carried.calendarState === "loading"
+            || carried.calendarBusy !== "false" || !carried.calendarCurrent) {
+          fail(`Calendar same-tuple successor lost its loading-focus claim: `
+            + JSON.stringify(carried));
+        }
+      } finally {
+        if (!renderHoldFinished) await renderHold.cleanup();
+      }
+    }
+
+    overviewHold.release();
+    await overviewHold.finish();
+    overviewFinished = true;
+    await page.waitForFunction((calendarId) => {
+      const root = document.querySelector(`[data-operational-card="${calendarId}"]`);
+      return root && root.dataset.cardState !== "loading"
+        && root.getAttribute("aria-busy") === "false"
+        && !!root.querySelector("[data-ice-builder-open]")
+        && cardIdentityCurrent(readCardState(calendarId).identity);
+    }, cardIds.calendar, { timeout: 10000 });
+    const settled = await navigationLoadingFocusState(page, cardIds);
+    const settledWrong = settled.builderPresent || !settled.calendarPresent
+      || settled.calendarState === "loading" || settled.calendarBusy !== "false"
+      || !settled.calendarCurrent || !settled.calendarOpen
+      || (contextOwned
+        ? settled.activeId !== "ctx-select"
+          || !settled.activeConnected || !settled.activeVisible
+        : bodyOwned
+        ? !settled.activeIsBody
+        : !settled.activeIsCalendarOpen || !settled.activeConnected
+          || !settled.activeVisible || settled.activeCard !== cardIds.calendar);
+    if (settledWrong || (!bodyOwned && settled.activeIsBody)) {
+      fail(`${label}: final Calendar settlement misplaced focus: `
+        + JSON.stringify(settled));
+    }
+  } finally {
+    if (!commitFinished) await commitHold.cleanup();
+    if (!overviewFinished) await overviewHold.cleanup();
+    await page.evaluate(() => {
+      delete window.__loadingFocusSource;
+      delete window.__loadingFocusBack;
+    });
+  }
+}
+
+// A failed Create stays in Builder, but still replaces both the Create source
+// and its PENDING loading heading. Inject one explicit transport failure and
+// hold it at delivery so the intermediate and final destinations are both
+// observable. The request count keeps this from passing without exercising
+// the real commit handler.
+async function assertCreateErrorFocus(page, fail, cardIds) {
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  const pattern = /\/api\/setup\/ice-availability\/commit(?:\?|$)/;
+  let started = false;
+  let released = false;
+  let requestCount = 0;
+  let markCaptured;
+  let markDelivered;
+  let releaseGate;
+  const captured = new Promise((resolve) => { markCaptured = resolve; });
+  const delivered = new Promise((resolve) => { markDelivered = resolve; });
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+  const release = () => {
+    if (released) return;
+    released = true;
+    releaseGate();
+  };
+  const handler = async (route) => {
+    if (requestCount) return route.fallback();
+    requestCount += 1;
+    started = true;
+    markCaptured(route.request().method());
+    try {
+      await gate;
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: {
+          code: "service_unavailable",
+          message: "Deliberate Create failure for the focus regression.",
+        } }),
+      });
+    } finally {
+      markDelivered();
+    }
+  };
+  await page.route(pattern, handler);
+  try {
+    const commit = page.locator(`${builderCard} [data-ib-commit]`);
+    if (await commit.count() !== 1 || await commit.isDisabled()) {
+      fail("Create error focus probe needs one enabled Create action");
+    }
+    await commit.focus();
+    await page.evaluate((selector) => {
+      window.__loadingFocusSource = document.querySelector(selector);
+    }, `${builderCard} [data-ib-commit]`);
+    await page.keyboard.press("Enter");
+    const method = await deadline(captured,
+      "Create error focus probe never reached the commit endpoint", 10000);
+    if (method !== "POST" || requestCount !== 1) {
+      fail(`Create error focus probe captured the wrong request: `
+        + JSON.stringify({ method, requestCount }));
+    }
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "loading"
+        && root.getAttribute("aria-busy") === "true"
+        && !!root.querySelector(".operational-stale-note h2");
+    }, cardIds.builder, { timeout: 10000 });
+    const pending = await navigationLoadingFocusState(page, cardIds);
+    if (pending.oldSourceConnected || !pending.activeIsBuilderLoadingHeading
+        || pending.activeTag !== "H2" || pending.activeTabIndex !== -1
+        || !pending.activeConnected || !pending.activeVisible
+        || pending.activeIsBody || pending.activeCard !== cardIds.builder
+        || !/loading ice-builder preview/i.test(pending.builderLoadingText || "")) {
+      fail(`failed Create did not own its held PENDING heading: `
+        + JSON.stringify(pending));
+    }
+
+    release();
+    await deadline(delivered,
+      "Create error response was not delivered", 10000);
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "error"
+        && root.getAttribute("aria-busy") === "false"
+        && !!root.querySelector(".banner.alert h2");
+    }, cardIds.builder, { timeout: 10000 });
+    const failed = await navigationLoadingFocusState(page, cardIds);
+    if (!failed.activeIsBuilderErrorHeading || failed.activeTag !== "H2"
+        || failed.activeTabIndex !== -1 || !failed.activeConnected
+        || !failed.activeVisible || failed.activeIsBody
+        || failed.activeCard !== cardIds.builder || failed.builderState !== "error"
+        || failed.builderBusy !== "false"
+        || !/couldn.t load ice-builder preview/i.test(failed.builderErrorText || "")) {
+      fail(`failed Create did not settle focus on its alert heading: `
+        + JSON.stringify(failed));
+    }
+  } finally {
+    release();
+    if (started) {
+      await deadline(delivered,
+        "Create error handler did not finish during cleanup", 10000);
+    }
+    await page.unroute(pattern, handler);
+    await page.evaluate(() => { delete window.__loadingFocusSource; });
+  }
+}
+
+// A preview mismatch is a two-response failure recovery: the rejected Create
+// is followed immediately by a replacement Preview. Keep the original loading
+// heading truthful, then prove a newer Back focus choice is re-found through
+// both replacement paints instead of collapsing to BODY or the default Create.
+async function assertPreviewMismatchFocus(page, fail, cardIds) {
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  const commitHold = await holdNextIceCommit(page, "preview mismatch focus");
+  const previewHold = await holdNextIcePreview(page, "preview mismatch focus");
+  let commitFinished = false;
+  let previewFinished = false;
+  try {
+    const commit = page.locator(`${builderCard} [data-ib-commit]`);
+    if (await commit.count() !== 1 || await commit.isDisabled()) {
+      fail("preview mismatch focus probe needs one enabled Create action");
+    }
+    await commit.focus();
+    await page.evaluate((selector) => {
+      window.__loadingFocusSource = document.querySelector(selector);
+      window.__loadingFocusBack = null;
+    }, `${builderCard} [data-ib-commit]`);
+    await page.keyboard.press("Enter");
+    await commitHold.waitCaptured(400);
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "loading"
+        && root.getAttribute("aria-busy") === "true"
+        && !!root.querySelector(".operational-stale-note h2")
+        && !!root.querySelector("[data-ib-cancel]");
+    }, cardIds.builder, { timeout: 10000 });
+    let state = await navigationLoadingFocusState(page, cardIds);
+    if (state.oldSourceConnected || !state.activeIsBuilderLoadingHeading
+        || state.activeTag !== "H2" || state.activeTabIndex !== -1
+        || !state.activeConnected || !state.activeVisible || state.activeIsBody
+        || state.activeCard !== cardIds.builder
+        || !/loading ice-builder preview/i.test(state.builderLoadingText || "")) {
+      fail(`preview mismatch did not hold the Create loading heading: `
+        + JSON.stringify(state));
+    }
+
+    await page.locator(`${builderCard} [data-ib-cancel]`).focus();
+    await page.evaluate((selector) => {
+      window.__loadingFocusBack = document.querySelector(selector);
+    }, `${builderCard} [data-ib-cancel]`);
+    state = await navigationLoadingFocusState(page, cardIds);
+    if (!state.activeIsBuilderBack || !state.activeConnected
+        || !state.activeVisible || state.activeIsBody) {
+      fail(`preview mismatch could not establish newer Back focus: `
+        + JSON.stringify(state));
+    }
+
+    commitHold.release();
+    await commitHold.finish();
+    commitFinished = true;
+    await previewHold.waitCaptured();
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "loading"
+        && root.getAttribute("aria-busy") === "true"
+        && !!root.querySelector("[data-ib-cancel]");
+    }, cardIds.builder, { timeout: 10000 });
+    state = await navigationLoadingFocusState(page, cardIds);
+    if (state.oldBackConnected || !state.activeIsBuilderBack
+        || !state.activeConnected || !state.activeVisible || state.activeIsBody
+        || state.activeCard !== cardIds.builder || state.builderState !== "loading"
+        || state.builderBusy !== "true" || !state.builderCurrent) {
+      fail(`replacement Preview did not carry Back focus into its loading paint: `
+        + JSON.stringify(state));
+    }
+    await page.evaluate((selector) => {
+      window.__loadingFocusBack = document.querySelector(selector);
+    }, `${builderCard} [data-ib-cancel]`);
+
+    previewHold.release();
+    await previewHold.finish();
+    previewFinished = true;
+    await page.waitForFunction((builderId) => {
+      const root = document.querySelector(`[data-operational-card="${builderId}"]`);
+      return root && root.dataset.cardState === "ready"
+        && root.getAttribute("aria-busy") === "false"
+        && !!root.querySelector("[data-ib-cancel]")
+        && !!root.querySelector("[data-ib-commit]")
+        && cardIdentityCurrent(readCardState(builderId).identity);
+    }, cardIds.builder, { timeout: 10000 });
+    state = await navigationLoadingFocusState(page, cardIds);
+    if (state.oldBackConnected || !state.activeIsBuilderBack
+        || !state.activeConnected || !state.activeVisible || state.activeIsBody
+        || state.activeCard !== cardIds.builder || state.builderState !== "ready"
+        || state.builderBusy !== "false" || !state.builderCurrent) {
+      fail(`replacement Preview settlement did not preserve Back focus: `
+        + JSON.stringify(state));
+    }
+    await page.waitForFunction(
+      () => /changed since preview/i.test(
+        (document.querySelector(".toast-msg") || {}).textContent || ""),
+      null, { timeout: 10000 });
+  } finally {
+    if (!commitFinished) await commitHold.cleanup();
+    if (!previewFinished) await previewHold.cleanup();
+    await page.evaluate(() => {
+      delete window.__loadingFocusSource;
+      delete window.__loadingFocusBack;
+    });
+  }
 }
 
 async function checkViewport(browser, viewport) {
@@ -650,6 +2096,7 @@ async function checkViewport(browser, viewport) {
     errors.push(`[console] ${text}`);
   });
   const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
+  const createFocusModeCounts = new Map();
 
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
@@ -744,12 +2191,14 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".mo-grid .mo-cell", { timeout: 10000 });
     const cellCount = await page.$$eval(".mo-grid .mo-cell", (els) => els.length);
     if (cellCount !== 42) fail(`month grid should have 42 day cells, got ${cellCount}`);
-    await assertCalendarNavigationFocus(page, fail, {
+    const cardIds = await assertCalendarNavigationFocus(page, fail, {
       primaryProgram: ids.league,
       primarySeason: ids.season,
       alternateProgram: ids.alternateLeague,
       alternateSeason: ids.alternateSeason,
     });
+    await assertCalendarBuilderLoadingFocus(page, fail, cardIds);
+    await assertBuilderRetryFocusFallback(page, fail, cardIds);
 
     // (B) Open the builder and select BOTH rinks, then revoke the second
     // venue's Season access BEFORE previewing (see the fixture comment): the
@@ -766,6 +2215,16 @@ async function checkViewport(browser, viewport) {
         headers: { "Content-Type": "application/json" }, body: "{}" });
     }, ids.access2);
     await preview(page);
+    const ordinaryPreviewFocus = await navigationLoadingFocusState(page, cardIds);
+    if (!ordinaryPreviewFocus.activeIsBuilderCommit
+        || ordinaryPreviewFocus.activeTag !== "BUTTON"
+        || !ordinaryPreviewFocus.activeConnected
+        || !ordinaryPreviewFocus.activeVisible
+        || ordinaryPreviewFocus.activeIsBody
+        || ordinaryPreviewFocus.activeCard !== cardIds.builder) {
+      fail(`ordinary Preview did not advance focus to Create: `
+        + JSON.stringify(ordinaryPreviewFocus));
+    }
     let s = await previewState(page);
     if (s.new !== EXPECTED_NEW) fail(`expected ${EXPECTED_NEW} new slots, got ${JSON.stringify(s)}`);
     if (s.accessMissing !== 1) fail(`expected 1 access-missing rink, got ${JSON.stringify(s)}`);
@@ -787,10 +2246,8 @@ async function checkViewport(browser, viewport) {
     }
 
     // (C) Commit creates exactly the accessible rink's slots.
-    await page.click("[data-ib-commit]");
-    await page.waitForFunction(
-      () => document.body.dataset.view === "calendar" && !document.querySelector(".ib-form"),
-      null, { timeout: 10000 });
+    await assertCreateLoadingFocus(
+      page, fail, cardIds, "keyboard", createFocusModeCounts);
     const created = await page.evaluate(async (rink) => {
       const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
       return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
@@ -881,6 +2338,14 @@ async function checkViewport(browser, viewport) {
       return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
     }, rink5);
     if (boundCommitted !== 0) fail(`an invalidated preview must commit nothing, got ${boundCommitted}`);
+    // Re-preview the still-fresh rink, then make a generic Create transport
+    // failure observable at both its PENDING and ERROR focus destinations.
+    await previewCurrent(page);
+    s = await previewState(page);
+    if (!(s.new >= 1) || s.commitDisabled !== false) {
+      fail(`Create error focus probe needs an enabled preview: ${JSON.stringify(s)}`);
+    }
+    await assertCreateErrorFocus(page, fail, cardIds);
 
     // (H) A STALE preview is refused and refreshed. Simulate the resolved
     // snapshot moving under the operator (a concurrent Season/timezone edit
@@ -905,12 +2370,7 @@ async function checkViewport(browser, viewport) {
       cardDisplayPayload(readCardState(ICE_BUILDER_CARD))
         .preview.template_fingerprint = "staledeadbeef00";
     });
-    await page.click("[data-ib-commit]");
-    // The commit is refused and the UI re-previews the current proposal — its
-    // toast announces the refresh (only the preview_mismatch branch sets it).
-    await page.waitForFunction(
-      () => /changed since preview/i.test((document.querySelector(".toast-msg") || {}).textContent || ""),
-      null, { timeout: 10000 });
+    await assertPreviewMismatchFocus(page, fail, cardIds);
     // Crucially, the stale commit wrote nothing, and the builder stayed open
     // (a successful commit would have closed it back to the calendar).
     await page.waitForSelector(".ib-form", { timeout: 10000 });
@@ -1098,10 +2558,8 @@ async function checkViewport(browser, viewport) {
     // Commit stays bound to the COMPLETE preview: it creates exactly the new rows
     // across the WHOLE range (the late Game collision skipped), not a truncated
     // 60-day subset.
-    await page.click("[data-ib-commit]");
-    await page.waitForFunction(
-      () => document.body.dataset.view === "calendar" && !document.querySelector(".ib-form"),
-      null, { timeout: 15000 });
+    await assertCreateLoadingFocus(
+      page, fail, cardIds, "context", createFocusModeCounts);
     const longCreated = await page.evaluate(async (rink) => {
       const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
       return (ov.ice_slots || []).filter((x) => x.rink_id === rink && !x.game_id).length;
@@ -1203,10 +2661,8 @@ async function checkViewport(browser, viewport) {
     }
     const springSlotCount = await page.$$eval(".ib-slot", (els) => els.length);
     if (springSlotCount !== 2) fail(`expected 2 visible slot rows for the spring-forward window, got ${springSlotCount}`);
-    await page.click("[data-ib-commit]");
-    await page.waitForFunction(
-      () => document.body.dataset.view === "calendar" && !document.querySelector(".ib-form"),
-      null, { timeout: 10000 });
+    await assertCreateLoadingFocus(
+      page, fail, cardIds, "body", createFocusModeCounts);
     const springCreated = await page.evaluate(async (rink) => {
       const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
       return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
@@ -1262,10 +2718,8 @@ async function checkViewport(browser, viewport) {
     if (new Set(fallSlotTexts).size !== fallSlotTexts.length) {
       fail(`every fall-back row must render distinct text, got ${JSON.stringify(fallSlotTexts)}`);
     }
-    await page.click("[data-ib-commit]");
-    await page.waitForFunction(
-      () => document.body.dataset.view === "calendar" && !document.querySelector(".ib-form"),
-      null, { timeout: 10000 });
+    await assertCreateLoadingFocus(
+      page, fail, cardIds, "back", createFocusModeCounts);
     const fallCreated = await page.evaluate(async (rink) => {
       const ov = await (await fetch("/api/demo/overview", { credentials: "same-origin" })).json();
       return (ov.ice_slots || []).filter((x) => x.rink_id === rink).length;
@@ -1406,8 +2860,15 @@ async function checkViewport(browser, viewport) {
       fail(`commit must persist exactly the previewed UTC tuple: ${JSON.stringify(crossCommitted)} vs preview ${JSON.stringify(crossPv)}`);
     }
 
+    const createFocusModeLedger = CREATE_FOCUS_MODES.map((mode) => [
+      mode, createFocusModeCounts.get(mode) || 0,
+    ]);
+    if (createFocusModeLedger.some(([, count]) => count !== 1)) {
+      fail(`Create focus modes must each run exactly once: `
+        + JSON.stringify(createFocusModeLedger));
+    }
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${viewport.label}] OK — month grid renders and all 42 day destinations preserve focus; Builder Back preserves focus through accepted context settlement and an overlapping same-tuple render without stealing a newer choice; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview (both a bogus token and a same-slot-set window edit that slips the suspenders), reports an exact-tuple collision as a conflict WITH its target, exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set, and in a DST-observing Program timezone visibly reports a spring-forward gap skip, commits a gap-spanning window's 2 real-duration slots, visibly distinguishes a fall-back day's 4 real-hour slots including the two that share a repeated local clock time, and — even with nothing else that day to collide against — visibly qualifies and explicitly calls out a single row that itself crosses the DST change, in both directions, with the exact real UTC duration/tuple committed as previewed.`);
+    console.log(`[${viewport.label}] OK — month grid renders and all 42 day destinations preserve focus; Builder Open, Back and successful Create preserve focus through their real loading paints and settlements without stealing the context selector on programmatic activation; Back also preserves focus through accepted context settlement and an overlapping same-tuple render without stealing a newer choice; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview (both a bogus token and a same-slot-set window edit that slips the suspenders), reports an exact-tuple collision as a conflict WITH its target, exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set, and in a DST-observing Program timezone visibly reports a spring-forward gap skip, commits a gap-spanning window's 2 real-duration slots, visibly distinguishes a fall-back day's 4 real-hour slots including the two that share a repeated local clock time, and — even with nothing else that day to collide against — visibly qualifies and explicitly calls out a single row that itself crosses the DST change, in both directions, with the exact real UTC duration/tuple committed as previewed.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
