@@ -2163,6 +2163,117 @@ function focusOperationalCardTarget(identity, el) {
   return focusCardTarget(identity, el);
 }
 
+// A synchronous, card-local navigation is not an async response and must not
+// be judged by the response identity it happened to replace. In particular,
+// Ice Builder's Back action remains available on a STALE card after a context
+// switch has already advanced the selected tuple; the old Calendar model's
+// identity is supposed to fail there, while the operator's new destination is
+// the Calendar surface rendered in this same call stack. Source ownership is
+// captured before repaint, and this post-repaint guard still refuses to steal
+// focus if anything newer and connected owns it.
+function focusLocalCardNavigationTarget(el) {
+  const active = document.activeElement;
+  if (active && active !== document.body && active !== document.documentElement
+      && active.isConnected) return false;
+  if (!el) return false;
+  if (!el.hasAttribute("tabindex")
+      && !/^(BUTTON|A|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) {
+    el.setAttribute("tabindex", "-1");
+  }
+  el.focus();
+  return true;
+}
+
+function calendarDateOwnsFocus(container) {
+  const active = document.activeElement;
+  if (!active || !container || !active.matches
+      || !active.matches(".cal-date") || !container.contains(active)) return false;
+  const root = active.closest("[data-operational-card]");
+  return !!(root && root.dataset.operationalCard === CALENDAR_CARD);
+}
+
+function restoreCalendarDateFocus(shouldRestore) {
+  if (!shouldRestore) return false;
+  const root = document.querySelector(
+    `[data-operational-card="${CALENDAR_CARD}"]`);
+  return focusLocalCardNavigationTarget(
+    root && root.querySelector(".cal-date"));
+}
+
+// A full render first replaces Calendar with skeletons, awaits unrelated page
+// reads, and only then paints the new Calendar card. Back from a stale Ice
+// Builder can land on `.cal-date` immediately before that sequence begins, so
+// synchronous replacement-local restoration alone cannot carry it through.
+// Keep one render-scoped claim. The single listener below invalidates it on
+// ANY later connected focus event: an operator who moves anywhere during the
+// await owns focus now. A newer same-identity render inherits the live claim
+// if the older pass already detached its source; every other newer render
+// cancels it. Principal + tuple checks keep it from crossing a boundary.
+let calendarDateFocusCarry = null;
+
+document.addEventListener("focusin", (event) => {
+  const carry = calendarDateFocusCarry;
+  const target = event.target;
+  if (carry && target && target.isConnected) carry.superseded = true;
+}, true);
+
+function cancelCalendarDateFocusCarry(renderTicket) {
+  const carry = calendarDateFocusCarry;
+  if (!carry || (renderTicket !== undefined && carry.renderTicket !== renderTicket)) {
+    return false;
+  }
+  calendarDateFocusCarry = null;
+  return true;
+}
+
+function beginCalendarDateFocusCarry(renderTicket, container) {
+  const existing = calendarDateFocusCarry;
+  if (existing) {
+    const tuple = currentCardTuple();
+    const stillCurrent = !existing.superseded && view === "calendar"
+      && existing.epoch === uiIdentityEpoch
+      && existing.principal === cardPrincipalId()
+      && existing.program_id === tuple.program_id
+      && existing.season_id === tuple.season_id
+      && existing.league_id === tuple.league_id;
+    if (stillCurrent) {
+      // The older pass may already have replaced the focused Calendar with
+      // skeletons. Transfer its still-live claim rather than requiring the
+      // newer pass to recapture a source node that no longer exists.
+      existing.renderTicket = renderTicket;
+      return true;
+    }
+    cancelCalendarDateFocusCarry();
+  }
+  if (view !== "calendar" || !calendarDateOwnsFocus(container)) return false;
+  const tuple = currentCardTuple();
+  const carry = {
+    renderTicket,
+    epoch: uiIdentityEpoch,
+    principal: cardPrincipalId(),
+    program_id: tuple.program_id,
+    season_id: tuple.season_id,
+    league_id: tuple.league_id,
+    superseded: false,
+  };
+  calendarDateFocusCarry = carry;
+  return true;
+}
+
+function finishCalendarDateFocusCarry(renderTicket) {
+  const carry = calendarDateFocusCarry;
+  if (!carry || carry.renderTicket !== renderTicket) return false;
+  cancelCalendarDateFocusCarry(renderTicket);
+  const tuple = currentCardTuple();
+  if (carry.superseded || view !== "calendar" || openOverlayElement()
+      || carry.epoch !== uiIdentityEpoch
+      || carry.principal !== cardPrincipalId()
+      || carry.program_id !== tuple.program_id
+      || carry.season_id !== tuple.season_id
+      || carry.league_id !== tuple.league_id) return false;
+  return restoreCalendarDateFocus(true);
+}
+
 // Structural optionality for Workflow 6 (Decision 9 / #365). `optional` is a
 // PARTITION of the workflow list, not a flag each call site is trusted to
 // remember: `required` is the ONLY list the completion and next-task
@@ -3255,6 +3366,7 @@ function cancelSupersededDestinationFocus() {
 function abandonFocusWorkForContextSwitch() {
   newFocusRequest();
   destinationFocusIntent = null;
+  cancelCalendarDateFocusCarry();
 }
 
 // THE settlement. `proof` names what the concluding render pass actually
@@ -8149,6 +8261,7 @@ function repaintCalendarSurface(cardId, chromeOverview) {
   const content = document.getElementById("content");
   if (!content) return;
   const focusedRetryCard = focusedOperationalRetryCard(content);
+  const restoreCalendarDate = calendarDateOwnsFocus(content);
   // The Calendar card owns the page-level season/context chrome. Ice Builder
   // is a sibling request owner: its response may repaint only its own card,
   // never rewrite the breadcrumb/header from a different request lifetime.
@@ -8170,6 +8283,7 @@ function repaintCalendarSurface(cardId, chromeOverview) {
   wireCalendarCards(content);
   restoreOperationalRetryFocus(focusedRetryCard);
   syncOverlayFocus();
+  restoreCalendarDateFocus(restoreCalendarDate);
 }
 
 async function loadCalendarCard(opts) {
@@ -8360,16 +8474,18 @@ function wireCalendarCards(c) {
     } else loadIceBuilderCard({ userInitiated: true });
   };
 
-  // Calendar's view/date/filter toolbar owns a stable semantic position even
+  // Calendar's local navigation controls own a stable semantic position even
   // though repaintCalendarSurface() replaces the control node that held focus.
   // Capture that position before repaint and re-resolve it inside THIS card.
+  // Month cells and Ice Builder's Back action have no same-control replacement;
+  // for those transitions, the selected Calendar date is the destination.
   // The source must actually own focus: a synthetic click on an unfocused
   // control may repaint, but must not steal focus from the context selector or
   // anything else the operator deliberately moved to.
   const rerender = (focusSource) => {
-    const restoreToolbarFocus = !!focusSource
+    const restoreLocalFocus = !!focusSource
       && document.activeElement === focusSource;
-    const returnSelector = restoreToolbarFocus
+    const returnSelector = restoreLocalFocus
       ? triggerSelector(focusSource) : null;
     repaintCalendarSurface(iceBuilder ? ICE_BUILDER_CARD : CALENDAR_CARD);
     if (!returnSelector) return;
@@ -8388,7 +8504,7 @@ function wireCalendarCards(c) {
     target = target || root.querySelector(".cal-date")
       || root.querySelector(".sched-empty-lead")
       || root.querySelector("h2,.section-title") || root;
-    focusOperationalCardTarget(calendarEntry.identity, target);
+    focusLocalCardNavigationTarget(target);
   };
   const refreshCalendar = (opts) => loadCalendarCard(opts || {});
   const commitMove = async (gid, slotId) => {
@@ -8476,7 +8592,7 @@ function wireCalendarCards(c) {
   c.querySelectorAll("[data-cal-day]").forEach((button) => {
     button.onclick = () => {
       calendarDate = button.dataset.calDay; calendarMode = "day"; toast = "";
-      rerender();
+      rerender(button);
     };
   });
   c.querySelectorAll("[data-filter]").forEach((select) => {
@@ -8520,7 +8636,7 @@ function wireCalendarCards(c) {
   };
   const ibCancel = c.querySelector("[data-ib-cancel]");
   if (ibCancel) ibCancel.onclick = () => {
-    iceOperationSeq += 1; iceBuilder = null; toast = ""; rerender();
+    iceOperationSeq += 1; iceBuilder = null; toast = ""; rerender(ibCancel);
   };
   const invalidateIcePreview = (shouldRepaint) => {
     if (!iceBuilder) return;
@@ -12671,6 +12787,7 @@ async function render() {
   // That pass proves nothing about whether a picker can exist, so it reports
   // nothing, and the intent waits for the pass that actually read.
   let hierarchyReadsSettled = false;
+  beginCalendarDateFocusCarry(myRenderPass, c);
   try {
     // #365 owner correction — the render LIFECYCLE, not just the card model.
     // This line used to blank #content unconditionally, and every card was
@@ -13375,6 +13492,7 @@ async function render() {
     // already put on screen with an error for a question nobody is still
     // asking, and would settle its focus intent on this pass's behalf.
     if (renderPass !== myRenderPass) return;
+    cancelCalendarDateFocusCarry(myRenderPass);
     setChrome(view === "scheduler" || view === "calendar"
       ? selectedContextChromeOverview() : ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -14942,6 +15060,10 @@ async function render() {
   // handles the close half: when the render that just ran removed the
   // dialog, focus returns to whatever opened it.
   syncOverlayFocus();
+  // Overlay open/close owns focus first. This restoration refuses any target
+  // that lifecycle just focused, so Calendar cannot steal dialog focus or
+  // suppress a just-closed dialog's trigger return.
+  finishCalendarDateFocusCarry(myRenderPass);
   // #365 review round 11: THE settlement, and the last thing of all. After
   // the paint and after every wiring pass, so a control this intent is
   // waiting for is in the document AND bound before focus reaches it; after
@@ -16564,6 +16686,7 @@ function resetTransientUiState() {
   // privileged response delivered in that window still holds the current
   // renderPass and can write the private data straight back after this reset.
   renderPass += 1;
+  cancelCalendarDateFocusCarry();
   checkoutConfirm = null; oppDetailGame = null; oppDetailTeam = null; oppDetail = null;
   substituteOptInWrites.clear();
   substituteOptInNotices.clear();

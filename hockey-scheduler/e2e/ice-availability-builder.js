@@ -4,6 +4,9 @@
 // recurring weekly template, previews it, and idempotently commits it. The
 // journey verifies, on the real UI:
 //   * the Arena Calendar has a Month view that renders a day grid;
+//   * every Month day and Ice Builder's Back action preserve keyboard focus
+//     on the selected Calendar destination after replacing their source node,
+//     without stealing focus for a programmatic, unfocused activation;
 //   * the builder previews the correct slot count for a Tue/Thu block in the
 //     selected date range, and reports rinks whose Venue lacks SeasonVenueAccess
 //     for the previewed Season (never generating ice for them) — re-checking
@@ -92,6 +95,14 @@ async function preview(page) {
   await previewCurrent(page);
 }
 
+function deadline(promise, label, timeoutMs = 15000) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(label)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 function previewState(page) {
   return page.evaluate(() => {
     const p = document.querySelector(".ib-preview");
@@ -121,6 +132,496 @@ async function selectWeekdaysOnly(page, weekdays) {
     if (boxes[0]) boxes[0].dispatchEvent(new Event("change", { bubbles: true }));
   }, weekdays);
   await page.waitForSelector(`.ib-wd-row[data-weekday="${weekdays[0]}"]`, { timeout: 10000 });
+}
+
+// Back remains actionable while its old Builder card is visibly STALE during
+// an accepted context switch. Hold the switch's LIVE options response after
+// the server has answered, so that exact window is deterministic. The first
+// full render is optionally held after it has detached the Calendar date; a
+// same-tuple successor must inherit the focus claim, while any newer connected
+// focus choice must cancel it. Card ids come from the client authority rather
+// than duplicating their literals here.
+async function assertHeldContextBackFocus(page, fail, cardIds, contextIds) {
+  const calendarCard = `[data-operational-card="${cardIds.calendar}"]`;
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  const primaryValue = `${contextIds.primaryProgram}|${contextIds.primarySeason}`;
+  const alternateValue = `${contextIds.alternateProgram}|${contextIds.alternateSeason}`;
+
+  const waitForCurrentCalendar = async (value, label) => {
+    await page.waitForFunction(({ cardId, wanted }) => {
+      const select = document.getElementById("ctx-select");
+      const root = document.querySelector(
+        `[data-operational-card="${cardId}"]`);
+      const entry = readCardState(cardId);
+      return !contextSwitchIntentPending && select && select.value === wanted
+        && root && !!root.querySelector(".cal-date")
+        && cardIdentityCurrent(entry.identity);
+    }, { cardId: cardIds.calendar, wanted: value }, { timeout: 30000 })
+      .catch((error) => fail(`${label} never reached a settled current Calendar: `
+        + error.message));
+  };
+
+  const selectContext = async (value, label) => {
+    const offered = await page.$eval("#ctx-select", (select, wanted) => ({
+      hidden: select.hidden,
+      current: select.value,
+      offered: Array.from(select.options, (option) => option.value).includes(wanted),
+    }), value);
+    if (offered.hidden || !offered.offered) {
+      fail(`${label} is not operator-reachable through #ctx-select: `
+        + JSON.stringify(offered));
+    }
+    if (offered.current !== value) await page.selectOption("#ctx-select", value);
+    await waitForCurrentCalendar(value, label);
+  };
+
+  const focusState = () => page.evaluate(({ calendarId, builderId }) => {
+    const active = document.activeElement;
+    const root = active && active.closest
+      ? active.closest("[data-operational-card]") : null;
+    const calendarRoot = document.querySelector(
+      `[data-operational-card="${calendarId}"]`);
+    const builderRoot = document.querySelector(
+      `[data-operational-card="${builderId}"]`);
+    const exactDate = calendarRoot && calendarRoot.querySelector(".cal-date");
+    const calendarEntry = readCardState(calendarId);
+    return {
+      activeTag: active && active.tagName,
+      activeId: active && active.id,
+      activeConnected: !!(active && active.isConnected),
+      activeVisible: !!(active && (active.offsetParent !== null
+        || active.getClientRects().length > 0)),
+      activeIsExactCalendarDate: !!active && active === exactDate,
+      activeCard: root && root.dataset.operationalCard,
+      builderOpen: !!iceBuilder,
+      builderPresent: !!builderRoot,
+      builderState: builderRoot && builderRoot.dataset.cardState,
+      calendarPresent: !!calendarRoot,
+      calendarCurrent: cardIdentityCurrent(calendarEntry.identity),
+      switchPending: !!contextSwitchIntentPending,
+      selectedValue: (document.getElementById("ctx-select") || {}).value || null,
+      oldBackConnected: !!(window.__heldContextBackSource
+        && window.__heldContextBackSource.isConnected),
+      immediateDateConnected: !!(window.__heldContextBackDate
+        && window.__heldContextBackDate.isConnected),
+      activeIsImmediateDate: !!active && active === window.__heldContextBackDate,
+      renderPass: typeof renderPass === "number" ? renderPass : null,
+    };
+  }, { calendarId: cardIds.calendar, builderId: cardIds.builder });
+
+  const openBuilderFromPrimary = async (label) => {
+    await selectContext(primaryValue, `${label}: restore original fixture`);
+    await page.evaluate(() => {
+      iceBuilder = null;
+      calendarMode = "month";
+      repaintCalendarSurface(CALENDAR_CARD);
+    });
+    const opener = page.locator(`${calendarCard} [data-ice-builder-open]`);
+    const openerCount = await opener.count();
+    if (openerCount !== 1) {
+      fail(`${label}: expected exactly one Ice Builder opener, got ${openerCount}`);
+    }
+    await opener.click();
+    await page.waitForSelector(`${builderCard} .ib-form`, { timeout: 10000 });
+  };
+
+  const exercise = async (label, {
+    overlapRender = false,
+    moveFocusBeforeRelease = false,
+    moveFocusBeforeSuccessor = false,
+  } = {}) => {
+    await openBuilderFromPrimary(label);
+
+    let optionsArmed = true;
+    let releaseOptions = () => {};
+    let markOptionsCaptured = () => {};
+    const optionsCaptured = new Promise((resolve) => { markOptionsCaptured = resolve; });
+    const optionsGate = new Promise((resolve) => { releaseOptions = resolve; });
+    const optionsPattern = /\/api\/context\/options(?:\?|$)/;
+    const holdOptions = async (route) => {
+      if (!optionsArmed) return route.fallback();
+      optionsArmed = false;
+      const response = await route.fetch();
+      markOptionsCaptured(response.status());
+      await optionsGate;
+      await route.fulfill({ response });
+    };
+
+    let notificationArmed = false;
+    let releaseNotification = () => {};
+    let markNotificationCaptured = () => {};
+    let markNotificationDelivered = () => {};
+    const notificationCaptured = new Promise(
+      (resolve) => { markNotificationCaptured = resolve; });
+    const notificationDelivered = new Promise(
+      (resolve) => { markNotificationDelivered = resolve; });
+    const notificationGate = new Promise(
+      (resolve) => { releaseNotification = resolve; });
+    const notificationPattern = /\/api\/notifications(?:\?|$)/;
+    const holdNotification = async (route) => {
+      if (!notificationArmed) return route.fallback();
+      notificationArmed = false;
+      const response = await route.fetch();
+      markNotificationCaptured(response.status());
+      await notificationGate;
+      await route.fulfill({ response });
+      markNotificationDelivered();
+    };
+
+    await page.route(optionsPattern, holdOptions);
+    await page.route(notificationPattern, holdNotification);
+    let optionsReleased = false;
+    let notificationReleased = false;
+    try {
+      await page.selectOption("#ctx-select", alternateValue);
+      const optionsStatus = await deadline(optionsCaptured,
+        `${label}: live /api/context/options was never captured`);
+      if (optionsStatus !== 200) {
+        fail(`${label}: live /api/context/options answered ${optionsStatus}`);
+      }
+
+      // The POST has genuinely committed B before its live options response is
+      // delivered to the browser. Without this read-back, STALE could be a
+      // fixture artefact and the race would prove nothing about an accepted switch.
+      const accepted = await page.evaluate(async () => {
+        const response = await fetch("/api/context", { credentials: "same-origin" });
+        let body = null;
+        try { body = await response.json(); } catch (_) { body = null; }
+        return {
+          status: response.status,
+          body,
+          tuple: currentCardTuple(),
+          switchPending: !!contextSwitchIntentPending,
+        };
+      });
+      if (accepted.status !== 200 || !accepted.body
+          || accepted.body.program_id !== contextIds.alternateProgram
+          || accepted.body.season_id !== contextIds.alternateSeason
+          || accepted.tuple.program_id !== contextIds.alternateProgram
+          || accepted.tuple.season_id !== contextIds.alternateSeason
+          || !accepted.switchPending) {
+        fail(`${label}: held window is not an accepted B switch: `
+          + JSON.stringify(accepted));
+      }
+
+      await page.waitForFunction((builderId) => {
+        const card = document.querySelector(
+          `[data-operational-card="${builderId}"]`);
+        return card && card.dataset.cardState === "stale"
+          && !!card.querySelector("[data-ib-cancel]");
+      }, cardIds.builder, { timeout: 10000 });
+
+      const back = page.locator(`${builderCard} [data-ib-cancel]`);
+      await back.focus();
+      await page.evaluate((selector) => {
+        window.__heldContextBackSource = document.querySelector(selector);
+        window.__heldContextBackDate = null;
+      }, `${builderCard} [data-ib-cancel]`);
+      await page.keyboard.press("Enter");
+      await page.evaluate((calendarId) => {
+        const root = document.querySelector(
+          `[data-operational-card="${calendarId}"]`);
+        window.__heldContextBackDate = root && root.querySelector(".cal-date");
+      }, cardIds.calendar);
+      const immediate = await focusState();
+      if (immediate.builderOpen || immediate.builderPresent
+          || !immediate.calendarPresent || immediate.oldBackConnected
+          || !immediate.immediateDateConnected || !immediate.activeIsImmediateDate
+          || !immediate.activeIsExactCalendarDate || !immediate.activeConnected
+          || !immediate.activeVisible || immediate.activeCard !== cardIds.calendar
+          || !immediate.switchPending || immediate.selectedValue !== alternateValue) {
+        fail(`${label}: keyboard Back did not immediately land on its connected `
+          + `Calendar date while the accepted switch remained held: `
+          + JSON.stringify(immediate));
+      }
+
+      if (moveFocusBeforeRelease) {
+        await page.locator("#ctx-select").focus();
+        const moved = await focusState();
+        if (moved.activeId !== "ctx-select" || !moved.activeConnected
+            || !moved.activeVisible || !moved.immediateDateConnected) {
+          fail(`${label}: could not establish the newer pre-release focus choice: `
+            + JSON.stringify(moved));
+        }
+      }
+
+      if (overlapRender) notificationArmed = true;
+      releaseOptions();
+      optionsReleased = true;
+
+      if (overlapRender) {
+        const notificationStatus = await deadline(notificationCaptured,
+          `${label}: the first full render never reached held /api/notifications`, 30000);
+        if (notificationStatus !== 200) {
+          fail(`${label}: held /api/notifications answered ${notificationStatus}`);
+        }
+        const held = await focusState();
+        if (held.immediateDateConnected || held.oldBackConnected
+            || !(held.renderPass > immediate.renderPass)) {
+          fail(`${label}: first full render did not reach the held post-skeleton `
+            + `window with both navigation nodes detached: ${JSON.stringify(held)}`);
+        }
+        if (moveFocusBeforeSuccessor) {
+          await page.locator("#ctx-select").focus();
+          const moved = await focusState();
+          if (moved.activeId !== "ctx-select" || !moved.activeConnected
+              || !moved.activeVisible) {
+            fail(`${label}: newer connected focus was not established before the `
+              + `same-tuple successor: `
+              + JSON.stringify(moved));
+          }
+        }
+        const firstRenderPass = held.renderPass;
+        await page.evaluate(async () => { await render(); });
+        await waitForCurrentCalendar(alternateValue,
+          `${label}: same-tuple successor Calendar`);
+        const successor = await focusState();
+        if (!(successor.renderPass > firstRenderPass)
+            || successor.oldBackConnected || successor.immediateDateConnected) {
+          fail(`${label}: same-tuple successor did not finish after replacing both `
+            + `old navigation nodes: `
+            + JSON.stringify(successor));
+        }
+        if (moveFocusBeforeSuccessor) {
+          if (successor.activeId !== "ctx-select" || !successor.activeConnected
+              || !successor.activeVisible) {
+            fail(`${label}: same-tuple successor stole the newer context-selector focus: `
+              + JSON.stringify(successor));
+          }
+        } else if (!successor.activeIsExactCalendarDate
+            || !successor.activeConnected || !successor.activeVisible
+            || successor.activeCard !== cardIds.calendar
+            || !successor.calendarCurrent) {
+          fail(`${label}: same-tuple successor did not inherit focus onto its `
+            + `current Calendar date: ${JSON.stringify(successor)}`);
+        }
+        releaseNotification();
+        notificationReleased = true;
+        await deadline(notificationDelivered,
+          `${label}: held /api/notifications was not released`, 10000);
+      }
+
+      await waitForCurrentCalendar(alternateValue,
+        `${label}: accepted alternate context`);
+      const final = await focusState();
+      if (final.oldBackConnected || final.immediateDateConnected
+          || final.builderOpen || final.builderPresent || !final.calendarPresent
+          || !final.calendarCurrent || final.selectedValue !== alternateValue
+          || final.switchPending) {
+        fail(`${label}: final reconciliation retained stale navigation state: `
+          + JSON.stringify(final));
+      }
+      if (moveFocusBeforeRelease || moveFocusBeforeSuccessor) {
+        if (final.activeId !== "ctx-select" || !final.activeConnected
+            || !final.activeVisible) {
+          fail(`${label}: final reconciliation stole the operator's newer focus: `
+            + JSON.stringify(final));
+        }
+      } else if (!final.activeIsExactCalendarDate || !final.activeConnected
+          || !final.activeVisible || final.activeCard !== cardIds.calendar) {
+        fail(`${label}: final current Calendar did not own exact .cal-date focus: `
+          + JSON.stringify(final));
+      }
+    } finally {
+      if (!optionsReleased) releaseOptions();
+      if (!notificationReleased) releaseNotification();
+      await page.unroute(optionsPattern, holdOptions);
+      await page.unroute(notificationPattern, holdNotification);
+    }
+  };
+
+  await exercise("held accepted switch + overlapping render", {
+    overlapRender: true,
+  });
+  await exercise("new focus before held switch release", {
+    moveFocusBeforeRelease: true,
+  });
+  await exercise("new focus before same-tuple successor", {
+    overlapRender: true,
+    moveFocusBeforeSuccessor: true,
+  });
+
+  // The rest of this long journey creates ice under the original fixture.
+  // Restore it through the real switcher and prove the restored Calendar is
+  // current before handing control back to the existing assertions.
+  await selectContext(primaryValue, "restore original fixture after focus races");
+  await page.evaluate(() => {
+    delete window.__heldContextBackSource;
+    delete window.__heldContextBackDate;
+  });
+}
+
+// Month cells and Ice Builder's Back button are navigation controls, not
+// toolbar toggles: their source has no same-selector replacement in the
+// destination. The Calendar date is their shared semantic destination. Sweep
+// the rendered Month axis rather than naming a convenient day, then drive Back
+// through the real async Builder entry. Each negative leg proves a synthetic
+// activation still changes the view without stealing a newer focus choice.
+async function assertCalendarNavigationFocus(page, fail, contextIds) {
+  const cardIds = await page.evaluate(() => ({
+    calendar: CALENDAR_CARD,
+    builder: ICE_BUILDER_CARD,
+  }));
+  const calendarCard = `[data-operational-card="${cardIds.calendar}"]`;
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  const anchor = await page.evaluate(() => calendarDate);
+  const monthDays = await page.$$eval(`${calendarCard} button[data-cal-day]`,
+    (buttons) => buttons.map((button) => button.dataset.calDay));
+  if (monthDays.length !== 42 || new Set(monthDays).size !== 42) {
+    fail(`Month navigation focus axis must contain 42 unique rendered days: `
+      + JSON.stringify(monthDays));
+  }
+
+  const resetMonth = () => page.evaluate((date) => {
+    iceBuilder = null;
+    calendarDate = date;
+    calendarMode = "month";
+    repaintCalendarSurface(CALENDAR_CARD);
+  }, anchor);
+
+  for (const day of monthDays) {
+    await resetMonth();
+    const selector = `${calendarCard} button[data-cal-day="${day}"]`;
+    const source = page.locator(selector);
+    if (await source.count() !== 1) {
+      fail(`expected one rendered Month cell for ${day}, got ${await source.count()}`);
+    }
+    await source.focus();
+    await page.evaluate((query) => {
+      window.__calendarNavigationFocusSource = document.querySelector(query);
+    }, selector);
+    await page.keyboard.press("Enter");
+    const landed = await page.evaluate((expectedDay) => {
+      const oldSource = window.__calendarNavigationFocusSource;
+      const active = document.activeElement;
+      const root = active && active.closest
+        ? active.closest("[data-operational-card]") : null;
+      const entry = readCardState(CALENDAR_CARD);
+      return {
+        date: calendarDate,
+        mode: calendarMode,
+        oldSourceConnected: !!(oldSource && oldSource.isConnected),
+        sameNode: !!active && active === oldSource,
+        activeTag: active && active.tagName,
+        activeIsCalendarDate: !!(active && active.matches
+          && active.matches(".cal-date")),
+        activeTabIndex: active && active.tabIndex,
+        activeConnected: !!(active && active.isConnected),
+        activeVisible: !!(active && (active.offsetParent !== null
+          || active.getClientRects().length > 0)),
+        card: root && root.dataset.operationalCard,
+        cardCurrent: cardIdentityCurrent(entry.identity),
+        expectedDay,
+      };
+    }, day);
+    if (landed.date !== day || landed.mode !== "day"
+        || landed.oldSourceConnected || landed.sameNode
+        || landed.activeTag !== "DIV" || !landed.activeIsCalendarDate
+        || landed.activeTabIndex !== -1 || !landed.activeConnected
+        || !landed.activeVisible || landed.card !== cardIds.calendar
+        || !landed.cardCurrent) {
+      fail(`Month day ${day} did not move focus to its Calendar destination: `
+        + JSON.stringify(landed));
+    }
+  }
+
+  // The source-focus guard is part of the contract: code may activate a local
+  // navigation control, but it cannot override a person's newer focus choice.
+  await resetMonth();
+  const syntheticDay = monthDays[0];
+  await page.locator("#ctx-select").focus();
+  const syntheticMonth = await page.evaluate((day) => {
+    const source = document.querySelector(`button[data-cal-day="${day}"]`);
+    if (!source) return { prepared: false };
+    window.__calendarNavigationFocusSource = source;
+    source.click();
+    return {
+      prepared: true,
+      date: calendarDate,
+      mode: calendarMode,
+      activeId: document.activeElement && document.activeElement.id,
+      oldSourceConnected: source.isConnected,
+    };
+  }, syntheticDay);
+  if (!syntheticMonth.prepared || syntheticMonth.date !== syntheticDay
+      || syntheticMonth.mode !== "day" || syntheticMonth.activeId !== "ctx-select"
+      || syntheticMonth.oldSourceConnected) {
+    fail(`an unfocused Month-day activation stole focus: `
+      + JSON.stringify(syntheticMonth));
+  }
+
+  await resetMonth();
+  const openBuilder = page.locator(`${calendarCard} [data-ice-builder-open]`);
+  await openBuilder.focus();
+  await page.keyboard.press("Enter");
+  await page.waitForSelector(`${builderCard} .ib-form`, { timeout: 10000 });
+  const back = page.locator(`${builderCard} [data-ib-cancel]`);
+  await back.focus();
+  await page.evaluate((query) => {
+    window.__calendarNavigationFocusSource = document.querySelector(query);
+  }, `${builderCard} [data-ib-cancel]`);
+  await page.keyboard.press("Enter");
+  const returned = await page.evaluate(() => {
+    const oldSource = window.__calendarNavigationFocusSource;
+    const active = document.activeElement;
+    const root = active && active.closest
+      ? active.closest("[data-operational-card]") : null;
+    const entry = readCardState(CALENDAR_CARD);
+    return {
+      builderOpen: !!iceBuilder,
+      builderCard: !!document.querySelector(
+        `[data-operational-card="${ICE_BUILDER_CARD}"]`),
+      calendarCard: !!document.querySelector(
+        `[data-operational-card="${CALENDAR_CARD}"]`),
+      oldSourceConnected: !!(oldSource && oldSource.isConnected),
+      sameNode: !!active && active === oldSource,
+      activeTag: active && active.tagName,
+      activeIsCalendarDate: !!(active && active.matches
+        && active.matches(".cal-date")),
+      activeTabIndex: active && active.tabIndex,
+      activeConnected: !!(active && active.isConnected),
+      activeVisible: !!(active && (active.offsetParent !== null
+        || active.getClientRects().length > 0)),
+      card: root && root.dataset.operationalCard,
+      cardCurrent: cardIdentityCurrent(entry.identity),
+    };
+  });
+  if (returned.builderOpen || returned.builderCard || !returned.calendarCard
+      || returned.oldSourceConnected || returned.sameNode
+      || returned.activeTag !== "DIV" || !returned.activeIsCalendarDate
+      || returned.activeTabIndex !== -1 || !returned.activeConnected
+      || !returned.activeVisible || returned.card !== cardIds.calendar
+      || !returned.cardCurrent) {
+    fail(`Ice Builder Back did not return focus to Calendar: `
+      + JSON.stringify(returned));
+  }
+
+  // Repeat Back without focusing it. The transition must still work, while
+  // the persistent context selector keeps the focus the operator gave it.
+  await page.locator(`${calendarCard} [data-ice-builder-open]`).click();
+  await page.waitForSelector(`${builderCard} .ib-form`, { timeout: 10000 });
+  await page.locator("#ctx-select").focus();
+  const syntheticBack = await page.evaluate(() => {
+    const source = document.querySelector("[data-ib-cancel]");
+    if (!source) return { prepared: false };
+    window.__calendarNavigationFocusSource = source;
+    source.click();
+    return {
+      prepared: true,
+      builderOpen: !!iceBuilder,
+      activeId: document.activeElement && document.activeElement.id,
+      oldSourceConnected: source.isConnected,
+    };
+  });
+  if (!syntheticBack.prepared || syntheticBack.builderOpen
+      || syntheticBack.activeId !== "ctx-select"
+      || syntheticBack.oldSourceConnected) {
+    fail(`an unfocused Ice Builder Back activation stole focus: `
+      + JSON.stringify(syntheticBack));
+  }
+  await resetMonth();
+  await page.evaluate(() => { delete window.__calendarNavigationFocusSource; });
+  await assertHeldContextBackFocus(page, fail, cardIds, contextIds);
 }
 
 async function checkViewport(browser, viewport) {
@@ -191,6 +692,24 @@ async function checkViewport(browser, viewport) {
       const venue2 = await F.create("venue2", "/api/setup/venue", { name: "Annex", league_id: league.id });
       const access2 = await F.create("access2", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue2.id });
       const rink2 = await F.create("rink2", "/api/setup/rink", { venue_id: venue2.id, name: "Annex Ice" });
+      // A second, operator-selectable Program+Season makes the accepted-switch
+      // focus race below reachable through the real #ctx-select. Restore this
+      // journey's original tuple before the reload so every pre-existing ice
+      // assertion still starts from the fixture it was written against.
+      const alternateLeague = await F.create("focus alternate Program",
+        "/api/setup/league", { name: "Focus Alternate", timezone: "UTC" });
+      await F.selectProgram("focus alternate Program", alternateLeague.id);
+      const alternateSeason = await F.create("focus alternate Season",
+        "/api/setup/season", {
+          league_id: alternateLeague.id,
+          name: "Focus Alternate Season",
+          start_date: "2027-09-01",
+          end_date: "2028-04-30",
+        });
+      await F.selectProgramSeason("focus alternate Program+Season",
+        alternateLeague.id, alternateSeason.id);
+      await F.selectProgramSeason("restore ice-builder fixture",
+        league.id, season.id);
       // The legacy v1 "league" IS a v2 Program under the shim (server.py's
       // POST /api/setup/league routes straight to api.create_program(), and
       // /api/setup/season passes its own league_id through as create_season()'s
@@ -201,7 +720,9 @@ async function checkViewport(browser, viewport) {
       // actively selected -- this fixture must actively select one, not rely
       // on a silent global default that no longer exists).
       return { league: league.id, season: season.id, rink: rink.id,
-               rink2: rink2.id, access2: access2.id };
+               rink2: rink2.id, access2: access2.id,
+               alternateLeague: alternateLeague.id,
+               alternateSeason: alternateSeason.id };
     });
     // The /api/context call above is a bare fetch, bypassing setActiveContext()
     // (the real switcher's own handler) entirely -- it moves the SERVER's
@@ -223,6 +744,12 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".mo-grid .mo-cell", { timeout: 10000 });
     const cellCount = await page.$$eval(".mo-grid .mo-cell", (els) => els.length);
     if (cellCount !== 42) fail(`month grid should have 42 day cells, got ${cellCount}`);
+    await assertCalendarNavigationFocus(page, fail, {
+      primaryProgram: ids.league,
+      primarySeason: ids.season,
+      alternateProgram: ids.alternateLeague,
+      alternateSeason: ids.alternateSeason,
+    });
 
     // (B) Open the builder and select BOTH rinks, then revoke the second
     // venue's Season access BEFORE previewing (see the fixture comment): the
@@ -880,7 +1407,7 @@ async function checkViewport(browser, viewport) {
     }
 
     if (errors.length) fail(`console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${viewport.label}] OK — month grid renders; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview (both a bogus token and a same-slot-set window edit that slips the suspenders), reports an exact-tuple collision as a conflict WITH its target, exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set, and in a DST-observing Program timezone visibly reports a spring-forward gap skip, commits a gap-spanning window's 2 real-duration slots, visibly distinguishes a fall-back day's 4 real-hour slots including the two that share a repeated local clock time, and — even with nothing else that day to collide against — visibly qualifies and explicitly calls out a single row that itself crosses the DST change, in both directions, with the exact real UTC duration/tuple committed as previewed.`);
+    console.log(`[${viewport.label}] OK — month grid renders and all 42 day destinations preserve focus; Builder Back preserves focus through accepted context settlement and an overlapping same-tuple render without stealing a newer choice; builder previews ${EXPECTED_NEW} slots, reports un-granted venue, commits idempotently, honors exclusions, applies per-weekday windows (narrow Thursday => 19), binds commit to the preview (edit invalidates it), refuses+refreshes a stale preview (both a bogus token and a same-slot-set window edit that slips the suspenders), reports an exact-tuple collision as a conflict WITH its target, exposes every row of a >60-day template — the final day and a late Game collision's exact target — while committing the full previewed set, and in a DST-observing Program timezone visibly reports a spring-forward gap skip, commits a gap-spanning window's 2 real-duration slots, visibly distinguishes a fall-back day's 4 real-hour slots including the two that share a repeated local clock time, and — even with nothing else that day to collide against — visibly qualifies and explicitly calls out a single row that itself crosses the DST change, in both directions, with the exact real UTC duration/tuple committed as previewed.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
