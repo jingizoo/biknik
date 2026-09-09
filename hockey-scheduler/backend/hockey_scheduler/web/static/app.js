@@ -8360,8 +8360,36 @@ function wireCalendarCards(c) {
     } else loadIceBuilderCard({ userInitiated: true });
   };
 
-  const rerender = () => repaintCalendarSurface(
-    iceBuilder ? ICE_BUILDER_CARD : CALENDAR_CARD);
+  // Calendar's view/date/filter toolbar owns a stable semantic position even
+  // though repaintCalendarSurface() replaces the control node that held focus.
+  // Capture that position before repaint and re-resolve it inside THIS card.
+  // The source must actually own focus: a synthetic click on an unfocused
+  // control may repaint, but must not steal focus from the context selector or
+  // anything else the operator deliberately moved to.
+  const rerender = (focusSource) => {
+    const restoreToolbarFocus = !!focusSource
+      && document.activeElement === focusSource;
+    const returnSelector = restoreToolbarFocus
+      ? triggerSelector(focusSource) : null;
+    repaintCalendarSurface(iceBuilder ? ICE_BUILDER_CARD : CALENDAR_CARD);
+    if (!returnSelector) return;
+    const root = c.querySelector(
+      `[data-operational-card="${CALENDAR_CARD}"]`);
+    if (!root) return;
+    let target = null;
+    try {
+      const matches = root.querySelectorAll(returnSelector);
+      if (matches.length === 1 && isUsableTarget(matches[0])
+          && !matches[0].disabled) target = matches[0];
+    } catch (err) {
+      // triggerSelector() already escapes data attributes. Keep a card-local
+      // fallback in case a future attribute shape still cannot be resolved.
+    }
+    target = target || root.querySelector(".cal-date")
+      || root.querySelector(".sched-empty-lead")
+      || root.querySelector("h2,.section-title") || root;
+    focusOperationalCardTarget(calendarEntry.identity, target);
+  };
   const refreshCalendar = (opts) => loadCalendarCard(opts || {});
   const commitMove = async (gid, slotId) => {
     if (!calendarCurrent) return;
@@ -8435,14 +8463,14 @@ function wireCalendarCards(c) {
       else if (calendarMode === "month") calendarDate = addMonths(calendarDate, direction);
       else shiftDate(direction * (calendarMode === "week" ? 7 : 1));
       toast = ""; conflict = null; movingGameId = null; pendingMove = null;
-      rerender();
+      rerender(button);
     };
   });
   c.querySelectorAll("[data-mode]").forEach((button) => {
     button.onclick = () => {
       calendarMode = button.dataset.mode;
       toast = ""; conflict = null; movingGameId = null; pendingMove = null;
-      rerender();
+      rerender(button);
     };
   });
   c.querySelectorAll("[data-cal-day]").forEach((button) => {
@@ -8457,7 +8485,7 @@ function wireCalendarCards(c) {
       calFilters[key] = event.target.value;
       if (key === "venueId") calFilters.rinkId = "all";
       toast = ""; conflict = null; movingGameId = null; pendingMove = null;
-      rerender();
+      rerender(select);
     };
   });
   c.querySelectorAll("[data-game]").forEach((element) => {
