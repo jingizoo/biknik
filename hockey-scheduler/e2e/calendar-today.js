@@ -28,7 +28,10 @@
 //      to the whole schedule.
 //   6. The demo really is seeded past the retired window, and its ice is on
 //      the calendar where the operator can reach it (pinned pass only).
-//   7. Structurally, `app.js` names no calendar date at all — the guard that
+//   7. All ten view/date/filter toolbar controls restore keyboard focus to the
+//      same semantic control after their card-wide repaint replaces the old
+//      node.
+//   8. Structurally, `app.js` names no calendar date at all — the guard that
 //      keeps any of the three sites above from quietly re-acquiring one.
 //
 // AND IT RUNS TWICE — the part that is easy to get wrong (#389 review).
@@ -136,6 +139,244 @@ function pinBrowserClock(context, iso) {
     }
     globalThis.Date = PinnedDate;
   }, iso);
+}
+
+// Day/Week/Month, previous/Today/next, and the four filters each repaint the
+// entire Calendar card. Derive those three control groups from the rendered
+// toolbar, activate every button through the keyboard and every focused
+// native select through its value-change path, then require focus to follow
+// the semantic action to the replacement node. "Not BODY" is deliberately
+// insufficient:
+// landing on a different toolbar action would still make keyboard operation
+// unpredictable.
+async function assertCalendarToolbarFocus(page, fail) {
+  const cardSelector = '[data-operational-card="calendar/board"]';
+  const initial = await page.evaluate(() => ({
+    date: calendarDate,
+    mode: calendarMode,
+    filters: Object.assign({}, calFilters),
+  }));
+  const controls = await page.evaluate((card) => {
+    const root = document.querySelector(card);
+    if (!root) return [];
+    return Array.from(root.querySelectorAll(
+      ".cal-controls [data-mode],.cal-controls [data-cal],"
+        + ".cal-filters [data-filter]"))
+      .map((node) => {
+        const attr = node.hasAttribute("data-mode") ? "data-mode"
+          : node.hasAttribute("data-cal") ? "data-cal" : "data-filter";
+        return {
+          attr,
+          value: node.getAttribute(attr),
+          tag: node.tagName,
+          text: (node.textContent || "").replace(/\s+/g, " ").trim(),
+        };
+      });
+  }, cardSelector);
+  const modeCount = controls.filter((control) => control.attr === "data-mode").length;
+  const dateCount = controls.filter((control) => control.attr === "data-cal").length;
+  const filterCount = controls.filter(
+    (control) => control.attr === "data-filter").length;
+  const keys = controls.map((control) => `${control.attr}:${control.value}`);
+  if (controls.length !== 10 || modeCount !== 3 || dateCount !== 3
+      || filterCount !== 4
+      || new Set(keys).size !== controls.length) {
+    fail(`Calendar toolbar focus axis changed: `
+      + JSON.stringify({ controls, modeCount, dateCount, filterCount }));
+  }
+  const baseline = Object.assign({}, initial, {
+    filters: Object.fromEntries(controls
+      .filter((control) => control.attr === "data-filter")
+      .map((control) => [control.value, "all"])),
+  });
+
+  for (const control of controls) {
+    // Restore the same seeded board before each leg so Today/next/previous do
+    // not make a later assertion depend on the machine clock or prior action.
+    await page.evaluate((state) => {
+      calendarDate = state.date;
+      calendarMode = state.mode;
+      Object.keys(state.filters).forEach((key) => {
+        calFilters[key] = state.filters[key];
+      });
+      repaintCalendarSurface(CALENDAR_CARD);
+    }, baseline);
+    const selector = `${cardSelector} `
+      + `[${control.attr}="${control.value}"]`;
+    const target = page.locator(selector);
+    if (await target.count() !== 1) {
+      fail(`expected one toolbar target for ${JSON.stringify(control)}, got `
+        + `${await target.count()}`);
+    }
+    await target.focus();
+    const armed = await page.evaluate(([query, descriptor]) => {
+      const source = document.querySelector(query);
+      window.__calendarTodayFocusSource = source;
+      const nextOption = source && source.tagName === "SELECT"
+        ? Array.from(source.options).find((option, index) =>
+          index > source.selectedIndex && !option.disabled) : null;
+      return {
+        focused: !!source && document.activeElement === source
+          && source.getAttribute(descriptor.attr) === descriptor.value,
+        nextValue: nextOption && nextOption.value,
+      };
+    }, [selector, control]);
+    if (!armed.focused || (control.tag === "SELECT" && !armed.nextValue)) {
+      fail(`toolbar control was not keyboard-focusable: ${JSON.stringify(control)}`);
+    }
+
+    if (control.tag === "SELECT") await target.selectOption(armed.nextValue);
+    else await page.keyboard.press("Enter");
+    const settled = await page.evaluate((descriptor) => {
+      const source = window.__calendarTodayFocusSource;
+      const active = document.activeElement;
+      const card = active && active.closest
+        ? active.closest("[data-operational-card]") : null;
+      return {
+        tag: active && active.tagName,
+        value: active && active.getAttribute
+          ? active.getAttribute(descriptor.attr) : null,
+        connected: !!(active && active.isConnected),
+        visible: !!(active && (active.offsetParent !== null
+          || active.getClientRects().length > 0)),
+        sameNode: !!active && active === source,
+        sourceConnected: !!(source && source.isConnected),
+        card: card && card.getAttribute("data-operational-card"),
+        selectedValue: active && active.tagName === "SELECT" ? active.value : null,
+        filterValue: descriptor.attr === "data-filter"
+          ? calFilters[descriptor.value] : null,
+      };
+    }, control);
+    if (settled.tag !== control.tag || settled.value !== control.value
+        || !settled.connected || !settled.visible || settled.sameNode
+        || settled.sourceConnected || settled.card !== "calendar/board"
+        || (control.tag === "SELECT"
+          && (settled.selectedValue !== armed.nextValue
+            || settled.filterValue !== armed.nextValue))) {
+      fail(`${control.text || `${control.attr}=${control.value}`} did not restore `
+        + `focus to its replacement: ${JSON.stringify(settled)}`);
+    }
+  }
+
+  // A context switch intent withdraws persisted writes, but these local
+  // view controls remain usable until reconciliation. A newer, explicit
+  // toolbar action must therefore keep its keyboard position while the
+  // existing identity gate still prevents focus crossing into a new tuple.
+  const pendingControl = controls.find((control) => control.tag === "BUTTON");
+  const pendingSelector = `${cardSelector} `
+    + `[${pendingControl.attr}="${pendingControl.value}"]`;
+  let pendingArmed = false;
+  try {
+    await page.evaluate((state) => {
+      calendarDate = state.date;
+      calendarMode = state.mode;
+      Object.keys(state.filters).forEach((key) => {
+        calFilters[key] = state.filters[key];
+      });
+      repaintCalendarSurface(CALENDAR_CARD);
+      beginContextSwitchIntentSettlement();
+    }, baseline);
+    pendingArmed = true;
+    const pendingTarget = page.locator(pendingSelector);
+    await pendingTarget.focus();
+    await page.evaluate((query) => {
+      window.__calendarTodayFocusSource = document.querySelector(query);
+    }, pendingSelector);
+    await page.keyboard.press("Enter");
+    const pendingSettled = await page.evaluate((descriptor) => {
+      const source = window.__calendarTodayFocusSource;
+      const active = document.activeElement;
+      return {
+        intentPending: contextSwitchIntentPending,
+        tag: active && active.tagName,
+        value: active && active.getAttribute
+          ? active.getAttribute(descriptor.attr) : null,
+        connected: !!(active && active.isConnected),
+        sameNode: !!active && active === source,
+        sourceConnected: !!(source && source.isConnected),
+      };
+    }, pendingControl);
+    if (!pendingSettled.intentPending || pendingSettled.tag !== "BUTTON"
+        || pendingSettled.value !== pendingControl.value
+        || !pendingSettled.connected || pendingSettled.sameNode
+        || pendingSettled.sourceConnected) {
+      fail(`pending context intent stranded a newer toolbar action: `
+        + JSON.stringify(pendingSettled));
+    }
+  } finally {
+    if (pendingArmed) {
+      await page.evaluate(() => releaseContextSwitchIntentSettlement());
+    }
+  }
+
+  // Negative controls: a synthetic activation from an unfocused toolbar node
+  // must not steal focus from a persistent control the operator moved to, or
+  // manufacture a keyboard position when focus was already parked on BODY.
+  const preserved = await page.evaluate(([state, descriptor]) => {
+    const reset = () => {
+      calendarDate = state.date;
+      calendarMode = state.mode;
+      Object.keys(state.filters).forEach((key) => {
+        calFilters[key] = state.filters[key];
+      });
+      repaintCalendarSurface(CALENDAR_CARD);
+    };
+    const sourceFor = () => {
+      const root = document.querySelector(
+        '[data-operational-card="calendar/board"]');
+      return root && Array.from(root.querySelectorAll(
+        `[${descriptor.attr}]`)).find(
+        (node) => node.getAttribute(descriptor.attr) === descriptor.value);
+    };
+    reset();
+    const context = document.getElementById("ctx-select");
+    const source = sourceFor();
+    if (!context || !source) return { prepared: false };
+    context.focus();
+    source.click();
+    const contextCase = {
+      activeId: document.activeElement && document.activeElement.id,
+      sourceConnected: source.isConnected,
+    };
+    reset();
+    const bodySource = sourceFor();
+    if (!bodySource) return { prepared: false };
+    if (document.activeElement && document.activeElement.blur) {
+      document.activeElement.blur();
+    }
+    const beforeBodyTag = document.activeElement && document.activeElement.tagName;
+    bodySource.click();
+    return {
+      prepared: true,
+      contextCase,
+      bodyCase: {
+        beforeTag: beforeBodyTag,
+        activeTag: document.activeElement && document.activeElement.tagName,
+        activeValue: document.activeElement && document.activeElement.getAttribute
+          ? document.activeElement.getAttribute(descriptor.attr) : null,
+        sourceConnected: bodySource.isConnected,
+      },
+    };
+  }, [baseline, controls[0]]);
+  if (!preserved.prepared || preserved.contextCase.activeId !== "ctx-select"
+      || preserved.contextCase.sourceConnected
+      || preserved.bodyCase.beforeTag !== "BODY"
+      || preserved.bodyCase.activeTag !== "BODY"
+      || preserved.bodyCase.activeValue === controls[0].value
+      || preserved.bodyCase.sourceConnected) {
+    fail(`unfocused toolbar activation changed the existing focus position: `
+      + JSON.stringify(preserved));
+  }
+
+  await page.evaluate((state) => {
+    calendarDate = state.date;
+    calendarMode = state.mode;
+    Object.keys(state.filters).forEach((key) => {
+      calFilters[key] = state.filters[key];
+    });
+    repaintCalendarSurface(CALENDAR_CARD);
+    delete window.__calendarTodayFocusSource;
+  }, initial);
 }
 
 // `pinned` is null for the real-clock pass, or an ISO-8601 instant to travel
@@ -390,10 +631,15 @@ async function checkViewport(browser, viewport, pinned) {
       }
     }
 
+    // (7) Every view/date/filter toolbar action replaces its initiating control. A
+    // keyboard operator must stay on the same semantic action, not fall to
+    // <body> and restart the tab sequence at the top of the application.
+    await assertCalendarToolbarFocus(page, fail);
+
     if (errors.length) fail(`browser errors: ${errors.join(" | ")}`);
     console.log(`  ${label}: calendar opens on ${today}, `
       + `"Today" returns there, slot drawer follows the viewed day, `
-      + `${GAMES_THIS_WEEK} games this week`);
+      + `${GAMES_THIS_WEEK} games this week, toolbar focus preserved`);
   } catch (e) {
     if (serverOutput.trim()) console.error(serverOutput.trim());
     throw e;
@@ -403,7 +649,7 @@ async function checkViewport(browser, viewport, pinned) {
   }
 }
 
-// (7) Structural: no calendar date may be named in app.js at all.
+// (8) Structural: no calendar date may be named in app.js at all.
 //
 // Runs LAST, deliberately. It used to run first and short-circuit the whole
 // gate, which meant a re-introduced literal was only ever demonstrated to fail
