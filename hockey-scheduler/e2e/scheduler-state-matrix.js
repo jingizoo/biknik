@@ -8,7 +8,9 @@
 //   facilities/ice-builder   Preview recurring ice
 //   calendar/board           Read the Arena Calendar board
 //
-// Every card must reach LOADING, READY, EMPTY, STALE and ERROR.  Transport
+// Every card must reach LOADING, READY, EMPTY, STALE and ERROR; the Scheduler
+// cards additionally derive and cover CONFIRM and PENDING from production.
+// Transport
 // holds capture the REAL response with route.fetch() before delaying browser
 // delivery; this is important because delaying the request would not prove
 // that an already-computed response is refused after identity changes.
@@ -56,6 +58,9 @@ const CARD_IDS = Object.freeze([
   "calendar/board",
 ]);
 const CARD_STATES = Object.freeze(["loading", "ready", "empty", "stale", "error"]);
+const SCHEDULER_ACTION_IDS = Object.freeze([
+  "commit", "discard", "generate", "publish",
+]);
 const DRAFT_CARD = "scheduler/draft";
 const REVIEW_CARD = "scheduler/review";
 const BUILDER_CARD = "facilities/ice-builder";
@@ -125,6 +130,7 @@ const DRAFT_RE = /\/api\/scheduler\/draft$/;
 const DRAFT_COMMIT_RE = /\/api\/scheduler\/commit$/;
 const DRAFTS_RE = /\/api\/scheduler\/drafts(?:\?|$)/;
 const PUBLISH_RE = /\/api\/scheduler\/drafts\/publish$/;
+const DISCARD_RE = /\/api\/scheduler\/drafts\/discard$/;
 const ICE_PREVIEW_RE = /\/api\/setup\/ice-availability\/preview$/;
 const ICE_COMMIT_RE = /\/api\/setup\/ice-availability\/commit$/;
 const ADD_ICE_RE = /\/api\/demo\/add-ice-slot$/;
@@ -2021,6 +2027,28 @@ function armHold(channel) {
   };
 }
 
+// Keep a stable, pre-write domain refusal unresolved so the operation's real
+// PENDING lease is observable without changing the fixture. Unlike an unknown
+// 500, this 400 validation_error is authoritative: delivery must settle ERROR
+// rather than reconcile a possibly committed write.
+function armHeldRefusal(channel) {
+  if (channel.mode !== "pass" || channel.heldNow) {
+    fail(`${channel.name}: cannot arm a held refusal while the channel is busy`);
+  }
+  channel.capture = new Promise((resolve) => { channel.resolveCapture = resolve; });
+  channel.gate = new Promise((resolve) => { channel.resolveGate = resolve; });
+  channel.mode = "hold-refuse";
+  let released = false;
+  return {
+    captured: channel.capture,
+    release() {
+      if (released) fail(`${channel.name}: held refusal released twice`);
+      released = true;
+      channel.resolveGate();
+    },
+  };
+}
+
 // Hold a real refused context response after the server has computed it.  The
 // browser still sends the offered B selection, but the transport substitutes
 // a definitely-missing Program only for route.fetch(); the server therefore
@@ -2060,6 +2088,13 @@ function failOnce(channel) {
     fail(`${channel.name}: cannot inject a failure while the channel is busy`);
   }
   channel.mode = "fail";
+}
+
+function refuseOnce(channel) {
+  if (channel.mode !== "pass" || channel.heldNow) {
+    fail(`${channel.name}: cannot inject a refusal while the channel is busy`);
+  }
+  channel.mode = "refuse";
 }
 
 async function installChannel(page, channel) {
@@ -2106,22 +2141,43 @@ async function installChannel(page, channel) {
       return;
     }
     channel.mode = "pass"; // every forced outcome is one-shot
-    if (mode === "fail") {
+    if (["fail", "refuse", "hold-refuse"].includes(mode)) {
+      const refusal = mode === "refuse" || mode === "hold-refuse";
+      const status = refusal ? 400 : 500;
       const rec = {
         method: route.request().method(),
         url: route.request().url(),
-        status: 500,
+        status,
         seen: false,
       };
       channel.injected.push(rec);
-      return route.fulfill({
-        status: 500,
+      const response = {
+        status,
         contentType: "application/json",
         body: JSON.stringify({ error: {
-          code: "matrix_forced_failure",
-          message: `Forced ${channel.name} failure for the state-matrix journey.`,
+          code: refusal ? "validation_error" : "matrix_forced_failure",
+          message: `Forced ${channel.name} ${refusal ? "refusal" : "failure"} for the state-matrix journey.`,
         } }),
+      };
+      if (mode === "fail" || mode === "refuse") return route.fulfill(response);
+      channel.heldNow += 1;
+      channel.resolveCapture({
+        method: rec.method,
+        url: rec.url,
+        status: rec.status,
+        releasedBefore: channel.released,
+        requestedBody: (() => {
+          try { return route.request().postDataJSON(); } catch (_) { return null; }
+        })(),
       });
+      await channel.gate;
+      try {
+        await route.fulfill(response);
+        channel.released += 1;
+      } finally {
+        channel.heldNow -= 1;
+      }
+      return;
     }
     if (mode !== "hold" && mode !== "hold-rejected-context") {
       fail(`${channel.name}: unknown transport mode ${mode}`);
@@ -2227,6 +2283,22 @@ async function cardSnapshot(page, cardId) {
     let model = null;
     try { model = typeof readCardState === "function" ? plain(readCardState(id)) : null; }
     catch (_) { model = null; }
+    const writeLedger = typeof cardWrites === "undefined"
+      ? null : (cardWrites[id] || null);
+    const writeEntries = writeLedger ? Object.values(writeLedger) : [];
+    const currentWrite = typeof currentCardWrite === "function"
+      ? currentCardWrite(id) : null;
+    const writeShape = (entry) => !entry ? null : {
+      card: entry.card,
+      state: entry.model && entry.model.state,
+      action: entry.model && entry.model.pendingAction,
+      current: typeof cardIdentityCurrent === "function"
+        ? cardIdentityCurrent(entry.identity) : null,
+      principal: entry.identity && entry.identity.principal,
+      epoch: entry.identity && entry.identity.epoch,
+      generation: entry.identity && entry.identity.generation,
+      tuple: entry.tuple ? plain(entry.tuple) : null,
+    };
     return {
       exists: !!root,
       state: root ? root.getAttribute("data-card-state") : null,
@@ -2244,6 +2316,29 @@ async function cardSnapshot(page, cardId) {
         ? root.querySelectorAll(`[data-card-retry="${id}"]`).length : 0,
       alertCount: root ? root.querySelectorAll('[role="alert"]').length
         + (root.getAttribute("role") === "alert" ? 1 : 0) : 0,
+      schedulerConfirm: root ? {
+        yes: Array.from(root.querySelectorAll("[data-sched-confirm-yes]"))
+          .map((node) => node.getAttribute("data-sched-confirm-yes")),
+        no: Array.from(root.querySelectorAll("[data-sched-confirm-no]"))
+          .map((node) => node.getAttribute("data-sched-confirm-no")),
+      } : { yes: [], no: [] },
+      schedulerPending: root
+        ? Array.from(root.querySelectorAll("[data-sched-pending]"))
+          .map((node) => ({
+            action: node.getAttribute("data-sched-pending"),
+            tabindex: node.getAttribute("tabindex"),
+            focused: node === document.activeElement,
+          }))
+        : [],
+      schedulerFilters: root
+        ? ["sched-filter-div", "sched-filter-rink", "sched-filter-issue"]
+          .filter((filterId) => root.querySelector(`#${filterId}`))
+        : [],
+      writeLedger: {
+        entries: writeEntries.length,
+        current: writeShape(currentWrite),
+        all: writeEntries.map(writeShape),
+      },
       model,
       generation: typeof cardGenerations === "undefined"
         ? null : (cardGenerations[id] || 0),
@@ -2277,10 +2372,433 @@ async function waitForCardState(page, cardId, state, step) {
   return cardSnapshot(page, cardId);
 }
 
+function schedulerActionCoverageFailures(axis, observations) {
+  const failures = [];
+  const actions = axis && Array.isArray(axis.actions) ? axis.actions : [];
+  const states = Array.from(new Set(axis && axis.states || [])).sort();
+  const names = actions.map((entry) => entry.action).sort();
+  const expectedNames = SCHEDULER_ACTION_IDS.slice().sort();
+  if (JSON.stringify(names) !== JSON.stringify(expectedNames)) {
+    failures.push(`action axis expected ${JSON.stringify(expectedNames)}, got ${JSON.stringify(names)}`);
+  }
+  if (JSON.stringify(states) !== JSON.stringify(["confirm", "pending"])) {
+    failures.push(`state axis expected ["confirm","pending"], got ${JSON.stringify(states)}`);
+  }
+
+  const duplicateNames = names.filter((name, index) => names.indexOf(name) !== index);
+  if (duplicateNames.length) failures.push(`duplicate action(s): ${duplicateNames.join(", ")}`);
+  const expectedCards = CARD_IDS.filter((id) => id.startsWith("scheduler/")).sort();
+  const declaredCards = Array.from(new Set(actions.map((entry) => entry.card))).sort();
+  if (JSON.stringify(declaredCards) !== JSON.stringify(expectedCards)) {
+    failures.push(`card axis expected ${JSON.stringify(expectedCards)}, got ${JSON.stringify(declaredCards)}`);
+  }
+  actions.forEach((entry) => {
+    if (!entry || typeof entry.action !== "string"
+        || typeof entry.path !== "string" || !entry.path.startsWith("/api/")
+        || !expectedCards.includes(entry.card) || entry.responseValid !== true) {
+      failures.push(`invalid declaration: ${JSON.stringify(entry)}`);
+    }
+  });
+
+  const tuple = (entry) => `${entry.action}@${entry.card}`;
+  const pendingExpected = actions.map(tuple).sort();
+  const confirmExpected = actions.filter((entry) => entry.confirm).map(tuple).sort();
+  const pendingObserved = Array.from(new Set(
+    (observations && observations.pending || []).map(tuple))).sort();
+  const confirmObserved = Array.from(new Set(
+    (observations && observations.confirm || []).map(tuple))).sort();
+  if (JSON.stringify(pendingObserved) !== JSON.stringify(pendingExpected)) {
+    failures.push(`PENDING expected ${JSON.stringify(pendingExpected)}, got ${JSON.stringify(pendingObserved)}`);
+  }
+  if (JSON.stringify(confirmObserved) !== JSON.stringify(confirmExpected)) {
+    failures.push(`CONFIRM expected ${JSON.stringify(confirmExpected)}, got ${JSON.stringify(confirmObserved)}`);
+  }
+  return failures;
+}
+
+// Prove the oracle itself is sensitive to both ways this axis has historically
+// drifted: an operation disappearing from the declaration and an operation
+// being observed on the wrong owner card.  The baseline is synthesized from
+// the live production axis, not from another four-entry route table.
+function selfTestSchedulerActionCoverage(axis, label) {
+  const observations = {
+    pending: axis.actions.map(({ action, card }) => ({ action, card })),
+    confirm: axis.actions.filter((entry) => entry.confirm)
+      .map(({ action, card }) => ({ action, card })),
+  };
+  const baseline = schedulerActionCoverageFailures(axis, observations);
+  if (baseline.length) {
+    fail(`[${label}] Scheduler action oracle rejected its production-derived baseline: `
+      + baseline.join("; "));
+  }
+  const shrunk = Object.assign({}, axis, { actions: axis.actions.slice(0, -1) });
+  if (!schedulerActionCoverageFailures(shrunk, observations).length) {
+    fail(`[${label}] Scheduler action oracle survived a shrunk declaration`);
+  }
+  const unvalidated = Object.assign({}, axis, {
+    actions: axis.actions.map((entry, index) => index
+      ? entry : Object.assign({}, entry, { responseValid: false })),
+  });
+  if (!schedulerActionCoverageFailures(unvalidated, observations).length) {
+    fail(`[${label}] Scheduler action oracle survived a missing response validator`);
+  }
+  const first = observations.pending[0];
+  const wrongCard = CARD_IDS.filter((id) => id.startsWith("scheduler/"))
+    .find((id) => id !== first.card);
+  const misrouted = Object.assign({}, observations, {
+    pending: observations.pending.map((entry, index) => index
+      ? entry : { action: entry.action, card: wrongCard }),
+  });
+  if (!schedulerActionCoverageFailures(axis, misrouted).length) {
+    fail(`[${label}] Scheduler action oracle survived a misrouted PENDING lease`);
+  }
+}
+
+function schedulerResponseContractFailures(axis, observed) {
+  const failures = [];
+  const declared = (axis && axis.actions || []).map((entry) => entry.action).sort();
+  const exercised = Array.from(new Set(
+    (observed && observed.cases || []).map((entry) => entry.action))).sort();
+  if (JSON.stringify(exercised) !== JSON.stringify(declared)) {
+    failures.push(`response-validator action coverage expected ${JSON.stringify(declared)}, `
+      + `got ${JSON.stringify(exercised)}`);
+  }
+  const duplicateCases = (observed && observed.cases || []).filter((entry, index, all) =>
+    all.findIndex((candidate) => candidate.action === entry.action
+      && candidate.name === entry.name) !== index);
+  if (duplicateCases.length) {
+    failures.push(`duplicate response case(s): ${duplicateCases.map(
+      (entry) => `${entry.action}/${entry.name}`).join(", ")}`);
+  }
+  for (const action of declared) {
+    const cases = (observed && observed.cases || []).filter(
+      (entry) => entry.action === action);
+    if (!cases.some((entry) => entry.expected === true)
+        || !cases.some((entry) => entry.expected === false)) {
+      failures.push(`${action} must have accepting and refusing controls`);
+    }
+  }
+  (observed && observed.cases || []).forEach((entry) => {
+    if (entry.actual !== entry.expected) {
+      failures.push(`${entry.action}/${entry.name} expected ${entry.expected}, got ${entry.actual}`);
+    }
+  });
+  (observed && observed.outcomes || []).forEach((entry) => {
+    if (entry.actual !== entry.expected) {
+      failures.push(`outcome/${entry.name} expected ${entry.expected}, got ${entry.actual}`);
+    }
+  });
+  (observed && observed.reviewReads || []).forEach((entry) => {
+    if (entry.actual !== entry.expected) {
+      failures.push(`review-read/${entry.name} expected ${entry.expected}, got ${entry.actual}`);
+    }
+  });
+  if (!(observed && observed.outcomes || []).some((entry) => entry.expected === true)
+      || !(observed && observed.outcomes || []).some((entry) => entry.expected === false)) {
+    failures.push("outcome taxonomy must have uncertain and authoritative controls");
+  }
+  if (!(observed && observed.reviewReads || []).some((entry) => entry.expected === true)
+      || !(observed && observed.reviewReads || []).some((entry) => entry.expected === false)) {
+    failures.push("Review read validator must have accepting and refusing controls");
+  }
+  return failures;
+}
+
+// The oracle has both positive and negative controls for every action. Prove
+// those controls are load-bearing: shrinking one complete action, accepting a
+// refusal, refusing an acceptance, or reversing the outcome taxonomy must all
+// make the oracle itself go red.
+function selfTestSchedulerResponseContracts(axis, observed, label) {
+  const baseline = schedulerResponseContractFailures(axis, observed);
+  if (baseline.length) {
+    fail(`[${label}] Scheduler response oracle rejected production: ${baseline.join("; ")}`);
+  }
+  const firstAction = axis.actions[0].action;
+  const shrunk = Object.assign({}, observed, {
+    cases: observed.cases.filter((entry) => entry.action !== firstAction),
+  });
+  if (!schedulerResponseContractFailures(axis, shrunk).length) {
+    fail(`[${label}] Scheduler response oracle survived removal of ${firstAction}`);
+  }
+  const accepted = observed.cases.find((entry) => entry.expected === true);
+  const refused = observed.cases.find((entry) => entry.expected === false);
+  for (const entry of [accepted, refused]) {
+    const inverted = Object.assign({}, observed, {
+      cases: observed.cases.map((candidate) => candidate === entry
+        ? Object.assign({}, candidate, { actual: !candidate.actual }) : candidate),
+    });
+    if (!schedulerResponseContractFailures(axis, inverted).length) {
+      fail(`[${label}] Scheduler response oracle survived inverted ${entry.action}/${entry.name}`);
+    }
+  }
+  const taxonomy = Object.assign({}, observed, {
+    outcomes: observed.outcomes.map((entry, index) => index
+      ? entry : Object.assign({}, entry, { actual: !entry.actual })),
+  });
+  if (!schedulerResponseContractFailures(axis, taxonomy).length) {
+    fail(`[${label}] Scheduler response oracle survived an inverted outcome class`);
+  }
+  const reviewRead = observed.reviewReads.find((entry) => entry.expected === false);
+  const invertedReviewRead = Object.assign({}, observed, {
+    reviewReads: observed.reviewReads.map((entry) => entry === reviewRead
+      ? Object.assign({}, entry, { actual: !entry.actual }) : entry),
+  });
+  if (!schedulerResponseContractFailures(axis, invertedReviewRead).length) {
+    fail(`[${label}] Scheduler response oracle survived an inverted Review read case`);
+  }
+}
+
+async function assertSchedulerResponseContracts(page, axis, label) {
+  const observed = await page.evaluate(() => {
+    const cases = [];
+    const outcomes = [];
+    const reviewReads = [];
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const record = (action, name, response, context, expected) => {
+      cases.push({ action, name, expected,
+        actual: schedulerWriteResponseValid(action, response, context) });
+    };
+    const recordOutcome = (name, response, expected) => {
+      outcomes.push({ name, expected,
+        actual: schedulerWriteOutcomeUnverified(response) });
+    };
+    const recordReviewRead = (name, response, expected) => {
+      reviewReads.push({ name, expected,
+        actual: schedulerDraftReviewPayloadValid(response) });
+    };
+    const identity = Object.freeze({
+      program_id: "league-a", league_id: "league-a", season_id: "season-a",
+    });
+    const request = Object.freeze({
+      division_id: "division-a", season_id: "season-a",
+      meetings_per_opponent: 1,
+      constraints: Object.freeze({ min_turnaround_minutes: 30 }),
+    });
+    const proposal = (suffix, overrides) => Object.assign({
+      division_id: "division-a",
+      home_team_id: `team-${suffix}-home`,
+      away_team_id: `team-${suffix}-away`,
+      home_team_name: `Home ${suffix}`,
+      away_team_name: `Away ${suffix}`,
+      ice_slot_id: `slot-${suffix}`,
+      rink_id: `rink-${suffix}`,
+      rink_name: `Rink ${suffix}`,
+      start_time: `2027-01-0${suffix === "a" ? "2" : "3"}T18:00:00Z`,
+      end_time: `2027-01-0${suffix === "a" ? "2" : "3"}T19:00:00Z`,
+    }, overrides || {});
+    const unscheduled = (suffix, overrides) => Object.assign({
+      division_id: "division-a",
+      home_team_id: `blocked-${suffix}-home`,
+      away_team_id: `blocked-${suffix}-away`,
+      home_team_name: `Blocked Home ${suffix}`,
+      away_team_name: `Blocked Away ${suffix}`,
+      reason_codes: ["no_ice"],
+      reason: `No ice ${suffix}`,
+      team_conflicts: [],
+      turnaround_conflicts: [],
+      explanation: { version: 1, alternatives: [`old-${suffix}`] },
+    }, overrides || {});
+    const generated = {
+      division_id: "division-a",
+      season_id: "season-a",
+      league_id: "league-a",
+      team_count: 2,
+      games_per_team: null,
+      meetings_per_opponent: 1,
+      min_turnaround_minutes: 30,
+      draft_games: [proposal("a")],
+      unscheduled: [],
+      already_scheduled: [],
+      unschedulable_teams: [],
+      // Deliberately opaque: the client binds presence, not a private server
+      // digest format that could change independently of this UI.
+      draft_fingerprint: "opaque fingerprint / vNext ?!",
+    };
+
+    Object.keys(SCHEDULER_WRITE_ACTIONS).forEach((action) => {
+      if (action === "generate") {
+        const context = { request, identity };
+        record(action, "valid-opaque-fingerprint", generated, context, true);
+        record(action, "null", null, context, false);
+        record(action, "undefined", undefined, context, false);
+        record(action, "string", "not an object", context, false);
+        record(action, "array", [], context, false);
+        const teamCount = clone(generated);
+        teamCount.team_count = 3;
+        record(action, "contradictory-team-count", teamCount, context, false);
+        const duplicateSlot = clone(generated);
+        duplicateSlot.draft_games.push(proposal("b", { ice_slot_id: "slot-a" }));
+        duplicateSlot.team_count = 4;
+        record(action, "duplicate-slot", duplicateSlot, context, false);
+        const selfPair = clone(generated);
+        selfPair.draft_games[0].away_team_id = selfPair.draft_games[0].home_team_id;
+        record(action, "self-pair", selfPair, context, false);
+        const reversed = clone(generated);
+        reversed.draft_games[0].end_time = "2027-01-02T17:59:59Z";
+        record(action, "reversed-dates", reversed, context, false);
+        const impossible = clone(generated);
+        impossible.draft_games[0].start_time = "2027-02-30T18:00:00Z";
+        record(action, "impossible-date", impossible, context, false);
+        const wrongDivision = clone(generated);
+        wrongDivision.division_id = "division-b";
+        record(action, "division-mismatch", wrongDivision, context, false);
+        const missingRendered = clone(generated);
+        delete missingRendered.draft_games[0].home_team_name;
+        record(action, "missing-rendered-field", missingRendered, context, false);
+        const leagueRequest = {
+          division_id: null, season_id: "season-a", league_id: "league-a",
+          meetings_per_opponent: 1,
+          constraints: { min_turnaround_minutes: 30 },
+        };
+        const singletonDivisions = Object.assign({}, clone(generated), {
+          division_id: null, team_count: 2,
+          draft_games: [], unscheduled: [], already_scheduled: [],
+          unschedulable_teams: [],
+        });
+        record(action, "league-wide-two-singleton-divisions", singletonDivisions,
+          { request: leagueRequest, identity }, true);
+        return;
+      }
+      if (action === "commit") {
+        const preview = Object.assign({}, clone(generated), {
+          draft_games: [proposal("a"), proposal("b")],
+          unscheduled: [unscheduled("a"), unscheduled("b")],
+          team_count: 8,
+        });
+        const created = preview.draft_games.map((row, index) => ({
+          game_id: `created-${index}`,
+          is_draft: true,
+          published: false,
+          division_id: row.division_id,
+          home_team_name: row.home_team_name,
+          away_team_name: row.away_team_name,
+          rink_name: row.rink_name,
+          start_time: row.start_time,
+        }));
+        const committed = {
+          division_id: preview.division_id,
+          season_id: preview.season_id,
+          league_id: preview.league_id,
+          created,
+          // A top-level reorder is not a change to the reviewed multiset.
+          unscheduled: [clone(preview.unscheduled[1]), clone(preview.unscheduled[0])],
+        };
+        const context = { preview, identity };
+        record(action, "valid-unscheduled-reorder", committed, context, true);
+        const explanationOnly = clone(committed);
+        explanationOnly.unscheduled.forEach((row) => {
+          row.explanation = { version: 99, alternatives: ["new explanatory copy"] };
+        });
+        record(action, "valid-explanation-only-change", explanationOnly, context, true);
+        for (const field of ["division_id", "season_id", "league_id"]) {
+          const wrongScope = clone(committed);
+          wrongScope[field] = `foreign-${field}`;
+          record(action, `wrong-${field.replace("_id", "")}`, wrongScope, context, false);
+        }
+        const shortened = clone(committed);
+        shortened.created.pop();
+        record(action, "shortened-created", shortened, context, false);
+        const foreignUnscheduled = clone(committed);
+        foreignUnscheduled.unscheduled[0].away_team_id = "foreign-away-team";
+        record(action, "same-length-foreign-unscheduled", foreignUnscheduled,
+          context, false);
+        return;
+      }
+      if (action === "publish" || action === "discard") {
+        const field = action === "publish" ? "published" : "discarded";
+        const context = { maxCount: 2 };
+        record(action, "zero", { [field]: 0 }, context, true);
+        record(action, "requested-count", { [field]: 2 }, context, true);
+        record(action, "over-count", { [field]: 3 }, context, false);
+        record(action, "fraction", { [field]: 1.5 }, context, false);
+        record(action, "string", { [field]: "2" }, context, false);
+        return;
+      }
+      // This branch is deliberately fatal. A fifth production action cannot
+      // arrive without its response contract joining this runtime oracle.
+      cases.push({ action, name: "missing-oracle", expected: true, actual: false });
+    });
+
+    recordOutcome("network-error",
+      { error: { code: "network_error", message: "offline" } }, true);
+    recordOutcome("server-unavailable",
+      { error: { code: "server_unavailable", message: "unavailable" } }, true);
+    recordOutcome("malformed-success", {}, true);
+    recordOutcome("malformed-error-object", { error: {} }, true);
+    recordOutcome("malformed-error-string", { error: "bad" }, true);
+    recordOutcome("blank-error-code", {
+      error: { code: "", message: "Refused" },
+    }, true);
+    recordOutcome("blank-error-message", {
+      error: { code: "validation_error", message: "" },
+    }, true);
+    recordOutcome("internal-error", {
+      error: { code: "internal_error", message: "Unexpected failure" },
+    }, true);
+    recordOutcome("future-error-code", {
+      error: { code: "future_scheduler_error", message: "New failure" },
+    }, true);
+    recordOutcome("domain-structured-refusal", {
+      error: { code: "validation_error", message: "Regenerate", details: {
+        reason: "preview_stale",
+      } },
+    }, false);
+
+    const reviewRow = {
+      game_id: "draft-a", issues: [],
+      home_team_name: "Home A", away_team_name: "Away A",
+      is_draft: true, published: false,
+      start_time: "2027-01-02T18:00:00Z",
+      end_time: "2027-01-02T19:00:00Z",
+      division_id: "division-a", division_name: "Division A",
+      rink_id: "rink-a", rink_name: "Rink A", reserved: null,
+    };
+    const reviewPayload = (row) => ({
+      draft_games: [row],
+      summary: {
+        draft_count: 1, published_count: 0, issue_count: 0,
+        by_division: { "Division A": 1 }, by_rink: { "Rink A": 1 },
+      },
+    });
+    recordReviewRead("valid-timed-row", reviewPayload(clone(reviewRow)), true);
+    const bothNull = clone(reviewRow);
+    bothNull.start_time = null;
+    bothNull.end_time = null;
+    recordReviewRead("valid-unscheduled-row", reviewPayload(bothNull), true);
+    const startOnlyNull = clone(reviewRow);
+    startOnlyNull.start_time = null;
+    recordReviewRead("start-only-null", reviewPayload(startOnlyNull), false);
+    const endOnlyNull = clone(reviewRow);
+    endOnlyNull.end_time = null;
+    recordReviewRead("end-only-null", reviewPayload(endOnlyNull), false);
+    return { cases, outcomes, reviewReads };
+  });
+  selfTestSchedulerResponseContracts(axis, observed, `${label}/oracle`);
+  return {
+    cases: observed.cases.length,
+    outcomes: observed.outcomes.length,
+    reviewReads: observed.reviewReads.length,
+  };
+}
+
 function coverageLedger() {
   const ledger = new Map(CARD_IDS.map((id) => [id, new Set()]));
+  const actionObservations = { confirm: [], pending: [] };
+  let schedulerWriteAxis = null;
   return {
-    mark(id, state) { ledger.get(id).add(state); },
+    mark(id, state, action) {
+      ledger.get(id).add(state);
+      if (state === "confirm" || state === "pending") {
+        actionObservations[state].push({ action, card: id });
+      }
+    },
+    configureSchedulerWriteAxis(axis, label) {
+      if (!axis || !Array.isArray(axis.actions)) {
+        fail(`[${label}] Scheduler write-state axis was not derived from production`);
+      }
+      selfTestSchedulerActionCoverage(axis, `${label}/oracle`);
+      schedulerWriteAxis = axis;
+    },
     assertComplete(label) {
       const missing = [];
       for (const id of CARD_IDS) {
@@ -2288,14 +2806,27 @@ function coverageLedger() {
           if (!ledger.get(id).has(state)) missing.push(`${id}:${state}`);
         }
       }
+      if (!schedulerWriteAxis) {
+        fail(`[${label}] Scheduler write-state axis was never derived from production`);
+      }
+      const schedulerCards = Array.from(new Set(
+        schedulerWriteAxis.actions.map((entry) => entry.card)));
+      for (const id of schedulerCards) {
+        for (const state of schedulerWriteAxis.states) {
+          if (!ledger.get(id).has(state)) missing.push(`${id}:${state}`);
+        }
+      }
+      const actionFailures = schedulerActionCoverageFailures(
+        schedulerWriteAxis, actionObservations);
       const checked = Array.from(ledger.values())
         .reduce((sum, states) => sum + states.size, 0);
-      const expected = CARD_IDS.length * CARD_STATES.length;
-      if (checked !== expected || missing.length) {
-        fail(`[${label}] state axis shrank: checked ${checked}/${expected}; missing `
-          + `${missing.join(", ")}`);
+      const expected = CARD_IDS.length * CARD_STATES.length
+        + schedulerCards.length * schedulerWriteAxis.states.length;
+      if (checked !== expected || missing.length || actionFailures.length) {
+        fail(`[${label}] state/action axis shrank: checked ${checked}/${expected}; missing `
+          + `${missing.join(", ")}; actions ${actionFailures.join("; ")}`);
       }
-      return checked;
+      return { stateCells: checked, schedulerActions: schedulerWriteAxis.actions.length };
     },
   };
 }
@@ -2305,6 +2836,24 @@ async function assertProductionAxes(page, label, sourceInventory) {
     cards: typeof SCHEDULE_FACILITY_CARD_IDS === "undefined"
       ? null : Array.from(SCHEDULE_FACILITY_CARD_IDS),
     states: typeof CARD_STATE === "undefined" ? null : Object.values(CARD_STATE),
+    schedulerWriteAxis: (() => {
+      if (typeof SCHEDULER_WRITE_ACTIONS === "undefined"
+          || typeof CARD_STATE === "undefined") return null;
+      return {
+        // Production owns action, route, owner card and confirmation. The
+        // journey independently observes each declared action's PENDING lease;
+        // only entries carrying `confirm` join the CONFIRM expectation.
+        actions: Object.entries(SCHEDULER_WRITE_ACTIONS)
+          .map(([action, declared]) => ({
+            action,
+            card: declared.card,
+            path: declared.path,
+            confirm: !!declared.confirm,
+            responseValid: typeof declared.responseValid === "function",
+          })),
+        states: [CARD_STATE.CONFIRM, CARD_STATE.PENDING],
+      };
+    })(),
     // The AST inventory owns call-site and owner completeness. Keep this
     // runtime check focused on the helper's two-sided ordering and on the
     // accepted-switch cleanup that makes its withdrawal meaningful.
@@ -2341,11 +2890,18 @@ async function assertProductionAxes(page, label, sourceInventory) {
       if (typeof generateSchedulerDraft !== "function") return false;
       const source = String(generateSchedulerDraft);
       const request = source.indexOf(
-        'await postOperationalCardScoped(\n    identity, "/api/scheduler/draft", request)');
+        "await postOperationalCardScoped(\n    identity, SCHEDULER_WRITE_ACTIONS.generate.path, request, {");
+      const serialized = source.indexOf("serializeCard: true", request);
+      const reconcile = source.indexOf(
+        'reconcileSettledSchedulerWrite(settledIdentity, "generate")', serialized);
       const guard = source.indexOf(
-        "if (!cardIdentityCurrent(identity)) return;", request);
-      const outcome = source.indexOf("if (result && !result.error)", request);
-      return request >= 0 && guard > request && outcome > guard;
+        "if (!cardIdentityCurrent(identity)) return;", reconcile);
+      const outcome = source.indexOf(
+        "if (schedulerWriteResponseValid(", guard);
+      const boundContext = source.indexOf(
+        '"generate", result, { request: request, identity: identity }', outcome);
+      return request >= 0 && serialized > request && reconcile > serialized
+        && guard > reconcile && outcome > guard && boundContext > outcome;
     })(),
   }));
   if (JSON.stringify(production.cards) !== JSON.stringify(CARD_IDS)) {
@@ -2376,6 +2932,7 @@ async function assertProductionAxes(page, label, sourceInventory) {
     fail(`[${label}] Generate must reject a superseded card identity directly `
       + "after its awaited response and before processing either outcome");
   }
+  return production.schedulerWriteAxis;
 }
 
 async function assertState(page, coverage, cardId, state, step, marker) {
@@ -2385,7 +2942,7 @@ async function assertState(page, coverage, cardId, state, step, marker) {
     fail(`[${step}] ${cardId} DOM says ${state}, model says ${got.model.state}: `
       + JSON.stringify(got));
   }
-  const shouldBusy = state === "loading" || state === "stale";
+  const shouldBusy = state === "loading" || state === "stale" || state === "pending";
   if (got.busy !== String(shouldBusy)) {
     fail(`[${step}] ${cardId}/${state} aria-busy=${JSON.stringify(got.busy)}, `
       + `expected ${shouldBusy}`);
@@ -2429,9 +2986,53 @@ async function assertState(page, coverage, cardId, state, step, marker) {
       fail(`[${step}] ${cardId} ERROR must offer exactly its own Retry, got `
         + `${got.retryCount}`);
     }
+  } else if (state === "confirm") {
+    if (!marker || got.model.schedulerAction !== marker
+        || JSON.stringify(got.schedulerConfirm.yes) !== JSON.stringify([marker])
+        || JSON.stringify(got.schedulerConfirm.no) !== JSON.stringify([marker])) {
+      fail(`[${step}] ${cardId} CONFIRM did not expose exactly one derived `
+        + `${marker || "unknown"} decision: ${JSON.stringify(got)}`);
+    }
+    const unrelated = got.mutations.filter((control) =>
+      !control.includes("data-sched-confirm-yes")
+        && !control.includes("data-sched-confirm-no"));
+    if (unrelated.length || got.mutations.length !== 2
+        || !got.focus || got.focus.operationalCard !== cardId
+        || (cardId === REVIEW_CARD && got.schedulerFilters.length)) {
+      fail(`[${step}] ${cardId} CONFIRM exposed an unrelated action or lost `
+        + `card-local focus: ${JSON.stringify(got)}`);
+    }
+  } else if (state === "pending") {
+    const pending = got.schedulerPending;
+    const unrelated = got.mutations.filter((control) =>
+      !control.includes("data-sched-pending"));
+    if (!marker || !got.model || got.model.pendingAction !== marker
+        || pending.length !== 1 || pending[0].action !== marker
+        || pending[0].tabindex !== "-1"
+        || unrelated.length || got.buttons.length
+        || !got.focus || got.focus.operationalCard !== cardId
+        || (cardId === REVIEW_CARD && got.schedulerFilters.length)
+        || !got.writeLedger || got.writeLedger.entries !== 1
+        || !got.writeLedger.current
+        || got.writeLedger.current.state !== "pending"
+        || got.writeLedger.current.action !== marker) {
+      fail(`[${step}] ${cardId} PENDING did not match its one serialized `
+        + `${marker || "unknown"} lease: ${JSON.stringify(got)}`);
+    }
   }
-  coverage.mark(cardId, state);
+  coverage.mark(cardId, state, marker);
   return got;
+}
+
+async function waitForCardWriteCount(page, cardId, expected, step) {
+  await page.waitForFunction(([id, count]) => {
+    const ledger = typeof cardWrites === "undefined" ? null : cardWrites[id];
+    return (ledger ? Object.keys(ledger).length : 0) === count;
+  }, [cardId, expected], { timeout: 20000 }).catch(async () => {
+    fail(`[${step}] ${cardId} write ledger did not reach ${expected}: `
+      + JSON.stringify((await cardSnapshot(page, cardId)).writeLedger));
+  });
+  return (await cardSnapshot(page, cardId)).writeLedger;
 }
 
 async function operationalSiblingSnapshot(page, targetCardId) {
@@ -2909,6 +3510,139 @@ async function waitForSelectedTuple(page, programId, seasonId, requireSettled, s
   });
 }
 
+function parallelSchedulerActions(axis, label) {
+  const byCard = (card) => axis.actions.filter((entry) =>
+    entry.card === card && !entry.confirm);
+  const draft = byCard(DRAFT_CARD);
+  const review = byCard(REVIEW_CARD);
+  if (draft.length !== 1 || review.length !== 1) {
+    fail(`[${label}] expected one confirmation-free Scheduler write per card, got `
+      + JSON.stringify({ draft, review }));
+  }
+  return { draft: draft[0], review: review[0] };
+}
+
+function channelForSchedulerAction(channels, declared, label) {
+  const matches = Object.values(channels).filter((channel) =>
+    channel.pattern.test(declared.path));
+  if (matches.length !== 1) {
+    fail(`[${label}] declared ${declared.action} route ${declared.path} matched `
+      + `${matches.length} transport channels`);
+  }
+  return matches[0];
+}
+
+function assertCapturedSchedulerAction(captured, declared, label,
+                                        expectedStatus = 400) {
+  let pathname = captured && captured.url;
+  try { pathname = new URL(pathname).pathname; } catch (_) {}
+  if (!captured || captured.method !== "POST" || pathname !== declared.path
+      || captured.status !== expectedStatus) {
+    fail(`[${label}] ${declared.action} did not use its production-declared `
+      + `POST route: ${JSON.stringify({ declared, captured })}`);
+  }
+}
+
+async function assertParallelSchedulerPending(page, actions, focusedAction, label) {
+  const observations = [];
+  for (const declared of actions) {
+    const snapshot = await cardSnapshot(page, declared.card);
+    const pending = snapshot.schedulerPending;
+    const shouldOwnFocus = declared.action === focusedAction.action;
+    if (snapshot.state !== "pending" || !snapshot.model
+        || snapshot.model.pendingAction !== declared.action
+        || pending.length !== 1 || pending[0].action !== declared.action
+        || pending[0].focused !== shouldOwnFocus
+        || !snapshot.writeLedger || snapshot.writeLedger.entries !== 1
+        || !snapshot.writeLedger.current
+        || snapshot.writeLedger.current.action !== declared.action
+        || snapshot.writeLedger.current.card !== declared.card
+        || snapshot.writeLedger.current.current !== true
+        || (declared.card === REVIEW_CARD && snapshot.schedulerFilters.length)) {
+      fail(`[${label}] overlapping ${declared.action} lease diverged: `
+        + JSON.stringify({ shouldOwnFocus, snapshot }));
+    }
+    observations.push({ action: declared.action, card: declared.card,
+      focused: pending[0].focused });
+  }
+  if (observations.filter((entry) => entry.focused).length !== 1) {
+    fail(`[${label}] overlapping writes exposed multiple or zero focus owners: `
+      + JSON.stringify(observations));
+  }
+}
+
+async function forceFullSchedulerRepaint(page, actions, newest, label) {
+  const result = await page.evaluate(async ([expectedAction, expectedCard]) => {
+    const oldFocused = document.activeElement;
+    if (oldFocused && typeof oldFocused.blur === "function") oldFocused.blur();
+    const bodyOwnedBeforeRender = document.activeElement === document.body;
+    await render();
+    const active = document.activeElement;
+    const root = active && active.closest
+      ? active.closest("[data-operational-card]") : null;
+    return {
+      bodyOwnedBeforeRender,
+      oldFocusedConnected: !!oldFocused && oldFocused.isConnected,
+      action: active && active.getAttribute
+        ? active.getAttribute("data-sched-pending") : null,
+      card: root ? root.getAttribute("data-operational-card") : null,
+      expectedAction,
+      expectedCard,
+    };
+  }, [newest.action, newest.card]);
+  if (!result.bodyOwnedBeforeRender || result.oldFocusedConnected
+      || result.action !== newest.action || result.card !== newest.card) {
+    fail(`[${label}] full repaint did not restore body focus to the newest `
+      + `current-principal Scheduler write: ${JSON.stringify(result)}`);
+  }
+  await assertParallelSchedulerPending(page, actions, newest, label);
+}
+
+async function runParallelSchedulerWriteOrder(page, tracker, channels, actions, label) {
+  const [first, second] = actions;
+  const firstChannel = channelForSchedulerAction(channels, first, `${label}/first`);
+  const secondChannel = channelForSchedulerAction(channels, second, `${label}/second`);
+  if (firstChannel === secondChannel) {
+    fail(`[${label}] independent card writes resolved to one transport channel`);
+  }
+  await page.click("[data-sched-select-all]");
+  const firstHold = armHeldRefusal(firstChannel);
+  const secondHold = armHeldRefusal(secondChannel);
+  await page.click(`[data-sched-${first.action}]`);
+  const firstCapture = await firstHold.captured;
+  assertCapturedSchedulerAction(firstCapture, first, `${label}/first`);
+  await page.click(`[data-sched-${second.action}]`);
+  const secondCapture = await secondHold.captured;
+  assertCapturedSchedulerAction(secondCapture, second, `${label}/second`);
+  await assertParallelSchedulerPending(page, actions, second,
+    `${label}/before-repaint`);
+  await forceFullSchedulerRepaint(page, actions, second,
+    `${label}/full-repaint`);
+
+  const firstReleased = firstChannel.released;
+  firstHold.release();
+  await waitForCardState(page, first.card, "error", `${label}/first-error`);
+  await waitForReleased(page, firstChannel, firstReleased, `${label}/first-error`);
+  await waitForCardWriteCount(page, first.card, 0, `${label}/first-drained`);
+  await assertParallelSchedulerPending(page, [second], second,
+    `${label}/second-survives-first-settlement`);
+
+  const secondReleased = secondChannel.released;
+  secondHold.release();
+  await waitForCardState(page, second.card, "error", `${label}/second-error`);
+  await waitForReleased(page, secondChannel, secondReleased, `${label}/second-error`);
+  await waitForCardWriteCount(page, second.card, 0, `${label}/second-drained`);
+  await waitForCardWriteCount(page, first.card, 0, `${label}/both-drained-first`);
+
+  // Restore both cards through their shipped Retry controls so the reverse
+  // start order begins from the same authoritative fixture state.
+  for (const card of [DRAFT_CARD, REVIEW_CARD]) {
+    await activateRetryWithKeyboard(page, card, `${label}/${card}-retry`);
+    await waitForCardState(page, card, "ready", `${label}/${card}-ready`);
+    await quiesce(page, tracker, `${label}/${card}-ready`);
+  }
+}
+
 async function assertContextChrome(page, expected, step) {
   const observed = await page.evaluate(() => {
     const select = document.getElementById("ctx-select");
@@ -3320,7 +4054,7 @@ async function seedFixtures(page) {
   return ids;
 }
 
-async function checkViewport(browser, viewport, sourceInventory) {
+async function checkViewport(browser, viewport, sourceInventory, responseOracleOnly) {
   const label = viewport.label;
   const base = `http://${HOST}:${viewport.port}`;
   const server = spawn(
@@ -3416,6 +4150,7 @@ async function checkViewport(browser, viewport, sourceInventory) {
     draftCommit: makeChannel("scheduler commit", DRAFT_COMMIT_RE),
     drafts: makeChannel("scheduler drafts", DRAFTS_RE),
     publish: makeChannel("scheduler publish", PUBLISH_RE),
+    discard: makeChannel("scheduler discard", DISCARD_RE),
     ice: makeChannel("ice preview", ICE_PREVIEW_RE),
     iceCommit: makeChannel("ice commit", ICE_COMMIT_RE),
     addIce: makeChannel("calendar add ice", ADD_ICE_RE),
@@ -3438,7 +4173,21 @@ async function checkViewport(browser, viewport, sourceInventory) {
     await installContextFixture(page);
     await armAnnouncements(page);
     await quiesce(page, tracker, `${label}/boot`);
-    await assertProductionAxes(page, `${label}/axes`, sourceInventory);
+    const schedulerWriteAxis = await assertProductionAxes(
+      page, `${label}/axes`, sourceInventory);
+    coverage.configureSchedulerWriteAxis(
+      schedulerWriteAxis, `${label}/scheduler-write-axis`);
+    const schedulerResponseCoverage = await assertSchedulerResponseContracts(
+      page, schedulerWriteAxis, `${label}/scheduler-response-contracts`);
+    if (responseOracleOnly) {
+      console.log(`[${label}] Scheduler response oracle passed — ${
+        schedulerResponseCoverage.cases} validator cases and ${
+        schedulerResponseCoverage.outcomes} outcome classes, plus ${
+        schedulerResponseCoverage.reviewReads} Review-read cases.`);
+      return;
+    }
+    const parallelActions = parallelSchedulerActions(
+      schedulerWriteAxis, `${label}/scheduler-parallel-actions`);
 
     // Scheduler starts honestly empty: no proposal has been generated and no
     // draft Game has been committed.
@@ -3460,7 +4209,9 @@ async function checkViewport(browser, viewport, sourceInventory) {
       `${label}/review-empty-refresh`);
 
     // Create an operation failure under A so its shipped Retry drives the
-    // ERROR -> LOADING -> READY state axis below.
+    // ERROR -> PENDING -> READY state axis below. Generate is a POST even
+    // though it only returns a proposal: its unresolved operation must own a
+    // durable card+tuple lease and refuse a second invocation.
     await page.selectOption("#sched-div", ids.readyDiv);
     await resetAnnouncements(page);
     failOnce(channels.draft);
@@ -3477,14 +4228,36 @@ async function checkViewport(browser, viewport, sourceInventory) {
     if (draftReadyResponse.status !== 200
         || !draftReadyResponse.body
         || !(draftReadyResponse.body.draft_games || []).length) {
-      fail(`[${label}/draft-loading] held Generate was not a real non-empty success: `
+      fail(`[${label}/draft-pending] held Generate was not a real non-empty success: `
         + JSON.stringify(draftReadyResponse));
     }
-    await assertState(page, coverage, DRAFT_CARD, "loading", `${label}/draft-loading`);
+    const heldDraft = await assertState(
+      page, coverage, DRAFT_CARD, "pending", `${label}/draft-pending`, "generate");
+    const generatePostsBeforeDuplicate = tracker.requests.filter((request) =>
+      request.method === "POST" && request.pathname === "/api/scheduler/draft").length;
+    await page.evaluate((cardId) => {
+      const held = readCardState(cardId);
+      const request = held && held.payload && held.payload.request;
+      if (!request) throw new Error("held Generate has no reusable request payload");
+      void generateSchedulerDraft(request);
+    }, DRAFT_CARD);
+    await page.waitForTimeout(QUIET_WINDOW_MS);
+    const afterDuplicateAttempt = await cardSnapshot(page, DRAFT_CARD);
+    const generatePostsAfterDuplicate = tracker.requests.filter((request) =>
+      request.method === "POST" && request.pathname === "/api/scheduler/draft").length;
+    if (generatePostsAfterDuplicate !== generatePostsBeforeDuplicate
+        || afterDuplicateAttempt.generation !== heldDraft.generation
+        || afterDuplicateAttempt.writeLedger.entries !== 1) {
+      fail(`[${label}/draft-pending] serialized Generate admitted a duplicate: `
+        + JSON.stringify({ generatePostsBeforeDuplicate,
+          generatePostsAfterDuplicate, heldDraft, afterDuplicateAttempt }));
+    }
     const draftReleased = channels.draft.released;
     draftRetry.release();
     await waitForCardState(page, DRAFT_CARD, "ready", `${label}/draft-ready`);
     await waitForReleased(page, channels.draft, draftReleased, `${label}/draft-ready`);
+    await waitForCardWriteCount(page, DRAFT_CARD, 0,
+      `${label}/draft-ready-ledger-drained`);
     await assertState(page, coverage, DRAFT_CARD, "ready", `${label}/draft-ready`,
       "Matrix A Ready");
     await assertCardActionsWired(page, DRAFT_CARD,
@@ -3525,7 +4298,7 @@ async function checkViewport(browser, viewport, sourceInventory) {
       fail(`[${label}/draft-overlap] held refresh was not a real A overview: `
         + JSON.stringify(olderOverview));
     }
-    await waitForCardState(page, DRAFT_CARD, "loading",
+    await assertState(page, coverage, DRAFT_CARD, "loading",
       `${label}/draft-overlap-loading`);
     await openView(page, "scheduler", [DRAFT_CARD, REVIEW_CARD],
       `${label}/draft-overlap-second`);
@@ -3580,8 +4353,18 @@ async function checkViewport(browser, viewport, sourceInventory) {
     // the same one-alert/no-toast contract, then use its shipped Retry to
     // regenerate before the successful commit that seeds Review.
     await resetAnnouncements(page);
-    failOnce(channels.draftCommit);
+    refuseOnce(channels.draftCommit);
+    const failedCommitPostsBefore = tracker.requests.filter((request) =>
+      request.method === "POST" && request.pathname === "/api/scheduler/commit").length;
     await page.click("[data-sched-commit]");
+    await assertState(page, coverage, DRAFT_CARD, "confirm",
+      `${label}/draft-commit-confirm`, "commit");
+    const failedCommitPostsAtConfirm = tracker.requests.filter((request) =>
+      request.method === "POST" && request.pathname === "/api/scheduler/commit").length;
+    if (failedCommitPostsAtConfirm !== failedCommitPostsBefore) {
+      fail(`[${label}/draft-commit-confirm] commit POST fired before confirmation`);
+    }
+    await page.click('[data-sched-confirm-yes="commit"]');
     await waitForCardState(page, DRAFT_CARD, "error",
       `${label}/draft-commit-error`);
     await assertSingleErrorLiveRegion(page, DRAFT_CARD,
@@ -3596,15 +4379,112 @@ async function checkViewport(browser, viewport, sourceInventory) {
     await assertState(page, coverage, DRAFT_CARD, "ready",
       `${label}/draft-commit-regenerated`, "Matrix A Ready");
 
-    // Commit the regenerated proposal through the shipped button so the
-    // review card has authoritative, non-empty server data.
+    // Commit the regenerated proposal through the shipped two-step decision.
+    // Hold the real response so COMMIT's own PENDING lease is observable too,
+    // then release it to seed authoritative, non-empty Review data.
+    const heldCommit = armHold(channels.draftCommit);
     await page.click("[data-sched-commit]");
+    await assertState(page, coverage, DRAFT_CARD, "confirm",
+      `${label}/draft-commit-confirm-success`, "commit");
+    await page.click('[data-sched-confirm-yes="commit"]');
+    const heldCommitResponse = await heldCommit.captured;
+    if (heldCommitResponse.status !== 200 || !heldCommitResponse.body
+        || !(heldCommitResponse.body.created || []).length) {
+      fail(`[${label}/draft-commit-pending] held commit was not a real success: `
+        + JSON.stringify(heldCommitResponse));
+    }
+    await assertState(page, coverage, DRAFT_CARD, "pending",
+      `${label}/draft-commit-pending`, "commit");
+    const heldCommitReleased = channels.draftCommit.released;
+    heldCommit.release();
     await waitForCardState(page, REVIEW_CARD, "ready", `${label}/review-ready`);
+    await waitForReleased(page, channels.draftCommit, heldCommitReleased,
+      `${label}/draft-commit-release`);
+    await waitForCardWriteCount(page, DRAFT_CARD, 0,
+      `${label}/draft-commit-ledger-drained`);
     await assertState(page, coverage, REVIEW_CARD, "ready", `${label}/review-ready`,
       "Matrix A Ready");
     await assertCardActionsWired(page, REVIEW_CARD,
       `${label}/review-ready-actions`);
     await assertReviewFilterEdges(page, `${label}/review-filter-edges`);
+
+    // Review owns its own CONFIRM state. Cancellation must be a real no-write
+    // decision that returns to the same selected rows rather than clearing
+    // them or routing through the page-level delete modal.
+    const discardProbePick = page.locator(".sched-pick").first();
+    await discardProbePick.check();
+    const discardPostsBefore = tracker.requests.filter((request) =>
+      request.method === "POST"
+        && request.pathname === "/api/scheduler/drafts/discard").length;
+    await page.click("[data-sched-discard]");
+    await assertState(page, coverage, REVIEW_CARD, "confirm",
+      `${label}/review-discard-confirm`, "discard");
+    const discardPostsAtConfirm = tracker.requests.filter((request) =>
+      request.method === "POST"
+        && request.pathname === "/api/scheduler/drafts/discard").length;
+    if (discardPostsAtConfirm !== discardPostsBefore) {
+      fail(`[${label}/review-discard-confirm] discard POST fired before confirmation`);
+    }
+    await page.click('[data-sched-confirm-no="discard"]');
+    const discardCancelled = await waitForCardState(
+      page, REVIEW_CARD, "ready", `${label}/review-discard-cancelled`);
+    const selectedAfterDiscardCancel = await page.locator(".sched-pick:checked").count();
+    if (selectedAfterDiscardCancel !== 1) {
+      fail(`[${label}/review-discard-cancelled] cancellation lost the selected row: `
+        + JSON.stringify(discardCancelled));
+    }
+
+    // Exercise Discard's declared write lease without destructively changing
+    // the fixture. A held domain refusal crosses the real confirmation boundary and
+    // leaves the request unresolved while the Review card is inspected in
+    // PENDING; delivery then follows the ordinary ERROR -> Retry path.
+    await resetAnnouncements(page);
+    const heldDiscard = armHeldRefusal(channels.discard);
+    await page.click("[data-sched-discard]");
+    await assertState(page, coverage, REVIEW_CARD, "confirm",
+      `${label}/review-discard-confirm-failure`, "discard");
+    await page.click('[data-sched-confirm-yes="discard"]');
+    const heldDiscardResponse = await heldDiscard.captured;
+    if (heldDiscardResponse.status !== 400
+        || !heldDiscardResponse.requestedBody
+        || !(heldDiscardResponse.requestedBody.game_ids || []).length) {
+      fail(`[${label}/review-discard-pending] held Discard was not the selected `
+        + `draft write: ${JSON.stringify(heldDiscardResponse)}`);
+    }
+    await assertState(page, coverage, REVIEW_CARD, "pending",
+      `${label}/review-discard-pending`, "discard");
+    const heldDiscardReleased = channels.discard.released;
+    heldDiscard.release();
+    await waitForCardState(page, REVIEW_CARD, "error",
+      `${label}/review-discard-error`);
+    await waitForReleased(page, channels.discard, heldDiscardReleased,
+      `${label}/review-discard-error`);
+    await waitForCardWriteCount(page, REVIEW_CARD, 0,
+      `${label}/review-discard-ledger-drained`);
+    await assertSingleErrorLiveRegion(page, REVIEW_CARD,
+      `${label}/review-discard-error-announcement`);
+    await assertErrorRepaintIsSilent(page, REVIEW_CARD,
+      `${label}/review-discard-error-reentry`);
+    await activateRetryWithKeyboard(page, REVIEW_CARD,
+      `${label}/review-discard-retry`);
+    await waitForCardState(page, REVIEW_CARD, "ready",
+      `${label}/review-discard-recovered`);
+    await quiesce(page, tracker, `${label}/review-discard-recovered`);
+
+    // Draft and Review are independent serialization domains, so both may
+    // legitimately have one unresolved write for the same tuple. Drive the
+    // production-declared confirmation-free action for each card in both
+    // registration orders. A full page repaint destroys the focused pending
+    // node after focus is deliberately left on <body>; the newest sequence
+    // must be the sole focus owner, while either lease may settle first
+    // without draining or repainting the other.
+    trace(`${label}: overlapping Scheduler writes preserve newest focus owner`);
+    await runParallelSchedulerWriteOrder(page, tracker, channels,
+      [parallelActions.draft, parallelActions.review],
+      `${label}/parallel-draft-then-review`);
+    await runParallelSchedulerWriteOrder(page, tracker, channels,
+      [parallelActions.review, parallelActions.draft],
+      `${label}/parallel-review-then-draft`);
 
     // A Review checkbox is local interaction state, not durable context data.
     // Select one row, leave Scheduler, and queue A -> B -> A while B's context
@@ -4272,6 +5152,8 @@ async function checkViewport(browser, viewport, sourceInventory) {
       fail(`[${label}/accepted-gap] held response lacks a real A proposal: `
         + JSON.stringify(acceptedGapPayload));
     }
+    await assertState(page, coverage, DRAFT_CARD, "pending",
+      `${label}/accepted-gap-pending`, "generate");
     const acceptedGapContext = armHold(channels.context);
     await startContextSwitch(page, ids.pb, ids.sb,
       `${label}/accepted-gap-switch`);
@@ -4293,6 +5175,8 @@ async function checkViewport(browser, viewport, sourceInventory) {
     const afterAcceptedGapGenerate = await immutableSnapshot(page, DRAFT_CARD);
     assertByteEqual(`${label}/accepted-gap`, beforeAcceptedGapGenerate,
       afterAcceptedGapGenerate);
+    await waitForCardWriteCount(page, DRAFT_CARD, 1,
+      `${label}/accepted-gap-ledger-held-through-intent`);
     const acceptedGapContextReleased = channels.context.released;
     acceptedGapContext.release();
     await waitForReleased(page, channels.context, acceptedGapContextReleased,
@@ -4300,6 +5184,8 @@ async function checkViewport(browser, viewport, sourceInventory) {
     await waitForSelectedTuple(page, ids.pb, ids.sb, true,
       `${label}/accepted-gap-b-selected`);
     await quiesce(page, tracker, `${label}/accepted-gap-b-selected`);
+    await waitForCardWriteCount(page, DRAFT_CARD, 0,
+      `${label}/accepted-gap-ledger-drained`);
     const acceptedGapB = await cardSnapshot(page, DRAFT_CARD);
     if (acceptedGapB.text.includes("Matrix A Race")
         || JSON.stringify(acceptedGapB.model).includes("Matrix A Race")) {
@@ -4389,15 +5275,21 @@ async function checkViewport(browser, viewport, sourceInventory) {
       fail(`[${label}/context-race] held response lacks a real A-only proposal: `
         + JSON.stringify(contextResponse));
     }
+    await assertState(page, coverage, DRAFT_CARD, "pending",
+      `${label}/context-race-pending`, "generate");
     await selectProgramSeason(page, `${label}: context race to B`, ids.pb, ids.sb);
     await openView(page, "scheduler", [DRAFT_CARD, REVIEW_CARD], `${label}/context-race-b`);
     await page.focus("#ctx-select");
     await resetAnnouncements(page);
     const beforeContextRelease = await immutableSnapshot(page, DRAFT_CARD);
+    await waitForCardWriteCount(page, DRAFT_CARD, 1,
+      `${label}/context-race-ledger-survives-switch`);
     const contextReleased = channels.draft.released;
     contextRace.release();
     await waitForReleased(page, channels.draft, contextReleased, `${label}/context-race`);
     await quiesce(page, tracker, `${label}/context-race-release`);
+    await waitForCardWriteCount(page, DRAFT_CARD, 0,
+      `${label}/context-race-ledger-drained`);
     const afterContextRelease = await immutableSnapshot(page, DRAFT_CARD);
     assertByteEqual(`${label}/context-race`, beforeContextRelease, afterContextRelease);
     if (afterContextRelease.text.includes("Matrix A Race")) {
@@ -4426,6 +5318,8 @@ async function checkViewport(browser, viewport, sourceInventory) {
       fail(`[${label}/round-trip] held response lacks a real A-only proposal: `
         + JSON.stringify(roundTripResponse));
     }
+    await assertState(page, coverage, DRAFT_CARD, "pending",
+      `${label}/round-trip-pending`, "generate");
     await openView(page, "dashboard", [], `${label}/round-trip-dashboard`);
     await quiesce(page, tracker, `${label}/round-trip-dashboard`, 1);
     const assertDashboardOnly = async (step) => {
@@ -4462,6 +5356,13 @@ async function checkViewport(browser, viewport, sourceInventory) {
       `${label}/round-trip-a-settled`);
     await quiesce(page, tracker, `${label}/round-trip-a` , 1);
     await assertDashboardOnly(`${label}/round-trip-a`);
+    const returnedLease = await waitForCardWriteCount(
+      page, DRAFT_CARD, 1, `${label}/round-trip-ledger-returned`);
+    if (!returnedLease.current || returnedLease.current.state !== "pending"
+        || returnedLease.current.action !== "generate") {
+      fail(`[${label}/round-trip] returning to A did not restore its unresolved `
+        + `Generate lease: ${JSON.stringify(returnedLease)}`);
+    }
     await page.focus("#ctx-select");
     await resetAnnouncements(page);
     const beforeRoundTripRelease = await immutableSnapshot(page, DRAFT_CARD);
@@ -4470,9 +5371,19 @@ async function checkViewport(browser, viewport, sourceInventory) {
     await waitForReleased(page, channels.draft, roundTripReleased,
       `${label}/round-trip-release`);
     await quiesce(page, tracker, `${label}/round-trip-release`);
+    await waitForCardWriteCount(page, DRAFT_CARD, 0,
+      `${label}/round-trip-ledger-drained`);
     const afterRoundTripRelease = await immutableSnapshot(page, DRAFT_CARD);
-    assertByteEqual(`${label}/round-trip`, beforeRoundTripRelease,
-      afterRoundTripRelease);
+    const roundTripPreview = afterRoundTripRelease.model
+      && afterRoundTripRelease.model.payload
+      && afterRoundTripRelease.model.payload.preview;
+    if (afterRoundTripRelease.text.includes("Matrix A Race")
+        || (roundTripPreview
+          && JSON.stringify(roundTripPreview).includes("Matrix A Race"))) {
+      fail(`[${label}/round-trip] settled obsolete Generate painted its A-only `
+        + `response after the lease drained: before ${JSON.stringify(
+          beforeRoundTripRelease)}, after ${JSON.stringify(afterRoundTripRelease)}`);
+    }
 
     // The exact inverse boundary: an ATTEMPT is not a confirmed tuple change.
     // Compute and hold both another genuine A response and B's real backend
@@ -4497,11 +5408,9 @@ async function checkViewport(browser, viewport, sourceInventory) {
       fail(`[${label}/failed-switch] held response lacks a real A proposal: `
         + JSON.stringify(failedSwitchResponse));
     }
-    const failedSwitchOutgoing = await cardSnapshot(page, DRAFT_CARD);
-    if (failedSwitchOutgoing.model.state !== "loading") {
-      fail(`[${label}/failed-switch] Generate was not in flight before refusal: `
-        + JSON.stringify(failedSwitchOutgoing));
-    }
+    const failedSwitchOutgoing = await assertState(
+      page, coverage, DRAFT_CARD, "pending",
+      `${label}/failed-switch-pending`, "generate");
     const failedContextEcho = armRejectedContextHold(channels.context);
     await startContextSwitch(page, ids.pb, ids.sb, `${label}/failed-switch-attempt`);
     const rejectedEcho = await failedContextEcho.captured;
@@ -4524,6 +5433,8 @@ async function checkViewport(browser, viewport, sourceInventory) {
     const duringFailedSwitch = await immutableSnapshot(page, DRAFT_CARD);
     assertByteEqual(`${label}/failed-switch-pending`,
       beforeFailedSwitchRelease, duringFailedSwitch);
+    await waitForCardWriteCount(page, DRAFT_CARD, 1,
+      `${label}/failed-switch-ledger-held-through-refusal`);
     const rejectedContextReleased = channels.context.released;
     failedContextEcho.release();
     await waitForReleased(page, channels.context, rejectedContextReleased,
@@ -4531,18 +5442,24 @@ async function checkViewport(browser, viewport, sourceInventory) {
     await waitForSelectedTuple(page, ids.pa, ids.sa, true,
       `${label}/failed-switch-reconciled`);
     await quiesce(page, tracker, `${label}/failed-switch-reconciled`);
+    await waitForCardWriteCount(page, DRAFT_CARD, 0,
+      `${label}/failed-switch-ledger-drained`);
     const admitted = await cardSnapshot(page, DRAFT_CARD);
     const admittedSpeech = await spoken(page);
+    const admittedLiveRegions = await page.locator(
+      `${operationalSelector(DRAFT_CARD)} [role="status"][aria-live="polite"]`)
+      .allTextContents();
     if (!admitted.model || admitted.model.state !== "ready"
         || !admitted.tuple || admitted.tuple.program_id !== ids.pa
         || admitted.tuple.season_id !== ids.sa
         || !JSON.stringify(admitted.model).includes("Matrix A Race")
-        || !admitted.toast.includes("Draft schedule preview updated")
-        || admittedSpeech.filter((message) =>
-          message === "Draft schedule preview updated.").length !== 1) {
+        || admitted.toast !== "" || admittedSpeech.length !== 0
+        || admittedLiveRegions.length !== 1
+        || !admittedLiveRegions[0].includes("Preview — 1 game(s)")) {
       fail(`[${label}/failed-switch] held A response was discarded after a `
         + `refused switch: card ${JSON.stringify(admitted)}, speech `
-        + JSON.stringify(admittedSpeech));
+        + `${JSON.stringify(admittedSpeech)}, live regions `
+        + JSON.stringify(admittedLiveRegions));
     }
 
     // Same-surface identity privacy window. Unlike the epoch race below,
@@ -4672,9 +5589,11 @@ async function checkViewport(browser, viewport, sourceInventory) {
       fail(`[${label}/epoch-race] held response is not a real successful proposal: `
         + JSON.stringify(epochResponse));
     }
-    const outgoing = await cardSnapshot(page, DRAFT_CARD);
-    if (outgoing.state !== "loading" || outgoing.principal !== "admin") {
-      fail(`[${label}/epoch-race] outgoing card was not admin's live LOADING request: `
+    const outgoing = await assertState(
+      page, coverage, DRAFT_CARD, "pending",
+      `${label}/epoch-race-pending`, "generate");
+    if (outgoing.principal !== "admin") {
+      fail(`[${label}/epoch-race] outgoing PENDING lease was not admin's: `
         + JSON.stringify(outgoing));
     }
 
@@ -4716,11 +5635,20 @@ async function checkViewport(browser, viewport, sourceInventory) {
       state: readCardState(id).state,
     })), CARD_IDS);
     if (invalidated.some((entry) => entry.state !== "loading")) {
-      fail(`[${label}/epoch-race] re-login did not invalidate all four card models: `
+      fail(`[${label}/epoch-race] re-login did not invalidate all four card models `
+        + `while the arriving tuple was still unknown: `
         + JSON.stringify(invalidated));
     }
+    const quarantinedWrite = insideEpochWindow.writeLedger.all[0];
     if (insideEpochWindow.text.includes("Matrix A Race")
-        || insideEpochWindow.mutations.length) {
+        || JSON.stringify(insideEpochWindow.model).includes("Matrix A Race")
+        || insideEpochWindow.mutations.length
+        || insideEpochWindow.writeLedger.entries !== 1
+        || insideEpochWindow.writeLedger.current !== null
+        || !quarantinedWrite || quarantinedWrite.state !== "pending"
+        || quarantinedWrite.action != null
+        || quarantinedWrite.principal !== "admin"
+        || quarantinedWrite.epoch !== outgoing.epoch) {
       fail(`[${label}/epoch-race] departing payload/control survived the identity boundary: `
         + JSON.stringify(insideEpochWindow));
     }
@@ -4738,7 +5666,12 @@ async function checkViewport(browser, viewport, sourceInventory) {
         || isolated.generation !== outgoing.generation
         || isolated.principal !== outgoing.principal
         || !isolated.tuple || !outgoing.tuple
-        || JSON.stringify(isolated.tuple) !== JSON.stringify(outgoing.tuple)) {
+        || JSON.stringify(isolated.tuple) !== JSON.stringify(outgoing.tuple)
+        || isolated.model.state !== "pending"
+        || isolated.model.pendingAction != null
+        || !isolated.writeLedger.current
+        || isolated.writeLedger.current.state !== "pending"
+        || isolated.writeLedger.current.action != null) {
       fail(`[${label}/epoch-race] test failed to isolate uiIdentityEpoch after `
         + `the same user's tuple settled: outgoing ${JSON.stringify(outgoing)}, `
         + `arriving ${JSON.stringify(isolated)}`);
@@ -4747,11 +5680,23 @@ async function checkViewport(browser, viewport, sourceInventory) {
     await page.focus("#ctx-select");
     await resetAnnouncements(page);
     const beforeEpochRelease = await immutableSnapshot(page, DRAFT_CARD);
+    await waitForCardWriteCount(page, DRAFT_CARD, 1,
+      `${label}/epoch-race-ledger-survives-principal`);
     const epochReleased = channels.draft.released;
     epochRace.release();
     await waitForReleased(page, channels.draft, epochReleased, `${label}/epoch-race`);
+    await waitForCardWriteCount(page, DRAFT_CARD, 0,
+      `${label}/epoch-race-ledger-drained`);
     const afterEpochRelease = await immutableSnapshot(page, DRAFT_CARD);
-    assertByteEqual(`${label}/epoch-race`, beforeEpochRelease, afterEpochRelease);
+    const epochPreview = afterEpochRelease.model && afterEpochRelease.model.payload
+      && afterEpochRelease.model.payload.preview;
+    if (afterEpochRelease.text.includes("Matrix A Race")
+        || (epochPreview && JSON.stringify(epochPreview).includes("Matrix A Race"))
+        || afterEpochRelease.toast || afterEpochRelease.speech.length) {
+      fail(`[${label}/epoch-race] departed principal's settled Generate leaked `
+        + `after its lease drained: before ${JSON.stringify(beforeEpochRelease)}, `
+        + `after ${JSON.stringify(afterEpochRelease)}`);
+    }
 
     await openView(page, "scheduler", [DRAFT_CARD, REVIEW_CARD],
       `${label}/epoch-recovery-open`);
@@ -4829,7 +5774,7 @@ async function checkViewport(browser, viewport, sourceInventory) {
     }
     await page.click("[data-sched-select-all]");
     await resetAnnouncements(page);
-    failOnce(channels.publish);
+    refuseOnce(channels.publish);
     await page.click("[data-sched-publish]");
     await waitForCardState(page, REVIEW_CARD, "error",
       `${label}/review-publish-error`);
@@ -4842,9 +5787,24 @@ async function checkViewport(browser, viewport, sourceInventory) {
     await waitForCardState(page, REVIEW_CARD, "ready",
       `${label}/review-publish-recovered`);
     await page.click("[data-sched-select-all]");
+    const heldPublish = armHold(channels.publish);
     await page.click("[data-sched-publish]");
+    const heldPublishResponse = await heldPublish.captured;
+    if (heldPublishResponse.status !== 200 || !heldPublishResponse.body
+        || heldPublishResponse.body.published < 1) {
+      fail(`[${label}/review-publish-pending] held publish was not a real success: `
+        + JSON.stringify(heldPublishResponse));
+    }
+    await assertState(page, coverage, REVIEW_CARD, "pending",
+      `${label}/review-publish-pending`, "publish");
+    const heldPublishReleased = channels.publish.released;
+    heldPublish.release();
     await waitForCardState(page, REVIEW_CARD, "empty",
       `${label}/review-publish-empty`);
+    await waitForReleased(page, channels.publish, heldPublishReleased,
+      `${label}/review-publish-release`);
+    await waitForCardWriteCount(page, REVIEW_CARD, 0,
+      `${label}/review-publish-ledger-drained`);
     await quiesce(page, tracker, `${label}/review-publish-empty`);
     const publishedEmpty = await cardSnapshot(page, REVIEW_CARD);
     const publishedSummary = publishedEmpty.model && publishedEmpty.model.payload
@@ -5032,8 +5992,11 @@ async function checkViewport(browser, viewport, sourceInventory) {
     if (badConsole.length) {
       fail(`[${label}] console/page error(s): ${JSON.stringify(badConsole)}`);
     }
-    console.log(`[${label}] OK — ${checked} card/state cells, context-response `
-      + `fence, and uiIdentityEpoch fence.`);
+    console.log(`[${label}] OK — ${checked.stateCells} card/state cells, `
+      + `${checked.schedulerActions} Scheduler action leases, context-response `
+      + `fence, uiIdentityEpoch fence, and ${schedulerResponseCoverage.cases} `
+      + `response-validator cases + ${schedulerResponseCoverage.outcomes} outcome classes `
+      + `+ ${schedulerResponseCoverage.reviewReads} Review-read cases.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- server output ---\n${serverOutput}`);
   } finally {
@@ -5064,10 +6027,13 @@ async function main() {
     }
     browser = await chromium.launch(process.env.SMOKE_CHROMIUM_PATH
       ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
+    const responseOracleOnly = process.argv.includes("--response-oracle-only");
     for (const viewport of VIEWPORTS) {
-      await checkViewport(browser, viewport, sourceInventory);
+      await checkViewport(browser, viewport, sourceInventory, responseOracleOnly);
     }
-    console.log("Scheduler operational-card state matrix passed.");
+    console.log(responseOracleOnly
+      ? "Scheduler response-validator matrix passed."
+      : "Scheduler operational-card state matrix passed.");
   } catch (error) {
     console.error("Scheduler operational-card state matrix FAILED.");
     console.error(error && error.stack ? error.stack : error);
