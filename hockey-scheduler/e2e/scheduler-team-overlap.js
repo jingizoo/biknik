@@ -260,6 +260,8 @@ async function checkViewport(browser, viewport) {
     // (2) Commit: exactly the reviewed game lands, and nothing impossible is
     // persisted.
     await page.click("[data-sched-commit]");
+    await page.waitForSelector('[data-sched-confirm-yes="commit"]');
+    await page.click('[data-sched-confirm-yes="commit"]');
     await page.waitForFunction(
       () => /Committed 1 draft game\(s\)/
         .test((document.querySelector(".toast-msg") || {}).textContent || ""),

@@ -1561,6 +1561,11 @@ function foreignCardWriteModel() {
 // unresolved write repaints the non-actionable pending presentation rather
 // than a settled card with a live control on it.
 const cardWrites = {};
+// A page-local ordering fact for focus ownership when two independent cards
+// legitimately have writes in flight at once. Request generations are scoped
+// per card, so they cannot answer which of two cards the operator acted on
+// last; this sequence can, without changing either write's serialization key.
+let cardWriteSequence = 0;
 
 // The three #345 axes as one comparable key. The Season axis is IN it, so
 // "card + target tuple" and "card + target Season" are the same lookup for
@@ -1608,6 +1613,7 @@ function registerCardWrite(identity, model) {
   const ledger = cardWrites[identity.card] || (cardWrites[identity.card] = {});
   ledger[cardTupleKey(identity)] = {
     card: identity.card, identity: identity,
+    sequence: ++cardWriteSequence,
     // The tuple this operation TARGETS — the key, spelled out — and the
     // Season its URL names. Both are the identity's, captured before the
     // await, never re-read from live context afterwards.
@@ -2063,16 +2069,17 @@ function operationalStaleCopy(cardId, noun) {
 }
 function operationalErrorCopy(cardId, noun, entry) {
   const displayed = cardDisplayModel(entry);
-  const earlier = displayed && displayed.identity
-    && !cardTupleCurrent(displayed.identity)
-    ? `<p class="operational-stale-note">The data below belongs to your earlier
-      selection and is read-only until this card refreshes.</p>` : "";
+  const retainedWarning = displayed && entry.retainedNote
+    ? `<p class="operational-stale-note">${esc(entry.retainedNote)}</p>`
+    : displayed && displayed.identity && !cardTupleCurrent(displayed.identity)
+      ? `<p class="operational-stale-note">The data below belongs to your earlier
+        selection and is read-only until this card refreshes.</p>` : "";
   // `role=alert` belongs to the transition into ERROR, not to every later
   // serialization of the stored error when a person revisits the surface.
   // The wiring pass marks the event exposed after this markup enters the DOM.
   const liveRole = entry.errorAnnounced ? "" : ' role="alert"';
   return `<div class="banner alert"${liveRole}><h2>Couldn't load ${esc(noun.toLowerCase())}</h2>
-    <p>${esc(entry.error || "Try again.")}</p>${earlier}</div>
+    <p>${esc(entry.error || "Try again.")}</p>${retainedWarning}</div>
     <div class="actions"><button class="act ghost" data-card-retry="${esc(cardId)}"
       >Retry ${esc(noun.toLowerCase())}</button></div>`;
 }
@@ -4591,6 +4598,7 @@ function factoryResetModalHtml(m) {
 
 function confirmDeleteModalHtml(m) {
   const noun = DEL_NOUN[m.kind] || "record";
+  const draftDiscard = m.deleteTransport === "draft-discard";
   const highRisk = HIGH_RISK_DELETE.has(m.kind);
   // High-risk records require typing the name (or DELETE) before the button
   // enables (#215); lower-risk ones confirm in one click.
@@ -4600,13 +4608,16 @@ function confirmDeleteModalHtml(m) {
        <input id="del-confirm" class="modal-confirm-input" autocomplete="off"
          spellcheck="false" placeholder="DELETE">`
     : "";
-  return modalShell("danger", `Delete this ${noun}?`,
-    `<p>You're about to permanently delete the ${esc(noun)}
+  return modalShell("danger", draftDiscard ? "Discard this draft game?" : `Delete this ${noun}?`,
+    `<p>You're about to ${draftDiscard ? "discard the draft game" : `permanently delete the ${esc(noun)}`}
        <strong>${esc(m.name)}</strong>. This can't be undone.</p>
-     <p class="muted">If anything depends on it, the delete is refused and nothing changes.</p>
+     <p class="muted">${draftDiscard
+       ? "The reserved ice is freed after the discard completes."
+       : "If anything depends on it, the delete is refused and nothing changes."}</p>
      ${confirmField}`,
     `<button class="act ghost" data-modal-close>Cancel</button>
-     <button class="act danger" data-del-confirm ${highRisk ? "disabled" : ""}>Delete ${esc(noun)}</button>`);
+     <button class="act danger" data-del-confirm ${highRisk ? "disabled" : ""}>${
+       draftDiscard ? "Discard draft" : `Delete ${esc(noun)}`}</button>`);
 }
 
 // Dependency group types (#232 review 6) an operator can resolve inline from
@@ -4869,30 +4880,27 @@ function wireModal(c) {
       }
       delConfirm.disabled = true;
       toast = "";
+      // A single-row Scheduler discard has already passed this modal's
+      // confirmation. Hand it to the same serialized Review-card writer as
+      // the bulk action so it cannot bypass PENDING or issue twice merely
+      // because its confirmation surface predates the in-card controls.
+      if (cardIdentity && m.deleteTransport === "draft-discard") {
+        modal = null;
+        repaintModalOnly();
+        await mutateSchedulerDrafts(
+          "discard", "Discarded",
+          { ids: [m.id], confirmed: true });
+        return;
+      }
       // Ownership and transport are separate facts. Scheduler Review uses its
       // draft-discard contract; Calendar keeps the generic setup-delete route,
       // but both are card-owned and must survive the same identity boundary.
       const res = cardIdentity
         ? await postOperationalCardScoped(cardIdentity,
-            m.deleteTransport === "draft-discard"
-              ? "/api/scheduler/drafts/discard" : deleteRoute(m.kind, m.id),
-            m.deleteTransport === "draft-discard" ? { game_ids: [m.id] } : {})
+            deleteRoute(m.kind, m.id), {})
         : await attemptDelete(m.kind, m.id);
       if (res === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
       if (cardIdentity && !cardIdentityCurrent(cardIdentity)) return;
-      if (cardIdentity && m.deleteTransport === "draft-discard") {
-        modal = null;
-        if (res && res.error) {
-          announceCardStatus(cardIdentity,
-            res.error.message || "The draft game could not be discarded.", true);
-          repaintModalOnly();
-          return;
-        }
-        announceCardStatus(cardIdentity, "Discarded 1 draft game.", false);
-        repaintModalOnly();
-        loadSchedulerReviewCard({ userInitiated: true, preserveAnnouncement: true });
-        return;
-      }
       // postOperationalCardScoped is deliberately silent while the Calendar
       // delete is in flight. Restore generic delete's page-level error only
       // after this card identity has survived both sides of the await.
@@ -7182,6 +7190,15 @@ function cardBusy(entry) {
 function restorePendingCardWriteFocus() {
   const active = document.activeElement;
   if (active && active !== document.body && active.id !== "content") return;
+  const candidates = [];
+  const remember = (held, line) => {
+    // A departing principal's write remains in the serialization ledger, but
+    // it cannot own the arriving principal's focus. Filter it before ordering
+    // so an older current-principal write is not hidden behind a newer foreign
+    // entry.
+    if (!held || !line || !cardIdentityCurrent(held.identity)) return;
+    candidates.push({ held: held, line: line });
+  };
   setupWorkflowsFor().forEach((w) => {
     const held = currentCardWrite(setupWorkflowCardId(w.key));
     if (!held) return;
@@ -7198,8 +7215,19 @@ function restorePendingCardWriteFocus() {
     // the arriving principal's focus is never moved by an operation they did
     // not start. Their card is still non-actionable — that comes from the
     // ledger, not from focus.
-    if (line) focusCardTarget(held.identity, line);
+    remember(held, line);
   });
+  [SCHEDULER_DRAFT_CARD, SCHEDULER_REVIEW_CARD].forEach((cardId) => {
+    const held = currentCardWrite(cardId);
+    if (!held) return;
+    const root = document.querySelector(
+      `[data-operational-card="${cardId}"]`);
+    const line = root && root.querySelector("[data-sched-pending]");
+    remember(held, line);
+  });
+  candidates.sort((a, b) => (b.held.sequence || 0) - (a.held.sequence || 0));
+  const newest = candidates[0];
+  if (newest) focusCardTarget(newest.held.identity, newest.line);
 }
 
 // (1) DOM mutation, scoped to ONE card: repaints this workflow's slot(s) --
@@ -11338,6 +11366,132 @@ function renderDangerZone() {
 }
 
 /* ---------- Draft scheduler review + publish (#86/#106) ---------- */
+// EMPTY is an asserted server outcome, never the absence of a usable payload.
+// A successful HTTP status with a missing/wrong-shaped draft list is just as
+// unknowable as a transport failure: accepting it as [] would tell an operator
+// there are no drafts and could invite new scheduling work over hidden state.
+// Validate the minimum row shape this card actually consumes as well, so a
+// malformed row cannot turn a supposedly successful read into a render crash.
+function plainRecord(value) {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function nonemptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+function nullableString(value) {
+  return value === null || typeof value === "string";
+}
+function isoDateTimeEpoch(value) {
+  if (!nonemptyString(value)) return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?(Z|[+-]\d{2}:\d{2})?$/.exec(value);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6] || 0);
+  if (year < 1 || month < 1 || month > 12 || hour > 23
+      || minute > 59 || second > 59) return null;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30,
+    31, 31, 30, 31, 30, 31];
+  if (day < 1 || day > monthDays[month - 1]) return null;
+  const milliseconds = Number((match[7] || "").padEnd(3, "0").slice(0, 3));
+  const stamp = new Date(0);
+  stamp.setUTCFullYear(year, month - 1, day);
+  stamp.setUTCHours(hour, minute, second, milliseconds);
+  let offsetMinutes = 0;
+  if (match[8] && match[8] !== "Z") {
+    const offsetHour = Number(match[8].slice(1, 3));
+    const offsetMinute = Number(match[8].slice(4, 6));
+    if (offsetHour > 23 || offsetMinute > 59) return null;
+    offsetMinutes = (offsetHour * 60 + offsetMinute)
+      * (match[8][0] === "+" ? 1 : -1);
+  }
+  return stamp.getTime() - offsetMinutes * 60000;
+}
+function isoDateTimeOrNull(value) {
+  return value === null || isoDateTimeEpoch(value) !== null;
+}
+function isoDateTimeRangeValid(start, end) {
+  const startEpoch = isoDateTimeEpoch(start);
+  const endEpoch = isoDateTimeEpoch(end);
+  return startEpoch !== null && endEpoch !== null && startEpoch < endEpoch;
+}
+function nonnegativeInteger(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+function countMapValid(value) {
+  return plainRecord(value)
+    && Object.values(value).every(nonnegativeInteger);
+}
+function reservedDraftSpanValid(value) {
+  return value === null || (plainRecord(value)
+    && nonnegativeInteger(value.warmup_minutes)
+    && nonnegativeInteger(value.resurfacing_minutes)
+    && isoDateTimeRangeValid(
+      value.reserved_start_time, value.reserved_end_time));
+}
+function rowCountMap(rows, key) {
+  const counts = Object.create(null);
+  rows.forEach((row) => {
+    const label = row[key] || "Unassigned";
+    counts[label] = (counts[label] || 0) + 1;
+  });
+  return counts;
+}
+function sameCountMap(actual, expected) {
+  return countMapValid(actual)
+    && JSON.stringify(Object.entries(actual).sort())
+      === JSON.stringify(Object.entries(expected).sort());
+}
+
+function schedulerDraftReviewPayloadValid(result) {
+  if (!plainRecord(result) || !Array.isArray(result.draft_games)) return false;
+  const ids = new Set();
+  const rowsValid = result.draft_games.every((row) => {
+    if (!plainRecord(row) || !nonemptyString(row.game_id)
+        || row.game_id !== row.game_id.trim()
+        || ids.has(row.game_id) || !Array.isArray(row.issues)
+        || row.issues.some((issue) => !nonemptyString(issue))
+        || !nonemptyString(row.home_team_name)
+        || !nonemptyString(row.away_team_name)
+        || row.is_draft !== true || row.published !== false
+        || !isoDateTimeOrNull(row.start_time)
+        || !isoDateTimeOrNull(row.end_time)
+        || ((row.start_time === null) !== (row.end_time === null))
+        || (row.start_time !== null && row.end_time !== null
+          && !isoDateTimeRangeValid(row.start_time, row.end_time))
+        || !nullableString(row.division_id)
+        || !nullableString(row.division_name)
+        || !nullableString(row.rink_id)
+        || !nullableString(row.rink_name)
+        || !reservedDraftSpanValid(row.reserved)) return false;
+    ids.add(row.game_id);
+    return true;
+  });
+  // The deliberately minimal explicit-empty response remains a valid EMPTY
+  // assertion. A nonempty result, however, must carry the census the card
+  // renders; silently dropping it would turn an incomplete response into an
+  // actionable READY card.
+  if (!rowsValid || result.summary == null) {
+    return rowsValid && result.draft_games.length === 0;
+  }
+  const summary = result.summary;
+  return plainRecord(summary)
+    && nonnegativeInteger(summary.draft_count)
+    && summary.draft_count === result.draft_games.length
+    && nonnegativeInteger(summary.published_count)
+    && nonnegativeInteger(summary.issue_count)
+    && summary.issue_count === result.draft_games.filter(
+      (row) => row.issues.length > 0).length
+    && sameCountMap(summary.by_division,
+      rowCountMap(result.draft_games, "division_name"))
+    && sameCountMap(summary.by_rink,
+      rowCountMap(result.draft_games, "rink_name"));
+}
+
 // Reconciles a Scheduler Review card's selection against the latest drafts
 // fetch and `previousDrafts` (the prior card payload): default-selects only
 // NEWLY-seen clean
@@ -11371,7 +11525,7 @@ const SCHED_ISSUE_LABEL = {
 // read red; softer in-progress states (pending acceptance, roster not yet
 // confirmed) read as a warning — same red/orange split as everywhere else.
 const SCHED_ISSUE_SEVERE = new Set(["missing_officials", "slot_conflict", "team_double_booked"]);
-function schedDraftRow(g, selected, actionable) {
+function schedDraftRow(g, selected, actionable, selectedForDecision) {
   const checked = selected.has(g.game_id);
   const badges = g.issues.map((i) =>
     `<span class="badge ${SCHED_ISSUE_SEVERE.has(i) ? "red" : "orange"}">${esc(SCHED_ISSUE_LABEL[i] || i)}</span>`).join(" ");
@@ -11381,15 +11535,29 @@ function schedDraftRow(g, selected, actionable) {
   const rsv = g.reserved
     ? `<div class="slot-reserved">reserved ${fmt(g.reserved.reserved_start_time)}–${fmt(g.reserved.reserved_end_time)} (+${g.reserved.warmup_minutes}m warm-up, +${g.reserved.resurfacing_minutes}m resurfacing)</div>`
     : "";
+  // Scheduler rows are governed by MANAGE_SCHEDULE, not MANAGE_SETUP.
+  // `delBtn()` deliberately enforces the latter for structural Setup records,
+  // so reusing it here silently hid this discard path from Arena Managers.
+  // Keep the shared confirmation transport, but let this card's independently
+  // derived `actionable` policy own whether the control exists.
+  const discardWhen = [fmtRowDate(g.start_time), fmt(g.start_time)]
+    .filter(Boolean).join(" ") || "time not set";
+  const discardName = `${g.home_team_name} vs ${g.away_team_name} — ${discardWhen} — ${g.rink_name || "Unassigned rink"}`;
+  const discardAria = `Discard draft ${discardName}`;
+  const discardButton = actionable ? `<button class="icon-btn danger"
+      data-del="game" data-del-id="${esc(g.game_id)}"
+      data-del-name="${esc(discardName)}" data-sched-row-discard="${esc(g.game_id)}"
+      title="${esc(discardAria)}" aria-label="${esc(discardAria)}"
+      >${ICONS.trash}</button>` : "";
   return `<div class="li">
-    ${actionable ? `<input type="checkbox" class="sched-pick" data-sched-pick="${esc(g.game_id)}" ${checked ? "checked" : ""} />` : ""}
+    ${actionable ? `<input type="checkbox" class="sched-pick" data-sched-pick="${esc(g.game_id)}"
+      aria-label="${esc(`Select draft ${discardName}`)}" ${checked ? "checked" : ""} />` : ""}
     <span class="li-when"><span class="li-date">${esc(fmtRowDate(g.start_time))}</span><span class="li-time">${fmt(g.start_time)}</span></span>
     <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
       <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}${badges ? " · " + badges : ""}</div>${rsv}</div>
-    <span class="pill gray">Draft</span>${actionable
-      ? delBtn("game", g.game_id,
-          g.home_team_name + " vs " + g.away_team_name, "Delete draft")
-      : ""}</div>`;
+    <span class="pill gray">Draft</span>${selectedForDecision
+      ? '<span class="pill orange" data-sched-discard-selected>Selected for discard</span>'
+      : ""}${discardButton}</div>`;
 }
 // #375 residual blocker — MIRRORS `MAX_GAMES_PER_TEAM` in
 // `services/scheduler.py`, the ceiling `_normalize_games_per_team` enforces.
@@ -11448,6 +11616,7 @@ function schedulerGeneratorControls(divs) {
   return `<div class="card">
     <div class="section-title" style="margin-top:0">Generate draft schedule</div>
     <div class="dq-actions sched-generate-row">
+      <label class="sr-only" for="sched-div">Division to schedule</label>
       <select id="sched-div">${divOptions}</select>
       <label class="sr-only" for="sched-format">Regular-season format</label>
       <select id="sched-format" title="Regular-season format">${
@@ -11516,7 +11685,12 @@ function schedulerPreviewHtml(pv, divs, actionable) {
       ? '<div class="li"><div class="li-main"><div class="li-sub">Every pairing is already scheduled — nothing missing to generate.</div></div></div>'
       : "") + gRows + aRows + uRows || '<div class="empty">No games generated.</div>';
   }
-  return `<div id="sched-preview" class="sched-preview"
+  // The generated READY result is announced once. Read-only copies used
+  // under CONFIRM/PENDING/LOADING carry no live-region semantics: those
+  // transitions announce their concise sentence through #toast-root, and
+  // re-announcing every preview row would create a second competing message.
+  const liveAttrs = actionable ? ' role="status" aria-live="polite"' : "";
+  return `<div id="sched-preview" class="sched-preview"${liveAttrs}
       data-team-count="${teamCount === null ? "" : teamCount}"
       data-games="${games.length}" data-conflicts="${unsched.length}"
       data-already-scheduled="${(pv.already_scheduled || []).length}"
@@ -11524,6 +11698,279 @@ function schedulerPreviewHtml(pv, divs, actionable) {
     ${head}<div class="card">${cardBody}</div>
     ${actionable ? `<div class="dq-actions"><button class="act primary" data-sched-commit
       ${games.length ? "" : "disabled"}>Commit as draft</button></div>` : ""}</div>`;
+}
+
+function stringList(value) {
+  return Array.isArray(value) && value.every(nonemptyString);
+}
+function schedulerProposalDraftValid(row) {
+  return plainRecord(row)
+    && ["home_team_id", "away_team_id", "home_team_name", "away_team_name",
+        "ice_slot_id", "rink_id"].every((key) => nonemptyString(row[key]))
+    && row.home_team_id !== row.away_team_id
+    && nullableString(row.division_id) && nullableString(row.rink_name)
+    && isoDateTimeRangeValid(row.start_time, row.end_time);
+}
+function schedulerUnscheduledValid(row) {
+  return plainRecord(row)
+    && ["home_team_id", "away_team_id", "home_team_name", "away_team_name",
+        "reason"].every((key) => nonemptyString(row[key]))
+    && row.home_team_id !== row.away_team_id
+    && nullableString(row.division_id) && stringList(row.reason_codes)
+    && Array.isArray(row.team_conflicts)
+    && row.team_conflicts.every(plainRecord)
+    && Array.isArray(row.turnaround_conflicts)
+    && row.turnaround_conflicts.every(plainRecord);
+}
+function schedulerAlreadyScheduledValid(row) {
+  return plainRecord(row)
+    && ["home_team_id", "away_team_id", "home_team_name", "away_team_name",
+        "existing_game_id"].every((key) => nonemptyString(row[key]))
+    && row.home_team_id !== row.away_team_id
+    && nullableString(row.division_id)
+    && Number.isInteger(row.existing_game_count)
+    && row.existing_game_count > 0;
+}
+function schedulerGenerateResponseValid(result, context) {
+  const request = context && context.request || {};
+  const identity = context && context.identity || {};
+  const games = request.games_per_team == null ? null : request.games_per_team;
+  const meetings = games === null ? (request.meetings_per_opponent || 1) : null;
+  const turnaround = request.constraints
+    && request.constraints.min_turnaround_minutes || 0;
+  const expectedLeague = request.league_id != null
+    ? request.league_id : (request.division_id != null
+      ? identity.program_id : identity.league_id);
+  if (!plainRecord(result)
+      || result.division_id !== (request.division_id || null)
+      || (request.season_id != null && result.season_id !== request.season_id)
+      || (request.league_id != null && result.league_id !== request.league_id)
+      || result.season_id !== identity.season_id
+      || result.league_id !== expectedLeague
+      || !nonnegativeInteger(result.team_count)
+      || result.games_per_team !== games
+      || result.meetings_per_opponent !== meetings
+      || !Number.isFinite(result.min_turnaround_minutes)
+      || result.min_turnaround_minutes !== turnaround
+      || !Array.isArray(result.draft_games)
+      || !result.draft_games.every(schedulerProposalDraftValid)
+      || !Array.isArray(result.unscheduled)
+      || !result.unscheduled.every(schedulerUnscheduledValid)
+      || !Array.isArray(result.already_scheduled)
+      || !result.already_scheduled.every(schedulerAlreadyScheduledValid)
+      || !Array.isArray(result.unschedulable_teams)
+      || !result.unschedulable_teams.every((row) => plainRecord(row)
+        && nonemptyString(row.team_id) && nonemptyString(row.team_name)
+        && stringList(row.reason_codes))
+      || !nonemptyString(result.draft_fingerprint)) return false;
+  const allPairings = result.draft_games.concat(
+    result.unscheduled, result.already_scheduled);
+  if (result.division_id !== null && allPairings.some(
+    (row) => row.division_id !== result.division_id)) return false;
+  const slotIds = result.draft_games.map((row) => row.ice_slot_id);
+  const existingIds = result.already_scheduled.map(
+    (row) => row.existing_game_id);
+  const unschedulableIds = result.unschedulable_teams.map(
+    (row) => row.team_id);
+  if (new Set(slotIds).size !== slotIds.length
+      || new Set(existingIds).size !== existingIds.length
+      || new Set(unschedulableIds).size !== unschedulableIds.length) return false;
+  const teamIds = new Set();
+  allPairings.forEach((row) => {
+    teamIds.add(row.home_team_id);
+    teamIds.add(row.away_team_id);
+  });
+  result.unschedulable_teams.forEach((row) => teamIds.add(row.team_id));
+  if (result.team_count < 2) {
+    return !result.draft_games.length && !result.unscheduled.length
+      && !result.already_scheduled.length
+      && !result.unschedulable_teams.length;
+  }
+  // A Division proposal necessarily mentions every eligible team across its
+  // pairing buckets. A League-wide proposal can contain multiple singleton
+  // Divisions; those teams are counted but have no pairing row by design.
+  return result.division_id === null
+    ? teamIds.size <= result.team_count
+    : teamIds.size === result.team_count;
+}
+function schedulerStructuredValue(value) {
+  if (Array.isArray(value)) return value.map(schedulerStructuredValue);
+  if (!plainRecord(value)) return value;
+  return Object.fromEntries(Object.keys(value).sort()
+    .map((key) => [key, schedulerStructuredValue(value[key])]));
+}
+function schedulerUnscheduledBoundValue(row) {
+  return schedulerStructuredValue({
+    division_id: row.division_id,
+    home_team_id: row.home_team_id,
+    away_team_id: row.away_team_id,
+    home_team_name: row.home_team_name,
+    away_team_name: row.away_team_name,
+    reason_codes: row.reason_codes.slice().sort(),
+    reason: row.reason,
+    team_conflicts: row.team_conflicts,
+    turnaround_conflicts: row.turnaround_conflicts,
+  });
+}
+function schedulerUnscheduledMultisetEqual(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)
+      || left.length !== right.length) return false;
+  const canonical = (rows) => rows.map((row) =>
+    JSON.stringify(schedulerUnscheduledBoundValue(row))).sort();
+  return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
+}
+function schedulerCreatedBoundValue(row) {
+  return schedulerStructuredValue({
+    division_id: row.division_id,
+    home_team_name: row.home_team_name,
+    away_team_name: row.away_team_name,
+    rink_name: row.rink_name,
+    start_time: row.start_time,
+  });
+}
+function schedulerCreatedMultisetEqual(created, proposals) {
+  if (!Array.isArray(created) || !Array.isArray(proposals)
+      || created.length !== proposals.length) return false;
+  const canonical = (rows) => rows.map((row) =>
+    JSON.stringify(schedulerCreatedBoundValue(row))).sort();
+  return JSON.stringify(canonical(created))
+    === JSON.stringify(canonical(proposals));
+}
+function schedulerCommitResponseValid(result, context) {
+  const preview = context && context.preview || {};
+  const identity = context && context.identity || {};
+  const expected = Array.isArray(preview.draft_games)
+    ? preview.draft_games : [];
+  const expectedUnscheduled = Array.isArray(preview.unscheduled)
+    ? preview.unscheduled : [];
+  const ids = new Set();
+  return plainRecord(result)
+    && result.division_id === (preview.division_id || null)
+    && result.season_id === preview.season_id
+    && result.league_id === preview.league_id
+    && Array.isArray(result.created)
+    && result.created.length === expected.length
+    && result.created.every((row) => {
+      if (!plainRecord(row) || !nonemptyString(row.game_id)
+          || ids.has(row.game_id) || row.is_draft !== true
+          || row.published !== false) return false;
+      ids.add(row.game_id);
+      return true;
+    })
+    && schedulerCreatedMultisetEqual(result.created, expected)
+    && Array.isArray(result.unscheduled)
+    && result.unscheduled.length === expectedUnscheduled.length
+    && result.unscheduled.every(schedulerUnscheduledValid)
+    && schedulerUnscheduledMultisetEqual(
+      result.unscheduled, expectedUnscheduled);
+}
+
+// One authoritative inventory for every Scheduler write. The PENDING state,
+// serialized lease, route, owner card and confirmation subset are all derived
+// from this declaration; adding or removing an operation cannot leave a
+// parallel four-item test list silently stale.
+const SCHEDULER_WRITE_ACTIONS = Object.freeze({
+  generate: Object.freeze({
+    card: SCHEDULER_DRAFT_CARD,
+    path: "/api/scheduler/draft",
+    responseValid: schedulerGenerateResponseValid,
+  }),
+  commit: Object.freeze({
+    card: SCHEDULER_DRAFT_CARD,
+    path: "/api/scheduler/commit",
+    responseValid: schedulerCommitResponseValid,
+    confirm: Object.freeze({
+    prompt: (count) => `Commit ${count} proposed game${count === 1 ? "" : "s"} as draft?`,
+    yes: "Commit as draft", no: "Keep reviewing",
+    busy: "Committing draft games…",
+    cancelled: "The proposal was not committed.",
+    }),
+  }),
+  publish: Object.freeze({
+    card: SCHEDULER_REVIEW_CARD,
+    path: "/api/scheduler/drafts/publish",
+    responseValid: (result, context) => nonnegativeInteger(result.published)
+      && result.published <= context.maxCount,
+  }),
+  discard: Object.freeze({
+    card: SCHEDULER_REVIEW_CARD,
+    path: "/api/scheduler/drafts/discard",
+    responseValid: (result, context) => nonnegativeInteger(result.discarded)
+      && result.discarded <= context.maxCount,
+    confirm: Object.freeze({
+    prompt: (count) => `Discard ${count} selected draft game${count === 1 ? "" : "s"}? This frees their ice and cannot be undone.`,
+    yes: "Discard drafts", no: "Keep drafts",
+    busy: "Discarding selected draft games…",
+    cancelled: "The selected drafts were kept.",
+    }),
+  }),
+});
+const SCHEDULER_CONFIRM_ACTIONS = Object.freeze(Object.fromEntries(
+  Object.entries(SCHEDULER_WRITE_ACTIONS)
+    .filter(([, declared]) => !!declared.confirm)
+    .map(([action, declared]) => [action, Object.freeze(Object.assign(
+      { card: declared.card }, declared.confirm))])));
+
+function schedulerWriteResponseValid(action, result, context) {
+  const declared = SCHEDULER_WRITE_ACTIONS[action];
+  return !!declared && typeof declared.responseValid === "function"
+    && !!result && !result.error
+    && declared.responseValid(result, context || {});
+}
+
+// Only stable, structured refusals which the server issues before a write (or
+// after rolling its transaction back) establish a definite no-write outcome.
+// A transport/proxy failure, internal_error, malformed error body, or future
+// code may have happened after commit but before the response was delivered;
+// default those cases to UNKNOWN and reconcile from fresh server truth before
+// exposing another write control.
+const SCHEDULER_CONFIRMED_NO_WRITE_CODES = new Set([
+  "active_context_required", "validation_error", "forbidden", "unauthorized",
+  "not_found", "conflict", "concurrency_conflict",
+]);
+function schedulerWriteOutcomeUnverified(result) {
+  const error = result && result.error;
+  return !plainRecord(error)
+    || !nonemptyString(error.code)
+    || !nonemptyString(error.message)
+    || !SCHEDULER_CONFIRMED_NO_WRITE_CODES.has(error.code);
+}
+
+function schedulerActionCount(action, entry) {
+  const payload = entry && entry.payload || {};
+  if (action === "commit") {
+    const preview = payload.preview || {};
+    return (preview.draft_games || preview.created || []).length;
+  }
+  if (action === "discard") {
+    const selected = payload.selected instanceof Set
+      ? payload.selected : new Set(payload.selected || []);
+    return selected.size;
+  }
+  return 0;
+}
+
+function schedulerConfirmCopy(entry) {
+  const action = entry && entry.schedulerAction;
+  const declared = action && SCHEDULER_CONFIRM_ACTIONS[action];
+  if (!declared) return "";
+  const count = schedulerActionCount(action, entry);
+  return `<div class="swf-confirm scheduler-confirm" role="group"
+      aria-label="${esc(declared.yes)}">
+    <p class="swf-confirm-prompt">${esc(declared.prompt(count))}</p>
+    <div class="swf-card-actions">
+      <button class="act ghost" data-sched-confirm-yes="${esc(action)}"
+        >${esc(declared.yes)}</button>
+      <button class="act ghost" data-sched-confirm-no="${esc(action)}"
+        >${esc(declared.no)}</button>
+    </div>
+  </div>`;
+}
+
+function schedulerPendingCopy(entry) {
+  return `<p class="swf-card-pending scheduler-pending"
+      data-sched-pending="${esc(entry.pendingAction || "write")}" tabindex="-1"
+      >${esc(entry.pendingNote || "Working…")}</p>`;
 }
 
 function renderScheduler(ov) {
@@ -11554,6 +12001,12 @@ function renderScheduler(ov) {
   } else if (draftEntry.state === CARD_STATE.STALE) {
     draftBody = operationalStaleCopy(SCHEDULER_DRAFT_CARD, "Draft schedule")
       + schedulerPreviewHtml(preview, divs, false);
+  } else if (draftEntry.state === CARD_STATE.PENDING) {
+    draftBody = schedulerPendingCopy(draftEntry)
+      + schedulerPreviewHtml(preview, divs, false);
+  } else if (draftEntry.state === CARD_STATE.CONFIRM) {
+    draftBody = schedulerPreviewHtml(preview, divs, false)
+      + schedulerConfirmCopy(draftEntry);
   } else {
     if (draftEntry.state === CARD_STATE.ERROR) {
       draftBody += operationalErrorCopy(SCHEDULER_DRAFT_CARD, "Draft schedule", draftEntry);
@@ -11616,16 +12069,39 @@ function renderScheduler(ov) {
       By division: ${Object.entries(summary.by_division || {}).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
       &nbsp;·&nbsp; By rink: ${Object.entries(summary.by_rink || {}).map(([k, v]) => `${esc(k)} (${v})`).join(", ") || "—"}
     </div>` : "";
-  const filterBlock = allDrafts.length ? `<div class="dq-actions" data-card-local-controls>
+  // CONFIRM/PENDING freeze the exact decision and therefore expose no local
+  // controls. Filters remain useful on retained read-only rows in the other
+  // states: they never mutate server truth, and their axis is derived from the
+  // Review card's own retained payload above.
+  const reviewDecisionLocked = reviewEntry.state === CARD_STATE.CONFIRM
+    || reviewEntry.state === CARD_STATE.PENDING;
+  const filterBlock = allDrafts.length && !reviewDecisionLocked
+    ? `<div class="dq-actions" data-card-local-controls>
+    <label class="sr-only" for="sched-filter-div">Filter draft games by division</label>
     <select id="sched-filter-div"><option value="all">All divisions</option>${divOptions(effectiveDivisionFilter === "all" ? null : effectiveDivisionFilter)}</select>
+    <label class="sr-only" for="sched-filter-rink">Filter draft games by rink</label>
     <select id="sched-filter-rink"><option value="all">All rinks</option>${rinkOpts}</select>
+    <label class="sr-only" for="sched-filter-issue">Filter draft games by review issue</label>
     <select id="sched-filter-issue"><option value="all" ${f.issue === "all" ? "selected" : ""}>All</option>
       <option value="issues" ${f.issue === "issues" ? "selected" : ""}>With issues</option>
-      <option value="clean" ${f.issue === "clean" ? "selected" : ""}>Clean only</option></select></div>` : "";
-  const rows = drafts.map((g) => schedDraftRow(g, selected, reviewActionable)).join("");
+      <option value="clean" ${f.issue === "clean" ? "selected" : ""}>Clean only</option></select></div>`
+    : "";
+  // A destructive confirmation must show the exact frozen decision, not a
+  // count beside whichever filter happened to be visible. Expand across the
+  // card's complete current payload and render only the selected rows with a
+  // noninteractive marker, so hidden selections are reviewable before Yes.
+  const discardConfirm = reviewEntry.state === CARD_STATE.CONFIRM
+    && reviewEntry.schedulerAction === "discard";
+  const displayedDrafts = discardConfirm
+    ? allDrafts.filter((g) => selected.has(g.game_id)) : drafts;
+  const rows = displayedDrafts.map((g) =>
+    schedDraftRow(g, selected, reviewActionable, discardConfirm)).join("");
   const selectedCount = reviewActionable ? selected.size : 0;
-  let reviewData = `${summaryBlock}<div class="section-title">Draft games (${drafts.length}${
-    drafts.length !== allDrafts.length ? ` of ${allDrafts.length}` : ""})</div>${filterBlock}
+  const listTitle = discardConfirm
+    ? `Drafts selected for discard (${displayedDrafts.length})`
+    : `Draft games (${drafts.length}${
+      drafts.length !== allDrafts.length ? ` of ${allDrafts.length}` : ""})`;
+  let reviewData = `${summaryBlock}<div class="section-title">${listTitle}</div>${filterBlock}
     <div class="card">${rows || '<div class="empty">No draft games match these filters.</div>'}</div>`;
   if (reviewActionable && allDrafts.length) {
     reviewData += `<div class="dq-actions"><button class="act ghost" data-sched-select-all>Select all</button>
@@ -11653,6 +12129,11 @@ function renderScheduler(ov) {
   } else if (reviewEntry.state === CARD_STATE.STALE) {
     reviewBody = operationalStaleCopy(SCHEDULER_REVIEW_CARD, "Draft review")
       + (displayedReview ? retainedReview : "");
+  } else if (reviewEntry.state === CARD_STATE.PENDING) {
+    reviewBody = schedulerPendingCopy(reviewEntry)
+      + (displayedReview ? reviewData : "");
+  } else if (reviewEntry.state === CARD_STATE.CONFIRM) {
+    reviewBody = reviewData + schedulerConfirmCopy(reviewEntry);
   } else if (reviewEntry.state === CARD_STATE.EMPTY) {
     reviewBody = retainedReview;
   } else {
@@ -11702,6 +12183,7 @@ function repaintSchedulerSurface(cardId, chromeOverview) {
   });
   wireSchedulerCards(content);
   restoreOperationalRetryFocus(focusedRetryCard);
+  restorePendingCardWriteFocus();
   syncOverlayFocus();
 }
 
@@ -11715,13 +12197,21 @@ async function loadSchedulerDraftCard(opts) {
   const currentRetentionChain = !!displayedBefore && (
     cardIdentityCurrent(displayedBefore.identity)
     || (!!before.retainedCurrentAtStart && cardIdentityCurrent(before.identity)));
-  const currentProposal = currentRetentionChain
+  const currentProposal = !(opts && opts.fresh) && currentRetentionChain
     && displayedBefore.payload && displayedBefore.payload.preview
     ? displayedBefore.payload : null;
-  const identity = beginOperationalCardLoad(SCHEDULER_DRAFT_CARD, opts);
+  const loadOpts = Object.assign({}, opts || {});
+  if (loadOpts.fresh) loadOpts.retain = false;
+  const identity = beginOperationalCardLoad(SCHEDULER_DRAFT_CARD, loadOpts);
   if (!identity) return;
   const renderedEpoch = contextEpoch;
   repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+  if (opts && opts.focusLoading) {
+    const root = document.querySelector(
+      `[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
+    focusOperationalCardTarget(identity, root && (
+      root.querySelector("[data-operational-status-heading],.skeleton") || root));
+  }
   const result = await getJSONContextScoped("/api/demo/overview", renderedEpoch);
   if (result === CONTEXT_READ_ABORTED) return;
   if (result && result.error) {
@@ -11769,13 +12259,41 @@ async function loadSchedulerReviewCard(opts) {
   if (!identity) return;
   const renderedEpoch = contextEpoch;
   repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+  let loadingFocusTarget = null;
+  // A completed Publish/Discard immediately starts this reconciliation read.
+  // If the pending line owned focus, its replacement LOADING heading inherits
+  // that ownership now; otherwise the later GET would strand the operator on
+  // <body> for the whole read. Never use this to steal focus from a control
+  // the operator deliberately moved to while the write was in flight.
+  if (opts && opts.focusLoading) {
+    const root = document.querySelector(
+      `[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
+    const target = root && root.querySelector("[data-operational-status-heading]");
+    if (focusOperationalCardTarget(identity, target)) loadingFocusTarget = target;
+  } else if (identity.userInitiated) {
+    // Retry focus may already have been transferred to this heading by the
+    // card repaint. Remember that exact ownership for the settled paint too.
+    const root = document.querySelector(
+      `[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
+    const active = document.activeElement;
+    if (root && active && root.contains(active)
+        && active.matches("[data-operational-status-heading]")) {
+      loadingFocusTarget = active;
+    }
+  }
   const result = await getJSONContextScoped(
     "/api/scheduler/drafts", renderedEpoch);
   if (result === CONTEXT_READ_ABORTED) return;
-  if (result && result.error) {
+  if ((result && result.error) || !schedulerDraftReviewPayloadValid(result)) {
+    const errorExtra = { retryOperation: "load" };
+    const retainedNote = opts && opts.retainedNote
+      || (currentRetentionChain && before.retainedNote);
+    if (retainedNote) errorExtra.retainedNote = retainedNote;
     if (!operationalCardError(
-        identity, result, "The draft list could not be loaded.",
-        { retryOperation: "load" })) return;
+        identity, result,
+        result && result.error ? "The draft list could not be loaded."
+          : "The draft list returned an invalid response.",
+        errorExtra)) return;
   } else {
     const drafts = (result && result.draft_games) || [];
     const sameTuple = currentRetentionChain && priorIdentity
@@ -11794,25 +12312,154 @@ async function loadSchedulerReviewCard(opts) {
                  selected: selected },
     })) return;
   }
+  const beforeSettle = document.querySelector(
+    `[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
+  const focusPlan = identity.userInitiated
+    ? captureOperationalSettlementFocus(
+      beforeSettle, loadingFocusTarget, !!(opts && opts.focusLoading))
+    : null;
   repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
-  if (identity.userInitiated) {
-    const root = document.querySelector(`[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
-    focusOperationalCardTarget(identity, root && (root.querySelector("[data-sched-publish]")
+  const root = document.querySelector(
+    `[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
+  // A partial/single-row discard can legitimately settle READY with no
+  // selected rows. Its Publish control exists but is disabled; focusing it
+  // is a browser no-op that would strand the operator on <body> while our
+  // helper reported success. Prefer it only when it is genuinely usable.
+  restoreOperationalSettlementFocus(identity, focusPlan, root,
+    root && (root.querySelector("[data-sched-publish]:not(:disabled)")
       || root.querySelector("h2,.section-title,.sched-empty-lead")));
+}
+
+function copySchedulerCardEntry(entry) {
+  const payload = Object.assign({}, entry && entry.payload || {});
+  if (payload.selected instanceof Set) payload.selected = new Set(payload.selected);
+  return Object.assign({}, entry || {}, { payload: payload });
+}
+
+function beginSchedulerCardWrite(cardId, heldEntry, action, pendingNote) {
+  const held = copySchedulerCardEntry(heldEntry);
+  const declared = SCHEDULER_WRITE_ACTIONS[action];
+  if (!declared || declared.card !== cardId
+      || !held.identity || !cardIdentityCurrent(held.identity)
+      || contextSwitchIntentPending || view !== "scheduler") return null;
+  const identity = beginCardRequest(cardId, { userInitiated: true });
+  if (!identity) return null;
+  toast = "";
+  toastIsError = false;
+  updateToast();
+  if (!commitCardState(identity, Object.assign({}, held, {
+    state: CARD_STATE.PENDING,
+    status: CARD_STATUS.UNKNOWN,
+    pendingAction: action,
+    pendingNote: pendingNote,
+    confirm: null,
+    schedulerAction: null,
+    resumeState: null,
+    error: null,
+    errorAnnounced: false,
+  }))) return null;
+  repaintSchedulerSurface(cardId);
+  announceCardStatus(identity, pendingNote);
+  const root = document.querySelector(`[data-operational-card="${cardId}"]`);
+  focusOperationalCardTarget(identity,
+    root && root.querySelector(`[data-sched-pending="${action}"]`));
+  return identity;
+}
+
+// A serialized Scheduler write can settle after its initiating tuple or
+// principal has gone away. The response is not UI truth in that case; once
+// the exact write lease has drained, rebuild the card from the server if its
+// target tuple is current again. Commit can change both cards, while the other
+// three operations own only the card that initiated them.
+function reconcileSettledSchedulerWrite(identity, action) {
+  if (contextSwitchIntentPending || !cardTupleCurrent(identity)
+      || view !== "scheduler") return;
+  if (action === "commit") {
+    loadSchedulerDraftCard({ preserveAnnouncement: true, fresh: true });
+    loadSchedulerReviewCard({ preserveAnnouncement: true });
+  } else if (identity.card === SCHEDULER_DRAFT_CARD) {
+    loadSchedulerDraftCard({ preserveAnnouncement: true, fresh: true });
+  } else {
+    loadSchedulerReviewCard({ preserveAnnouncement: true });
   }
+}
+
+function schedulerConfirmEntry(action) {
+  const declared = SCHEDULER_CONFIRM_ACTIONS[action];
+  if (!declared || contextSwitchIntentPending) return null;
+  const held = currentReadyCard(declared.card);
+  return held && schedulerActionCount(action, held) > 0 ? held : null;
+}
+
+function askSchedulerCardConfirm(action) {
+  const declared = SCHEDULER_CONFIRM_ACTIONS[action];
+  const held = schedulerConfirmEntry(action);
+  if (!declared || !held) return;
+  const identity = beginCardRequest(declared.card, { userInitiated: true });
+  if (!identity) return;
+  toast = "";
+  toastIsError = false;
+  updateToast();
+  if (!commitCardState(identity, Object.assign({}, copySchedulerCardEntry(held), {
+    state: CARD_STATE.CONFIRM,
+    confirm: declared,
+    schedulerAction: action,
+    resumeState: held.state,
+  }))) return;
+  repaintSchedulerSurface(declared.card);
+  announceCardStatus(identity, declared.prompt(schedulerActionCount(action, held)));
+  const root = document.querySelector(
+    `[data-operational-card="${declared.card}"]`);
+  focusOperationalCardTarget(identity,
+    root && root.querySelector(`[data-sched-confirm-yes="${action}"]`));
+}
+
+function resolveSchedulerCardConfirm(action, yes) {
+  const declared = SCHEDULER_CONFIRM_ACTIONS[action];
+  const held = declared && readCardState(declared.card);
+  if (!declared || !held || held.state !== CARD_STATE.CONFIRM
+      || held.schedulerAction !== action || !cardIdentityCurrent(held.identity)) return;
+  if (yes) {
+    if (action === "commit") return commitSchedulerDraft(held);
+    if (action === "discard") {
+      return mutateSchedulerDrafts(
+        "discard", "Discarded",
+        { held: held, confirmed: true });
+    }
+    return;
+  }
+  const identity = beginCardRequest(declared.card, { userInitiated: true });
+  if (!identity) return;
+  if (!commitCardState(identity, Object.assign({}, copySchedulerCardEntry(held), {
+    state: held.resumeState || CARD_STATE.READY,
+    confirm: null,
+    schedulerAction: null,
+    resumeState: null,
+  }))) return;
+  repaintSchedulerSurface(declared.card);
+  announceCardStatus(identity, declared.cancelled);
+  const root = document.querySelector(
+    `[data-operational-card="${declared.card}"]`);
+  focusOperationalCardTarget(identity, root && root.querySelector(
+    action === "commit" ? "[data-sched-commit]" : "[data-sched-discard]"));
 }
 
 async function generateSchedulerDraft(request) {
   const before = readCardState(SCHEDULER_DRAFT_CARD);
   const prior = cardDisplayPayload(before) || {};
-  const identity = beginOperationalCardLoad(SCHEDULER_DRAFT_CARD, { userInitiated: true });
+  const identity = beginSchedulerCardWrite(
+    SCHEDULER_DRAFT_CARD, before, "generate", "Generating draft schedule…");
   if (!identity) return;
-  repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
   const result = await postOperationalCardScoped(
-    identity, "/api/scheduler/draft", request);
+    identity, SCHEDULER_WRITE_ACTIONS.generate.path, request, {
+      serializeCard: true,
+      onWithdrawn: (settledIdentity) =>
+        reconcileSettledSchedulerWrite(settledIdentity, "generate"),
+    });
   if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
   if (!cardIdentityCurrent(identity)) return;
-  if (result && !result.error) {
+  if (schedulerWriteResponseValid(
+      "generate", result, { request: request, identity: identity })) {
     commitCardState(identity, {
       state: CARD_STATE.READY,
       status: CARD_STATUS.UNKNOWN,
@@ -11820,16 +12467,23 @@ async function generateSchedulerDraft(request) {
       payload: { overview: prior.overview || {}, preview: result,
                  formatRefusal: null, request: request },
     });
-    announceCardStatus(identity, "Draft schedule preview updated.", false);
+    // READY's preview is itself the one polite live region. Retire the
+    // PENDING sentence before painting it; a second success toast would make
+    // assistive technology speak the same settlement twice.
+    toast = "";
+    toastIsError = false;
+    updateToast();
   } else {
     const details = result && result.error && result.error.details;
+    const invalidSuccess = !(result && result.error);
     const refusal = details && SCHED_FORMAT_REFUSALS.includes(details.reason)
       ? { message: result.error.message, details: details } : null;
     commitCardState(identity, {
       state: CARD_STATE.ERROR,
       status: CARD_STATUS.UNKNOWN,
-      error: (result && result.error && result.error.message)
-        || "The draft schedule could not be generated.",
+      error: invalidSuccess
+        ? "The draft schedule returned an invalid response. No preview was accepted."
+        : result.error.message || "The draft schedule could not be generated.",
       readOutcome: CARD_READ.FAILED,
       retryOperation: "generate",
       payload: { overview: prior.overview || {}, preview: null,
@@ -11840,6 +12494,185 @@ async function generateSchedulerDraft(request) {
   repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
   const root = document.querySelector(`[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
   focusOperationalCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
+    || root.querySelector("h2,.section-title")));
+}
+
+async function commitSchedulerDraft(heldEntry) {
+  const held = copySchedulerCardEntry(heldEntry);
+  const preview = held.payload && held.payload.preview;
+  if (held.state !== CARD_STATE.CONFIRM || held.schedulerAction !== "commit"
+      || !preview || !cardIdentityCurrent(held.identity)) return;
+  const request = held.payload.request || {};
+  const identity = beginSchedulerCardWrite(
+    SCHEDULER_DRAFT_CARD, held, "commit",
+    SCHEDULER_CONFIRM_ACTIONS.commit.busy);
+  if (!identity) return;
+  const result = await postOperationalCardScoped(
+    identity, SCHEDULER_WRITE_ACTIONS.commit.path, {
+    division_id: request.division_id || schedulerState.division,
+    ...(preview.games_per_team != null
+      ? { games_per_team: preview.games_per_team }
+      : { meetings_per_opponent: preview.meetings_per_opponent || 1 }),
+    constraints: { min_turnaround_minutes: preview.min_turnaround_minutes || 0 },
+    draft_fingerprint: preview.draft_fingerprint,
+  }, {
+    serializeCard: true,
+    onWithdrawn: (settledIdentity) =>
+      reconcileSettledSchedulerWrite(settledIdentity, "commit"),
+  });
+  if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+  if (!cardIdentityCurrent(identity)) return;
+  const responseValid = schedulerWriteResponseValid(
+    "commit", result, { preview: preview, identity: held.identity });
+  if (responseValid) {
+    commitCardState(identity, {
+      state: CARD_STATE.EMPTY, status: CARD_STATUS.UNKNOWN,
+      reason: "no_preview", readOutcome: CARD_READ.OK,
+      payload: { overview: held.payload.overview || {}, preview: null,
+                 formatRefusal: null },
+    });
+    announceCardStatus(identity,
+      `Committed ${(result.created || []).length} draft game(s).`, false);
+    repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+    const root = document.querySelector(
+      `[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
+    focusOperationalCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
+      || root.querySelector("h2,.section-title")));
+    loadSchedulerReviewCard({
+      preserveAnnouncement: true,
+      retainedNote: "The rows below are the last draft list loaded before the commit. The commit completed, but this list could not be refreshed. It may be out of date and remains read-only until Retry succeeds.",
+    });
+    return;
+  }
+  if (schedulerWriteOutcomeUnverified(result)) {
+    // A malformed 2xx is an unknown write outcome, not a safe failure. The
+    // transaction may have committed, so never offer a blind Commit retry or
+    // keep presenting the reviewed proposal as authoritative. Re-read both
+    // cards and let fresh server truth decide what exists now.
+    announceCardStatus(identity,
+      "The commit response could not be verified. Refreshing schedule state before another action.",
+      true);
+    const draftRoot = document.querySelector(
+      `[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
+    const pendingLine = draftRoot
+      && draftRoot.querySelector('[data-sched-pending="commit"]');
+    const pendingOwnedFocus = !!pendingLine
+      && document.activeElement === pendingLine;
+    await Promise.all([
+      loadSchedulerDraftCard({
+        preserveAnnouncement: true, fresh: true, userInitiated: true,
+        focusLoading: pendingOwnedFocus,
+      }),
+      loadSchedulerReviewCard({
+        preserveAnnouncement: true,
+        retainedNote: "The rows below are the last draft list loaded before the commit attempt. The response could not be verified and this list could not be refreshed. It may be out of date and remains read-only until Retry succeeds.",
+      }),
+    ]);
+    return;
+  }
+  const reason = result && result.error && result.error.details
+    && result.error.details.reason;
+  const clearPreview = reason === "pairing_already_scheduled"
+    || reason === "preview_stale";
+  commitCardState(identity, {
+    state: CARD_STATE.ERROR, status: CARD_STATUS.UNKNOWN,
+    error: (result && result.error && result.error.message)
+      || "The draft could not be committed.",
+    readOutcome: CARD_READ.FAILED,
+    retryOperation: "generate",
+    payload: { overview: held.payload.overview || {},
+               preview: clearPreview ? null : preview,
+               formatRefusal: null, request: held.payload.request || null },
+  });
+  repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
+  const root = document.querySelector(
+    `[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
+  focusOperationalCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
+    || root.querySelector("h2,.section-title")));
+}
+
+async function mutateSchedulerDrafts(action, successNoun, opts) {
+  const options = opts || {};
+  const declared = SCHEDULER_WRITE_ACTIONS[action];
+  if (!declared || declared.card !== SCHEDULER_REVIEW_CARD) return;
+  const held = copySchedulerCardEntry(
+    options.held || currentReadyCard(SCHEDULER_REVIEW_CARD));
+  const selected = held.payload && held.payload.selected;
+  const ids = options.ids || Array.from(selected || []);
+  const discard = action === "discard";
+  const allowedState = held.state === CARD_STATE.READY
+    || (discard && options.confirmed && held.state === CARD_STATE.CONFIRM);
+  if (!held.identity || !cardIdentityCurrent(held.identity) || !ids.length
+      || !allowedState || (discard && !options.confirmed)) return;
+  const identity = beginSchedulerCardWrite(
+    SCHEDULER_REVIEW_CARD, held, action,
+    `${successNoun === "Published" ? "Publishing" : "Discarding"} ${ids.length} selected draft game${ids.length === 1 ? "" : "s"}…`);
+  if (!identity) return;
+  const result = await postOperationalCardScoped(
+    identity, declared.path, { game_ids: ids }, {
+    serializeCard: true,
+    onWithdrawn: (settledIdentity) =>
+      reconcileSettledSchedulerWrite(settledIdentity, action),
+  });
+  if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
+  if (!cardIdentityCurrent(identity)) return;
+  const responseValid = schedulerWriteResponseValid(
+    action, result, { maxCount: new Set(ids).size });
+  if (responseValid || schedulerWriteOutcomeUnverified(result)) {
+    const reviewRoot = document.querySelector(
+      `[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
+    const pendingLine = reviewRoot
+      && reviewRoot.querySelector(`[data-sched-pending="${action}"]`);
+    const pendingOwnedFocus = !!pendingLine
+      && document.activeElement === pendingLine;
+    // The write lease has settled, but its follow-up read has not. Restore a
+    // safe, read-only version of the pre-write Review model synchronously (do
+    // not paint it) so beginOperationalCardLoad can retain it beneath an
+    // explicit LOADING banner. Without this handoff PENDING is not retainable,
+    // the card collapses to a bare skeleton, and the pending line's focus has
+    // no visible destination for the duration of the reconciliation GET.
+    if (!commitCardState(identity, Object.assign({}, held, {
+      state: held.resumeState || CARD_STATE.READY,
+      confirm: null,
+      schedulerAction: null,
+      resumeState: null,
+      pendingAction: null,
+      pendingNote: null,
+    }))) return;
+    if (responseValid) {
+      announceCardStatus(identity,
+        `${successNoun} ${action === "publish" ? result.published : result.discarded} game(s).`,
+        false);
+    } else {
+      announceCardStatus(identity,
+        `The ${action} response could not be verified. Refreshing the draft list before another action.`,
+        true);
+    }
+    const retainedNote = responseValid
+      ? `The rows below are the last draft list loaded before the ${action}. The ${action} completed, but this list could not be refreshed. It may be out of date and remains read-only until Retry succeeds.`
+      : `The rows below are the last draft list loaded before the ${action} attempt. The response could not be verified and this list could not be refreshed. It may be out of date and remains read-only until Retry succeeds.`;
+    await loadSchedulerReviewCard({
+      userInitiated: true, preserveAnnouncement: true,
+      focusLoading: pendingOwnedFocus,
+      retainedNote: retainedNote,
+    });
+    return;
+  }
+  commitCardState(identity, Object.assign({}, held, {
+    state: CARD_STATE.ERROR,
+    status: CARD_STATUS.UNKNOWN,
+    error: (result && result.error && result.error.message)
+      || `The selected drafts could not be ${successNoun.toLowerCase()}.`,
+    readOutcome: CARD_READ.FAILED,
+    retryOperation: "load",
+    confirm: null,
+    schedulerAction: null,
+    resumeState: null,
+  }));
+  repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+  const root = document.querySelector(
+    `[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
+  focusOperationalCardTarget(identity, root && (root.querySelector("[data-card-retry]")
     || root.querySelector("h2,.section-title")));
 }
 
@@ -11910,73 +12743,53 @@ function wireSchedulerCards(c) {
   };
 
   const schedCommit = c.querySelector("[data-sched-commit]");
-  if (schedCommit) schedCommit.onclick = async () => {
-    const ready = currentReadyCard(SCHEDULER_DRAFT_CARD);
-    const preview = ready && ready.payload && ready.payload.preview;
-    if (!ready || !preview) return;
-    const identity = beginOperationalCardLoad(
-      SCHEDULER_DRAFT_CARD, { userInitiated: true });
-    if (!identity) return;
-    repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
-    const result = await postOperationalCardScoped(identity, "/api/scheduler/commit", {
-      division_id: schedulerState.division,
-      ...(preview.games_per_team != null
-        ? { games_per_team: preview.games_per_team }
-        : { meetings_per_opponent: preview.meetings_per_opponent || 1 }),
-      constraints: { min_turnaround_minutes: preview.min_turnaround_minutes || 0 },
-      draft_fingerprint: preview.draft_fingerprint,
-    });
-    if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
-    if (!cardIdentityCurrent(identity)) return;
-    if (result && !result.error) {
-      commitCardState(identity, {
-        state: CARD_STATE.EMPTY, status: CARD_STATUS.UNKNOWN,
-        reason: "no_preview", readOutcome: CARD_READ.OK,
-        payload: { overview: ready.payload.overview || {}, preview: null,
-                   formatRefusal: null },
-      });
-      announceCardStatus(identity,
-        `Committed ${(result.created || []).length} draft game(s).`, false);
-      repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
-      loadSchedulerReviewCard();
-      return;
-    }
-    const reason = result && result.error && result.error.details
-      && result.error.details.reason;
-    const clearPreview = reason === "pairing_already_scheduled"
-      || reason === "preview_stale";
-    commitCardState(identity, {
-      state: CARD_STATE.ERROR, status: CARD_STATUS.UNKNOWN,
-      error: (result && result.error && result.error.message)
-        || "The draft could not be committed.",
-      readOutcome: CARD_READ.FAILED,
-      retryOperation: "generate",
-      payload: { overview: ready.payload.overview || {},
-                 preview: clearPreview ? null : preview,
-                 formatRefusal: null, request: ready.payload.request || null },
-    });
-    // operationalErrorCopy owns the one assertive announcement for ERROR.
-    repaintSchedulerSurface(SCHEDULER_DRAFT_CARD);
-    const root = document.querySelector(
-      `[data-operational-card="${SCHEDULER_DRAFT_CARD}"]`);
-    focusOperationalCardTarget(identity, root && (root.querySelector("[data-sched-generate]")
-      || root.querySelector("h2,.section-title")));
-  };
+  if (schedCommit) schedCommit.onclick = () =>
+    askSchedulerCardConfirm("commit");
+  c.querySelectorAll("[data-sched-confirm-yes]").forEach((button) => {
+    button.onclick = () =>
+      resolveSchedulerCardConfirm(button.dataset.schedConfirmYes, true);
+  });
+  c.querySelectorAll("[data-sched-confirm-no]").forEach((button) => {
+    button.onclick = () =>
+      resolveSchedulerCardConfirm(button.dataset.schedConfirmNo, false);
+  });
 
+  // Review's filters and selection controls repaint only their own card.
+  // Record the focused control before replacing it, then re-resolve that
+  // semantic id/data-* identity in the new DOM. Looking only after repaint is
+  // too late: the browser has already moved focus to <body> by then.
+  const repaintReviewLocalControl = (control) => {
+    const ownedFocus = document.activeElement === control;
+    const selector = ownedFocus ? triggerSelector(control) : null;
+    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+    if (!ownedFocus) return;
+    const entry = readCardState(SCHEDULER_REVIEW_CARD);
+    const root = document.querySelector(
+      `[data-operational-card="${SCHEDULER_REVIEW_CARD}"]`);
+    let target = null;
+    if (root && selector) {
+      try {
+        const matches = root.querySelectorAll(selector);
+        if (matches.length === 1) target = matches[0];
+      } catch (_) { /* fall through to the card heading */ }
+    }
+    focusCardTarget(entry.identity,
+      target || (root && root.querySelector("h2,.section-title")) || root);
+  };
   const schedFilterDiv = c.querySelector("#sched-filter-div");
   if (schedFilterDiv) schedFilterDiv.onchange = () => {
     schedulerState.filters.division = schedFilterDiv.value;
-    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+    repaintReviewLocalControl(schedFilterDiv);
   };
   const schedFilterRink = c.querySelector("#sched-filter-rink");
   if (schedFilterRink) schedFilterRink.onchange = () => {
     schedulerState.filters.rink = schedFilterRink.value;
-    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+    repaintReviewLocalControl(schedFilterRink);
   };
   const schedFilterIssue = c.querySelector("#sched-filter-issue");
   if (schedFilterIssue) schedFilterIssue.onchange = () => {
     schedulerState.filters.issue = schedFilterIssue.value;
-    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+    repaintReviewLocalControl(schedFilterIssue);
   };
   c.querySelectorAll("[data-sched-pick]").forEach((el) => {
     el.onchange = () => {
@@ -11987,55 +12800,30 @@ function wireSchedulerCards(c) {
         else selected.delete(el.dataset.schedPick);
         payload.selected = selected;
       });
-      repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+      repaintReviewLocalControl(el);
     };
   });
-  const setReviewSelection = (predicate) => {
+  const setReviewSelection = (predicate, control) => {
     updateSchedulerReviewCard((payload) => {
       payload.selected = new Set((payload.drafts || []).filter(predicate)
         .map((g) => g.game_id));
     });
-    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
+    repaintReviewLocalControl(control);
   };
   const selectAll = c.querySelector("[data-sched-select-all]");
-  if (selectAll) selectAll.onclick = () => setReviewSelection(() => true);
+  if (selectAll) selectAll.onclick = () => setReviewSelection(() => true, selectAll);
   const selectClean = c.querySelector("[data-sched-select-clean]");
   if (selectClean) selectClean.onclick = () =>
-    setReviewSelection((g) => !g.issues.length);
+    setReviewSelection((g) => !g.issues.length, selectClean);
   const selectNone = c.querySelector("[data-sched-select-none]");
-  if (selectNone) selectNone.onclick = () => setReviewSelection(() => false);
+  if (selectNone) selectNone.onclick = () => setReviewSelection(() => false, selectNone);
 
-  const mutateDrafts = async (path, successNoun) => {
-    const ready = currentReadyCard(SCHEDULER_REVIEW_CARD);
-    const selected = ready && ready.payload && ready.payload.selected;
-    const ids = Array.from(selected || []);
-    if (!ready || !ids.length) return;
-    const identity = beginOperationalCardLoad(
-      SCHEDULER_REVIEW_CARD, { userInitiated: true });
-    if (!identity) return;
-    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
-    const result = await postOperationalCardScoped(identity, path, { game_ids: ids });
-    if (result === OPERATIONAL_CARD_WRITE_WITHDRAWN) return;
-    if (!cardIdentityCurrent(identity)) return;
-    if (result && !result.error) {
-      announceCardStatus(identity,
-        `${successNoun} ${result.published == null ? result.discarded : result.published} game(s).`,
-        false);
-      await loadSchedulerReviewCard({
-        userInitiated: true, preserveAnnouncement: true,
-      });
-      return;
-    }
-    operationalCardError(identity, result, `The selected drafts could not be ${successNoun.toLowerCase()}.`);
-    // operationalErrorCopy owns the one assertive announcement for ERROR.
-    repaintSchedulerSurface(SCHEDULER_REVIEW_CARD);
-  };
   const publish = c.querySelector("[data-sched-publish]");
   if (publish) publish.onclick = () =>
-    mutateDrafts("/api/scheduler/drafts/publish", "Published");
+    mutateSchedulerDrafts("publish", "Published");
   const discard = c.querySelector("[data-sched-discard]");
   if (discard) discard.onclick = () =>
-    mutateDrafts("/api/scheduler/drafts/discard", "Discarded");
+    askSchedulerCardConfirm("discard");
 }
 
 /* ---------- Pilot onboarding import wizard (#96/#99) ----------
@@ -14415,7 +15203,7 @@ async function render() {
   // (the serialization rule refused the commit) and must keep its focus too,
   // or an ordinary re-entry into the same destination strands a keyboard
   // operator on <body> with a write still outstanding.
-  if (view === "setup") restorePendingCardWriteFocus();
+  if (view === "setup" || view === "scheduler") restorePendingCardWriteFocus();
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; rosterSideChosen = true; toast = ""; render(); });
@@ -16184,6 +16972,7 @@ function withdrawContextScopedActionControls() {
     + "[data-setup-landing-actions] button,"
     + "[data-setup-card-ask],[data-setup-card-confirm-yes],[data-setup-card-confirm-no],"
     + "[data-sched-generate],[data-sched-commit],[data-sched-publish],[data-sched-discard],"
+    + "[data-sched-confirm-yes],[data-sched-confirm-no],"
     + "[data-del],.sched-pick,[data-ice-builder-open],[data-ib-preview],[data-ib-commit],"
     + "[data-slot],[data-game],[data-move-game],[data-move-confirm],[data-move-undo],"
     + "[data-addslot],[data-wizcreate],[data-publish],[data-del-confirm]"
@@ -16306,12 +17095,12 @@ const OPERATIONAL_CARD_WRITE_WITHDRAWN = Object.freeze({ withdrawn: true });
 // card state. The caller receives a sentinel so it cannot mistake withdrawal
 // for a transport failure and paint an ERROR under the departing tuple.
 async function postOperationalCardScoped(identity, path, body, opts) {
-  // Ice Builder Create commits PENDING before it repaints or reaches this
-  // boundary. That synchronous commit also opens its unresolved-operation
-  // lease, so the waiting presentation and the serialization fact cannot
-  // disagree. Keep this opt-in narrow — READY Calendar/Scheduler cards need
-  // different presentation and foreign-principal reconciliation semantics
-  // before they can use it.
+  // Ice Builder Create and Scheduler's four POST operations commit PENDING
+  // before they repaint or reach this boundary. That synchronous commit also
+  // opens the unresolved-operation lease, so the waiting presentation and
+  // the serialization fact cannot disagree. Keep this opt-in owner-driven:
+  // each card supplies its own waiting presentation and foreign-principal /
+  // stale-tuple reconciliation semantics.
   const serializeCard = !!(opts && opts.serializeCard);
   // Reconciliation is owner-specific: the shared transport boundary only
   // reports withdrawal, while an opt-in owner decides which fresh surface to
@@ -17000,7 +17789,16 @@ if (loginForm) loginForm.onsubmit = (e) => {
 // Escape closes an open Setup drawer (#44).
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
-  if (modal) { modal = null; render(); }
+  if (modal) {
+    const cardOwned = !!modal.cardIdentity;
+    modal = null;
+    // A Scheduler/Calendar confirmation belongs to its operational card.
+    // Escape follows the same overlay-only close path as its Close button so
+    // it neither launches fresh reads nor supersedes the card identity whose
+    // exact trigger must regain focus.
+    if (cardOwned) repaintModalOnly();
+    else render();
+  }
   else if (drawer) { drawer = null; drawerError = ""; drawerValues = {}; render(); }
   else if (movingGameId != null) { movingGameId = null; render(); }
 });

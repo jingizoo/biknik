@@ -315,6 +315,8 @@ async function checkViewport(browser, viewport) {
 
     // (4) COMMIT sends the reviewed turnaround, and really creates the game.
     await page.click("[data-sched-commit]");
+    await page.waitForSelector('[data-sched-confirm-yes="commit"]');
+    await page.click('[data-sched-confirm-yes="commit"]');
     try {
       await page.waitForFunction(
         () => /Committed 1 draft game\(s\)/.test(document.body.textContent || ""),
