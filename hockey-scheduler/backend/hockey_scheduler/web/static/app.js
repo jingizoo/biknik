@@ -4721,8 +4721,13 @@ function subtreeDeleteModalHtml(m) {
     // no-write statement.  Transport/proxy failures, internal_error, a missing
     // code, and every future error default to UNKNOWN: execute may have
     // committed before response serialization or delivery failed.
+    // rate_limited is sent before the route dispatches; active_context_required
+    // is a domain refusal inside the rolled-back transaction. Both are proven
+    // to write nothing (and leave the challenge usable) by
+    // test_subtree_deletion's *_execute_writes_nothing tests.
     const confirmedRefusal = ["validation_error", "forbidden", "unauthorized",
-      "not_found", "concurrency_conflict"].includes(m.errorCode);
+      "not_found", "concurrency_conflict", "rate_limited",
+      "active_context_required"].includes(m.errorCode);
     const outcomeUncertain = !confirmedRefusal;
     let consequence;
     if (previewFailed && outcomeUncertain) {
