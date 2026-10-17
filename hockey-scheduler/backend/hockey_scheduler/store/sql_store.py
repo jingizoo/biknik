@@ -374,6 +374,14 @@ _DIALECT_PAIR = {"sqlite", "postgres"}
 # this whitelist is the injection guard — never format an arbitrary string in).
 _ISOLATION_LEVELS = frozenset({"SERIALIZABLE", "REPEATABLE READ"})
 
+# Write order for chronological reads (#451). Ids are ``{prefix}_{n}`` TEXT
+# from a monotonic counter, so a bare ``ORDER BY id`` is lexicographic and
+# returns ``audit_10`` before ``audit_9``. Within one prefix, shorter ids carry
+# smaller counters, so length-then-id is numeric order: the order rows were
+# written, which is what InMemoryStore returns. Timestamps cannot do this —
+# a pinned clock gives every row of a burst the same instant.
+_WRITE_ORDER = "LENGTH(id), id"
+
 # Strength order, so a NESTED transaction() can tell "I need at least X" from "I
 # need exactly X" (#369). A join cannot RAISE the isolation of an already-open
 # transaction — that is still a programming error — but joining one that is
@@ -1731,11 +1739,12 @@ class SqlStore:
     # -- audit / notifications --------------------------------------------
     def add_audit(self, entry): return self._insert(entry)
     def audit_for_game(self, game_id):
-        return self._query(AuditLog, "game_id = ?", (game_id,), order="id")
+        return self._query(AuditLog, "game_id = ?", (game_id,), order=_WRITE_ORDER)
 
     def add_notification(self, event): return self._insert(event)
     def notifications_for_game(self, game_id):
-        return self._query(NotificationEvent, "game_id = ?", (game_id,), order="id")
+        return self._query(NotificationEvent, "game_id = ?", (game_id,),
+                           order=_WRITE_ORDER)
 
     # -- organization & arena setup ---------------------------------------
     # Umbrella competition entity: Program (#233, formerly League).
@@ -2169,7 +2178,7 @@ class SqlStore:
                            (getattr(scope_type, "value", scope_type), scope_id))
 
     def add_setup_audit(self, entry): return self._insert(entry)
-    def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
+    def all_setup_audit(self): return self._query(SetupAuditLog, order=_WRITE_ORDER)
 
     # -- sensitive-read audit (#124; ordering/validation/durability #426) ---
     #: Dedicated ``counters`` row for the audit log's own monotonic ordering
@@ -2588,7 +2597,8 @@ class SqlStore:
     def save_notification_feed(self, n): return self._update(n)
     def get_notification_feed(self, notification_id):
         return self._get(Notification, notification_id)
-    def all_notifications_feed(self): return self._query(Notification, order="id")
+    def all_notifications_feed(self):
+        return self._query(Notification, order=_WRITE_ORDER)
 
     # -- per-recipient read state (#57) ------------------------------------
     def get_notification_recipient(self, recipient_id):
@@ -2605,9 +2615,9 @@ class SqlStore:
         return self._get(NotificationDelivery, delivery_id)
     def deliveries_for_notification(self, notification_id):
         return self._query(NotificationDelivery, "notification_id = ?",
-                           (notification_id,), order="id")
+                           (notification_id,), order=_WRITE_ORDER)
     def all_notification_deliveries(self):
-        return self._query(NotificationDelivery, order="id")
+        return self._query(NotificationDelivery, order=_WRITE_ORDER)
     def pending_deliveries(self, max_attempts):
         return self._query(
             NotificationDelivery,
