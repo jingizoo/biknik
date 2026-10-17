@@ -166,8 +166,10 @@ def _seed(store):
     # A wholly unrelated facility tree is a byte-for-byte survivor control;
     # unlike venue_keep/slot_keep it has no edge crossing the deletion boundary.
     store.add_organization(Organization("org_unrelated", "South Facility"))
+    # Minted like every production setup-audit row: chronological reads order
+    # by the counter (#451), so a hand-written id would not sort as written.
     store.add_setup_audit(SetupAuditLog(
-        "audit_org_unrelated", "organization_created", "organization",
+        store.next_id("setupaudit"), "organization_created", "organization",
         "org_unrelated", NOW, actor_id="admin2"))
     store.add_venue(Venue(
         "venue_unrelated", "South Arena", organization_id="org_unrelated"))
