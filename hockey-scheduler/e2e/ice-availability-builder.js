@@ -393,6 +393,19 @@ async function selectWeekdaysOnly(page, weekdays) {
     if (boxes[0]) boxes[0].dispatchEvent(new Event("change", { bubbles: true }));
   }, weekdays);
   await page.waitForSelector(`.ib-wd-row[data-weekday="${weekdays[0]}"]`, { timeout: 10000 });
+  // A weekday change repaints the Builder card asynchronously, and the new
+  // day's row already exists in the LOADING paint. Returning there let the
+  // caller's next page.fill race the settle repaint: fill resolved the old
+  // input, the settle replaced it, and the value was written to the detached
+  // node and lost. That is how a fall-back day intermittently previewed with
+  // the default 15-minute turnover (3 slots instead of 4). Wait for the
+  // settled card before handing the form back.
+  await page.waitForFunction(() => {
+    const card = document.querySelector(
+      '[data-operational-card="facilities/ice-builder"]');
+    return !!card && card.getAttribute("aria-busy") !== "true"
+      && card.dataset.cardState !== "loading";
+  }, null, { timeout: 10000 });
 }
 
 // Back remains actionable while its old Builder card is visibly STALE during
