@@ -8969,7 +8969,7 @@ function wireCalendarCards(c) {
   if (ibCancel) ibCancel.onclick = () => {
     iceOperationSeq += 1; iceBuilder = null; toast = ""; rerender(ibCancel);
   };
-  const invalidateIcePreview = (shouldRepaint) => {
+  const invalidateIcePreview = (shouldRepaint, entryFocusPlan) => {
     if (!iceBuilder) return;
     iceOperationSeq += 1;
     const form = iceFormSnapshot(iceBuilder.form);
@@ -8977,7 +8977,10 @@ function wireCalendarCards(c) {
     resetOperationalCard(ICE_BUILDER_CARD, "no_preview", {
       overview: payload.overview || {}, form: form, preview: null,
     });
-    if (shouldRepaint) loadIceBuilderCard({ form: form });
+    if (shouldRepaint) {
+      loadIceBuilderCard(Object.assign({ form: form },
+        entryFocusPlan ? { entryFocusPlan: entryFocusPlan } : {}));
+    }
     else {
       const preview = c.querySelector(".ib-preview");
       if (preview) preview.remove();
@@ -9116,23 +9119,36 @@ function wireCalendarCards(c) {
       errorRoot && (errorRoot.querySelector(".banner.alert h2")
         || errorRoot.querySelector("h2,.section-title")));
   };
+  // Editing exclusion dates repaints the whole Builder card (LOADING, then
+  // settled), which detaches the focused control and used to strand keyboard
+  // focus on <body>. Carry focus through both paints the way Builder's other
+  // card-local transitions do, but only when this card owns focus: Add
+  // re-finds itself; Remove's own button is gone, so it moves to the
+  // exclusion date field the operator was working in.
+  const exclusionFocusPlan = (removedOwnControl) => {
+    const plan = iceBuilderReconciliationFocusPlan();
+    if (!plan || !removedOwnControl) return plan;
+    return { destination: false, selector: 'input[id="ib-excl"]', inside: true };
+  };
   const ibExclAdd = c.querySelector("[data-ib-excl-add]");
   if (ibExclAdd) ibExclAdd.onclick = () => {
     if (!iceBuilder) return;
+    const focusPlan = exclusionFocusPlan(false);
     iceBuilder.form = readIceBuilderForm(c);
     const input = c.querySelector("#ib-excl");
     const date = input && input.value;
     if (date && !iceBuilder.form.exclusion_dates.includes(date))
       iceBuilder.form.exclusion_dates.push(date);
-    invalidateIcePreview(true);
+    invalidateIcePreview(true, focusPlan);
   };
   c.querySelectorAll("[data-ib-excl-remove]").forEach((button) => {
     button.onclick = () => {
       if (!iceBuilder) return;
+      const focusPlan = exclusionFocusPlan(true);
       iceBuilder.form = readIceBuilderForm(c);
       iceBuilder.form.exclusion_dates = iceBuilder.form.exclusion_dates
         .filter((date) => date !== button.dataset.ibExclRemove);
-      invalidateIcePreview(true);
+      invalidateIcePreview(true, focusPlan);
     };
   });
 
