@@ -8994,7 +8994,12 @@ function wireCalendarCards(c) {
     const weekday = event.target.classList
       && event.target.classList.contains("ib-weekday");
     iceBuilder.form = readIceBuilderForm(c);
-    invalidateIcePreview(weekday || !!c.querySelector(".ib-preview"));
+    // A weekday toggle (and any change once a preview is showing) repaints the
+    // card. Carry the changed control's focus through that repaint; the
+    // weekday and rink checkboxes carry ids so the plan can re-find them.
+    const repaint = weekday || !!c.querySelector(".ib-preview");
+    invalidateIcePreview(repaint,
+      repaint ? iceBuilderReconciliationFocusPlan() : null);
   });
   if (ibForm) ibForm.addEventListener("input", (event) => {
     if (!iceBuilder || (event.target && event.target.id === "ib-excl")) return;
@@ -9456,7 +9461,7 @@ function renderIceBuilder(ov) {
     `<option value="${esc(s.id)}" ${s.id === f.season_id ? "selected" : ""}>${esc(s.name)}</option>`).join("");
   const venues = ov.venues || [];
   const rinkCheck = (r) =>
-    `<label class="ib-check"><input type="checkbox" class="ib-rink" value="${esc(r.id)}" ${f.rink_ids.includes(r.id) ? "checked" : ""}> ${esc(r.name)}</label>`;
+    `<label class="ib-check"><input type="checkbox" class="ib-rink" id="ib-rink-${esc(r.id)}" value="${esc(r.id)}" ${f.rink_ids.includes(r.id) ? "checked" : ""}> ${esc(r.name)}</label>`;
   const venueGroups = venues.map((v) => {
     const rs = (ov.rinks || []).filter((r) => r.venue_id === v.id);
     return rs.length ? `<div class="ib-venue"><div class="ib-venue-name">${esc(v.name)}</div>${rs.map(rinkCheck).join("")}</div>` : "";
@@ -9464,7 +9469,7 @@ function renderIceBuilder(ov) {
   const orphans = (ov.rinks || []).filter((r) => !venues.some((v) => v.id === r.venue_id));
   const orphanGroup = orphans.length ? `<div class="ib-venue">${orphans.map(rinkCheck).join("")}</div>` : "";
   const weekdayChips = IB_WEEKDAYS.map(([n, lbl]) =>
-    `<label class="ib-day"><input type="checkbox" class="ib-weekday" value="${n}" ${f.weekdays.includes(n) ? "checked" : ""}>${lbl}</label>`).join("");
+    `<label class="ib-day"><input type="checkbox" class="ib-weekday" id="ib-weekday-${n}" value="${n}" ${f.weekdays.includes(n) ? "checked" : ""}>${lbl}</label>`).join("");
   // One local start/end row per SELECTED weekday (sorted) — the #158 operator
   // flow gives each day its own time. Freshly-checked days default to the block.
   const perDayRows = f.weekdays.slice().sort((a, b) => a - b).map((wd) => {
