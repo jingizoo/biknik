@@ -2535,8 +2535,36 @@ async function checkViewport(browser, viewport) {
     // Adding the exclusion re-renders the builder, which refetches the overview
     // and surfaces the new rink's checkbox.
     await page.fill("#ib-excl", "2026-09-08");
-    await page.click("[data-ib-excl-add]");
+    // Real keyboard, not page.click: the repaint detaches the focused button,
+    // and the keyboard operator must not be dropped onto <body>. Add keeps
+    // focus on Add; Remove, whose own button is gone, lands on the date field.
+    const exclusionFocus = async (expected, step) => {
+      try {
+        await page.waitForFunction((sel) => {
+          const a = document.activeElement;
+          return !!(a && a.matches && a.matches(sel));
+        }, expected, { timeout: 10000 });
+      } catch (err) {
+        const got = await page.evaluate(() => {
+          const a = document.activeElement;
+          return a ? a.outerHTML.slice(0, 120) : "null";
+        });
+        fail(`${step} did not keep keyboard focus on ${expected}: ${got}`);
+      }
+    };
+    await page.focus("[data-ib-excl-add]");
+    await page.keyboard.press("Enter");
     await page.waitForSelector(`.ib-rink[value="${rink3}"]`, { timeout: 10000 });
+    await exclusionFocus("[data-ib-excl-add]", "exclusion Add");
+    await page.fill("#ib-excl", "2026-12-25");
+    await page.focus("[data-ib-excl-add]");
+    await page.keyboard.press("Enter");
+    await page.waitForSelector('[data-ib-excl-remove="2026-12-25"]', { timeout: 10000 });
+    await page.focus('[data-ib-excl-remove="2026-12-25"]');
+    await page.keyboard.press("Enter");
+    await page.waitForSelector('[data-ib-excl-remove="2026-12-25"]',
+      { state: "detached", timeout: 10000 });
+    await exclusionFocus("#ib-excl", "exclusion Remove");
     await page.uncheck(`.ib-rink[value="${ids.rink}"]`);
     await page.check(`.ib-rink[value="${rink3}"]`);
     await preview(page);
