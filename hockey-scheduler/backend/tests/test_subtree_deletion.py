@@ -1995,6 +1995,68 @@ class TestSubtreeDeletionHttp(unittest.TestCase):
         self.assertIsNone(srv.STATE.api.store.get_organization("http_org"))
         self.assertIsNone(srv.STATE.api.store.get_venue("http_venue"))
 
+    # The confirm modal may only say "no deletion was committed" for codes
+    # that provably wrote nothing; every other code is reported as an
+    # unknown outcome. These two are proven here: refused, nothing written,
+    # and the SAME single-use challenge still executes once the cause is gone.
+
+    def _assert_untouched_then_executable(self, cookie, token):
+        store = srv.STATE.api.store
+        self.assertIsNotNone(store.get_organization("http_org"))
+        self.assertIsNotNone(store.get_venue("http_venue"))
+        self.assertNotIn("subtree_deleted",
+                         [a.action for a in store.all_setup_audit()])
+        status, result = self._req(
+            "/api/admin/subtree-deletion/execute",
+            {"challenge_token": token, "typed_name": "HTTP Facility",
+             "reason": "Facility closed"}, cookie)
+        self.assertEqual(status, 200, result)
+        self.assertIsNone(store.get_organization("http_org"))
+
+    def test_rate_limited_execute_writes_nothing(self):
+        cookie = self._login("subtree-admin", "subtree-password")
+        status, preview = self._req(
+            "/api/admin/subtree-deletion/preview",
+            {"root_type": "organizations", "root_id": "http_org"}, cookie)
+        self.assertEqual(status, 200, preview)
+        # Spend the rest of the route's bucket without touching app state.
+        while srv.RATE_LIMITER.allow("subtree_deletion", "127.0.0.1",
+                                     10, 300):
+            pass
+        try:
+            status, refused = self._req(
+                "/api/admin/subtree-deletion/execute",
+                {"challenge_token": preview["challenge_token"],
+                 "typed_name": "HTTP Facility", "reason": "Facility closed"},
+                cookie)
+            self.assertEqual(status, 429, refused)
+            self.assertEqual(refused["error"]["code"], "rate_limited")
+        finally:
+            srv.RATE_LIMITER.reset()
+        self._assert_untouched_then_executable(
+            cookie, preview["challenge_token"])
+
+    def test_active_context_required_execute_writes_nothing(self):
+        cookie = self._login("subtree-admin", "subtree-password")
+        status, preview = self._req(
+            "/api/admin/subtree-deletion/preview",
+            {"root_type": "organizations", "root_id": "http_org"}, cookie)
+        self.assertEqual(status, 200, preview)
+        store = srv.STATE.api.store
+        store.set_active_context(ActiveContext(
+            self.admin.id, "no_such_program", "no_such_season", NOW))
+        status, refused = self._req(
+            "/api/admin/subtree-deletion/execute",
+            {"challenge_token": preview["challenge_token"],
+             "typed_name": "HTTP Facility", "reason": "Facility closed"},
+            cookie)
+        self.assertEqual(status, 409, refused)
+        self.assertEqual(refused["error"]["code"], "active_context_required")
+        store.set_active_context(ActiveContext(
+            self.admin.id, "http_program", "http_season", NOW))
+        self._assert_untouched_then_executable(
+            cookie, preview["challenge_token"])
+
 
 if __name__ == "__main__":
     unittest.main()

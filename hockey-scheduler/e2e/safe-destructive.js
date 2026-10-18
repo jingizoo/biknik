@@ -459,6 +459,27 @@ async function checkViewport(browser, viewport) {
     }
     await page.fill("#sd-reason", "Retire duplicate competition");
     await page.fill("#sd-confirm", "Del League");
+    // Outcome copy per execute error code, rendered by the production modal
+    // in the live page. rate_limited and active_context_required are proven
+    // no-write by test_subtree_deletion's *_execute_writes_nothing tests, so
+    // the modal must say nothing was deleted. internal_error is the control:
+    // it must stay UNKNOWN.
+    const outcomeCopy = await page.evaluate(() => Object.fromEntries(
+      ["rate_limited", "active_context_required", "internal_error"].map((code) => [
+        code, subtreeDeleteModalHtml({ type: "subtree-delete", step: "error",
+          errorPhase: "execute", errorCode: code, error: "Refused." })])));
+    for (const code of ["rate_limited", "active_context_required"]) {
+      if (!/no deletion was committed/.test(outcomeCopy[code])
+          || /could not be confirmed/.test(outcomeCopy[code])) {
+        throw new Error(`[${viewport.label}] ${code} execute refusal was reported `
+          + `as an unknown outcome although it writes nothing`);
+      }
+    }
+    if (!/outcome could not be confirmed/.test(outcomeCopy.internal_error)
+        || /no deletion was committed/.test(outcomeCopy.internal_error)) {
+      throw new Error(`[${viewport.label}] internal_error execute outcome was `
+        + "stated as certain");
+    }
     if (viewport.label === "desktop") {
       // The destructive transaction may commit before a later response-layer
       // failure. Fetch the real response (and therefore commit), replace only
