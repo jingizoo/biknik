@@ -886,7 +886,16 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
 .ib-days { display: flex; flex-wrap: wrap; gap: 6px; }
 .ib-day { display: inline-flex; align-items: center; padding: 8px 12px; border: 1px solid var(--sep);
   border-radius: 999px; font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
-.ib-day input { display: none; }
+.ib-day { position: relative; }
+/* Visually hidden but still focusable and announced (#457 review): the chip is
+   the visible control, so the native checkbox stays in the tab order and the
+   accessibility tree. display:none removed it from both, which left the
+   weekday axis unreachable by keyboard. Same technique as .sr-only. */
+.ib-day input {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+.ib-day:has(input:focus-visible) { outline: 3px solid #2563eb; outline-offset: 3px; }
 .ib-day:has(input:checked) { background: var(--blue); border-color: var(--blue); color: #fff; }
 .ib-wd-times { display: flex; flex-direction: column; gap: 8px; }
 .ib-wd-row { display: flex; align-items: center; gap: 8px; }

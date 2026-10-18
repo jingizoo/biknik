@@ -1749,6 +1749,12 @@ async function assertBuilderRetryFocusFallback(page, fail, cardIds) {
     }, cardIds.builder, { timeout: 10000 });
 
     const rink = page.locator(`${builderCard} .ib-rink`).first();
+    // This probe exercises restoreOperationalSettlementFocus's FALLBACK: a
+    // focused in-card control with no unique selector. Builder's rink and
+    // weekday checkboxes now carry ids so a toggle restores focus exactly, so
+    // strip this node's id to recreate the selector-less control on purpose.
+    // The fallback code under test is unchanged production code.
+    await rink.evaluate((checkbox) => checkbox.removeAttribute("id"));
     await rink.focus();
     const unselectable = await rink.evaluate((checkbox) => ({
       id: checkbox.id,
@@ -2571,6 +2577,60 @@ async function checkViewport(browser, viewport) {
     s = await previewState(page);
     if (s.new !== EXPECTED_NEW - 3) fail(`exclusion should drop 3 slots (=> ${EXPECTED_NEW - 3}), got ${JSON.stringify(s)}`);
     if (s.skipped < 1) fail(`the excluded date should be reported as skipped: ${JSON.stringify(s)}`);
+
+    // Weekday and rink checkboxes are keyboard controls. The weekday chips used
+    // to hide their checkbox with display:none, so Tab skipped the whole axis;
+    // and toggling either kind repaints the card, which dropped focus to
+    // <body>. Each toggle below runs twice so the counts above stay intact.
+    await page.focus("#ib-season");
+    const tabbedWeekdays = new Set();
+    for (let i = 0; i < 60 && tabbedWeekdays.size < 7; i += 1) {
+      await page.keyboard.press("Tab");
+      const v = await page.evaluate(() => {
+        const a = document.activeElement;
+        return a && a.classList && a.classList.contains("ib-weekday") ? a.value : null;
+      });
+      if (v !== null) tabbedWeekdays.add(v);
+      if (await page.evaluate(() => !!(document.activeElement
+          && document.activeElement.matches("[data-ib-preview]")))) break;
+    }
+    if (tabbedWeekdays.size !== 7) {
+      fail(`Tab should reach all 7 weekday checkboxes, reached ${tabbedWeekdays.size}`);
+    }
+    const cdp = await page.context().newCDPSession(page);
+    const wdNode = await cdp.send("DOM.getDocument").then(({ root }) =>
+      cdp.send("DOM.querySelector", { nodeId: root.nodeId, selector: "#ib-weekday-2" }));
+    const ax = await cdp.send("Accessibility.getPartialAXTree",
+      { nodeId: wdNode.nodeId, fetchRelatives: false });
+    const axNode = ax.nodes && ax.nodes[0];
+    if (!axNode || !axNode.role || axNode.role.value !== "checkbox" || axNode.ignored
+        || !axNode.name || !axNode.name.value) {
+      fail(`weekday checkbox is not an announced, named checkbox: ${JSON.stringify(axNode)}`);
+    }
+    await cdp.detach();
+    const keepsFocusThroughToggle = async (selector, step) => {
+      for (let round = 0; round < 2; round += 1) {
+        await page.focus(selector);
+        await page.keyboard.press("Space");
+        try {
+          await page.waitForFunction((sel) => {
+            const a = document.activeElement;
+            return !!(a && a.matches && a.matches(sel) && a.isConnected);
+          }, selector, { timeout: 10000 });
+          await page.waitForTimeout(400);
+          if (!await page.evaluate((sel) => !!(document.activeElement
+              && document.activeElement.matches(sel)), selector)) throw new Error("moved");
+        } catch (err) {
+          const got = await page.evaluate(() => {
+            const a = document.activeElement;
+            return a ? a.outerHTML.slice(0, 120) : "null";
+          });
+          fail(`${step} (Space, round ${round + 1}) did not keep focus on ${selector}: ${got}`);
+        }
+      }
+    };
+    await keepsFocusThroughToggle("#ib-weekday-2", "weekday checkbox");
+    await keepsFocusThroughToggle(`#ib-rink-${rink3}`, "rink checkbox with a preview showing");
 
     // (F) Per-weekday windows: each selected day carries its OWN local start/end
     // time. Open a fresh builder on a clean rink, keep Tuesday 18:00-22:00 (3
