@@ -1006,12 +1006,24 @@ class SubtreeDeletionService:
                 "Typed confirmation name did not match.",
                 {"reason": "confirmation_mismatch"})
 
-        # PostgreSQL intentionally uses READ COMMITTED here.  Once the NOWAIT
-        # graph lock succeeds, each live authorization/projection statement
-        # sees writers that committed before the lock; in-flight writers make
-        # acquisition fail, and later writers remain blocked until commit.
-        # SERIALIZABLE would instead preserve the pre-lock snapshot and could
-        # therefore defeat both rechecks.
+        # PostgreSQL intentionally uses READ COMMITTED here (#452), and the
+        # consistency argument rests on the graph lock, not on isolation:
+        #
+        # * Every read after lock_subtree_graph() takes a fresh statement
+        #   snapshot, so it sees every graph write committed before the lock.
+        # * An in-flight writer that already holds a graph table makes the
+        #   NOWAIT acquisition fail (retryable), so nothing half-written is
+        #   read through.
+        # * An in-flight writer that has touched only tables OUTSIDE the lock
+        #   (counters, say) does NOT make acquisition fail. It is still safe:
+        #   its first graph write blocks until this transaction commits, so no
+        #   graph write can commit between our lock and our commit.
+        #
+        # So the guarantee is exactly as complete as the lock. Every table that
+        # holds graph state must be in SPECS and therefore locked;
+        # test_graph_lock_catalog_coverage (#454) fails the build otherwise.
+        # SERIALIZABLE would instead pin the pre-lock snapshot and could defeat
+        # both post-lock rechecks.
         with self.store.transaction():
             # Join the same global cross-replica fence held SHARED by every
             # scoped read.  This is deliberately the transaction's first
