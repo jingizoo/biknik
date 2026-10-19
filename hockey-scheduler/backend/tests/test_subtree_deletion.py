@@ -1843,6 +1843,95 @@ class TestSubtreeDeletionPostgres(SubtreeDeletionContract, unittest.TestCase):
         self.assertIsNone(self.store.substitute_for_player(
             "game_program", "player_private"))
 
+    def test_foreign_grant_committed_before_graph_lock_is_refused(self):
+        """A pre-lock commit that crosses the deletion BOUNDARY is refused.
+
+        The two races above commit a row inside the subtree, and an account
+        change. Neither touches the boundary gate: whether a Venue being
+        deleted is also granted to another Program. Park the deleter before
+        its graph lock, grant the Venue to a foreign Program's Season through
+        a second real connection, then let deletion continue. The post-lock
+        recheck must see the grant and refuse cleanly (the boundary gate
+        answers root_not_found), with nothing deleted and the challenge
+        intact. With the pre-#452 SERIALIZABLE snapshot the deleter misses the
+        grant and attempts the delete. Here season_venue_access's real foreign
+        key aborts it as an IntegrityConflictError, so no data is lost, but
+        the operator gets an integrity error instead of a refusal. Boundary
+        references without a foreign key have no such backstop.
+        """
+        self.store.add_venue(Venue(
+            "venue_race", "Race Arena", organization_id="org_delete"))
+        self.store.add_rink(Rink("rink_race", "venue_race", "Race Ice"))
+        self.store.add_ice_slot(IceSlot(
+            "slot_race", "rink_race", NOW + timedelta(days=5),
+            NOW + timedelta(days=5, hours=1), status=IceSlotStatus.AVAILABLE))
+        self.store.add_season_venue_access(SeasonVenueAccess(
+            id="sva_race_own", season_id="season_delete", venue_id="venue_race"))
+        preview = self.preview(kind="venues", root_id="venue_race")
+        challenge_before = copy.deepcopy(
+            self.store.get_subtree_deletion_challenge("admin"))
+        peer = self.make_peer_store()
+        before_graph_lock = threading.Event()
+        writer_committed = threading.Event()
+        release_graph_lock = threading.Event()
+        outcome = {}
+        ordering = []
+        original_graph_lock = self.store.lock_subtree_graph
+
+        def graph_lock():
+            ordering.append("before_graph_lock")
+            before_graph_lock.set()
+            if not release_graph_lock.wait(10):
+                raise RuntimeError("writer did not release the graph lock")
+            if not writer_committed.is_set():
+                raise RuntimeError("graph lock resumed before writer commit")
+            ordering.append("graph_lock")
+            return original_graph_lock()
+
+        def run_delete():
+            try:
+                outcome["result"] = self.execute(
+                    preview, name="Race Arena", reason="Facility closed")
+            except Exception as exc:  # exact safe refusal is checked below
+                outcome["error"] = exc
+
+        self.store.lock_subtree_graph = graph_lock
+        thread = threading.Thread(target=run_delete)
+        try:
+            thread.start()
+            self.assertTrue(
+                before_graph_lock.wait(10),
+                "delete never reached its graph lock")
+            with peer.transaction():
+                peer.add_season_venue_access(SeasonVenueAccess(
+                    id="sva_race_foreign", season_id="season_keep",
+                    venue_id="venue_race"))
+            ordering.append("writer_committed")
+            writer_committed.set()
+        finally:
+            release_graph_lock.set()
+            thread.join(20)
+            self.store.lock_subtree_graph = original_graph_lock
+            if peer is not self.store:
+                peer.close()
+
+        self.assertFalse(thread.is_alive(), "subtree deletion thread hung")
+        self.assertEqual(
+            ordering[:3],
+            ["before_graph_lock", "writer_committed", "graph_lock"],
+            ordering)
+        self.assertNotIn("result", outcome, outcome)
+        self.assertIsInstance(
+            outcome.get("error"), (NotFoundError, ValidationError), outcome)
+        self.assertIsNotNone(self.store.get_venue("venue_race"))
+        self.assertIn(
+            "sva_race_foreign",
+            [a.id for a in self.store.season_venue_access_for_venue("venue_race")])
+        self.assertEqual(
+            self.store.get_subtree_deletion_challenge("admin"),
+            challenge_before,
+            "a boundary refusal must roll challenge consumption back")
+
     def test_account_deactivation_after_context_check_aborts_locked_recheck(self):
         preview = self.preview()
         context_checked = threading.Event()
