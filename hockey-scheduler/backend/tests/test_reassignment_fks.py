@@ -10,8 +10,10 @@ Both foreign keys are NAMED (fk_players_team, fk_teams_club) with the default
 NO ACTION delete behavior — never ON DELETE CASCADE, never any data cleanup. The
 service layer already validates the destination parent up front, and
 delete_team/delete_club block on dependents (each row-locking its subject), so:
-  * a child reassignment/create that races behind a parent delete loses at the
-    foreign key and surfaces the stable team_not_found / club_not_found conflict;
+  * a child reassignment/create that races behind a parent delete loses either
+    at its up-front parent lookup (NotFoundError) or, if the delete commits
+    after that read, at the foreign key with the stable team_not_found /
+    club_not_found conflict;
   * a parent delete that races behind a committed child serializes on the subject
     row lock and surfaces the stable has-dependencies block.
 Neither direction ever lets a raw psycopg/sqlite exception escape, orphans a row,
@@ -570,6 +572,21 @@ class ReassignmentRaceTest(unittest.TestCase):
         tc.start(); td.start(); tc.join(20); td.join(20)
         return results
 
+    def _assert_barrier_delete_won(self, results, fk_reason):
+        """The delete-wins branch of an open barrier race (#434). The child can
+        lose at either of two points, and which one it hits depends only on
+        commit interleaving:
+          * its pre-write parent lookup, if the delete committed before that
+            read: NotFoundError, recorded as ``not_found``;
+          * the foreign key, if the delete committed after the read but before
+            the child's write: the stable ``fk_reason`` conflict.
+        Both are the same linearization (delete first, child fails, nothing
+        written), so both are accepted here. _forced_delete_wins pins the
+        foreign-key point deterministically; the sequential missing-parent tests
+        pin the lookup point."""
+        self.assertEqual(results["delete"], "ok", results)
+        self.assertIn(results["child"], {"not_found", fk_reason}, results)
+
     def _forced_child_wins(self, child_store, write_method, child_fn,
                            delete_store, delete_fn):
         """Force the child-commit-wins ordering deterministically: pause the child
@@ -697,8 +714,7 @@ class ReassignmentRaceTest(unittest.TestCase):
             self.assertIsNotNone(check.get_team(team_t), results)
             self.assertEqual(_audit_actions(check, "team_deleted"), 0, results)
         else:
-            self.assertEqual(results, {"child": "team_not_found", "delete": "ok"},
-                             results)
+            self._assert_barrier_delete_won(results, "team_not_found")
             self.assertEqual(check.all_players(), [], results)
             self.assertIsNone(check.get_team(team_t), results)
             self.assertEqual(_audit_actions(check, "player_added"), 0, results)
@@ -746,8 +762,7 @@ class ReassignmentRaceTest(unittest.TestCase):
             self.assertEqual(check.get_player(player).team_id, team_t, results)
             self.assertIsNotNone(check.get_team(team_t), results)
         else:
-            self.assertEqual(results, {"child": "team_not_found", "delete": "ok"},
-                             results)
+            self._assert_barrier_delete_won(results, "team_not_found")
             self.assertEqual(check.get_player(player).team_id, team_a, results)
             self.assertIsNone(check.get_team(team_t), results)
             self.assertEqual(_audit_actions(check, "player_team_assigned"), 0,
@@ -792,8 +807,7 @@ class ReassignmentRaceTest(unittest.TestCase):
             self.assertIsNotNone(check.get_club(club), results)
             self.assertEqual(_audit_actions(check, "club_deleted"), 0, results)
         else:
-            self.assertEqual(results, {"child": "club_not_found", "delete": "ok"},
-                             results)
+            self._assert_barrier_delete_won(results, "club_not_found")
             self.assertEqual(teams_on_club, [], results)
             self.assertIsNone(check.get_club(club), results)
             self.assertEqual(_audit_actions(check, "team_created"), 0, results)
@@ -842,8 +856,7 @@ class ReassignmentRaceTest(unittest.TestCase):
             self.assertIsNotNone(check.get_club(club_c), results)
             self.assertEqual(_audit_actions(check, "club_deleted"), 0, results)
         else:
-            self.assertEqual(results, {"child": "club_not_found", "delete": "ok"},
-                             results)
+            self._assert_barrier_delete_won(results, "club_not_found")
             self.assertEqual(check.get_team(team_t).club_id, club_old, results)
             self.assertIsNone(check.get_club(club_c), results)
             self.assertEqual(_audit_actions(check, "team_club_assigned"), 0,
