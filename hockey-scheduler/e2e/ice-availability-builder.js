@@ -408,6 +408,23 @@ async function selectWeekdaysOnly(page, weekdays) {
   }, null, { timeout: 10000 });
 }
 
+// A current Calendar can still be LOADING, STALE or ERROR. Those states paint
+// .cal-date from the retained board, which is all a "current Calendar" wait
+// asks for, but leave out the whole controls row, Build ice included. A step
+// that counts the live opener while the previous step's overview read is still
+// in flight therefore intermittently finds 0. Wait for the settled board
+// first. Call this BEFORE arming a step's own overview hold, so it never waits
+// on the response that step means to hold.
+async function waitForSettledCalendar(page, fail, calendarId, label) {
+  await page.waitForFunction((cardId) => {
+    const entry = readCardState(cardId);
+    return (entry.state === CARD_STATE.READY || entry.state === CARD_STATE.EMPTY)
+      && cardIdentityCurrent(entry.identity);
+  }, calendarId, { timeout: 30000 })
+    .catch((error) => fail(`${label}: the Calendar never settled READY/EMPTY: `
+      + error.message));
+}
+
 // Back remains actionable while its old Builder card is visibly STALE during
 // an accepted context switch. Hold the switch's LIVE options response after
 // the server has answered, so that exact window is deterministic. The first
@@ -485,6 +502,8 @@ async function assertHeldContextBackFocus(page, fail, cardIds, contextIds) {
 
   const openBuilderFromPrimary = async (label) => {
     await selectContext(primaryValue, `${label}: restore original fixture`);
+    await waitForSettledCalendar(page, fail, cardIds.calendar,
+      `${label}: restored Calendar`);
     await page.evaluate(() => {
       iceBuilder = null;
       calendarMode = "month";
@@ -1008,6 +1027,8 @@ async function assertCalendarBuilderLoadingFocus(page, fail, cardIds) {
       && cardIdentityCurrent(readCardState(calendarId).identity);
   }, cardIds.calendar, { timeout: 10000 });
 
+  await waitForSettledCalendar(page, fail, cardIds.calendar,
+    "keyboard Build ice loading focus");
   let hold = await holdNextOverview(page, "keyboard Build ice loading focus");
   let finished = false;
   try {
@@ -1356,6 +1377,8 @@ async function assertCalendarBuilderLoadingFocus(page, fail, cardIds) {
   // so the transition must advance semantically rather than strand BODY. This
   // is distinct from the persistent #ctx-select inverse below, which lives
   // outside the departing card and therefore must retain focus.
+  await waitForSettledCalendar(page, fail, cardIds.calendar,
+    "Calendar-owned synthetic Build ice loading focus");
   hold = await holdNextOverview(page,
     "Calendar-owned synthetic Build ice loading focus");
   finished = false;
