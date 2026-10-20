@@ -4844,30 +4844,8 @@ async function checkImportLeagueConflict(browser, viewport) {
       return !!(btn && !btn.disabled);
     }, null, { timeout: 10000 });
 
-    const commitResp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/import/commit/teams-players` && r.request().method() === "POST");
-    await page.click("[data-import-commit]");
-    const commitJson = await (await commitResp).json();
-    if (commitJson.committed) {
-      fail(`expected the same-upload League conflict to be rejected, not `
-        + `committed: ${JSON.stringify(commitJson)}`);
-    }
-    if (!(commitJson.errors || []).some(
-        (e) => e.reason === "import_new_division_league_conflict")) {
-      fail(`expected an import_new_division_league_conflict structured `
-        + `error, got: ${JSON.stringify(commitJson)}`);
-    }
-    // The UI itself must SURFACE the structured incompatibility, not just
-    // the raw network response -- no silent "Committed" success state.
-    await page.waitForFunction(() => {
-      const body = document.body.textContent || "";
-      return !/\bCommitted\b/.test(body) || /conflict|already belongs|different/i.test(body);
-    }, null, { timeout: 10000 });
-    const bodyText = await page.evaluate(() => document.body.textContent || "");
-    if (/^\s*Committed\s*$/im.test(bodyText.split("\n").find((l) => l.trim()) || "")) {
-      fail("expected the Import screen to show the structured incompatibility, "
-        + "not a bare Committed success state");
-    }
+    await commitImportExpectingVisibleRejection(
+      page, base, fail, "import_new_division_league_conflict");
 
     if (errors.length) {
       fail(`unexpected browser errors: ${JSON.stringify(errors)}`);
@@ -4880,6 +4858,101 @@ async function checkImportLeagueConflict(browser, viewport) {
   } finally {
     await context.close();
     await stopServer(server);
+  }
+}
+
+// #339: a rejected Import Commit must be SEEN, not merely answered. The real
+// commit response is held after the server has answered it, so the visible
+// check can first be run against the pre-result page, where it must NOT hold.
+// That keeps the check from passing on a page the result never reached. Once
+// released, the rendered result itself must show the "Not committed" alert,
+// the server's exact structured error message in that same report, and no
+// visible "Committed" success anywhere.
+function visibleImportRejection(expectedMessage) {
+  const visible = (el) => !!el && el.getClientRects().length > 0
+    && getComputedStyle(el).visibility !== "hidden";
+  const alert = Array.from(
+    document.querySelectorAll(".import-report .banner.alert h2"))
+    .find((h) => visible(h) && h.textContent.trim() === "Not committed");
+  const report = alert ? alert.closest(".import-report") : null;
+  const rows = report
+    ? Array.from(report.querySelectorAll(".li-sub.error")).filter(visible)
+      .map((row) => row.textContent.trim().replace(/^⚠\s*/, ""))
+    : [];
+  const committed = Array.from(document.querySelectorAll(".banner.ok h2"))
+    .some((h) => visible(h) && h.textContent.trim() === "Committed");
+  return {
+    ok: !!alert && rows.includes(expectedMessage) && !committed,
+    notCommitted: !!alert, rows, committed,
+  };
+}
+
+async function commitImportExpectingVisibleRejection(page, base, fail, reason) {
+  const commitUrl = `${base}/api/import/commit/teams-players`;
+  let markCaptured, markDelivered, releaseGate;
+  let started = false;
+  const captured = new Promise((resolve) => { markCaptured = resolve; });
+  const delivered = new Promise((resolve) => { markDelivered = resolve; });
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+  const handler = async (route) => {
+    started = true;
+    try {
+      const response = await route.fetch();
+      markCaptured(await response.json());
+      await gate;
+      await route.fulfill({ response });
+    } finally {
+      markDelivered();
+    }
+  };
+  const within = (promise, label) => Promise.race([promise, new Promise(
+    (_, reject) => setTimeout(() => reject(new Error(label)), 15000))]);
+  await page.route(commitUrl, handler);
+  try {
+    await page.click("[data-import-commit]");
+    const commitJson = await within(captured,
+      "the Import Commit request never reached the server");
+    if (commitJson.committed) {
+      fail(`expected ${reason} to reject the commit, not commit it: `
+        + JSON.stringify(commitJson));
+    }
+    const structured = (commitJson.errors || []).find((e) => e.reason === reason);
+    if (!structured || !structured.message) {
+      fail(`expected a ${reason} structured error with a message, got: `
+        + JSON.stringify(commitJson));
+    }
+    const before = await page.evaluate(visibleImportRejection, structured.message);
+    if (before.ok) {
+      fail(`the visible-rejection check already held before the Commit `
+        + `response was delivered, so it cannot tell the result from the `
+        + `pre-result page: ${JSON.stringify(before)}`);
+    }
+    releaseGate();
+    await within(delivered, "the held Import Commit response was not delivered");
+    try {
+      await page.waitForFunction(
+        (message) => {
+          const visible = (el) => !!el && el.getClientRects().length > 0
+            && getComputedStyle(el).visibility !== "hidden";
+          return Array.from(
+            document.querySelectorAll(".import-report .banner.alert h2"))
+            .some((h) => visible(h) && h.textContent.trim() === "Not committed")
+            || Array.from(document.querySelectorAll(".banner h2"))
+              .some((h) => visible(h) && /^(Committed|Commit failed)$/
+                .test(h.textContent.trim()));
+        }, structured.message, { timeout: 10000 });
+    } catch (_) { /* reported with the full rendered state below */ }
+    const after = await page.evaluate(visibleImportRejection, structured.message);
+    if (!after.ok) {
+      fail(`expected the rendered Import result to show "Not committed" with `
+        + `the exact ${reason} message ${JSON.stringify(structured.message)} `
+        + `and no "Committed" state, got: ${JSON.stringify(after)}`);
+    }
+    return commitJson;
+  } finally {
+    releaseGate();
+    if (started) await delivered;
+    await page.unroute(commitUrl, handler);
   }
 }
 
@@ -4957,30 +5030,8 @@ async function checkImportAmbiguousDivisionRejection(browser, viewport) {
       return !!(btn && !btn.disabled);
     }, null, { timeout: 10000 });
 
-    const commitResp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/import/commit/teams-players` && r.request().method() === "POST");
-    await page.click("[data-import-commit]");
-    const commitJson = await (await commitResp).json();
-    if (commitJson.committed) {
-      fail(`expected the ambiguous Division name to be rejected, not `
-        + `committed: ${JSON.stringify(commitJson)}`);
-    }
-    if (!(commitJson.errors || []).some(
-        (e) => e.reason === "import_division_name_ambiguous")) {
-      fail(`expected an import_division_name_ambiguous structured error, `
-        + `got: ${JSON.stringify(commitJson)}`);
-    }
-    // The UI itself must SURFACE the structured incompatibility, not just
-    // the raw network response -- no silent "Committed" success state.
-    await page.waitForFunction(() => {
-      const body = document.body.textContent || "";
-      return !/\bCommitted\b/.test(body) || /ambiguous|more than one|different/i.test(body);
-    }, null, { timeout: 10000 });
-    const bodyText = await page.evaluate(() => document.body.textContent || "");
-    if (/^\s*Committed\s*$/im.test(bodyText.split("\n").find((l) => l.trim()) || "")) {
-      fail("expected the Import screen to show the structured incompatibility, "
-        + "not a bare Committed success state");
-    }
+    await commitImportExpectingVisibleRejection(
+      page, base, fail, "import_division_name_ambiguous");
 
     if (errors.length) {
       fail(`unexpected browser errors: ${JSON.stringify(errors)}`);
