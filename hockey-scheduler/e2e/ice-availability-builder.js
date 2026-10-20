@@ -2243,6 +2243,97 @@ async function assertCreateErrorFocus(page, fail, cardIds) {
   }
 }
 
+// #334: a superseded Builder's failure must stay silent. Builder A's Preview is
+// held in flight; the operator cancels A and opens Builder B; A's request then
+// fails. A is discarded by its operation token, and its error must not be left
+// armed anywhere a later, legitimate render of B could show it: not in the
+// page-wide toast, and not in B's own card. The issue's exact trigger is a
+// weekday toggle in B while B has no preview.
+async function assertSupersededBuilderErrorSilent(page, fail, cardIds, rinkId) {
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  const pattern = /\/api\/setup\/ice-availability\/preview(?:\?|$)/;
+  const staleMessage = "Superseded Builder A preview failure (#334).";
+  let requests = 0;
+  let started = false;
+  let markRequested, markDelivered, releaseGate;
+  const requested = new Promise((resolve) => { markRequested = resolve; });
+  const delivered = new Promise((resolve) => { markDelivered = resolve; });
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+  const handler = async (route) => {
+    if (requests) return route.fallback();
+    requests += 1;
+    started = true;
+    markRequested();
+    try {
+      await gate;
+      await route.fulfill({
+        status: 500, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "server_unavailable",
+          message: staleMessage } }),
+      });
+    } finally {
+      markDelivered();
+    }
+  };
+  await page.click(`${builderCard} [data-ib-cancel]`);
+  await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+  await page.click("[data-ice-builder-open]");
+  await page.waitForSelector(".ib-form", { timeout: 10000 });
+  await page.check(`.ib-rink[value="${rinkId}"]`);
+  await page.fill("#ib-from", "2026-09-01");
+  await page.fill("#ib-to", "2026-09-30");
+  await page.route(pattern, handler);
+  try {
+    await page.click("[data-ib-preview]");  // Builder A's Preview, held
+    await deadline(requested, "Builder A's Preview never left", 10000);
+    await page.click(`${builderCard} [data-ib-cancel]`);  // cancel A in flight
+    await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+    await page.click("[data-ice-builder-open]");  // Builder B, same context
+    await page.waitForSelector(".ib-form", { timeout: 10000 });
+    releaseGate();
+    await deadline(delivered, "Builder A's held Preview was not delivered", 10000);
+    await new Promise((r) => setTimeout(r, 300));  // let A's discarded handler run
+    if (await page.$(".ib-preview")) {
+      fail("(#334) Builder B must open without a preview");
+    }
+    const latent = await page.evaluate(() => toast);
+    if (latent === staleMessage) {
+      fail(`(#334) Builder A's discarded failure was left armed in the page `
+        + `toast: ${JSON.stringify(latent)}`);
+    }
+    // The legitimate render the issue names: toggle a weekday in B.
+    const weekdays = await page.evaluate(() => Array.from(
+      document.querySelectorAll(".ib-weekday:checked"), (cb) => +cb.value));
+    const toggled = weekdays.includes(2)
+      ? weekdays.filter((d) => d !== 2) : weekdays.concat([2]).sort();
+    await selectWeekdaysOnly(page, toggled);
+    const shown = await page.evaluate((selector) => {
+      const toastRoot = document.getElementById("toast-root");
+      const card = document.querySelector(selector);
+      return {
+        toast: toastRoot && !toastRoot.hidden ? toastRoot.textContent : "",
+        card: card ? card.textContent : "",
+        cardState: card ? card.dataset.cardState : null,
+      };
+    }, builderCard);
+    if (shown.toast.includes(staleMessage) || shown.card.includes(staleMessage)
+        || shown.cardState === "error") {
+      fail(`(#334) a Builder B render surfaced Builder A's discarded failure: `
+        + JSON.stringify(shown));
+    }
+    if (requests !== 1) {
+      fail(`(#334) expected exactly one held Builder A Preview, got ${requests}`);
+    }
+  } finally {
+    releaseGate();
+    if (started) {
+      await deadline(delivered,
+        "Builder A's held Preview did not finish during cleanup", 10000);
+    }
+    await page.unroute(pattern, handler);
+  }
+}
+
 // A preview mismatch is a two-response failure recovery: the rejected Create
 // is followed immediately by a replacement Preview. Keep the original pending
 // heading truthful, then prove a newer Back focus choice is re-found through
@@ -2644,6 +2735,7 @@ async function checkViewport(browser, viewport) {
     };
     await keepsFocusThroughToggle("#ib-weekday-2", "weekday checkbox");
     await keepsFocusThroughToggle(`#ib-rink-${rink3}`, "rink checkbox with a preview showing");
+    await assertSupersededBuilderErrorSilent(page, fail, cardIds, rink3);
 
     // (F) Per-weekday windows: each selected day carries its OWN local start/end
     // time. Open a fresh builder on a clean rink, keep Tuesday 18:00-22:00 (3

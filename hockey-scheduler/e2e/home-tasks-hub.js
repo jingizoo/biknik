@@ -2891,6 +2891,110 @@ async function checkRoleScenarios(browser, viewport) {
         + `Commit in the HTTP failure ledger, got:\n${errorReport()}`);
     }
 
+    // ---- (J, stale-error toast) #334: the cases above prove a superseded
+    // Import response cannot change the report, Commit enablement or
+    // banners. This one proves it cannot leave anything SAID behind either.
+    // The older request fails, but only after a newer identical-input
+    // request has already succeeded. Its handler correctly discards it, yet
+    // a transport that publishes errors into the page-wide toast before the
+    // handler's ownership check runs would still have left the stale message
+    // armed. The next unrelated render then shows it, over a result it has
+    // nothing to do with. The check reads that toast state directly and also
+    // forces an unrelated render() and reads the visible toast region.
+    const assertNoStaleImportToast = async (staleMessage, label) => {
+      const latent = await page.evaluate(() => toast);
+      if (latent === staleMessage) {
+        fail(`(J, stale-error toast) ${label}: the discarded response left `
+          + `its error armed in the page toast: ${JSON.stringify(latent)}`);
+      }
+      await page.evaluate(async () => { await render(); });
+      const shown = await page.evaluate(() => {
+        const root = document.getElementById("toast-root");
+        return root && !root.hidden ? root.textContent : "";
+      });
+      if (shown.includes(staleMessage)) {
+        fail(`(J, stale-error toast) ${label}: an unrelated render surfaced `
+          + `the discarded response's error: ${JSON.stringify(shown)}`);
+      }
+    };
+    const runStaleErrorReorder = async ({ pattern, responseUrl, click,
+                                          staleMessage, newerFulfil,
+                                          newerSettled, label }) => {
+      let calls = 0;
+      let releaseOlder, releaseNewer;
+      const holdOlder = new Promise((resolve) => { releaseOlder = resolve; });
+      const holdNewer = new Promise((resolve) => { releaseNewer = resolve; });
+      await page.route(pattern, async (route) => {
+        calls += 1;
+        if (calls === 1) {
+          await holdOlder;
+          await route.fulfill({
+            status: 500, contentType: "application/json",
+            body: JSON.stringify({ error: { code: "server_unavailable",
+              message: staleMessage } }),
+          });
+        } else {
+          await holdNewer;
+          if (newerFulfil) await route.fulfill(newerFulfil);
+          else await route.continue();
+        }
+      });
+      await page.click(click);  // older request (call #1)
+      await new Promise((r) => setTimeout(r, 200));
+      await page.click(click);  // newer request (call #2), identical input
+      await new Promise((r) => setTimeout(r, 100));
+      // The NEWER (succeeding) response lands first, the OLDER failure last.
+      releaseNewer();
+      await page.waitForFunction(newerSettled, null, { timeout: 10000 });
+      const olderAnswered = page.waitForResponse((r) =>
+        responseUrl.test(r.url()) && r.status() === 500);
+      releaseOlder();
+      await olderAnswered;
+      await page.unroute(pattern);
+      await new Promise((r) => setTimeout(r, 300));  // let the stale handler run
+      if (calls !== 2) {
+        fail(`(J, stale-error toast) ${label}: expected exactly two `
+          + `overlapping requests, got ${calls}`);
+      }
+      await assertNoStaleImportToast(staleMessage, label);
+    };
+    await page.click("[data-import-sample]");
+    await runStaleErrorReorder({
+      pattern: "**/api/import/dry-run",
+      responseUrl: /\/api\/import\/dry-run$/,
+      click: "[data-import-validate]",
+      staleMessage: "Superseded Validate failure (#334).",
+      // The newer request reaches the REAL server: the sample is known-good.
+      newerSettled: () => {
+        const btn = document.querySelector("[data-import-commit]");
+        return !!(btn && !btn.disabled);
+      },
+      label: "Validate",
+    });
+    if (!consumeHttpFailure(500, "POST", "/api/import/dry-run")) {
+      fail("(J, stale-error toast) expected the deliberately failed older "
+        + `Validate in the HTTP failure ledger, got:\n${errorReport()}`);
+    }
+    // Commit, from the newer Validate's own fresh review above.
+    await runStaleErrorReorder({
+      pattern: "**/api/import/commit/**",
+      responseUrl: /\/api\/import\/commit\/teams-players$/,
+      click: "[data-import-commit]",
+      staleMessage: "Superseded Commit failure (#334).",
+      newerFulfil: {
+        status: 200, contentType: "application/json",
+        body: JSON.stringify({ committed: true, summary: {} }),
+      },
+      newerSettled: () => Array.from(document.querySelectorAll(".banner h2"))
+        .some((h) => h.textContent === "Committed"),
+      label: "Commit",
+    });
+    if (!consumeHttpFailure(
+        500, "POST", "/api/import/commit/teams-players")) {
+      fail("(J, stale-error toast) expected the deliberately failed older "
+        + `Commit in the HTTP failure ledger, got:\n${errorReport()}`);
+    }
+
     // ---- (J, type-switch reorder) A Validate held across a type switch
     // AWAY and back must still be recognized as stale, even though both the
     // type key and the (empty, freshly-reset) sheets trivially match again

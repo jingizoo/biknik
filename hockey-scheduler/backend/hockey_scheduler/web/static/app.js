@@ -15317,10 +15317,15 @@ async function render() {
     // a review the operator's own latest click already superseded).
     const requestOp = ++importOperationSeq;
     importState.committed = null;
-    const res = await post("/api/import/dry-run", body);
+    // postScoped, not post() (#334): post() writes a failure into the global
+    // toast before the guard below can reject this response as superseded,
+    // and the next unrelated render would then show it over the newer result.
+    // The report renders the outcome, so the toast is only ever cleared, and
+    // only by a response that still owns the screen.
+    const res = await postScoped("/api/import/dry-run", body);
     if (importState.type !== type.key || importSnapshotKey(type) !== requestKey
         || contextRevision !== requestRevision || requestOp !== importOperationSeq) return;
-    toast = "";
+    toast = ""; toastIsError = false;
     importState.report = res;
     importState.validatedKey = (res && !res.error) ? requestKey : null;
     await render();
@@ -15342,7 +15347,7 @@ async function render() {
     const requestOp = ++importOperationSeq;  // #331 review round 10, same reasoning as Validate above
     const body = buildImportBody(type);
     if (type.needsSeason) body.season_id = importState.seasonId;
-    const res = await post(type.commitPath, body);
+    const res = await postScoped(type.commitPath, body);  // #334, as Validate above
     // Same stale-response guard as Validate above — discard this response
     // if the sheets, the selected type, the context, or a newer operation
     // superseded it while the request was in flight, rather than showing a
@@ -15353,7 +15358,7 @@ async function render() {
     // RESPONSE, same as the others below it).
     if (importState.type !== type.key || importSnapshotKey(type) !== requestKey
         || contextRevision !== requestRevision || requestOp !== importOperationSeq) return;
-    toast = "";
+    toast = ""; toastIsError = false;
     importState.committed = res;
     if (res && res.committed) { importState.report = null; importState.validatedKey = null; }
     await render();
