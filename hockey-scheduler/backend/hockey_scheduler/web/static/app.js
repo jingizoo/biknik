@@ -8982,9 +8982,18 @@ function wireCalendarCards(c) {
         entryFocusPlan ? { entryFocusPlan: entryFocusPlan } : {}));
     }
     else {
-      const preview = c.querySelector(".ib-preview");
-      if (preview) preview.remove();
+      // #335: the edit supersedes the whole previous result, not only a
+      // successful .ib-preview. A failed Preview's warning, its error and its
+      // Retry describe the superseded inputs just as much. Everything after
+      // the form is the card's state region, so replace all of it with the
+      // EMPTY copy the card now reports. The form itself is never touched,
+      // so the focused control, its value and its cursor survive.
       const card = c.querySelector(`[data-operational-card="${ICE_BUILDER_CARD}"]`);
+      const formRoot = card && card.querySelector(".ib-form");
+      if (formRoot) {
+        while (formRoot.nextSibling) formRoot.nextSibling.remove();
+        formRoot.insertAdjacentHTML("afterend", ICE_BUILDER_EMPTY_HTML);
+      }
       if (card) { card.dataset.cardState = CARD_STATE.EMPTY; card.setAttribute("aria-busy", "false"); }
     }
   };
@@ -9526,7 +9535,7 @@ function renderIceBuilder(ov) {
     stateHtml = operationalErrorCopy(ICE_BUILDER_CARD, "Ice-builder preview", entry)
       + (preview ? renderIcePreview(preview, false) : "");
   } else if (entry.state === CARD_STATE.EMPTY) {
-    stateHtml = '<div class="card sched-empty" data-card-empty="ice-builder"><div class="sched-empty-lead">No ice preview yet.</div><p>Complete the template and preview every resolved slot before creating ice.</p></div>';
+    stateHtml = ICE_BUILDER_EMPTY_HTML;
   } else if (preview) {
     stateHtml = renderIcePreview(preview, actionable);
   }
@@ -9539,6 +9548,10 @@ function renderIceBuilder(ov) {
   </div>`;
   return operationalCardFrame(ICE_BUILDER_CARD, entry, body);
 }
+
+// The Builder card's EMPTY state region. Shared with the live-edit
+// invalidation in wireCalendarCards, which swaps it in without a repaint.
+const ICE_BUILDER_EMPTY_HTML = '<div class="card sched-empty" data-card-empty="ice-builder"><div class="sched-empty-lead">No ice preview yet.</div><p>Complete the template and preview every resolved slot before creating ice.</p></div>';
 
 function renderIcePreview(pv, actionable) {
   if (pv.error) {

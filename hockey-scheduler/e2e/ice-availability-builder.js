@@ -2334,6 +2334,94 @@ async function assertSupersededBuilderErrorSilent(page, fail, cardIds, rinkId) {
   }
 }
 
+// #335: a live edit supersedes the whole previous result, including a FAILED
+// Preview's feedback. Preview with an invalid Playable minutes value, then
+// correct that field with real keystrokes. The failure must stop presenting as
+// current, while the same focused input keeps its node, its value and the
+// keyboard flow (Tab still reaches the next field). The edit must not rebuild
+// the form.
+async function assertFailedPreviewFeedbackClearsOnEdit(page, fail, cardIds, rinkId) {
+  const builderCard = `[data-operational-card="${cardIds.builder}"]`;
+  const feedback = () => page.evaluate((selector) => {
+    const card = document.querySelector(selector);
+    const visible = (el) => !!el && el.getClientRects().length > 0;
+    const pick = (q) => Array.from(card ? card.querySelectorAll(q) : [])
+      .filter(visible).map((el) => el.textContent.trim().replace(/\s+/g, " "));
+    return {
+      state: card && card.dataset.cardState,
+      busy: card && card.getAttribute("aria-busy"),
+      failures: pick(".banner.warn, .banner.alert"),
+      retry: pick("[data-card-retry]").length,
+      empty: pick('[data-card-empty="ice-builder"]').length,
+      preview: pick(".ib-preview").length,
+      commit: pick("[data-ib-commit]").length,
+    };
+  }, builderCard);
+  await page.check(`.ib-rink[value="${rinkId}"]`);
+  await page.fill("#ib-from", "2026-09-01");
+  await page.fill("#ib-to", "2026-09-30");
+  await page.fill("#ib-playable", "0");
+  await page.click("[data-ib-preview]");
+  try {
+    await page.waitForFunction((selector) => {
+      const card = document.querySelector(selector);
+      return !!card && card.dataset.cardState !== "loading"
+        && card.getAttribute("aria-busy") !== "true"
+        && !!card.querySelector(".banner.warn, .banner.alert");
+    }, builderCard, { timeout: 10000 });
+  } catch (_) {
+    fail(`(#335) a Preview with Playable minutes 0 must fail visibly first: `
+      + JSON.stringify(await feedback()));
+  }
+  const failed = await feedback();
+  if (!failed.failures.length || failed.preview || failed.commit) {
+    fail(`(#335) expected a visible failed Preview with no Create: `
+      + JSON.stringify(failed));
+  }
+  await page.locator("#ib-playable").focus();
+  await page.evaluate(() => { window.__ib335Field = document.activeElement; });
+  // A number input has no caret API, so End cannot place the cursor; select
+  // the invalid value with the keyboard and type the correction over it.
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.type("60");
+  const edited = await page.evaluate(() => {
+    const active = document.activeElement;
+    return {
+      sameNode: active === window.__ib335Field,
+      connected: !!(active && active.isConnected),
+      id: active && active.id,
+      value: active && active.value,
+    };
+  });
+  if (!edited.sameNode || !edited.connected || edited.id !== "ib-playable"
+      || edited.value !== "60") {
+    fail(`(#335) correcting the field must keep the same focused input and `
+      + `its typed value: ${JSON.stringify(edited)}`);
+  }
+  const after = await feedback();
+  if (after.failures.length || after.retry || after.preview || after.commit
+      || after.empty !== 1 || after.state !== "empty") {
+    fail(`(#335) the failed Preview's feedback still presents as current after `
+      + `the corrected edit (it must be replaced by the EMPTY state, with no `
+      + `Create): before ${JSON.stringify(failed)}, after ${JSON.stringify(after)}`);
+  }
+  await page.keyboard.press("Tab");
+  const tabbed = await page.evaluate(() => document.activeElement
+    && document.activeElement.id);
+  if (tabbed !== "ib-turnover") {
+    fail(`(#335) keyboard flow broke after the edit: Tab reached `
+      + `${JSON.stringify(tabbed)}, expected ib-turnover`);
+  }
+  await page.evaluate(() => { delete window.__ib335Field; });
+  // The corrected template previews normally.
+  await previewCurrent(page);
+  const recovered = await feedback();
+  if (!recovered.preview || recovered.failures.length) {
+    fail(`(#335) the corrected template did not preview: `
+      + JSON.stringify(recovered));
+  }
+}
+
 // A preview mismatch is a two-response failure recovery: the rejected Create
 // is followed immediately by a replacement Preview. Keep the original pending
 // heading truthful, then prove a newer Back focus choice is re-found through
@@ -2736,6 +2824,7 @@ async function checkViewport(browser, viewport) {
     await keepsFocusThroughToggle("#ib-weekday-2", "weekday checkbox");
     await keepsFocusThroughToggle(`#ib-rink-${rink3}`, "rink checkbox with a preview showing");
     await assertSupersededBuilderErrorSilent(page, fail, cardIds, rink3);
+    await assertFailedPreviewFeedbackClearsOnEdit(page, fail, cardIds, rink3);
 
     // (F) Per-weekday windows: each selected day carries its OWN local start/end
     // time. Open a fresh builder on a clean rink, keep Tuesday 18:00-22:00 (3
