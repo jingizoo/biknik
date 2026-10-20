@@ -570,6 +570,8 @@ async function checkViewport(browser, viewport) {
 
     // (3) COMMIT sends the reviewed format, and really creates 16 games.
     await page.click("[data-sched-commit]");
+    await page.waitForSelector('[data-sched-confirm-yes="commit"]');
+    await page.click('[data-sched-confirm-yes="commit"]');
     await page.waitForFunction(
       () => /Committed 16 draft game\(s\)/.test(document.body.textContent || ""),
       null, { timeout: 15000 });
