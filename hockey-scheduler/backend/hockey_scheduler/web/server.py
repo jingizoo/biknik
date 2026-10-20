@@ -13,6 +13,8 @@ import re
 import ssl
 import sys
 import uuid
+import threading
+import time
 import traceback
 from contextlib import contextmanager
 from datetime import datetime
@@ -734,6 +736,25 @@ def _validate_reassignment_body(path: str, body: dict):
 DISCARDED_READ = object()
 
 
+# Per-request server-side tracing (#465). A browser journey intermittently
+# times out waiting for a response to a POST it did send. Observing that from
+# the browser (Playwright request listeners) changed the timing enough to make
+# the failure disappear, so this observes from the other side instead. With
+# HS_REQUEST_TRACE set, one stderr line is printed per connection accepted,
+# per request parsed and per request finished, each with a monotonic
+# timestamp and the handling thread. A POST that never ARRIVEs was stuck
+# before the server read it; one that ARRIVEs but is never DONE was stuck
+# inside the server. Off by default; read once at import, as the server
+# process starts.
+_REQUEST_TRACE = bool(os.environ.get("HS_REQUEST_TRACE"))
+
+
+def _trace_request(event: str, detail: str) -> None:
+    if _REQUEST_TRACE:
+        print(f"TRACE {time.monotonic():.3f} {event} "
+              f"t={threading.get_ident()} {detail}", file=sys.stderr, flush=True)
+
+
 class Handler(BaseHTTPRequestHandler):
     # When True (set by ``do_HEAD``), the body-writing response helpers send the
     # status line + headers + a correct Content-Length but SKIP the body write,
@@ -775,11 +796,25 @@ class Handler(BaseHTTPRequestHandler):
         self._boundary_wire_written = True
         super().flush_headers()
 
+    def parse_request(self):
+        parsed = super().parse_request()
+        if _REQUEST_TRACE:
+            self._trace_started = time.monotonic()
+            _trace_request("ARRIVE", f"{self.command} {self.path}")
+        return parsed
+
     def handle_one_request(self):
         self._boundary_wire_written = False
+        self._trace_started = None
         try:
             super().handle_one_request()
+            if self._trace_started is not None:
+                _trace_request("DONE", f"{self.command} {self.path} "
+                               f"{time.monotonic() - self._trace_started:.3f}s")
         except Exception as exc:      # noqa: BLE001 — deliberate catch-all
+            if self._trace_started is not None:
+                _trace_request("RAISED", f"{self.command} {self.path} "
+                               f"{type(exc).__name__}")
             # A client that has already gone away cannot be answered; writing
             # would raise again. Mirrors ``Server.handle_error``'s exemption.
             if isinstance(exc, (BrokenPipeError, ConnectionResetError,
@@ -6119,6 +6154,11 @@ class Server(ThreadingHTTPServer):
     already gone; there is nothing left to send. Anything else still gets the
     default traceback so a genuine bug is never silently swallowed.
     """
+
+    def get_request(self):
+        request = super().get_request()
+        _trace_request("ACCEPT", f"{request[1][0]}:{request[1][1]}")
+        return request
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
