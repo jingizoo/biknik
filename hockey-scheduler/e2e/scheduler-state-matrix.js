@@ -94,6 +94,25 @@ const SCOPED_POST_BOUNDARIES = Object.freeze({
     settlement: "substitute",
     arguments: /^\s*\(\s*`\/api\/me\/substitute-opportunities\/\$\{encodeURIComponent\(gid\)\}\/\$\{verb\}`\s*,\s*body\s*\)/,
   }),
+  // #334: Import Validate/Commit own their response through importOperationSeq
+  // and contextRevision, not a card identity. They use the silent transport so
+  // a superseded failure cannot publish into the page toast before that guard.
+  "import-validate-ledger": Object.freeze({
+    owner: "render",
+    functionDepth: 2,
+    shape: "direct",
+    result: "res",
+    settlement: "import",
+    arguments: /^\s*\(\s*"\/api\/import\/dry-run"\s*,\s*body\s*\)/,
+  }),
+  "import-commit-ledger": Object.freeze({
+    owner: "render",
+    functionDepth: 2,
+    shape: "direct",
+    result: "res",
+    settlement: "import",
+    arguments: /^\s*\(\s*type\.commitPath\s*,\s*body\s*\)/,
+  }),
   "substitute-detail-ledger": Object.freeze({
     owner: "render",
     functionDepth: 3,
@@ -411,6 +430,33 @@ function boundarySettlementHolds(contract, call, ancestors, assignment) {
           "settleCardWrite", ["identity"])) return false;
     return isNegatedBindingReturn(
       nextStatement(ancestors, settlement), "settled");
+  }
+  if (contract.settlement === "import") {
+    // The ownership guard must be the very next statement: a bare return when
+    // either the operation or the context moved on, before anything can act
+    // on (or announce) a superseded response.
+    const guard = nextStatement(ancestors, assignment.statement);
+    if (!guard || guard.type !== "IfStatement" || guard.alternate) return false;
+    const consequent = guard.consequent;
+    const bareReturn = consequent.type === "ReturnStatement"
+      ? consequent.argument == null
+      : consequent.type === "BlockStatement" && consequent.body.length === 1
+        && consequent.body[0].type === "ReturnStatement"
+        && consequent.body[0].argument == null;
+    if (!bareReturn) return false;
+    const terms = [];
+    const collect = (node) => {
+      if (node.type === "LogicalExpression" && node.operator === "||") {
+        collect(node.left); collect(node.right);
+      } else terms.push(node);
+    };
+    collect(guard.test);
+    const rejects = (left, right) => terms.some((node) =>
+      node.type === "BinaryExpression" && node.operator === "!=="
+      && node.left.type === "Identifier" && node.left.name === left
+      && node.right.type === "Identifier" && node.right.name === right);
+    return rejects("requestOp", "importOperationSeq")
+      && rejects("contextRevision", "requestRevision");
   }
   if (contract.settlement === "substitute") {
     const enclosingTry = ancestors.slice().reverse().find((node) =>
