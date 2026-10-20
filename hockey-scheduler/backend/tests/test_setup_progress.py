@@ -20,18 +20,21 @@ method).
 """
 
 import json
+import os
+import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import Role, SeasonTeamRegistration
-from hockey_scheduler.store import InMemoryStore
+from hockey_scheduler.store import InMemoryStore, SqlStore
 
 ADMIN = (Role.LEAGUE_ADMIN, {})
 ARENA = (Role.ARENA_MANAGER, {})
@@ -44,14 +47,21 @@ def _statuses(progress):
 
 
 class SetupProgressComputationTest(unittest.TestCase):
-    """Facade-level, Memory-backed: the workflow-completion logic itself has
-    no concurrency angle (a pure read composed from store methods that each
-    already carry their own Memory/SQLite/PostgreSQL parity coverage), so one
-    backend is sufficient here — the same scope test_v2_onboarding_status.py
-    takes for the sibling logic this mirrors."""
+    """Facade-level setup-progress computation, on Memory here and on
+    file-backed SQLite and real PostgreSQL through the subclasses below
+    (#332).
+
+    Every test builds its fixture through the same ``ApiService`` writes and
+    then reads ``get_setup_progress``, so each subclass runs the whole
+    composed calculation against that store's own queries. A Memory pass
+    alone left the SQL CI jobs running this module without ever reaching a
+    SQL store."""
+
+    def make_store(self):
+        return InMemoryStore()
 
     def _api(self):
-        return ApiService(InMemoryStore())
+        return ApiService(self.make_store())
 
     def test_no_program_is_a_named_empty_state_not_an_error(self):
         api = self._api()
@@ -1372,16 +1382,62 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertIsNone(progress["next_blocked"], progress)
 
 
+class SetupProgressComputationSQLiteTest(SetupProgressComputationTest):
+    """The same contract on a file-backed SQLite store (#332)."""
+
+    def make_store(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(path)
+        store = SqlStore(path)
+
+        def cleanup():
+            store.close()
+            if os.path.exists(path):
+                os.unlink(path)
+        self.addCleanup(cleanup)
+        return store
+
+    def test_ran_on_sqlite(self):
+        self.assertEqual(self._api().store.backend, "sqlite")
+
+
+class SetupProgressComputationPostgresTest(SetupProgressComputationTest):
+    """The same contract on real PostgreSQL when ``TEST_DATABASE_URL`` is set
+    (#332)."""
+
+    def make_store(self):
+        dsn = os.environ.get("TEST_DATABASE_URL")
+        if not dsn:
+            self.skipTest("TEST_DATABASE_URL not configured")
+        store = SqlStore(dsn)
+        store.reset_schema()
+        self.addCleanup(store.close)
+        return store
+
+    def test_ran_on_postgres(self):
+        self.assertEqual(self._api().store.backend, "postgres")
+
+
 class SetupProgressHttpTest(unittest.TestCase):
     """Route/authz contract over real HTTP — mirrors test_v2_setup_contract.
     py's harness. The demo seed (STATE.reset()) provisions the standard
     admin/arena/coach accounts this reuses."""
 
+    #: The store the demo server builds (``create_store`` reads
+    #: ``DATABASE_URL``). ``None`` keeps the in-memory demo default; the SQL
+    #: subclasses below point it at a real database (#332).
+    DATABASE_URL = None
+
     @classmethod
     def setUpClass(cls):
         srv = __import__("hockey_scheduler.web.server", fromlist=["x"])
         cls.srv = srv
-        srv.STATE.reset()
+        env = {"DATABASE_URL": cls.DATABASE_URL} if cls.DATABASE_URL else {}
+        with mock.patch.dict(os.environ, env):
+            if not cls.DATABASE_URL:
+                os.environ.pop("DATABASE_URL", None)
+            srv.STATE.reset()
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
         cls.port = cls.httpd.server_address[1]
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
@@ -1924,6 +1980,64 @@ class SetupProgressHttpTest(unittest.TestCase):
         self.assertFalse(rows[1]["met"], rows)
         self.assertEqual(rows[1]["reason"], "season_archived", rows)
         self.assertIn(season["name"], rows[1]["detail"], rows)
+
+
+class _SqlSetupProgressHttp(SetupProgressHttpTest):
+    """Shared teardown for the SQL HTTP runs: put the process-wide demo
+    STATE back on the in-memory default, so a later module never inherits a
+    server bound to this run's database."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not cls.DATABASE_URL:  # this shared base itself, not a backend
+            raise unittest.SkipTest("abstract SQL HTTP base")
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("DATABASE_URL", None)
+            cls.srv.STATE.reset()
+
+    def test_server_ran_on_the_sql_store(self):
+        self.assertEqual(self.srv.STATE.api.store.backend, self.BACKEND_NAME)
+
+
+class SetupProgressHttpSQLiteTest(_SqlSetupProgressHttp):
+    """The HTTP route/authz contract against a file-backed SQLite demo
+    server (#332)."""
+
+    BACKEND_NAME = "sqlite"
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls._db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(cls._db_path)
+        cls.DATABASE_URL = cls._db_path
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        if os.path.exists(cls._db_path):
+            os.unlink(cls._db_path)
+
+
+class SetupProgressHttpPostgresTest(_SqlSetupProgressHttp):
+    """The HTTP route/authz contract against a real PostgreSQL demo server
+    when ``TEST_DATABASE_URL`` is set (#332)."""
+
+    BACKEND_NAME = "postgres"
+
+    @classmethod
+    def setUpClass(cls):
+        dsn = os.environ.get("TEST_DATABASE_URL")
+        if not dsn:
+            raise unittest.SkipTest("TEST_DATABASE_URL not configured")
+        cls.DATABASE_URL = dsn
+        super().setUpClass()
 
 
 if __name__ == "__main__":
