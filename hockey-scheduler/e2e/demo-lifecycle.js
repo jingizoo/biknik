@@ -181,7 +181,11 @@ async function checkViewport(browser, viewport) {
   const server = spawn(
     process.env.PYTHON || "python3",
     ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST, "--port", String(viewport.port)],
-    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
+    // HS_REQUEST_TRACE (#465): the server logs every accept, request arrival
+    // and completion, so a timed-out waitForResponse below can be told apart
+    // as "the POST never reached the server" versus "it never finished there".
+    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, HS_REQUEST_TRACE: "1" } });
   let serverOutput = "";
   server.stdout.on("data", (d) => { serverOutput += d.toString(); });
   server.stderr.on("data", (d) => { serverOutput += d.toString(); });
@@ -615,7 +619,15 @@ async function checkViewport(browser, viewport) {
       + `a stale render() cannot destroy the confirm modal, and cancellation `
       + `releases and reuses ice while retaining fixture history.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    // The stack names the waitForResponse that timed out; the trace tail
+    // shows what the server saw around it (#465).
+    const lines = serverOutput.split("\n");
+    const trace = lines.filter((l) => l.startsWith("TRACE "));
+    const other = lines.filter((l) => !l.startsWith("TRACE ")).join("\n");
+    throw new Error(`${error.stack || error.message}`
+      + `\n--- demo server output ---\n${other}`
+      + `\n--- server request trace (last ${Math.min(trace.length, 200)} of `
+      + `${trace.length}) ---\n${trace.slice(-200).join("\n")}`);
   } finally {
     await context.close();
     await stopServer(server);
