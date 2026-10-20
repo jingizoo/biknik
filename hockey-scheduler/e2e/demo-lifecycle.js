@@ -501,10 +501,47 @@ async function checkViewport(browser, viewport) {
     }
 
     // Re-open and activate the focused destructive action with Enter.
+    //
+    // #465: any render() that lands between focusing Confirm and pressing
+    // Enter rebuilds the open dialog, and syncOverlayFocus() then re-anchors
+    // focus on the dialog CONTAINER (its contract, asserted by
+    // accessibility-foundations), so Enter activates nothing and no cancel
+    // POST is ever sent. CI's request trace showed exactly that: the cancel
+    // never reached the server while every request that did arrive finished.
+    // app.js renders on no timer, so once the open transition has settled
+    // (the container holds focus, as the first open above waits for) and no
+    // render() pass is still in flight (the Escape's own pass may be), nothing
+    // can repaint the dialog before the keystroke. render() is wrapped from
+    // here, coach-scope's pattern, with the shipped app untouched.
+    await page.evaluate(() => {
+      if (window.__dlRenderWatch) return;
+      const watch = { entered: 0, ended: 0 };
+      const inner = window.render;
+      window.__dlRenderWatch = watch;
+      window.render = async function watchedRender(...args) {
+        watch.entered += 1;
+        try { return await inner.apply(this, args); } finally { watch.ended += 1; }
+      };
+    });
     await page.click(cancelSelector);
     await page.waitForSelector(".modal.danger [data-cancel-game-confirm]",
       { timeout: 5000 });
+    await page.waitForFunction(() => {
+      const w = window.__dlRenderWatch;
+      return w.entered === w.ended && document.activeElement
+        && document.activeElement.matches(".modal.danger");
+    }, null, { timeout: 10000 });
     await page.focus("[data-cancel-game-confirm]");
+    const beforeEnter = await page.evaluate(() => ({
+      onConfirm: !!(document.activeElement
+        && document.activeElement.matches("[data-cancel-game-confirm]")),
+      active: document.activeElement && document.activeElement.className,
+      inFlight: window.__dlRenderWatch.entered - window.__dlRenderWatch.ended,
+    }));
+    if (!beforeEnter.onConfirm || beforeEnter.inFlight) {
+      throw new Error(`[${V}] keyboard cancellation lost Confirm focus before `
+        + `Enter (#465): ${JSON.stringify(beforeEnter)}`);
+    }
     const cancelResponse = page.waitForResponse((r) =>
       r.url() === `${base}/api/games/${target.game_id}/cancel`
       && r.request().method() === "POST");
