@@ -1088,8 +1088,11 @@ reproductions from the review (Memory/SQLite/HTTP), the same-upload
 conflicting-Division case, and a forced two-connection PostgreSQL transfer
 race (an existing Team's permanent League changes between this attempt's
 unlocked pre-read and its row lock); the desktop/390px import smoke test
-gains a same-upload-conflict case asserting the structured error rather
-than a bare `Committed` state.
+gains a same-upload-conflict case. Since #339 that case holds the real
+Commit response until it has confirmed the check fails on the pre-result
+page, then requires the rendered result to show the visible `Not committed`
+alert, the server's exact `import_new_division_league_conflict` message in
+that report's error row, and no visible `Committed` state.
 
 Re-verifying this fix against the full suite surfaced a further, non-review
 correction: round 14's own `test_identical_global_team_and_player_codes_
@@ -1281,8 +1284,11 @@ helper, and the registration-repair gate check) reverted in turn, with the
 rest of the fix left in place, confirming each scenario's own regressions
 fail for the exact documented reason and no other, before every revert is
 restored. Desktop and 390px import smoke coverage gains a second scenario
-(alongside round 15's) proving the ambiguous-Division-name rejection
-surfaces in the real UI, never a false `Committed` state.
+(alongside round 15's) for the ambiguous-Division-name rejection. Since
+#339 it makes the same held-response check: the visible `Not committed`
+alert and the exact `import_division_name_ambiguous` message in the
+rendered error row, never a `Committed` state. Suppressing the error
+render while the JSON is unchanged fails both scenarios.
 
 Round 16's own convergence review (#331 review round 17) found one further
 blocker in the same registration lifecycle, adjacent to but distinct from
@@ -1384,8 +1390,9 @@ backend. No UI change and no new e2e coverage was needed for the new
 (`renderImportRows`/`renderImportResult`) is reason-agnostic — it renders
 `sheet`/`row`/`field`/`message` generically for every entry in `errors[]`
 — so the identical code path round 16's own desktop/390px coverage above
-already exercises for `import_division_name_ambiguous` renders this reason
-too, with no reason-specific branch to leave uncovered.
+exercises for `import_division_name_ambiguous` (whose visible error row
+that coverage asserts since #339) renders this reason too, with no
+reason-specific branch to leave uncovered.
 
 Out of scope for this round, found during investigation and intentionally
 NOT fixed here: `upsert_imported_registration` (the analogous upsert
